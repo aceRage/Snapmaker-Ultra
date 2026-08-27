@@ -984,7 +984,7 @@ void GizmoObjectManipulation::do_render_move_window(ImGuiWrapper *imgui_wrapper,
                     if (inst_idx >= 0 && inst_idx < (int) mo->instances.size())
                         parent_box = mo->instance_convex_hull_bounding_box((size_t) inst_idx);
                     else
-                        parent_box = mo->bounding_box();
+                        parent_box = mo->bounding_box_approx();
                 }
             }
             m_alignment_helper->set_parent_box(parent_box);
