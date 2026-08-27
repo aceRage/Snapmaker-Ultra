@@ -11900,7 +11900,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 error_message += "-" + it->first + ": " + it->second + "\n";
                                 any_entry = true;
                             }
-                            if (any_entry) {
+                            if (any_entry && wxGetApp().app_config->get("skip_settings_mapping_warnings") != "true") {
                                 error_message += "\n";
                                 error_message += L("Please correct them in the param tabs");
                                 notify_manager->bbl_show_3mf_warn_notification(error_message);

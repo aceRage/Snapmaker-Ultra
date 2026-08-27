@@ -359,8 +359,18 @@ static wxString substitution_message(const wxString& changes)
 		_L("Some values have been replaced. Please check them:") + "\n" + changes + "\n";
 }
 
+// Loaded configs with unrecognized values have already had substitutions applied by the
+// time these dialogs run; when the user opts out of mapping warnings, skip the report.
+static bool skip_settings_mapping_warnings()
+{
+	const AppConfig* config = wxGetApp().app_config;
+	return config != nullptr && config->get("skip_settings_mapping_warnings") == "true";
+}
+
 void show_substitutions_info(const PresetsConfigSubstitutions& presets_config_substitutions)
 {
+	if (skip_settings_mapping_warnings())
+		return;
 	wxString changes;
 
 	auto preset_type_name = [](Preset::Type type) {
@@ -389,6 +399,8 @@ void show_substitutions_info(const PresetsConfigSubstitutions& presets_config_su
 
 void show_substitutions_info(const ConfigSubstitutions& config_substitutions, const std::string& filename)
 {
+	if (skip_settings_mapping_warnings())
+		return;
 	wxString changes = "\n";
 	add_config_substitutions(config_substitutions, changes);
 

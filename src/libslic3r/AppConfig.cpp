@@ -405,6 +405,10 @@ void AppConfig::set_defaults()
         set("backup_interval", "10");
     }
 
+    if (get("skip_settings_mapping_warnings").empty()) {
+        set_bool("skip_settings_mapping_warnings", true);
+    }
+
     if (get("autosave_switch").empty()) {
         set_bool("autosave_switch", false);
     }

@@ -1337,6 +1337,8 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_save_presets = create_item_button(_L("Clear my choice on the unsaved presets."), _L("Clear"), page, L"", _L("Clear my choice on the unsaved presets."), []() {
         wxGetApp().app_config->set("save_preset_choise", "");
     });
+    auto item_skip_mapping_warnings = create_item_checkbox(_L("Skip Settings Mapping Warnings"), page,
+        _L("Don't show warnings about unrecognized or invalid settings replaced while loading project files; the defaults or automatic fixes are applied silently."), 50, "skip_settings_mapping_warnings");
 
 #ifdef _WIN32
     auto title_associate_file = create_item_title(_L("Associate files to Snapmaker Orca"), page, _L("Associate files to Snapmaker Orca"));
@@ -1439,6 +1441,7 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_system_sync, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_remember_printer_config, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_save_presets, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_skip_mapping_warnings, 0, wxTOP, FromDIP(3));
     //sizer_page->Add(title_network, 0, wxTOP | wxEXPAND, FromDIP(20));
     //sizer_page->Add(item_check_stable_version_only, 0, wxTOP, FromDIP(3));
 
