@@ -23974,9 +23974,20 @@ int Plater::delete_plate(int plate_index)
 
     take_snapshot("delete partplate");
 
+    // CRASH FIX: Stop any running background slice before PartPlateList::delete_plate destroys
+    // the Print and GCodeResult the worker thread is using. stop() blocks until the worker is
+    // idle and must be called while the Print is still alive, as it dereferences m_print to
+    // cancel it. Without this, deleting a plate during (or right after) slicing is a
+    // use-after-free in the worker thread.
+    p->background_process.stop();
+
     // CRASH FIX: Clear fff_print reference before PartPlateList::delete_plate destroys the Print,
-    // preventing dangling pointer access during subsequent update calls.
+    // preventing dangling pointer access during subsequent update calls. Clear the gcode result
+    // and current plate references for the same reason; update_slice_context_to_current_plate()
+    // below re-points all of them at the new current plate.
     p->background_process.set_fff_print(nullptr);
+    p->background_process.set_gcode_result(nullptr);
+    p->background_process.set_current_plate(nullptr);
 
     ret = p->partplate_list.delete_plate(index);
 
