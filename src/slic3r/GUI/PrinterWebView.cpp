@@ -122,6 +122,88 @@ void PrinterWebView::OnClose(wxCloseEvent& evt)
     this->Hide();
 }
 
+// High-FPS LAN camera overlay for the Snapmaker U1 device page. The Flutter app polls
+// http://<printer-ip>/server/files/camera/monitor.jpg (~1 fps); this script sniffs that
+// URL to learn the printer's LAN address, then offers a floating "HD" button that opens
+// the printer's camera-streamer WebRTC player (http://<ip>/webcam/webrtc, ~15 fps) in a
+// full-view iframe overlay. Inert on pages that never poll the monitor snapshot.
+static const char* hd_camera_script()
+{
+    return R"JS(
+    (function() {
+        if (window.__snorca_hd_cam) return;
+        window.__snorca_hd_cam = true;
+        var printerHost = null, btn = null, overlay = null;
+        function onUrl(u) {
+            try {
+                if (printerHost || typeof u !== 'string') return;
+                var m = u.match(/^https?:\/\/([^\/]+)\/server\/files\/camera\/monitor\.jpg/i);
+                if (m) { printerHost = m[1]; ensureBtn(); }
+            } catch (e) {}
+        }
+        try {
+            var d = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+            if (d && d.set) Object.defineProperty(HTMLImageElement.prototype, 'src', {
+                configurable: true,
+                get: d.get,
+                set: function(v) { onUrl(v); return d.set.call(this, v); }
+            });
+        } catch (e) {}
+        try {
+            if (window.fetch) {
+                var of = window.fetch;
+                window.fetch = function(input, init) {
+                    onUrl(typeof input === 'string' ? input : (input && input.url));
+                    return of.apply(this, arguments);
+                };
+            }
+        } catch (e) {}
+        try {
+            var oo = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) { onUrl(url); return oo.apply(this, arguments); };
+        } catch (e) {}
+        function ensureBtn() {
+            if (btn) return;
+            if (!document.body) { setTimeout(ensureBtn, 1000); return; }
+            btn = document.createElement('div');
+            btn.textContent = 'HD';
+            btn.title = 'High-FPS camera stream (LAN)';
+            btn.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483645;width:44px;height:44px;border-radius:22px;background:rgba(0,0,0,0.65);color:#fff;font:bold 15px sans-serif;display:flex;align-items:center;justify-content:center;cursor:pointer;user-select:none;box-shadow:0 2px 8px rgba(0,0,0,0.4);';
+            btn.onclick = toggleOverlay;
+            document.body.appendChild(btn);
+        }
+        function toggleOverlay() {
+            if (overlay) { overlay.remove(); overlay = null; return; }
+            overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:#000;';
+            var frame = document.createElement('iframe');
+            frame.src = 'http://' + printerHost + '/webcam/webrtc';
+            frame.allow = 'autoplay';
+            frame.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;border:0;';
+            overlay.appendChild(frame);
+            var close = document.createElement('div');
+            close.textContent = '✕';
+            close.title = 'Close';
+            close.style.cssText = 'position:absolute;right:16px;top:16px;z-index:2;width:36px;height:36px;border-radius:18px;background:rgba(255,255,255,0.15);color:#fff;font:bold 16px sans-serif;display:flex;align-items:center;justify-content:center;cursor:pointer;user-select:none;';
+            close.onclick = toggleOverlay;
+            overlay.appendChild(close);
+            document.body.appendChild(overlay);
+        }
+    })();
+    )JS";
+}
+
+void PrinterWebView::InjectHdCameraScript()
+{
+    if (m_browser == nullptr)
+        return;
+    // Inject into the current page and persist for future navigations (idempotent JS guard).
+    WebView::RunScript(m_browser, hd_camera_script());
+#ifndef __WXMAC__
+    m_browser->AddUserScript(hd_camera_script());
+#endif
+}
+
 void PrinterWebView::SendAPIKey()
 {
     if (m_apikey.IsEmpty())
@@ -184,6 +266,8 @@ void PrinterWebView::SendAPIKey()
     // Do NOT call Reload() — the current page is already handled by RunScript above.
     m_browser->RemoveAllUserScripts();
     m_browser->AddUserScript(script);
+    // RemoveAllUserScripts above also dropped the HD camera script; re-add it.
+    m_browser->AddUserScript(hd_camera_script());
 #endif
 }
 
@@ -226,6 +310,7 @@ void PrinterWebView::OnLoaded(wxWebViewEvent &evt)
     if (evt.GetURL() != m_browser->GetCurrentURL())
         return;
     SendAPIKey();
+    InjectHdCameraScript();
 }
 
 void PrinterWebView::OnScriptMessage(wxWebViewEvent& evt) {
