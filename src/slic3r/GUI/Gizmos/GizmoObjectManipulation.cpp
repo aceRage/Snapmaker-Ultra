@@ -1027,8 +1027,11 @@ void GizmoObjectManipulation::do_render_move_window(ImGuiWrapper *imgui_wrapper,
                             _L("Distribute left-right") + " (X)", _L("Please select at least 3 parts or objects"), true);
         }
 
-        float new_space_size = space_size * 0.8f;
-        ImGui::SameLine(start_x + unit_size + space_size + new_space_size);
+        // Chain the Y/Z groups after the X group with an explicit gap instead of absolute
+        // offsets: BBS's unit_size-based offsets land short of the X row's end with this
+        // panel's metrics, drawing "Align front" on top of "Align right".
+        float group_gap = space_size * 2.0f;
+        ImGui::SameLine(0, group_gap);
         show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::Y_MIN,
                         (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Y_MIN_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Y_MIN), icon_size,
                         _L("Align front") + " (-Y)", "");
@@ -1047,7 +1050,7 @@ void GizmoObjectManipulation::do_render_move_window(ImGuiWrapper *imgui_wrapper,
                             _L("Distribute front-back") + " (Y)", _L("Please select at least 3 parts or objects"), true);
         }
         if (show_align_parts_objects || is_part_node) {
-            ImGui::SameLine(start_x + 2 * (unit_size + space_size) + new_space_size + new_space_size);
+            ImGui::SameLine(0, group_gap);
             show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::Z_MIN,
                             (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Z_MIN_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Z_MIN), icon_size,
                             _L("Align bottom") + " (-Z)", "");
