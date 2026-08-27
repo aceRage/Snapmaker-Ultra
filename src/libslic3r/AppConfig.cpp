@@ -405,6 +405,14 @@ void AppConfig::set_defaults()
         set("backup_interval", "10");
     }
 
+    if (get("autosave_switch").empty()) {
+        set_bool("autosave_switch", false);
+    }
+
+    if (get("autosave_interval").empty()) {
+        set("autosave_interval", "300");
+    }
+
     if (get("curr_bed_type").empty()) {
         set("curr_bed_type", "1");
     }

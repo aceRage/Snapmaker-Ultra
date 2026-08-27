@@ -637,6 +637,58 @@ wxBoxSizer *PreferencesDialog::create_item_backup_input(wxString title, wxWindow
     return m_sizer_input;
 }
 
+// BBS: same layout as the backup interval row, but drives the project auto-save timer
+wxBoxSizer *PreferencesDialog::create_item_autosave_input(wxString title, wxWindow *parent, wxString tooltip, std::string param)
+{
+    wxBoxSizer *m_sizer_input = new wxBoxSizer(wxHORIZONTAL);
+    auto input_title = new wxStaticText(parent, wxID_ANY, title, wxDefaultPosition, wxDefaultSize, 0);
+    input_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    input_title->SetFont(::Label::Body_13);
+    input_title->SetToolTip(tooltip);
+    input_title->Wrap(-1);
+
+    auto input = new ::TextInput(parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, DESIGN_INPUT_SIZE, wxTE_PROCESS_ENTER);
+    StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled), std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
+    input->SetBackgroundColor(input_bg);
+    input->GetTextCtrl()->SetValue(app_config->get(param));
+    wxTextValidator validator(wxFILTER_DIGITS);
+    input->GetTextCtrl()->SetValidator(validator);
+
+    auto second_title = new wxStaticText(parent, wxID_ANY, _L("Second"), wxDefaultPosition, DESIGN_TITLE_SIZE, 0);
+    second_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    second_title->SetFont(::Label::Body_13);
+    second_title->SetToolTip(tooltip);
+    second_title->Wrap(-1);
+
+    m_sizer_input->Add(0, 0, 0, wxEXPAND | wxLEFT, 23);
+    m_sizer_input->Add(input_title, 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    m_sizer_input->Add(input, 0, wxALIGN_CENTER_VERTICAL, 0);
+    m_sizer_input->Add(0, 0, 0, wxEXPAND | wxLEFT, 3);
+    m_sizer_input->Add(second_title, 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+
+    std::function<void()> autosave_interval = [this, param, input]() {
+        app_config->set(param, std::string(input->GetTextCtrl()->GetValue().mb_str()));
+        app_config->save();
+        wxGetApp().mainframe->update_autosave_timer();
+    };
+
+    input->GetTextCtrl()->Bind(wxEVT_TEXT_ENTER, [autosave_interval](wxCommandEvent &e) {
+        autosave_interval();
+        e.Skip();
+    });
+
+    input->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [autosave_interval](wxFocusEvent &e) {
+        autosave_interval();
+        e.Skip();
+    });
+
+    input->Enable(app_config->get("autosave_switch") == "true");
+    input->Refresh();
+
+    if (param == "autosave_interval") { m_autosave_interval_textinput = input; }
+    return m_sizer_input;
+}
+
 
 wxBoxSizer *PreferencesDialog::create_item_switch(wxString title, wxWindow *parent, wxString tooltip ,std::string param)
 {
@@ -788,6 +840,13 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxWindow *pa
             app_config->get("backup_interval", backup_interval);
             Slic3r::set_backup_interval(pbool ? boost::lexical_cast<long>(backup_interval) : 0);
             if (m_backup_interval_textinput != nullptr) { m_backup_interval_textinput->Enable(pbool); }
+        }
+
+        // auto-save
+        if (param == "autosave_switch") {
+            bool pbool = app_config->get("autosave_switch") == "true" ? true : false;
+            wxGetApp().mainframe->update_autosave_timer();
+            if (m_autosave_interval_textinput != nullptr) { m_autosave_interval_textinput->Enable(pbool); }
         }
 
         if (param == "sync_user_preset") {
@@ -1322,6 +1381,8 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_gcodes_warning = create_item_checkbox(_L("No warnings when loading 3MF with modified G-code"), page, _L("No warnings when loading 3MF with modified G-code"), 50, "no_warn_when_modified_gcodes");
     auto item_backup  = create_item_checkbox(_L("Auto-Backup"), page,_L("Backup your project periodically for restoring from the occasional crash."), 50, "backup_switch");
     auto item_backup_interval = create_item_backup_input(_L("every"), page, _L("The period of backup in seconds."), "backup_interval");
+    auto item_autosave = create_item_checkbox(_L("Auto-Save project"), page, _L("Periodically save the project to its own file. Only projects that have already been saved once are auto-saved."), 50, "autosave_switch");
+    auto item_autosave_interval = create_item_autosave_input(_L("every"), page, _L("The period of auto-save in seconds."), "autosave_interval");
 
     //downloads
     auto title_downloads = create_item_title(_L("Downloads"), page, _L("Downloads"));
@@ -1417,6 +1478,8 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_gcodes_warning, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_backup, 0, wxTOP,FromDIP(3));
     item_backup->Add(item_backup_interval, 0, wxLEFT, 0);
+    sizer_page->Add(item_autosave, 0, wxTOP, FromDIP(3));
+    item_autosave->Add(item_autosave_interval, 0, wxLEFT, 0);
 
     sizer_page->Add(title_downloads, 0, wxTOP| wxEXPAND, FromDIP(20));
     sizer_page->Add(item_downloads, 0, wxEXPAND, FromDIP(3));

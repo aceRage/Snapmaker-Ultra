@@ -597,6 +597,23 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
         Bind(EVT_BACKUP_POST, [](wxCommandEvent& e) {
             Slic3r::run_backup_ui_tasks();
             });
+
+        // BBS: auto-save the project to its own file, in addition to auto-backup
+        m_autosave_timer = new wxTimer(this);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent& e) {
+            if (m_plater == nullptr)
+                return;
+            // Only save projects that already have a file on disk; never pop a Save-As dialog.
+            if (m_plater->get_project_filename(".3mf").IsEmpty())
+                return;
+            if (!m_plater->is_project_dirty())
+                return;
+            if (m_plater->save_project(false) != wxID_YES) {
+                // The failed save already showed an error dialog; stop retrying every interval.
+                m_autosave_timer->Stop();
+            }
+        }, m_autosave_timer->GetId());
+        update_autosave_timer();
 ;    }
     this->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &evt) {
 #ifdef __APPLE__
@@ -972,12 +989,36 @@ void MainFrame::update_layout()
     Thaw();
 }
 
+// BBS: start/stop the project auto-save timer from the current app config
+void MainFrame::update_autosave_timer()
+{
+    if (m_autosave_timer == nullptr)
+        return;
+    long interval = 0;
+    if (wxGetApp().app_config->get("autosave_switch") == "true") {
+        std::string autosave_interval;
+        if (!wxGetApp().app_config->get("app", "autosave_interval", autosave_interval))
+            autosave_interval = "300";
+        try {
+            interval = boost::lexical_cast<long>(autosave_interval);
+        } catch (...) {
+            interval = 0;
+        }
+    }
+    if (interval > 0)
+        m_autosave_timer->Start(int(interval) * 1000);
+    else
+        m_autosave_timer->Stop();
+}
+
 // Called when closing the application and when switching the application language.
 void MainFrame::shutdown(bool isRecreate)
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "MainFrame::shutdown enter";
     // BBS: backup
     Slic3r::set_backup_callback(nullptr);
+    if (m_autosave_timer != nullptr)
+        m_autosave_timer->Stop();
 #ifdef _WIN32
 	if (m_hDeviceNotify) {
 		::UnregisterDeviceNotification(HDEVNOTIFY(m_hDeviceNotify));

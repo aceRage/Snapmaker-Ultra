@@ -91,6 +91,7 @@ class MainFrame : public DPIFrame
 {
     bool        m_loaded {false};
     wxTimer* m_reset_title_text_colour_timer{ nullptr };
+    wxTimer* m_autosave_timer{ nullptr };
 
     wxString    m_qs_last_input_file = wxEmptyString;
     wxString    m_qs_last_output_file = wxEmptyString;
@@ -202,6 +203,9 @@ protected:
 public:
     MainFrame();
     ~MainFrame() = default;
+
+    // BBS: auto-save the project to its own file on a timer, in addition to auto-backup
+    void update_autosave_timer();
 
     //BBS GUI refactor
     enum TabPosition
