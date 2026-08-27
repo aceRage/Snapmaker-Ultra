@@ -1147,6 +1147,18 @@ void MenuFactory::append_menu_item_merge_to_multipart_object(wxMenu* menu)
         []() { return obj_list()->can_merge_to_multipart_object(); }, m_parent);
 }
 
+// Ported from BambuStudio's "Sub merge": extract the selected parts into a new assembly.
+void MenuFactory::append_menu_item_assemble_separately(wxMenu* menu)
+{
+    append_menu_item(menu, wxID_ANY, _L("Assemble Separately"), _L("Move the selected parts into a new assembly, keeping their position in space"),
+        [](wxCommandEvent&) { obj_list()->assemble_separately(); }, "", nullptr,
+        []() {
+            if (plater()->get_current_canvas3D()->get_canvas_type() != GLCanvas3D::ECanvasType::CanvasView3D)
+                return false;
+            return obj_list()->can_assemble_separately();
+        }, m_parent);
+}
+
 void MenuFactory::append_menu_item_merge_to_single_object(wxMenu* menu)
 {
     menu->AppendSeparator();
@@ -1871,6 +1883,7 @@ wxMenu* MenuFactory::multi_selection_menu()
     else {
         append_menu_item_center(menu);
         append_menu_item_drop(menu);
+        append_menu_item_assemble_separately(menu);
         append_menu_item_fix_through_netfabb(menu);
         //append_menu_item_simplify(menu);
         append_menu_item_delete(menu);

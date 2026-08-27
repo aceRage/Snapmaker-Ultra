@@ -3041,6 +3041,89 @@ void ObjectList::merge(bool to_multipart_object)
     }
 }
 
+// Ported from BambuStudio's "Sub merge" (add_new_model_object_from_old_object):
+// move the selected parts of one object into a new object, keeping world positions.
+// Unlike BambuStudio, the new object is NOT dropped onto the bed (no ensure_on_bed),
+// so extracted parts keep their exact place in space.
+void ObjectList::assemble_separately()
+{
+    wxDataViewItemArray sels;
+    GetSelections(sels);
+    if (sels.IsEmpty())
+        return;
+    int obj_idx = -1;
+    std::vector<int> vol_idxs;
+    for (wxDataViewItem item : sels) {
+        const int temp_obj_idx = m_objects_model->GetObjectIdByItem(item);
+        const int vol_idx      = m_objects_model->GetVolumeIdByItem(item);
+        if (temp_obj_idx < 0 || vol_idx < 0)
+            return;
+        if (obj_idx != -1 && temp_obj_idx != obj_idx)
+            return;
+        obj_idx = temp_obj_idx;
+        vol_idxs.emplace_back(vol_idx);
+    }
+    if (vol_idxs.empty())
+        return;
+    ModelObject* mo = (*m_objects)[obj_idx];
+    // the source object must keep at least one part
+    if (vol_idxs.size() >= mo->volumes.size())
+        return;
+
+    take_snapshot("Assemble Separately");
+    wxBusyCursor cursor;
+    std::sort(vol_idxs.begin(), vol_idxs.end());
+    ModelVolumePtrs sel_volumes;
+    for (int i = int(vol_idxs.size()) - 1; i >= 0; i--) {
+        const int vol_idx = vol_idxs[i];
+        if (vol_idx >= int(mo->volumes.size())) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "check error:array bound";
+            continue;
+        }
+        sel_volumes.emplace_back(mo->volumes[vol_idx]);
+        mo->volumes.erase(mo->volumes.begin() + vol_idx);
+    }
+    for (int i = int(vol_idxs.size()) - 1; i >= 0; i--)
+        delete_volume_from_list(obj_idx, vol_idxs[i]);
+
+    // Add the extracted parts to the model as a new object
+    Model& model = wxGetApp().plater()->model();
+    ModelObject* new_object = model.add_object();
+    new_object->name = _u8L("Assembly");
+    new_object->add_instance();
+    int min_extruder = (int) EnforcerBlockerType::ExtruderMax;
+    for (ModelVolume* mv : sel_volumes) {
+        new_object->add_volume(*mv, mv->type());
+        auto option = mv->config.option("extruder");
+        if (option) {
+            const int volume_extruder_id = dynamic_cast<const ConfigOptionInt*>(option)->getInt();
+            if (min_extruder > volume_extruder_id)
+                min_extruder = volume_extruder_id;
+        } else {
+            auto opt = mo->config.option("extruder");
+            if (opt && min_extruder != opt->getInt())
+                min_extruder = opt->getInt();
+        }
+        delete mv;
+    }
+    new_object->sort_volumes(true);
+    if (min_extruder != (int) EnforcerBlockerType::ExtruderMax)
+        new_object->config.set_key_value("extruder", new ConfigOptionInt(min_extruder));
+    new_object->invalidate_bounding_box();
+    // same instance transform as the source: volume matrices unchanged -> world positions kept
+    new_object->instances[0]->set_transformation(mo->instances[0]->get_transformation());
+    // BBS: backup
+    Slic3r::save_object_mesh(*new_object);
+    // BBS init assemble transformation
+    Geometry::Transformation t = new_object->instances[0]->get_transformation();
+    new_object->instances[0]->set_assemble_transformation(t);
+    notify_instance_updated(m_objects->size() - 1);
+
+    paste_objects_into_list({ model.objects.size() - 1 });
+    changed_object(obj_idx);
+    wxGetApp().mainframe->update_title();
+}
+
 /*void ObjectList::merge_volumes()
 {
     std::vector<int> obj_idxs, vol_idxs;
@@ -3367,6 +3450,34 @@ bool ObjectList::can_merge_to_multipart_object() const
             return false;
 
     return true;
+}
+
+bool ObjectList::can_assemble_separately() const
+{
+    if (has_selected_cut_object())
+        return false;
+
+    if (printer_technology() == ptSLA)
+        return false;
+
+    wxDataViewItemArray sels;
+    GetSelections(sels);
+    if (sels.IsEmpty())
+        return false;
+
+    // only parts, all from the same object, and not all of that object's parts
+    int obj_idx = -1;
+    for (wxDataViewItem item : sels) {
+        if (!(m_objects_model->GetItemType(item) & itVolume))
+            return false;
+        const int this_obj = m_objects_model->GetObjectIdByItem(item);
+        if (this_obj < 0 || (obj_idx != -1 && this_obj != obj_idx))
+            return false;
+        obj_idx = this_obj;
+    }
+    if (obj_idx < 0)
+        return false;
+    return size_t(sels.GetCount()) < (*m_objects)[obj_idx]->volumes.size();
 }
 
 bool ObjectList::can_merge_to_single_object() const

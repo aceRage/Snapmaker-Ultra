@@ -300,6 +300,7 @@ public:
     void                del_info_item(const int obj_idx, InfoItemType type);
     void                split();
     void                merge(bool to_multipart_object);
+    void                assemble_separately(); // extract selected parts into a new object, keeping world positions
     // void                merge_volumes(); // BBS: merge parts to single part
     void                layers_editing();
 
@@ -314,6 +315,7 @@ public:
     bool                can_split_instances();
     bool                can_merge_to_multipart_object() const;
     bool                can_merge_to_single_object() const;
+    bool                can_assemble_separately() const;
     bool                can_mesh_boolean() const;
 
     bool                has_selected_cut_object() const;
