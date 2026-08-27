@@ -3158,6 +3158,10 @@ Sidebar::Sidebar(Plater *parent)
             populate_all_combo();
             e.Skip();
         });
+        // Swallow the selection event: without this it propagates to
+        // Plater::priv::on_combobox_select, which treats unknown plain combos as the
+        // bed-type combo and indexes the bed-type enum with our selection index.
+        all_combo->Bind(wxEVT_COMBOBOX, [](wxCommandEvent&) {});
 
         Button* apply_all_btn = new Button(apply_all_box, _L("Apply All"));
         apply_all_btn->SetStyle(ButtonStyle::Confirm, ButtonType::Compact);
@@ -14743,6 +14747,11 @@ void Plater::priv::on_combobox_select(wxCommandEvent &evt)
 void Plater::priv::on_select_bed_type(wxCommandEvent &evt)
 {
     ComboBox* combo = static_cast<ComboBox*>(evt.GetEventObject());
+    // Any plain ComboBox in the sidebar propagates wxEVT_COMBOBOX here; only the bed-type
+    // combo may be interpreted below, or its selection index gets used as a bed-type enum
+    // index (out-of-bounds crash for other, longer combos).
+    if (combo != sidebar->get_bed_type_combox())
+        return;
     int selection = combo->GetSelection();
     const std::vector<std::string>& combo_values = sidebar->get_bed_type_combo_enum_values();
     std::string bed_type_name = (combo_values.size() > (size_t)selection)

@@ -227,6 +227,7 @@ public:
     std::string&                    get_search_line();
     void                            update_printer_thumbnail();
     const std::vector<std::string>& get_bed_type_combo_enum_values() const { return m_bed_type_combo_enum_values; }
+    ComboBox*                       get_bed_type_combox() { return m_bed_type_list; }
 
 private:
     struct priv;
