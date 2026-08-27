@@ -345,7 +345,8 @@ public:
 
     void translate(unsigned int object_idx, const Vec3d& displacement);
     void translate(unsigned int object_idx, unsigned int instance_idx, const Vec3d& displacement);
-    void translate(unsigned int object_idx, unsigned int instance_idx, unsigned int volume_idx, const Vec3d &displacement);
+    // BBS: local=false converts a world-space displacement into the volume's instance-local space (needed by part alignment)
+    void translate(unsigned int object_idx, unsigned int instance_idx, unsigned int volume_idx, const Vec3d &displacement, bool local = true);
 
     void rotate(unsigned int object_idx, unsigned int instance_idx, const Transform3d &overwrite_tran);
     void rotate(unsigned int object_idx, unsigned int instance_idx, unsigned int volume_idx, const Transform3d &overwrite_tran);

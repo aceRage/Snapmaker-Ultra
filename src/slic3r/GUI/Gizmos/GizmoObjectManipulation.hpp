@@ -8,6 +8,7 @@
 #include <float.h>
 
 #include "slic3r/GUI/GUI_Geometry.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoAlignment.hpp"
 
 //#include "slic3r/GUI/GLCanvas3D.hpp"
 
@@ -106,9 +107,29 @@ protected:
     float last_rotate_input_window_width = 0.0f;
     float last_scale_input_window_width = 0.0f;
 
+    GLGizmoAlignment* m_alignment_helper{nullptr};
+
 public:
     GizmoObjectManipulation(GLCanvas3D& glcanvas);
-    ~GizmoObjectManipulation() {}
+    ~GizmoObjectManipulation() { delete m_alignment_helper; }
+
+    // BBS: align/distribute helpers shown in the Move panel
+    GLGizmoAlignment::AlignType m_align_type{GLGizmoAlignment::AlignType::NONE};
+    enum class AlignChoiceType {
+        AlignPartOrObject = 0,
+        AlignParent,
+    };
+    AlignChoiceType   m_align_choice_type{AlignChoiceType::AlignParent};
+    bool              m_align_to_parent_node{false};
+    GLGizmoAlignment* get_alignment_helper() { return m_alignment_helper; }
+    void show_align_icon(ImGuiWrapper *imgui_wrapper,
+                         float         max_tooltip_width,
+                         GLGizmoAlignment::AlignType align_type,
+                         int             icon,
+                         float           icon_size,
+                         const wxString &function_tip,
+                         const wxString &enable_tip,
+                         bool            show_enable_tip = false);
 
     bool        IsShown();
     void        UpdateAndShow(const bool show);

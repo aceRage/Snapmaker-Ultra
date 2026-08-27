@@ -52,6 +52,7 @@ static double get_volume_min_z(const GLVolume* volume)
 GizmoObjectManipulation::GizmoObjectManipulation(GLCanvas3D& glcanvas)
     : m_glcanvas(glcanvas)
 {
+    m_alignment_helper = new GLGizmoAlignment(glcanvas);
     m_imperial_units = wxGetApp().app_config->get("use_inches") == "1";
     m_new_unit_string = m_imperial_units ? L("in") : L("mm");
 
@@ -928,6 +929,149 @@ void GizmoObjectManipulation::do_render_move_window(ImGuiWrapper *imgui_wrapper,
         }
     }
     if (!focued_on_text) m_glcanvas.handle_sidebar_focus_event("", false);
+
+    // BBS: align and distribute buttons (ported from BambuStudio's Move panel)
+    size_t selection_count = selection.get_volume_idxs().size();
+    if (selection_count >= 1 && m_coordinates_type == ECoordinatesType::World) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        const bool is_dark_mode           = wxGetApp().dark_mode();
+        bool  show_align_parts_objects = selection_count >= 2;
+        bool  is_part_node = selection.is_single_volume_or_modifier() || selection.is_multiple_volume() || selection.is_multiple_modifier();
+        std::vector<std::string> align_modes = {_u8L("Align selected"), is_part_node ? _u8L("Align Object") : _u8L("Align Plate")};
+        size_t align_mode_idx = (size_t) m_align_choice_type;
+        if (!show_align_parts_objects) {
+            align_modes.erase(align_modes.begin());
+            m_align_choice_type = AlignChoiceType::AlignParent;
+            align_mode_idx      = 0;
+        }
+        if (align_mode_idx >= align_modes.size()) {
+            m_align_choice_type = AlignChoiceType::AlignParent;
+            align_mode_idx      = 0;
+        }
+
+        ImGuiWrapper::push_combo_style(m_glcanvas.get_scale());
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushID(1);
+        if (render_combo(imgui_wrapper, "", align_modes, align_mode_idx, caption_size, combox_content_size)) {
+            if (align_modes.size() > 1 && show_align_parts_objects)
+                m_align_choice_type = (AlignChoiceType) align_mode_idx;
+        }
+        ImGui::PopID();
+        ImGuiWrapper::pop_combo_style();
+        float temp_tip_caption_max = imgui_wrapper->calc_text_size(_L("Align top-bottom center") + " (-X)").x * 1.3f;
+        if (ImGui::IsItemHovered()) {
+            imgui_wrapper->tooltip(_L("Holded down Ctrl key continuously and click by left mouse button can select multiple objects, or holded down Alt key continuously and "
+                                      "click by left mouse button can select multiple parts"),
+                                   temp_tip_caption_max * 1.5);
+        }
+        // Feed the reference box for Align Plate / Align Object each frame. In BambuStudio this
+        // happens in the Move gizmo's hover-preview render, which is not ported.
+        if (m_align_choice_type == AlignChoiceType::AlignParent) {
+            BoundingBoxf3 parent_box;
+            if (selection.is_single_full_object() || selection.is_multiple_full_object()) {
+                parent_box = wxGetApp().plater()->get_partplate_list().get_curr_plate()->get_plate_box();
+                parent_box.max[2] = std::max(parent_box.min[2], selection.get_bounding_box().max[2]);
+                parent_box.min += Vec3d(0.1, 0.1, 0.1);
+                parent_box.max -= Vec3d(0.1, 0.1, 0.1);
+            } else {
+                const int obj_idx  = selection.get_object_idx();
+                const int inst_idx = selection.get_instance_idx();
+                Model*    model    = selection.get_model();
+                if (model != nullptr && obj_idx >= 0 && obj_idx < (int) model->objects.size()) {
+                    ModelObject* mo = model->objects[obj_idx];
+                    if (inst_idx >= 0 && inst_idx < (int) mo->instances.size())
+                        parent_box = mo->instance_convex_hull_bounding_box((size_t) inst_idx);
+                    else
+                        parent_box = mo->bounding_box();
+                }
+            }
+            m_alignment_helper->set_parent_box(parent_box);
+        }
+
+        float scale_icon = 1.2f;
+        float icon_size  = ImGui::GetFrameHeight() * scale_icon;
+
+        float start_y       = ImGui::GetCursorPosY();
+        float text_height   = ImGui::GetTextLineHeight();
+        float button_height = icon_size + ImGui::GetStyle().FramePadding.y * 2.0f;
+        float max_h         = std::max(text_height, button_height);
+
+        ImGui::SetCursorPosY(start_y + (max_h - text_height) * 0.5f);
+        if (m_align_choice_type == AlignChoiceType::AlignPartOrObject)
+            imgui_wrapper->text(" " + _L("Align") + "/" + _L("Distribute"));
+        else
+            imgui_wrapper->text(" " + _L("Align selected"));
+
+        float button_spacing = 0;
+        float start_x = caption_max + space_size * 1.5;
+        ImGui::SameLine(start_x);
+        ImGui::SetCursorPosY(start_y + (max_h - button_height) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(61.f / 255.f, 203.f / 255.f, 115.f / 255.f, 1.f));
+        show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::X_MIN,
+                        (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_X_MIN_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_X_MIN), icon_size,
+                        _L("Align left") + " (-X)", "");
+        ImGui::SameLine(0, button_spacing);
+        show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::CENTER_X,
+                        (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_X_CENTER_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_X_CENTER), icon_size,
+                        _L("Align left-right center") + " (X)", "");
+        ImGui::SameLine(0, button_spacing);
+        show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::X_MAX,
+                        (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_X_MAX_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_X_MAX), icon_size,
+                        _L("Align right") + " (+X)", "");
+        if (m_align_choice_type == AlignChoiceType::AlignPartOrObject) {
+            ImGui::SameLine(0, button_spacing);
+            show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::DISTRIBUTE_X,
+                            (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_DISTRIBUTE_X_DARK : GLGizmosManager::MENU_ICON_NAME::IC_DISTRIBUTE_X), icon_size,
+                            _L("Distribute left-right") + " (X)", _L("Please select at least 3 parts or objects"), true);
+        }
+
+        float new_space_size = space_size * 0.8f;
+        ImGui::SameLine(start_x + unit_size + space_size + new_space_size);
+        show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::Y_MIN,
+                        (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Y_MIN_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Y_MIN), icon_size,
+                        _L("Align front") + " (-Y)", "");
+        ImGui::SameLine(0, button_spacing);
+        show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::CENTER_Y,
+                        (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Y_CENTER_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Y_CENTER), icon_size,
+                        _L("Align front-back center") + " (Y)", "");
+        ImGui::SameLine(0, button_spacing);
+        show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::Y_MAX,
+                        (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Y_MAX_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Y_MAX), icon_size,
+                        _L("Align back") + " (+Y)", "");
+        if (m_align_choice_type == AlignChoiceType::AlignPartOrObject) {
+            ImGui::SameLine(0, button_spacing);
+            show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::DISTRIBUTE_Y,
+                            (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_DISTRIBUTE_Y_DARK : GLGizmosManager::MENU_ICON_NAME::IC_DISTRIBUTE_Y), icon_size,
+                            _L("Distribute front-back") + " (Y)", _L("Please select at least 3 parts or objects"), true);
+        }
+        if (show_align_parts_objects || is_part_node) {
+            ImGui::SameLine(start_x + 2 * (unit_size + space_size) + new_space_size + new_space_size);
+            show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::Z_MIN,
+                            (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Z_MIN_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Z_MIN), icon_size,
+                            _L("Align bottom") + " (-Z)", "");
+            ImGui::SameLine(0, button_spacing);
+            show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::CENTER_Z,
+                            (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Z_CENTER_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Z_CENTER), icon_size,
+                            _L("Align top-bottom center") + " (Z)", "");
+            ImGui::SameLine(0, button_spacing);
+            show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::Z_MAX,
+                            (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Z_MAX_DARK : GLGizmosManager::MENU_ICON_NAME::IC_ALIGN_Z_MAX), icon_size,
+                            _L("Align top") + " (+Z)", "");
+        }
+        if (m_align_choice_type == AlignChoiceType::AlignPartOrObject) {
+            ImGui::SameLine(0, button_spacing);
+            show_align_icon(imgui_wrapper, temp_tip_caption_max, GLGizmoAlignment::AlignType::DISTRIBUTE_Z,
+                            (int) (is_dark_mode ? GLGizmosManager::MENU_ICON_NAME::IC_DISTRIBUTE_Z_DARK : GLGizmosManager::MENU_ICON_NAME::IC_DISTRIBUTE_Z), icon_size,
+                            _L("Distribute top-bottom") + " (Z)", _L("Please select at least 3 parts or objects"), true);
+        }
+        ImGui::PopStyleColor();
+        ImGui::SetCursorPosY(start_y + max_h + ImGui::GetStyle().ItemSpacing.y);
+        if (!ImGui::IsAnyItemHovered())
+            m_align_type = GLGizmoAlignment::AlignType::NONE;
+    }
+
     float get_cur_y      = ImGui::GetContentRegionMax().y + ImGui::GetFrameHeight() + y;
     float tip_caption_max    = 0.f;
     float total_text_max = 0.f;
@@ -941,6 +1085,70 @@ void GizmoObjectManipulation::do_render_move_window(ImGuiWrapper *imgui_wrapper,
     imgui_wrapper->end();
     ImGui::PopStyleVar(1);
     ImGuiWrapper::pop_toolbar_style();
+}
+
+// BBS: one align/distribute button with enable-check, dispatch and tooltip (ported from BambuStudio)
+void GizmoObjectManipulation::show_align_icon(ImGuiWrapper *              imgui_wrapper,
+                                              float                       max_tooltip_width,
+                                              GLGizmoAlignment::AlignType align_type,
+                                              int                         icon,
+                                              float                       icon_size,
+                                              const wxString &            function_tip,
+                                              const wxString &            enable_tip,
+                                              bool                        show_enable_tip)
+{
+    bool can_align = false;
+    if (m_align_choice_type == AlignChoiceType::AlignPartOrObject) {
+        if (GLGizmoAlignment::AlignType::DISTRIBUTE_X <= align_type)
+            can_align = m_alignment_helper->can_distribute(align_type);
+        else
+            can_align = m_alignment_helper->can_align(align_type);
+    } else {
+        can_align = true;
+    }
+
+    ImTextureID normal_id = m_glcanvas.get_gizmos_manager().get_icon_texture_id((GLGizmosManager::MENU_ICON_NAME) icon);
+    if (!can_align) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.3f);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyle().Colors[ImGuiCol_Button]);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyle().Colors[ImGuiCol_Button]);
+    }
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    if (ImGui::ImageButton3(normal_id, normal_id, ImVec2(icon_size, icon_size))) {
+        if (can_align) {
+            if (m_align_choice_type == AlignChoiceType::AlignPartOrObject) {
+                if (GLGizmoAlignment::AlignType::DISTRIBUTE_X <= align_type)
+                    m_alignment_helper->distribute_objects(align_type);
+                else
+                    m_alignment_helper->align_objects(align_type);
+            } else {
+                m_alignment_helper->align_objects(align_type, true);
+            }
+        }
+    }
+    ImGui::PopStyleVar();
+    if (!can_align) {
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar();
+    }
+
+    if (ImGui::IsItemHovered()) {
+        if (can_align) {
+            m_align_type           = align_type;
+            m_align_to_parent_node = m_align_choice_type == AlignChoiceType::AlignParent;
+        } else {
+            m_align_type = GLGizmoAlignment::AlignType::NONE;
+        }
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGuiWrapper::COL_WINDOW_BACKGROUND);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        if (can_align || !show_enable_tip) {
+            ImGui::SetTooltip("%s", function_tip.ToUTF8().data());
+        } else {
+            wxString combined = function_tip + "\n" + enable_tip;
+            ImGui::SetTooltip("%s", combined.ToUTF8().data());
+        }
+        ImGui::PopStyleColor(2);
+    }
 }
 
 void GizmoObjectManipulation::do_render_rotate_window(ImGuiWrapper *imgui_wrapper, std::string window_name, float x, float y, float bottom_limit)
