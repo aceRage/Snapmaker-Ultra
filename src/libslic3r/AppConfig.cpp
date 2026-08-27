@@ -409,6 +409,10 @@ void AppConfig::set_defaults()
         set_bool("skip_settings_mapping_warnings", true);
     }
 
+    if (get("keep_printer_on_open").empty()) {
+        set_bool("keep_printer_on_open", true);
+    }
+
     if (get("autosave_switch").empty()) {
         set_bool("autosave_switch", false);
     }

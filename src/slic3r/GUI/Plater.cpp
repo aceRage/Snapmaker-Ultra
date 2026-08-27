@@ -12051,6 +12051,21 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             q->on_filaments_change(preset_bundle->filament_presets.size());
                             is_project_file = true;
 
+                            // Restore the user's preferred printer instead of the printer embedded in the
+                            // file. force_select bypasses the transfer/discard dialogs: the file's
+                            // printer-tab modifications are dropped, and incompatible process/filament
+                            // presets are remapped to compatible ones silently.
+                            if (wxGetApp().app_config->get("keep_printer_on_open") == "true") {
+                                const std::string preferred = wxGetApp().app_config->get("preferred_printer");
+                                if (!preferred.empty()
+                                    && preferred != preset_bundle->printers.get_selected_preset_name()
+                                    && preset_bundle->printers.find_preset(preferred) != nullptr) {
+                                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": restoring preferred printer " << preferred
+                                                            << " over project printer " << preset_bundle->printers.get_selected_preset_name();
+                                    wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preferred, false, "", true);
+                                }
+                            }
+
                             //BBS: rewrite wipe tower pos stored in 3mf file , the code above should be seriously reconsidered
                             {
                                 DynamicConfig& proj_cfg = wxGetApp().preset_bundle->project_config;
@@ -14903,6 +14918,8 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
     // update plater with new config
     q->on_config_change(wxGetApp().preset_bundle->full_config());
     if (preset_type == Preset::TYPE_PRINTER) {
+        // Remember the user's manual printer choice so project files can restore it on open.
+        wxGetApp().app_config->set("preferred_printer", wxGetApp().preset_bundle->printers.get_selected_preset_name());
     /* Settings list can be changed after printer preset changing, so
      * update all settings items for all item had it.
      * Furthermore, Layers editing is implemented only for FFF printers
@@ -15264,6 +15281,10 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
     //BBS: set the current plater's slice result to valid
     if (!this->background_process.empty())
         this->background_process.get_current_plate()->update_slice_result_valid_state(evt.success());
+
+    // A successful slice confirms the current printer as the user's working setup.
+    if (evt.success())
+        wxGetApp().app_config->set("preferred_printer", wxGetApp().preset_bundle->printers.get_selected_preset_name());
 
     //BBS: update the action button according to the current plate's status
     bool ready_to_slice = !this->partplate_list.get_curr_plate()->is_slice_result_valid();

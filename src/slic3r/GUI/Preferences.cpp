@@ -1337,6 +1337,8 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_save_presets = create_item_button(_L("Clear my choice on the unsaved presets."), _L("Clear"), page, L"", _L("Clear my choice on the unsaved presets."), []() {
         wxGetApp().app_config->set("save_preset_choise", "");
     });
+    auto item_keep_printer = create_item_checkbox(_L("Keep my printer when opening project files"), page,
+        _L("When opening a project made for another printer, switch back to the last printer you selected or sliced with, instead of the printer embedded in the file."), 50, "keep_printer_on_open");
     auto item_skip_mapping_warnings = create_item_checkbox(_L("Skip Settings Mapping Warnings"), page,
         _L("Don't show warnings about unrecognized or invalid settings replaced while loading project files; the defaults or automatic fixes are applied silently."), 50, "skip_settings_mapping_warnings");
 
@@ -1441,6 +1443,7 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_system_sync, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_remember_printer_config, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_save_presets, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_keep_printer, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_skip_mapping_warnings, 0, wxTOP, FromDIP(3));
     //sizer_page->Add(title_network, 0, wxTOP | wxEXPAND, FromDIP(20));
     //sizer_page->Add(item_check_stable_version_only, 0, wxTOP, FromDIP(3));
