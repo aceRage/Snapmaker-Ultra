@@ -3125,6 +3125,84 @@ Sidebar::Sidebar(Plater *parent)
     sizer_filaments2->AddSpacer(FromDIP(8));
     sizer_filaments2->Add(p->m_panel_physical_filaments_title, 0, wxEXPAND, 0);
     sizer_filaments2->AddSpacer(FromDIP(8));
+
+    // Set-all-filaments row: pick one preset and apply it to every filament slot at once,
+    // boxed in a rounded rectangle for visual separation from the per-filament list.
+    {
+        StaticBox* apply_all_box = new StaticBox(p->m_panel_filament_content, wxID_ANY);
+        apply_all_box->SetCornerRadius(FromDIP(6));
+        apply_all_box->SetBorderColor(StateColor(std::make_pair(0xCECECE, (int) StateColor::Normal)));
+        apply_all_box->SetBackgroundColor(StateColor(std::make_pair(*wxWHITE, (int) StateColor::Normal)));
+
+        ComboBox* all_combo = new ComboBox(apply_all_box, wxID_ANY, wxString(""), wxDefaultPosition, {-1, FromDIP(30)}, 0, nullptr, wxCB_READONLY);
+        all_combo->SetToolTip(_L("Filament preset to apply to all filaments"));
+
+        auto populate_all_combo = [all_combo]() {
+            PresetBundle* pb = wxGetApp().preset_bundle;
+            if (pb == nullptr)
+                return;
+            wxString cur = all_combo->GetStringSelection();
+            all_combo->Clear();
+            for (const Preset& preset : pb->filaments) {
+                if (!preset.is_visible || !preset.is_compatible)
+                    continue;
+                all_combo->AppendString(wxString::FromUTF8(preset.name));
+            }
+            int idx = all_combo->FindString(cur);
+            if (idx != wxNOT_FOUND)
+                all_combo->SetSelection(idx);
+        };
+        populate_all_combo();
+        // Repopulate on every open so printer/preset changes are always reflected.
+        all_combo->Bind(wxEVT_COMBOBOX_DROPDOWN, [populate_all_combo](wxCommandEvent& e) {
+            populate_all_combo();
+            e.Skip();
+        });
+
+        Button* apply_all_btn = new Button(apply_all_box, _L("Apply All"));
+        apply_all_btn->SetStyle(ButtonStyle::Confirm, ButtonType::Compact);
+        apply_all_btn->SetToolTip(_L("Set all filaments to the selected preset"));
+        apply_all_btn->Bind(wxEVT_BUTTON, [this, all_combo](wxCommandEvent&) {
+            int sel = all_combo->GetSelection();
+            if (sel == wxNOT_FOUND)
+                return;
+            PresetBundle* pb = wxGetApp().preset_bundle;
+            std::string preset_name = all_combo->GetString(sel).ToUTF8().data();
+            if (pb == nullptr || pb->filaments.find_preset(preset_name) == nullptr)
+                return;
+            const size_t count = p->combos_filament.size();
+            // Mirror the per-combo path in Plater::priv::on_select_preset, once per slot.
+            std::vector<bool> support_flags(count);
+            for (size_t i = 0; i < count; ++i)
+                support_flags[i] = is_support_filament(int(i));
+            for (size_t i = 0; i < count; ++i)
+                pb->set_filament_preset(i, preset_name);
+            wxGetApp().plater()->update_project_dirty_from_presets();
+            pb->export_selections(*wxGetApp().app_config);
+            update_dynamic_filament_list();
+            update_color_mix_panel();
+            for (PlaterPresetComboBox* combo : p->combos_filament)
+                if (combo != nullptr)
+                    combo->update();
+            for (size_t i = 0; i < count; ++i)
+                if (support_flags[i] != is_support_filament(int(i)))
+                    auto_calc_flushing_volumes(int(i));
+            // Marks the slice result invalid, same as changing a single filament.
+            wxGetApp().plater()->on_config_change(pb->full_config());
+        });
+
+        auto* apply_all_sizer = new wxBoxSizer(wxHORIZONTAL);
+        apply_all_sizer->AddSpacer(FromDIP(SidebarProps::ElementSpacing()));
+        apply_all_sizer->Add(all_combo, 1, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, FromDIP(4));
+        apply_all_sizer->AddSpacer(FromDIP(SidebarProps::ElementSpacing()));
+        apply_all_sizer->Add(apply_all_btn, 0, wxALIGN_CENTER_VERTICAL | wxTOP | wxBOTTOM, FromDIP(4));
+        apply_all_sizer->AddSpacer(FromDIP(SidebarProps::ElementSpacing()));
+        apply_all_box->SetSizer(apply_all_sizer);
+
+        sizer_filaments2->Add(apply_all_box, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(SidebarProps::ContentMargin()));
+        sizer_filaments2->AddSpacer(FromDIP(8));
+    }
+
     sizer_filaments2->Add(p->m_scrolled_filaments, 0, wxEXPAND, 0);
     sizer_filaments2->AddSpacer(FromDIP(8));
     // --- Color Mix Panel (inside filament content, same level as filaments) ---
