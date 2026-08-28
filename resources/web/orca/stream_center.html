@@ -78,13 +78,15 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
     }
     function validHost(ip) {
-        // bare host, or a full stream URL used verbatim (e.g. a go2rtc/WebRTC relay for Bambu cams)
-        return /^https?:\/\/\S+$/i.test(ip) || /^[A-Za-z0-9.:\-_]+$/.test(ip);
+        // bare host, or a full stream URL used verbatim (http(s) pages, or rtsp(s) fed through go2rtc)
+        return /^(https?|rtsps?):\/\/\S+$/i.test(ip) || /^[A-Za-z0-9.:\-_]+$/.test(ip);
     }
     var relayPort = 0;
     try { relayPort = parseInt(new URLSearchParams(location.search).get('relay')) || 0; } catch (e) {}
     function kindOf(h) {
         if (h.kind === 'rtsps') return 'rtsps';
+        if (/^rtsps?:\/\//i.test(h.ip)) return 'rtsp-url'; // a pasted rtsp:// URL wins over the picked type
+        if (h.kind === 'flashforge') return 'flashforge';
         if (h.kind === 'p1' || (h.code && h.kind !== 'auto-url')) return 'p1';
         return 'url';
     }
@@ -106,9 +108,9 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         go2rtcRequested = true;
         try { window.snorca.postMessage('start_go2rtc'); } catch (e) {}
     }
-    function go2rtcCell(h, cell) {
+    function go2rtcCell(h, cell, srcOverride) {
         var name = h.ip.replace(/[^A-Za-z0-9]/g, '_');
-        var src  = 'rtspx://bblp:' + encodeURIComponent(h.code) + '@' + h.ip + ':322/streaming/live/1';
+        var src  = srcOverride || ('rtspx://bblp:' + encodeURIComponent(h.code) + '@' + h.ip + ':322/streaming/live/1');
         if (!go2rtcStreams[name]) {
             go2rtcStreams[name] = true;
             fetch('http://127.0.0.1:' + go2rtcPort + '/api/streams?name=' + name + '&src=' + encodeURIComponent(src), { method: 'PUT' })
@@ -118,6 +120,55 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         f.allow = 'autoplay';
         f.src = 'http://127.0.0.1:' + go2rtcPort + '/stream.html?src=' + name + '&mode=mse';
         cell.appendChild(f);
+    }
+
+    // Flashforge (Creator 5 / Adventurer 5M family): the printer reports its own
+    // camera URL through the LAN detail API; the slicer probes it for us because
+    // the printer sends no CORS headers. rtsp:// results ride go2rtc, MJPEG http://
+    // results embed directly.
+    var ffUrls = {}; // ip -> stream url, '' = probe failed, undefined = pending
+    window.__ffDetail = function(ip, url) {
+        ffUrls[ip] = url || '';
+        render();
+    };
+    function ffCell(h, cell) {
+        var url = ffUrls[h.ip];
+        if (url === undefined) {
+            try { window.snorca.postMessage('ff_detail:' + h.ip); } catch (e) {}
+            var wait = document.createElement('div');
+            wait.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:13px;';
+            wait.textContent = 'Contacting printer…';
+            cell.appendChild(wait);
+            return;
+        }
+        if (url === '') {
+            var err = document.createElement('div');
+            err.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#c66;font-size:12px;text-align:center;padding:8px;';
+            err.textContent = 'No camera URL from ' + h.ip + ':8898. If you know the stream address, re-add this printer using the full rtsp:// URL.';
+            cell.appendChild(err);
+            return;
+        }
+        if (/^rtsps?:\/\//i.test(url)) {
+            if (go2rtcPort) { go2rtcCell(h, cell, url); }
+            else {
+                ensureGo2rtc();
+                var wait2 = document.createElement('div');
+                wait2.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:13px;';
+                wait2.textContent = 'Starting stream relay…';
+                cell.appendChild(wait2);
+                cell.dataset.ip = '';
+            }
+        } else if (/action=stream/i.test(url)) {
+            var im = document.createElement('img');
+            im.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
+            im.src = url;
+            cell.appendChild(im);
+        } else {
+            var f2 = document.createElement('iframe');
+            f2.allow = 'autoplay';
+            f2.src = url;
+            cell.appendChild(f2);
+        }
     }
     // In-page modal: the embedded WebView does not service prompt()/confirm() dialogs.
     // opts = { title, message, fields: [{key,label,value,placeholder}] }; cb(null | {key:value})
@@ -270,9 +321,11 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
                     cell.dataset.ip = ip;
                     var hh   = h || { ip: ip };
                     var kind = kindOf(hh);
-                    if (kind === 'rtsps') {
+                    if (kind === 'flashforge') {
+                        ffCell(hh, cell);
+                    } else if (kind === 'rtsp-url' || kind === 'rtsps') {
                         if (go2rtcPort) {
-                            go2rtcCell(hh, cell);
+                            go2rtcCell(hh, cell, kind === 'rtsp-url' ? hh.ip : null);
                         } else {
                             ensureGo2rtc();
                             var wait = document.createElement('div');
@@ -310,12 +363,13 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         showModal({
             title: 'Add printer',
             fields: [
-                { key: 'ip', label: 'IP address, hostname, or full stream URL', placeholder: 'e.g. 10.0.0.106' },
+                { key: 'ip', label: 'IP address, hostname, or full stream URL (http/rtsp)', placeholder: 'e.g. 10.0.0.106' },
                 { key: 'alias', label: 'Alias (optional)', placeholder: 'e.g. U1 Left' },
                 { key: 'kind', label: 'Printer type', type: 'select', options: [
                     { value: 'auto',  label: 'Snapmaker / direct stream URL' },
                     { value: 'p1',    label: 'Bambu P1 / A1 (needs access code)' },
-                    { value: 'rtsps', label: 'Bambu X1 / H2 (needs access code + LAN Liveview on)' }
+                    { value: 'rtsps', label: 'Bambu X1 / H2 (needs access code + LAN Liveview on)' },
+                    { value: 'flashforge', label: 'Flashforge (Creator 5 / Adventurer 5M family)' }
                 ] },
                 { key: 'code', label: 'LAN access code (Bambu printers only)', placeholder: 'leave empty for Snapmaker / URLs' }
             ]
