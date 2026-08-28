@@ -1276,7 +1276,7 @@ void MainFrame::init_tabpanel() {
     // Stream tab: grid of LAN camera streams, always right after Device.
     m_stream = new StreamPanel(m_tabpanel);
     m_stream->SetBackgroundColour(*wxWHITE);
-    m_tabpanel->AddPage(m_stream, _L("Stream"), std::string("tab_monitor_active"), std::string("tab_monitor_active"), false);
+    m_tabpanel->AddPage(m_stream, _L("Stream"), std::string("tab_stream_active"), std::string("tab_stream_active"), false);
 
     m_printer_view = new PrinterWebView(m_tabpanel);
     Bind(EVT_LOAD_PRINTER_URL, [this](LoadPrinterViewEvent &evt) {
