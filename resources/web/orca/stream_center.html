@@ -81,6 +81,12 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         // bare host, or a full stream URL used verbatim (http(s) pages, or rtsp(s) fed through go2rtc)
         return /^(https?|rtsps?):\/\/\S+$/i.test(ip) || /^[A-Za-z0-9.:\-_]+$/.test(ip);
     }
+    // The slicer's webview injects the app-wide "wx" script channel; the panel
+    // listens for our messages on it. ("snorca" was never injected on Edge.)
+    function postToSlicer(msg) {
+        try { window.wx.postMessage(msg); return; } catch (e) {}
+        try { window.snorca.postMessage(msg); } catch (e) {}
+    }
     var relayPort = 0;
     try { relayPort = parseInt(new URLSearchParams(location.search).get('relay')) || 0; } catch (e) {}
     function kindOf(h) {
@@ -98,15 +104,16 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
     }
 
     // go2rtc relay for RTSPS printers (X1/H2 family): started by the slicer on request.
-    var go2rtcPort = 0, go2rtcRequested = false, go2rtcStreams = {};
+    var go2rtcPort = 0, go2rtcRequested = false, go2rtcFailed = false, go2rtcStreams = {};
     window.__go2rtcReady = function(p) {
         go2rtcPort = p || 0;
+        go2rtcFailed = !go2rtcPort;
         render();
     };
     function ensureGo2rtc() {
         if (go2rtcPort || go2rtcRequested) return;
         go2rtcRequested = true;
-        try { window.snorca.postMessage('start_go2rtc'); } catch (e) {}
+        postToSlicer('start_go2rtc');
     }
     function go2rtcCell(h, cell, srcOverride) {
         var name = h.ip.replace(/[^A-Za-z0-9]/g, '_');
@@ -134,7 +141,7 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
     function ffCell(h, cell) {
         var url = ffUrls[h.ip];
         if (url === undefined) {
-            try { window.snorca.postMessage('ff_detail:' + h.ip); } catch (e) {}
+            postToSlicer('ff_detail:' + h.ip);
             var wait = document.createElement('div');
             wait.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:13px;';
             wait.textContent = 'Contacting printer…';
@@ -153,8 +160,8 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             else {
                 ensureGo2rtc();
                 var wait2 = document.createElement('div');
-                wait2.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:13px;';
-                wait2.textContent = 'Starting stream relay…';
+                wait2.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:' + (go2rtcFailed ? '#c66' : '#888') + ';font-size:13px;text-align:center;padding:8px;';
+                wait2.textContent = go2rtcFailed ? 'Stream relay failed to start - restart the app and check the log for Go2RtcLauncher errors.' : 'Starting stream relay…';
                 cell.appendChild(wait2);
                 cell.dataset.ip = '';
             }
@@ -358,8 +365,8 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
                         } else {
                             ensureGo2rtc();
                             var wait = document.createElement('div');
-                            wait.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:13px;';
-                            wait.textContent = 'Starting stream relay…';
+                            wait.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:' + (go2rtcFailed ? '#c66' : '#888') + ';font-size:13px;text-align:center;padding:8px;';
+                            wait.textContent = go2rtcFailed ? 'Stream relay failed to start - restart the app and check the log for Go2RtcLauncher errors.' : 'Starting stream relay…';
                             cell.appendChild(wait);
                             cell.dataset.ip = ''; // rebuild this cell once the relay reports in
                         }
