@@ -1587,6 +1587,14 @@ wxWindow* PreferencesDialog::create_ultra_page()
     auto item_auto_shadow = create_item_checkbox(_L("Seamless System Filament Edits"), page,
         _L("Saving a modified system preset silently saves and selects \"<name> - Custom\" instead of asking for a new name every time."), 50, "auto_shadow_system_presets");
 
+    auto title_spoolman = create_item_title(_L("Spool Manager"), page, _L("Spool Manager"));
+    auto item_spoolman_enabled = create_item_checkbox(_L("Enable Spoolman integration"), page,
+        _L("Connect to a self-hosted Spoolman server for spool inventory and filament-usage tracking."), 50, "spoolman_enabled");
+    auto item_spoolman_url = create_item_text_input(_L("Server URL"), page,
+        _L("Spoolman server address, e.g. http://10.0.0.5:7912"), "spoolman_url");
+    auto item_spoolman_deduct = create_item_checkbox(_L("Deduct filament usage when sending a print"), page,
+        _L("After a job is sent to the printer, subtract the sliced filament weight from the spools bound to each slot in the Spool Manager."), 50, "spoolman_deduct");
+
     sizer_page->Add(title_project, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_autosave, 0, wxTOP, FromDIP(3));
     item_autosave->Add(item_autosave_interval, 0, wxLEFT, 0);
@@ -1597,6 +1605,10 @@ wxWindow* PreferencesDialog::create_ultra_page()
     sizer_page->Add(title_presets, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_prefer_last_print, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_auto_shadow, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(title_spoolman, 0, wxTOP | wxEXPAND, FromDIP(20));
+    sizer_page->Add(item_spoolman_enabled, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_spoolman_url, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_spoolman_deduct, 0, wxTOP, FromDIP(3));
 
     page->SetSizer(sizer_page);
     page->Layout();

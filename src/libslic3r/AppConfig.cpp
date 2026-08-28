@@ -429,6 +429,14 @@ void AppConfig::set_defaults()
         set_bool("auto_shadow_system_presets", true);
     }
 
+    if (get("spoolman_enabled").empty()) {
+        set_bool("spoolman_enabled", false);
+    }
+
+    if (get("spoolman_deduct").empty()) {
+        set_bool("spoolman_deduct", true);
+    }
+
     if (get("autosave_switch").empty()) {
         set_bool("autosave_switch", false);
     }

@@ -1,6 +1,7 @@
 // Implementation of web communication protocol for Slicer Studio
 #include "SSWCP.hpp"
 #include "FilamentColorUtils.hpp"
+#include "SpoolmanDialog.hpp"
 #include "GUI_App.hpp"
 #include "MainFrame.hpp"
 #include "DownloadManager.hpp"
@@ -2347,6 +2348,9 @@ void SSWCP_MachineOption_Instance::sw_MachinePrintStart() {
                     SSWCP_Instance::on_mqtt_msg_arrived(self, response);
                 }
             });
+
+            // Ultra: deduct the job's filament usage from bound Spoolman spools
+            wxGetApp().CallAfter([]() { SpoolmanDialog::deduct_after_send_async(); });
         }
     }
 }

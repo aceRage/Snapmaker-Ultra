@@ -135,6 +135,7 @@
 #include "SendMultiMachinePage.hpp"
 #include "SendToPrinter.hpp"
 #include "PublishDialog.hpp"
+#include "SpoolmanDialog.hpp"
 #include "ModelMall.hpp"
 #include "ConfigWizard.hpp"
 #include "../Utils/ASCIIFolding.hpp"
@@ -3071,6 +3072,14 @@ Sidebar::Sidebar(Plater *parent)
     h_physical_title->Add(physical_label, 0, wxALIGN_CENTER_VERTICAL);
     h_physical_title->AddStretchSpacer();
 
+    // Spool Manager button (Ultra: Spoolman integration)
+    ScalableButton* spool_btn = new ScalableButton(p->m_panel_physical_filaments_title, wxID_ANY, "spool");
+    spool_btn->SetToolTip(_L("Spool Manager"));
+    spool_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+        SpoolmanDialog dlg(this);
+        dlg.ShowModal();
+    });
+
     // Sync filament button
     ScalableButton* sync_filament_btn = new ScalableButton(p->m_panel_physical_filaments_title, wxID_ANY, "sync_filament");
     sync_filament_btn->SetToolTip(_L("Sync Filament Information"));
@@ -3110,6 +3119,7 @@ Sidebar::Sidebar(Plater *parent)
     });
     p->m_bpButton_add_filament = add_btn;
 
+    h_physical_title->Add(spool_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(10));
     h_physical_title->Add(sync_filament_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(10));
     h_physical_title->Add(del_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
     h_physical_title->Add(add_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
@@ -21721,6 +21731,9 @@ void Plater::send_calibration_job_finished(wxCommandEvent & evt)
 
 void Plater::print_job_finished(wxCommandEvent &evt)
 {
+    // Ultra: deduct the sent job's filament usage from bound Spoolman spools
+    SpoolmanDialog::deduct_after_send_async();
+
     //start print failed
     if (Slic3r::GUI::wxGetApp().get_inf_dialog_contect().empty()) {
         p->hide_select_machine_dlg();

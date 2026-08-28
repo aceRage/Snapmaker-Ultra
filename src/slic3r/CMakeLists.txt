@@ -400,6 +400,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Project.hpp
     GUI/PublishDialog.cpp
     GUI/PublishDialog.hpp
+    GUI/SpoolmanDialog.cpp
+    GUI/SpoolmanDialog.hpp
     GUI/RammingChart.cpp
     GUI/RammingChart.hpp
     GUI/RecenterDialog.cpp
@@ -606,6 +608,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/HexFile.cpp
     Utils/HexFile.hpp
     Utils/Http.cpp
+    Utils/Spoolman.cpp
+    Utils/Spoolman.hpp
     Utils/Http.hpp
     Utils/InstanceID.cpp
     Utils/InstanceID.hpp
