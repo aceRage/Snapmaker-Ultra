@@ -74,7 +74,11 @@ struct SupportParameters {
             external_perimeter_width = std::max(external_perimeter_width, coordf_t(region.flow(object, frExternalPerimeter, slicing_params.layer_height).width()));
             bridge_flow_ratio += region.config().bridge_flow;
         }
-        this->gap_xy = object_config.support_object_xy_distance.value;
+        // BBS port: with Z-overrides-X/Y, cap the xy gap at the top z distance so
+        // supports still appear directly beneath overhangs.
+        this->gap_xy = !print_config.top_z_overrides_xy_distance ?
+                           object_config.support_object_xy_distance.value :
+                           std::min(object_config.support_object_xy_distance.value, std::max(0.2, object_config.support_top_z_distance.value));
         this->gap_xy_first_layer = object_config.support_object_first_layer_gap.value;
         bridge_flow_ratio /= object.num_printing_regions();
 

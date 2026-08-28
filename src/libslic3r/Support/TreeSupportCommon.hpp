@@ -69,6 +69,9 @@ struct TreeSupportMeshGroupSettings {
             0;
         this->support_material_buildplate_only = config.support_on_build_plate_only;
         this->support_xy_distance       = scaled<coord_t>(config.support_object_xy_distance.value);
+        // BBS port: Z-overrides-X/Y caps the xy distance at the top z gap.
+        if (print_config.top_z_overrides_xy_distance)
+            this->support_xy_distance = std::min(this->support_xy_distance, std::max(scaled<coord_t>(slicing_params.gap_support_object), coord_t(scale_(0.2))));
         this->support_xy_distance_1st_layer = scaled<coord_t>(config.support_object_first_layer_gap.value);
         // Separation of interfaces, it is likely smaller than support_xy_distance.
         this->support_xy_distance_overhang = std::min(this->support_xy_distance, scaled<coord_t>(0.5 * external_perimeter_width));
