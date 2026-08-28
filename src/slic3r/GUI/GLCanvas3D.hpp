@@ -591,6 +591,13 @@ private:
     // Following variable is obsolete and it should be safe to remove it.
     // I just don't want to do it now before a release (Lukas Matena 24.3.2019)
     bool m_render_sla_auxiliaries;
+
+public:
+    // Ultra: per-object view modes in the Prepare view (session-only, keyed by
+    // ModelObject/ModelVolume id). Declared here, above the member that uses it.
+    enum class ObjectViewMode : int { Normal = 0, Ghost = 1, Hidden = 2 };
+
+private:
     // Ultra: per-object view modes (Normal entries are not stored)
     std::map<size_t, ObjectViewMode> m_object_view_modes;
 
@@ -763,8 +770,7 @@ public:
     };
     void reset_volumes(ResetVolumesMode mode = ResetVolumesMode::Normal);
 
-    // Ultra: per-object view modes in the Prepare view (session-only, keyed by ModelObject id).
-    enum class ObjectViewMode : int { Normal = 0, Ghost = 1, Hidden = 2 };
+    // Ultra: per-object view modes in the Prepare view (session-only; enum declared earlier in the class).
     void set_object_view_mode(size_t object_id, ObjectViewMode mode);
     ObjectViewMode get_object_view_mode(size_t object_id) const;
     bool has_object_view_modes() const { return !m_object_view_modes.empty(); }
