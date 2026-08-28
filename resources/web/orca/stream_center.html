@@ -21,6 +21,16 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
 .cell .label { position: absolute; left: 8px; top: 6px; z-index: 2; padding: 2px 8px; border-radius: 10px; background: rgba(0,0,0,0.55); color: #fff; font-size: 12px; pointer-events: none; }
 .cell.empty { border: 1px dashed #555; background: #262626; }
 #note { color: #999; font-size: 12px; }
+#modal-bg { display: none; position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; }
+#modal { background: #333; border-radius: 8px; padding: 18px; min-width: 320px; color: #fff; box-shadow: 0 6px 24px rgba(0,0,0,0.5); }
+#modal h3 { font-size: 15px; margin-bottom: 12px; font-weight: 600; }
+#modal .field { margin-bottom: 10px; }
+#modal .field label { display: block; font-size: 12px; color: #aaa; margin-bottom: 4px; }
+#modal input { width: 100%; background: #222; color: #fff; border: 1px solid #555; border-radius: 5px; padding: 7px 9px; font-size: 13px; }
+#modal .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+#modal .buttons span { padding: 7px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; user-select: none; }
+#modal .ok { background: #0a9e50; }
+#modal .cancel { background: #555; }
 </style>
 </head>
 <body>
@@ -41,6 +51,7 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
   </select>
 </div>
 <div id="grid"></div>
+<div id="modal-bg"><div id="modal"></div></div>
 <script>
 (function() {
     var KEY = 'snorca_streams_v1';
@@ -73,6 +84,65 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
     function streamSrc(ip) {
         return /^https?:\/\//i.test(ip) ? ip : 'http://' + ip + '/webcam/webrtc';
     }
+    // In-page modal: the embedded WebView does not service prompt()/confirm() dialogs.
+    // opts = { title, message, fields: [{key,label,value,placeholder}] }; cb(null | {key:value})
+    function showModal(opts, cb) {
+        var bg = document.getElementById('modal-bg');
+        var modal = document.getElementById('modal');
+        modal.innerHTML = '';
+        var h = document.createElement('h3');
+        h.textContent = opts.title;
+        modal.appendChild(h);
+        if (opts.message) {
+            var msg = document.createElement('div');
+            msg.style.cssText = 'font-size:13px;color:#ccc;margin-bottom:8px;';
+            msg.textContent = opts.message;
+            modal.appendChild(msg);
+        }
+        var inputs = {};
+        (opts.fields || []).forEach(function(f) {
+            var wrap = document.createElement('div');
+            wrap.className = 'field';
+            var lab = document.createElement('label');
+            lab.textContent = f.label;
+            wrap.appendChild(lab);
+            var inp = document.createElement('input');
+            inp.value = f.value || '';
+            inp.placeholder = f.placeholder || '';
+            wrap.appendChild(inp);
+            modal.appendChild(wrap);
+            inputs[f.key] = inp;
+        });
+        function close(result) {
+            bg.style.display = 'none';
+            modal.innerHTML = '';
+            cb(result);
+        }
+        var buttons = document.createElement('div');
+        buttons.className = 'buttons';
+        var cancel = document.createElement('span');
+        cancel.className = 'cancel';
+        cancel.textContent = 'Cancel';
+        cancel.onclick = function() { close(null); };
+        buttons.appendChild(cancel);
+        var ok = document.createElement('span');
+        ok.className = 'ok';
+        ok.textContent = 'OK';
+        ok.onclick = function() {
+            var values = {};
+            for (var k in inputs) values[k] = inputs[k].value.trim();
+            close(values);
+        };
+        buttons.appendChild(ok);
+        modal.appendChild(buttons);
+        bg.style.display = 'flex';
+        modal.onkeydown = function(e) {
+            if (e.key === 'Enter') ok.onclick();
+            if (e.key === 'Escape') close(null);
+        };
+        var first = modal.querySelector('input');
+        if (first) first.focus();
+    }
     function cellCount(layout) {
         var p = layout.split('x');
         return { cols: +p[0], rows: +p[1], n: (+p[0]) * (+p[1]) };
@@ -93,8 +163,9 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             edit.title = 'Set alias';
             edit.onclick = function(e) {
                 e.stopPropagation();
-                var a = prompt('Alias for ' + h.ip + ' (empty to clear):', h.alias || '');
-                if (a !== null) { h.alias = a.trim(); save(); render(); }
+                showModal({ title: 'Alias for ' + h.ip, fields: [{ key: 'alias', label: 'Alias (empty to clear)', value: h.alias || '' }] }, function(r) {
+                    if (r !== null) { h.alias = r.alias; save(); render(); }
+                });
             };
             c.appendChild(edit);
             var del = document.createElement('span');
@@ -103,10 +174,12 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             del.title = 'Remove';
             del.onclick = function(e) {
                 e.stopPropagation();
-                if (!confirm('Remove ' + (h.alias ? h.alias + ' (' + h.ip + ')' : h.ip) + ' from the list?')) return;
-                state.hosts = state.hosts.filter(function(x) { return x.ip !== h.ip; });
-                state.active = state.active.filter(function(x) { return x !== h.ip; });
-                save(); render();
+                showModal({ title: 'Remove printer', message: 'Remove ' + (h.alias ? h.alias + ' (' + h.ip + ')' : h.ip) + ' from the list?' }, function(r) {
+                    if (r === null) return;
+                    state.hosts = state.hosts.filter(function(x) { return x.ip !== h.ip; });
+                    state.active = state.active.filter(function(x) { return x !== h.ip; });
+                    save(); render();
+                });
             };
             c.appendChild(del);
             c.onclick = function() {
@@ -165,15 +238,19 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         }
     }
     document.getElementById('addchip').onclick = function() {
-        var ip = prompt('Printer IP address, or a full stream URL (http…):');
-        if (ip === null) return;
-        ip = ip.trim();
-        if (!ip || !validHost(ip)) { alert('Invalid address'); return; }
-        if (state.hosts.some(function(h) { return h.ip === ip; })) return;
-        var alias = prompt('Alias (optional):') || '';
-        state.hosts.push({ ip: ip, alias: alias.trim() });
-        state.active.push(ip);
-        save(); render();
+        showModal({
+            title: 'Add printer',
+            fields: [
+                { key: 'ip', label: 'IP address, hostname, or full stream URL', placeholder: 'e.g. 10.0.0.106' },
+                { key: 'alias', label: 'Alias (optional)', placeholder: 'e.g. U1 Left' }
+            ]
+        }, function(r) {
+            if (r === null || !r.ip) return;
+            if (!validHost(r.ip) || state.hosts.some(function(h) { return h.ip === r.ip; })) return;
+            state.hosts.push({ ip: r.ip, alias: r.alias || '' });
+            state.active.push(r.ip);
+            save(); render();
+        });
     };
     document.getElementById('layout').onchange = function() {
         state.layout = this.value;
