@@ -12062,7 +12062,18 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                     && preset_bundle->printers.find_preset(preferred) != nullptr) {
                                     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": restoring preferred printer " << preferred
                                                             << " over project printer " << preset_bundle->printers.get_selected_preset_name();
+                                    // Auto-transfer: capture the project's process modifications and re-apply
+                                    // them after the silent printer switch, like the dialog's Transfer button.
+                                    DynamicPrintConfig print_dirty;
+                                    {
+                                        const Preset& edited_print = preset_bundle->prints.get_edited_preset();
+                                        for (const std::string& opt : preset_bundle->prints.current_dirty_options())
+                                            if (const ConfigOption* o = edited_print.config.option(opt))
+                                                print_dirty.set_key_value(opt, o->clone());
+                                    }
                                     wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preferred, false, "", true);
+                                    if (!print_dirty.empty())
+                                        wxGetApp().get_tab(Preset::TYPE_PRINT)->load_config(print_dirty);
                                 }
                             }
 
