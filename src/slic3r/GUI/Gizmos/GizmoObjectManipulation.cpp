@@ -930,9 +930,12 @@ void GizmoObjectManipulation::do_render_move_window(ImGuiWrapper *imgui_wrapper,
     }
     if (!focued_on_text) m_glcanvas.handle_sidebar_focus_event("", false);
 
-    // BBS: align and distribute buttons (ported from BambuStudio's Move panel)
+    // BBS: align and distribute buttons (ported from BambuStudio's Move panel).
+    // Unlike upstream this is not gated on world coordinates: snorca switches the
+    // panel to Instance coordinates for single-part selections, and the alignment
+    // engine operates on world-space boxes regardless of the displayed system.
     size_t selection_count = selection.get_volume_idxs().size();
-    if (selection_count >= 1 && m_coordinates_type == ECoordinatesType::World) {
+    if (selection_count >= 1) {
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
