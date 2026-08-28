@@ -81,8 +81,13 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         // bare host, or a full stream URL used verbatim (e.g. a go2rtc/WebRTC relay for Bambu cams)
         return /^https?:\/\/\S+$/i.test(ip) || /^[A-Za-z0-9.:\-_]+$/.test(ip);
     }
-    function streamSrc(ip) {
-        return /^https?:\/\//i.test(ip) ? ip : 'http://' + ip + '/webcam/webrtc';
+    var relayPort = 0;
+    try { relayPort = parseInt(new URLSearchParams(location.search).get('relay')) || 0; } catch (e) {}
+    function isBambu(h) { return !!(h && h.code); }
+    function streamSrc(h) {
+        if (isBambu(h))
+            return 'http://127.0.0.1:' + relayPort + '/bambu?ip=' + encodeURIComponent(h.ip) + '&code=' + encodeURIComponent(h.code);
+        return /^https?:\/\//i.test(h.ip) ? h.ip : 'http://' + h.ip + '/webcam/webrtc';
     }
     // In-page modal: the embedded WebView does not service prompt()/confirm() dialogs.
     // opts = { title, message, fields: [{key,label,value,placeholder}] }; cb(null | {key:value})
@@ -214,20 +219,27 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         for (var i = 0; i < lay.n; i++) {
             var ip = shown[i];
             if (ip) {
+                var h = state.hosts.filter(function(x) { return x.ip === ip; })[0];
                 var cell = existing[ip];
                 if (!cell) {
                     cell = document.createElement('div');
                     cell.className = 'cell';
                     cell.dataset.ip = ip;
-                    var f = document.createElement('iframe');
-                    f.allow = 'autoplay';
-                    f.src = streamSrc(ip);
+                    var f;
+                    if (isBambu(h)) {
+                        // The relay serves MJPEG, which renders in a plain <img>.
+                        f = document.createElement('img');
+                        f.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
+                    } else {
+                        f = document.createElement('iframe');
+                        f.allow = 'autoplay';
+                    }
+                    f.src = streamSrc(h || { ip: ip });
                     cell.appendChild(f);
                     var lab = document.createElement('span');
                     lab.className = 'label';
                     cell.appendChild(lab);
                 }
-                var h = state.hosts.filter(function(x) { return x.ip === ip; })[0];
                 cell.querySelector('.label').textContent = (h && h.alias) ? h.alias : ip;
                 grid.appendChild(cell);
             } else {
@@ -242,12 +254,13 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             title: 'Add printer',
             fields: [
                 { key: 'ip', label: 'IP address, hostname, or full stream URL', placeholder: 'e.g. 10.0.0.106' },
-                { key: 'alias', label: 'Alias (optional)', placeholder: 'e.g. U1 Left' }
+                { key: 'alias', label: 'Alias (optional)', placeholder: 'e.g. U1 Left' },
+                { key: 'code', label: 'LAN access code (Bambu printers only)', placeholder: 'leave empty for Snapmaker / URLs' }
             ]
         }, function(r) {
             if (r === null || !r.ip) return;
             if (!validHost(r.ip) || state.hosts.some(function(h) { return h.ip === r.ip; })) return;
-            state.hosts.push({ ip: r.ip, alias: r.alias || '' });
+            state.hosts.push({ ip: r.ip, alias: r.alias || '', code: r.code || '' });
             state.active.push(r.ip);
             save(); render();
         });
