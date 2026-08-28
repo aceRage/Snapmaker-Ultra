@@ -1037,6 +1037,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat, ironing_angle))
     // Detect bridging perimeters
     ((ConfigOptionBool, detect_overhang_wall))
+    ((ConfigOptionBool, unsupported_wall_last))
     ((ConfigOptionInt, wall_filament))
     // Ultra: 0 = same as wall_filament
     ((ConfigOptionInt, outer_wall_filament))
