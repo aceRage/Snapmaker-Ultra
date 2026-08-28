@@ -8,5 +8,5 @@
     "bed_model": "flashforge_c5_buildplate_model.stl",
     "bed_texture": "flashforge_c5_buildplate_texture.png",
     "hotend_model": "",
-    "default_materials": "Generic PLA;Flashforge PLA Basic;Flashforge HS PLA;Flashforge PLA  Matte;Flashforge PETG Basic;Flashforge ABS Basic;Flashforge TPU-95A"
+    "default_materials": "Generic PLA;Flashforge PLA Basic;Flashforge HS PLA;Flashforge PLA Matte;Flashforge PETG Basic;Flashforge ABS Basic;Flashforge TPU-95A"
 }
