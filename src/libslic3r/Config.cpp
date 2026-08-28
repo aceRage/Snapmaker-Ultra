@@ -910,6 +910,17 @@ int ConfigBase::load_from_json(const std::string &file, ConfigSubstitutionContex
                         if (iter.value().is_string()) {
                             array_values.emplace_back(iter.value());
                         }
+                        else if (iter.value().is_boolean()) {
+                            // Ultra (companion to OrcaSlicer#15370): bare scalars in arrays used
+                            // to invalidate and silently drop the whole list - convert instead.
+                            array_values.emplace_back(iter.value().get<bool>() ? "1" : "0");
+                        }
+                        else if (iter.value().is_number_integer()) {
+                            array_values.emplace_back(std::to_string(iter.value().get<int64_t>()));
+                        }
+                        else if (iter.value().is_number()) {
+                            array_values.emplace_back(float_to_string_decimal_point(iter.value().get<double>()));
+                        }
                         else {
                             //should not happen
                             BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": parse "<<file<<" error, invalid json array for " << it.key();
