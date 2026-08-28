@@ -230,7 +230,9 @@ extern bool is_json_file(const std::string& path);
 // Orca: custom protocal support utils
 inline bool is_orca_open(const std::string& url)
 {
-    return boost::starts_with(url, "Snapmaker_Orca://open") || boost::starts_with(url, "snapmaker-orca://open");
+    return boost::starts_with(url, "Snapmaker_Orca://open") || boost::starts_with(url, "snapmaker-orca://open")
+        // Ultra: also accept Printables' native OrcaSlicer button scheme.
+        || boost::starts_with(url, "orcaslicer://open");
 }
 inline bool is_prusaslicer_open(const std::string& url) { return boost::starts_with(url, "prusaslicer://open"); }
 inline bool is_bambustudio_open(const std::string& url) { return boost::starts_with(url, "bambustudio://open") || boost::starts_with(url, "bambustudioopen://"); }

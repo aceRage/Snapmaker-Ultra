@@ -1410,6 +1410,7 @@ wxWindow* PreferencesDialog::create_general_page()
 
     auto title_associate_url = create_item_title(_L("Associate web links to Snapmaker Orca"), page, _L("Associate URLs to Snapmaker Orca"));
 
+    auto associate_url_orcaslicer  = create_item_link_association(page, L"orcaslicer", "Printables.com (Orca links)");
     auto associate_url_prusaslicer = create_item_link_association(page, L"prusaslicer", "Printables.com");
     auto associate_url_bambustudio = create_item_link_association(page, L"bambustudio", "Makerworld.com");
     auto associate_url_cura        = create_item_link_association(page, L"cura", "Thingiverse.com");
@@ -1511,6 +1512,7 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_associate_stl, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_associate_step, 0, wxTOP, FromDIP(3));
     sizer_page->Add(title_associate_url, 0, wxTOP| wxEXPAND, FromDIP(20));
+    sizer_page->Add(associate_url_orcaslicer, 0, wxTOP, FromDIP(3));
     sizer_page->Add(associate_url_prusaslicer, 0, wxTOP, FromDIP(3));
     sizer_page->Add(associate_url_bambustudio, 0, wxTOP, FromDIP(3));
     sizer_page->Add(associate_url_cura, 0, wxTOP, FromDIP(3));
