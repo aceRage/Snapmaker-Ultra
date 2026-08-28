@@ -375,7 +375,8 @@ void GLGizmoMeshBoolean::on_render_input_window(float x, float y, float bottom_l
             TriangleMesh temp_tool_mesh = m_tool.mv->mesh();
             temp_tool_mesh.transform(m_tool.trafo);
             std::vector<TriangleMesh> temp_mesh_resuls;
-            Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "UNION");
+            if (!Slic3r::MeshBoolean::mfd::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "UNION"))
+                Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "UNION");
             if (temp_mesh_resuls.size() != 0) {
                 generate_new_volume(true, *temp_mesh_resuls.begin());
                 wxGetApp().notification_manager()->close_plater_warning_notification(warning_text);
@@ -393,7 +394,8 @@ void GLGizmoMeshBoolean::on_render_input_window(float x, float y, float bottom_l
             TriangleMesh temp_tool_mesh = m_tool.mv->mesh();
             temp_tool_mesh.transform(m_tool.trafo);
             std::vector<TriangleMesh> temp_mesh_resuls;
-            Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "A_NOT_B");
+            if (!Slic3r::MeshBoolean::mfd::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "A_NOT_B"))
+                Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "A_NOT_B");
             if (temp_mesh_resuls.size() != 0) {
                 generate_new_volume(m_diff_delete_input, *temp_mesh_resuls.begin());
                 wxGetApp().notification_manager()->close_plater_warning_notification(warning_text);
@@ -411,7 +413,8 @@ void GLGizmoMeshBoolean::on_render_input_window(float x, float y, float bottom_l
             TriangleMesh temp_tool_mesh = m_tool.mv->mesh();
             temp_tool_mesh.transform(m_tool.trafo);
             std::vector<TriangleMesh> temp_mesh_resuls;
-            Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "INTERSECTION");
+            if (!Slic3r::MeshBoolean::mfd::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "INTERSECTION"))
+                Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "INTERSECTION");
             if (temp_mesh_resuls.size() != 0) {
                 generate_new_volume(m_inter_delete_input, *temp_mesh_resuls.begin());
                 wxGetApp().notification_manager()->close_plater_warning_notification(warning_text);

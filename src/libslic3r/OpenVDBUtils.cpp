@@ -86,6 +86,22 @@ openvdb::FloatGrid::Ptr mesh_to_grid(const indexed_triangle_set &    mesh,
     return grid;
 }
 
+// declared in MeshRepair.hpp (kept free of OpenVDB includes)
+indexed_triangle_set remesh_by_voxels(const indexed_triangle_set &mesh, double voxel_size)
+{
+    if (mesh.indices.empty() || voxel_size <= 0.)
+        return {};
+    try {
+        const float voxel_scale = float(1. / voxel_size);
+        auto grid = mesh_to_grid(mesh, {}, voxel_scale, 3.0f, 3.0f);
+        if (!grid)
+            return {};
+        return grid_to_mesh(*grid, 0.0, 0.0);
+    } catch (const std::exception &) {
+        return {};
+    }
+}
+
 indexed_triangle_set grid_to_mesh(const openvdb::FloatGrid &grid,
                           double                    isovalue,
                           double                    adaptivity,

@@ -42,7 +42,6 @@ openvdb::FloatGrid::Ptr redistance_grid(const openvdb::FloatGrid &grid,
                                         double                    iso,
                                         double ext_range = 3.,
                                         double int_range = 3.);
-
 } // namespace Slic3r
 
 #endif // OPENVDBUTILS_HPP

@@ -301,6 +301,7 @@ include(MPFR/MPFR.cmake)
 include(CGAL/CGAL.cmake)
 
 include(NLopt/NLopt.cmake)
+include(Manifold/Manifold.cmake)
 include(libnoise/libnoise.cmake)
 
 
@@ -374,6 +375,7 @@ set(_dep_list
     ${WXWIDGETS_PKG}
     dep_Cereal
     dep_NLopt
+    dep_Manifold
     dep_OpenVDB
     dep_OpenCSG
     dep_OpenCV

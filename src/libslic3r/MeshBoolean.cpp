@@ -9,6 +9,7 @@
 #include "boost/log/trivial.hpp"
 // Include igl first. It defines "L" macro which then clashes with our localization
 #include <igl/copyleft/cgal/mesh_boolean.h>
+#include <manifold/manifold.h>
 #undef L
 
 // CGAL headers
@@ -818,6 +819,72 @@ void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, st
 
 } // namespace mcut
 
+namespace mfd {
+
+static manifold::Manifold to_manifold(const indexed_triangle_set &its)
+{
+    manifold::MeshGL m;
+    m.numProp = 3;
+    m.vertProperties.reserve(its.vertices.size() * 3);
+    for (const Vec3f &v : its.vertices) {
+        m.vertProperties.push_back(v.x());
+        m.vertProperties.push_back(v.y());
+        m.vertProperties.push_back(v.z());
+    }
+    m.triVerts.reserve(its.indices.size() * 3);
+    for (const Vec3i32 &t : its.indices) {
+        m.triVerts.push_back(uint32_t(t[0]));
+        m.triVerts.push_back(uint32_t(t[1]));
+        m.triVerts.push_back(uint32_t(t[2]));
+    }
+    // Fuse duplicated vertices so meshes exported as triangle soup can still
+    // form a topological manifold.
+    m.Merge();
+    return manifold::Manifold(m);
+}
+
+bool make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts)
+{
+    manifold::OpType op;
+    if (boolean_opts == "UNION")
+        op = manifold::OpType::Add;
+    else if (boolean_opts == "A_NOT_B")
+        op = manifold::OpType::Subtract;
+    else if (boolean_opts == "INTERSECTION")
+        op = manifold::OpType::Intersect;
+    else
+        return false;
+
+    try {
+        manifold::Manifold a = to_manifold(src_mesh.its);
+        manifold::Manifold b = to_manifold(cut_mesh.its);
+        if (a.Status() != manifold::Manifold::Error::NoError || b.Status() != manifold::Manifold::Error::NoError) {
+            BOOST_LOG_TRIVIAL(info) << "MeshBoolean::mfd: input not manifold, falling back (src="
+                                    << int(a.Status()) << " tool=" << int(b.Status()) << ")";
+            return false;
+        }
+        manifold::MeshGL out = a.Boolean(b, op).GetMeshGL();
+        if (out.triVerts.empty())
+            return true; // legitimately empty result (e.g. void intersection)
+
+        indexed_triangle_set its;
+        const size_t stride = out.numProp;
+        const size_t nv     = out.vertProperties.size() / stride;
+        its.vertices.reserve(nv);
+        for (size_t i = 0; i < nv; ++i)
+            its.vertices.emplace_back(out.vertProperties[i * stride], out.vertProperties[i * stride + 1], out.vertProperties[i * stride + 2]);
+        its.indices.reserve(out.triVerts.size() / 3);
+        for (size_t i = 0; i + 2 < out.triVerts.size(); i += 3)
+            its.indices.emplace_back(int(out.triVerts[i]), int(out.triVerts[i + 1]), int(out.triVerts[i + 2]));
+        dst_mesh.emplace_back(std::move(its));
+        return true;
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "MeshBoolean::mfd: exception, falling back: " << e.what();
+        return false;
+    }
+}
+
+} // namespace mfd
 
 } // namespace MeshBoolean
 } // namespace Slic3r

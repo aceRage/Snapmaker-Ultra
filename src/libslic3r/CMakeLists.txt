@@ -13,7 +13,7 @@ endif ()
 
 set(OpenVDBUtils_SOURCES "")
 if (TARGET OpenVDB::openvdb)
-    set(OpenVDBUtils_SOURCES OpenVDBUtils.cpp OpenVDBUtils.hpp)
+    set(OpenVDBUtils_SOURCES OpenVDBUtils.cpp OpenVDBUtils.hpp MeshRepair.hpp)
 endif()
 
 option(BUILD_SHARED_LIBS "Build shared libs" OFF)
@@ -576,6 +576,7 @@ target_link_libraries(libslic3r
         glu-libtess
         JPEG::JPEG
         libslic3r_cgal
+        manifold::manifold
         mcut
         noise::noise
         PNG::PNG

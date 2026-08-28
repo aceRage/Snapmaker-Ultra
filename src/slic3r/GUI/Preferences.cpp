@@ -1577,7 +1577,7 @@ wxWindow* PreferencesDialog::create_ultra_page()
     auto title_presets = create_item_title(_L("Presets"), page, _L("Presets"));
     auto item_prefer_last_print = create_item_checkbox(_L("Prefer Last Used Print Profile"), page,
         _L("When a project's print profile is not available, pick the profile you last used at the same layer height instead of the first compatible one."), 50, "prefer_last_print_profile");
-    auto item_auto_shadow = create_item_checkbox(_L("Save system preset edits to a Custom copy automatically"), page,
+    auto item_auto_shadow = create_item_checkbox(_L("Seamless System Filament Edits"), page,
         _L("Saving a modified system preset silently saves and selects \"<name> - Custom\" instead of asking for a new name every time."), 50, "auto_shadow_system_presets");
 
     sizer_page->Add(title_project, 0, wxTOP | wxEXPAND, FromDIP(20));

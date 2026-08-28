@@ -94,7 +94,19 @@ void do_boolean(McutMesh &srcMesh, const McutMesh &cutMesh, const std::string &b
 
 // do boolean and convert result to TriangleMesh
 void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts);
+
 } // namespace mcut
+
+// Ultra: robust booleans via the Manifold library (primary backend of the Mesh
+// Boolean gizmo; callers fall back to mcut when this returns false).
+namespace mfd {
+
+// boolean_opts: "UNION" / "A_NOT_B" / "INTERSECTION" (same contract as mcut).
+// Returns false and leaves dst_mesh untouched when an input is not a valid
+// manifold or the operation is unknown; true otherwise (dst may legitimately be
+// empty, e.g. a void intersection).
+bool make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts);
+} // namespace mfd
 
 } // namespace MeshBoolean
 } // namespace Slic3r

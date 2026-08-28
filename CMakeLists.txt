@@ -726,6 +726,9 @@ endforeach()
 
 find_package(NLopt 1.4 REQUIRED)
 
+# Ultra: Manifold - robust mesh booleans (primary backend of the Mesh Boolean gizmo)
+find_package(manifold CONFIG REQUIRED)
+
 
 if(SLIC3R_STATIC)
     set(OPENVDB_USE_STATIC_LIBS ON)

@@ -425,6 +425,7 @@ public:
     void split_instances();
     void rename_item();
     void fix_through_netfabb();
+    void repair_by_remesh();
     void simplify();
     void update_item_error_icon(const int obj_idx, int vol_idx) const ;
 

@@ -14,6 +14,7 @@
 #include "Tab.hpp"
 #include "wxExtensions.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/MeshRepair.hpp"
 #include "GLCanvas3D.hpp"
 #include "Selection.hpp"
 #include "PartPlate.hpp"
@@ -5636,6 +5637,77 @@ void ObjectList::rename_item()
 
     if (m_objects_model->SetName(new_name, item))
         update_name_in_model(item);
+}
+
+// Ultra: robust local repair - rebuild each selected part from its signed distance
+// field (OpenVDB voxel remesh). Always produces a watertight manifold mesh; detail
+// below the voxel size is lost. Complements the Windows-only "Fix model".
+void ObjectList::repair_by_remesh()
+{
+    if (!wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager().check_gizmos_closed_except(GLGizmosManager::Undefined))
+        return;
+
+    std::vector<int> obj_idxs, vol_idxs;
+    get_selection_indexes(obj_idxs, vol_idxs);
+    if (obj_idxs.empty() && vol_idxs.empty())
+        return;
+
+    Plater* plater = wxGetApp().plater();
+    Plater::TakeSnapshot snapshot(plater, "Repair by remeshing");
+    wxBusyCursor wait;
+
+    auto remesh_volume = [](ModelVolume& mv) -> bool {
+        const BoundingBoxf3 bb = mv.mesh().bounding_box();
+        const double voxel = std::clamp(bb.size().norm() / 300., 0.05, 0.3);
+        indexed_triangle_set its = remesh_by_voxels(mv.mesh().its, voxel);
+        if (its.indices.empty())
+            return false;
+        mv.set_mesh(std::move(its));
+        mv.set_new_unique_id();
+        mv.calculate_convex_hull();
+        return true;
+    };
+
+    int repaired = 0, failed = 0;
+    auto process_object = [&](int obj_idx, const std::vector<int>& vols) {
+        ModelObject* mo = object(obj_idx);
+        if (mo == nullptr)
+            return;
+        plater->clear_before_change_mesh(obj_idx);
+        bool any = false;
+        for (size_t i = 0; i < mo->volumes.size(); ++i) {
+            if (!vols.empty() && std::find(vols.begin(), vols.end(), int(i)) == vols.end())
+                continue;
+            if (!mo->volumes[i]->is_model_part())
+                continue;
+            if (remesh_volume(*mo->volumes[i])) { ++repaired; any = true; }
+            else ++failed;
+        }
+        if (any) {
+            mo->invalidate_bounding_box();
+            mo->ensure_on_bed();
+            plater->changed_mesh(obj_idx);
+            plater->get_partplate_list().notify_instance_update(obj_idx, 0);
+            update_item_error_icon(obj_idx, -1);
+            update_info_items(obj_idx);
+        }
+    };
+
+    if (vol_idxs.empty()) {
+        for (int obj_idx : obj_idxs)
+            process_object(obj_idx, {});
+    } else if (!obj_idxs.empty()) {
+        process_object(obj_idxs.front(), vol_idxs);
+    }
+    plater->sidebar().obj_list()->update_plate_values_for_items();
+
+    NotificationManager* notify = plater->get_notification_manager();
+    if (notify != nullptr) {
+        if (failed == 0)
+            notify->push_notification(GUI::format(_L("Repaired %1% part(s) by remeshing."), repaired));
+        else
+            notify->push_notification(GUI::format(_L("Repaired %1% part(s), %2% failed."), repaired, failed));
+    }
 }
 
 void ObjectList::fix_through_netfabb()
