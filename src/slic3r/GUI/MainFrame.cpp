@@ -2602,6 +2602,10 @@ void MainFrame::init_menubar_as_editor()
         append_menu_item(import_menu, wxID_ANY, _L("Import Configs") + dots /*+ "\t" + ctrl + "I"*/, _L("Load configs"),
             [this](wxCommandEvent&) { load_config_file(); }, "menu_import", nullptr,
             [this](){return true; }, this);
+        // Ultra: import the config block embedded in a sliced G-code file.
+        append_menu_item(import_menu, wxID_ANY, _L("Import Config from G-code") + dots, _L("Load print/filament/printer settings embedded in a sliced G-code file"),
+            [this](wxCommandEvent&) { import_config_from_gcode(); }, "menu_import", nullptr,
+            [this](){return true; }, this);
 
         append_submenu(fileMenu, import_menu, wxID_ANY, _L("Import"), "");
 
@@ -3477,6 +3481,29 @@ void MainFrame::load_config_file()
     MessageDialog dlg2(this,msg ,
                         _L("Import result"), wxOK);
     dlg2.ShowModal();
+}
+
+// Ultra: import the config block embedded in a sliced G-code file (PrusaSlicer-style).
+void MainFrame::import_config_from_gcode()
+{
+    wxFileDialog dlg(this, _L("Select a sliced G-code file to import settings from:"),
+        wxGetApp().app_config->get_last_dir(), "",
+        "G-code files (*.gcode;*.g;*.ngc)|*.gcode;*.g;*.ngc", wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+    const std::string path = into_u8(dlg.GetPath());
+    try {
+        ConfigSubstitutions subst = wxGetApp().preset_bundle->load_config_file(path, ForwardCompatibilitySubstitutionRule::Enable);
+        if (!subst.empty())
+            show_substitutions_info(subst, path);
+        wxGetApp().app_config->update_config_dir(get_dir_name(from_u8(path)));
+        wxGetApp().load_current_presets();
+        wxGetApp().preset_bundle->update_compatible(PresetSelectCompatibleType::Always);
+        update_side_preset_ui();
+        MessageDialog(this, _L("Settings imported from the G-code file as modified presets."), _L("Import result"), wxOK).ShowModal();
+    } catch (const std::exception& ex) {
+        show_error(this, ex.what());
+    }
 }
 
 // Load a config file containing a Print, Filament & Printer preset from command line.
