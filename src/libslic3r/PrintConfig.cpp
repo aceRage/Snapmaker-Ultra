@@ -2434,6 +2434,17 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionInts{ 100 });
 
+    // Ultra: per-filament additive Z offset (OrcaSlicer #4660)
+    def = this->add("filament_z_offset", coFloats);
+    def->label = L("Filament Z offset");
+    def->category = L("Advanced");
+    def->tooltip = L("Added to the printer's Z offset when printing with this filament. Useful for per-filament squish "
+                     "or textured/smooth plate differences without editing the printer profile. Applied for the first "
+                     "printing filament of a job.");
+    def->sidetext = "mm";	// millimeters, don't need translation
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloats { 0. });
+
     def = this->add("filament_cost", coFloats);
     def->label = L("Price");
     def->tooltip = L("Filament price. For statistics only.");

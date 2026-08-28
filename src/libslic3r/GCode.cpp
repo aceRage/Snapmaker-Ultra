@@ -2477,6 +2477,18 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
     }
     print.throw_if_canceled();
 
+    // Ultra: fold the first printing filament's Z offset into the job's Z offset
+    // (per-filament squish / plate-surface compensation, OrcaSlicer #4660).
+    if (initial_extruder_id != static_cast<unsigned int>(-1) &&
+        initial_extruder_id < m_config.filament_z_offset.values.size()) {
+        const double filament_z_offset = m_config.filament_z_offset.get_at(initial_extruder_id);
+        if (filament_z_offset != 0.) {
+            m_config.z_offset.value += filament_z_offset;
+            BOOST_LOG_TRIVIAL(info) << "GCode: applying filament_z_offset " << filament_z_offset
+                                    << " for filament " << initial_extruder_id;
+        }
+    }
+
     m_cooling_buffer = make_unique<CoolingBuffer>(*this);
     m_cooling_buffer->set_current_extruder(initial_extruder_id);
 

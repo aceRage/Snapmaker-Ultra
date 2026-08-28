@@ -3722,6 +3722,7 @@ void TabFilament::build()
         optgroup->append_single_option_line("filament_shrink");
         optgroup->append_single_option_line("filament_shrinkage_compensation_z");
         optgroup->append_single_option_line("filament_cost");
+        optgroup->append_single_option_line("filament_z_offset");
         //BBS
         optgroup->append_single_option_line("temperature_vitrification");
         // filament_is_high_temperature is controlled by preset data, not user-facing

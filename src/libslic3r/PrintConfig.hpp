@@ -1180,6 +1180,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBools,               filament_soluble))
     ((ConfigOptionBools,               filament_is_support))
     ((ConfigOptionFloats,              filament_cost))
+    // Ultra: per-filament additive Z offset (applied for the first printing filament)
+    ((ConfigOptionFloats,              filament_z_offset))
     ((ConfigOptionStrings,             default_filament_colour))
     ((ConfigOptionInts,                temperature_vitrification))  //BBS
     ((ConfigOptionBools,               filament_is_high_temperature))
