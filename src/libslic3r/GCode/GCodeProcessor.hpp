@@ -496,6 +496,8 @@ class Print;
             float filament_unload_times;
             //Orca:  time for tool change
             float machine_tool_change_time;
+            // Ultra: fixed prepare seconds added to the total estimate
+            float machine_prepare_time { 0.f };
 
             std::array<TimeMachine, static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count)> machines;
 

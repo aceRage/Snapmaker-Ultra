@@ -2138,6 +2138,15 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.0));
 
+    def = this->add("machine_prepare_time", coFloat);
+    def->label = L("Prepare time");
+    def->tooltip = L("Fixed time added to the print time estimate to account for machine startup routines "
+                     "(homing, bed mesh, nozzle purge, etc.). Added once to the total; does not affect the sliced G-code.");
+    def->sidetext = "s";	// seconds, don't need translation
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
     def = this->add("machine_tool_change_time", coFloat);
     def->label = L("Tool change time");
     def->tooltip = L("Time taken to switch tools. It's usually applicable for tool changers or multi-tool machines. "

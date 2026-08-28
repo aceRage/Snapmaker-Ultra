@@ -767,6 +767,7 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
     m_time_processor.filament_load_times = static_cast<float>(config.machine_load_filament_time.value);
     m_time_processor.filament_unload_times = static_cast<float>(config.machine_unload_filament_time.value);
     m_time_processor.machine_tool_change_time = static_cast<float>(config.machine_tool_change_time.value);
+    m_time_processor.machine_prepare_time = static_cast<float>(config.machine_prepare_time.value);
 
     for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
         float max_acceleration = get_option_value(m_time_processor.machine_limits.machine_max_acceleration_extruding, i);
@@ -987,6 +988,11 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
     const ConfigOptionFloat* machine_unload_filament_time = config.option<ConfigOptionFloat>("machine_unload_filament_time");
     if (machine_unload_filament_time != nullptr)
         m_time_processor.filament_unload_times = static_cast<float>(machine_unload_filament_time->value);
+
+    // Ultra: fixed prepare-time offset for the estimate
+    const ConfigOptionFloat* machine_prepare_time = config.option<ConfigOptionFloat>("machine_prepare_time");
+    if (machine_prepare_time != nullptr)
+        m_time_processor.machine_prepare_time = static_cast<float>(machine_prepare_time->value);
 
     const ConfigOptionFloat* machine_tool_change_time = config.option<ConfigOptionFloat>("machine_tool_change_time");
     if (machine_tool_change_time != nullptr)
@@ -1363,7 +1369,9 @@ void GCodeProcessor::finalize(bool post_process)
 
 float GCodeProcessor::get_time(PrintEstimatedStatistics::ETimeMode mode) const
 {
-    return (mode < PrintEstimatedStatistics::ETimeMode::Count) ? m_time_processor.machines[static_cast<size_t>(mode)].time : 0.0f;
+    // Ultra: include the machine's fixed prepare time in the total estimate.
+    return (mode < PrintEstimatedStatistics::ETimeMode::Count) ?
+        m_time_processor.machines[static_cast<size_t>(mode)].time + m_time_processor.machine_prepare_time : 0.0f;
 }
 
 float GCodeProcessor::get_prepare_time(PrintEstimatedStatistics::ETimeMode mode) const

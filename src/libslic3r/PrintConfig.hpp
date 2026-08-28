@@ -1258,6 +1258,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,               extra_loading_move))
     ((ConfigOptionFloat,               machine_load_filament_time))
     ((ConfigOptionFloat,               machine_tool_change_time))
+    // Ultra: fixed startup/prepare seconds added to the print time estimate
+    ((ConfigOptionFloat,               machine_prepare_time))
     ((ConfigOptionBool,                tool_change_temprature_wait))
     ((ConfigOptionFloat,               machine_unload_filament_time))
     ((ConfigOptionFloats,              filament_loading_speed))

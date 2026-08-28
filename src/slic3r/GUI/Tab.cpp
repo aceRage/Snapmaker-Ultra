@@ -4824,6 +4824,7 @@ if (is_marlin_flavor)
         optgroup->append_single_option_line("high_current_on_filament_swap", "semm");
 
         optgroup = page->new_optgroup(L("Advanced"), L"param_advanced");
+        optgroup->append_single_option_line("machine_prepare_time");
         optgroup->append_single_option_line("machine_load_filament_time");
         optgroup->append_single_option_line("machine_unload_filament_time");
         optgroup->append_single_option_line("machine_tool_change_time");
