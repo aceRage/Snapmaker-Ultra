@@ -2876,6 +2876,422 @@
         {
             "name": "Generic PVA @FF C5P",
             "sub_path": "filament/Generic PVA @FF C5P.json"
+        },
+        {
+            "name": "Fiberon ASA-CF08 @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon ASA-CF08 @FF C5.json"
+        },
+        {
+            "name": "Fiberon ASA-CF08 @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon ASA-CF08 @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PA12-CF10 @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PA12-CF10 @FF C5.json"
+        },
+        {
+            "name": "Fiberon PA12-CF10 @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PA12-CF10 @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PA6-CF20 @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PA6-CF20 @FF C5.json"
+        },
+        {
+            "name": "Fiberon PA6-CF20 @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PA6-CF20 @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PA6-GF25 @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PA6-GF25 @FF C5.json"
+        },
+        {
+            "name": "Fiberon PA6-GF25 @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PA6-GF25 @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PA612-CF15 @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PA612-CF15 @FF C5.json"
+        },
+        {
+            "name": "Fiberon PA612-CF15 @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PA612-CF15 @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PA612-ESD @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PA612-ESD @FF C5.json"
+        },
+        {
+            "name": "Fiberon PA612-ESD @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PA612-ESD @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PET-CF17 @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PET-CF17 @FF C5.json"
+        },
+        {
+            "name": "Fiberon PET-CF17 @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PET-CF17 @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PET-GF15 @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PET-GF15 @FF C5.json"
+        },
+        {
+            "name": "Fiberon PET-GF15 @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PET-GF15 @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PETG-ESD @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PETG-ESD @FF C5.json"
+        },
+        {
+            "name": "Fiberon PETG-ESD @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PETG-ESD @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PETG-rCF08 @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PETG-rCF08 @FF C5.json"
+        },
+        {
+            "name": "Fiberon PETG-rCF08 @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PETG-rCF08 @FF C5P.json"
+        },
+        {
+            "name": "Fiberon PPS-GF20 @FF C5",
+            "sub_path": "filament/Polymaker/Fiberon PPS-GF20 @FF C5.json"
+        },
+        {
+            "name": "Fiberon PPS-GF20 @FF C5P",
+            "sub_path": "filament/Polymaker/Fiberon PPS-GF20 @FF C5P.json"
+        },
+        {
+            "name": "Panchroma CoPE @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma CoPE @FF C5.json"
+        },
+        {
+            "name": "Panchroma CoPE @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma CoPE @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Celestial @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Celestial @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Celestial @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Celestial @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Galaxy @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Galaxy @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Galaxy @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Galaxy @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Glow @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Glow @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Glow @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Glow @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Luminous @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Luminous @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Luminous @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Luminous @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Marble @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Marble @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Marble @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Marble @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Matte @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Matte @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Matte @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Matte @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Metallic @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Metallic @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Metallic @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Metallic @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Neon @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Neon @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Neon @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Neon @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Satin @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Satin @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Satin @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Satin @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Silk @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Silk @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Silk @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Silk @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Starlight @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Starlight @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Starlight @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Starlight @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA Translucent @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA Translucent @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA Translucent @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA Translucent @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA UV Shift @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA UV Shift @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA UV Shift @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA UV Shift @FF C5P.json"
+        },
+        {
+            "name": "Panchroma PLA @FF C5",
+            "sub_path": "filament/Polymaker/Panchroma PLA @FF C5.json"
+        },
+        {
+            "name": "Panchroma PLA @FF C5P",
+            "sub_path": "filament/Polymaker/Panchroma PLA @FF C5P.json"
+        },
+        {
+            "name": "PolyLite CosPLA @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite CosPLA @FF C5.json"
+        },
+        {
+            "name": "PolyLite CosPLA @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite CosPLA @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PETG Translucent @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PETG Translucent @FF C5.json"
+        },
+        {
+            "name": "PolyLite PETG Translucent @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PETG Translucent @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PETG @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PETG @FF C5.json"
+        },
+        {
+            "name": "PolyLite PETG @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PETG @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA Galaxy @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA Galaxy @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA Galaxy @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA Galaxy @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA Glow @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA Glow @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA Glow @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA Glow @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA Luminous @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA Luminous @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA Luminous @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA Luminous @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA Neon @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA Neon @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA Neon @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA Neon @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA Pro Metallic @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA Pro Metallic @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA Pro Metallic @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA Pro Metallic @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA Pro @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA Pro @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA Pro @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA Pro @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA Starlight @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA Starlight @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA Starlight @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA Starlight @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA Translucent @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA Translucent @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA Translucent @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA Translucent @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA-CF @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA-CF @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA-CF @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA-CF @FF C5P.json"
+        },
+        {
+            "name": "PolyLite PLA @FF C5",
+            "sub_path": "filament/Polymaker/PolyLite PLA @FF C5.json"
+        },
+        {
+            "name": "PolyLite PLA @FF C5P",
+            "sub_path": "filament/Polymaker/PolyLite PLA @FF C5P.json"
+        },
+        {
+            "name": "PolyTerra PLA Marble @FF C5",
+            "sub_path": "filament/Polymaker/PolyTerra PLA Marble @FF C5.json"
+        },
+        {
+            "name": "PolyTerra PLA Marble @FF C5P",
+            "sub_path": "filament/Polymaker/PolyTerra PLA Marble @FF C5P.json"
+        },
+        {
+            "name": "PolyTerra PLA+ @FF C5",
+            "sub_path": "filament/Polymaker/PolyTerra PLA+ @FF C5.json"
+        },
+        {
+            "name": "PolyTerra PLA+ @FF C5P",
+            "sub_path": "filament/Polymaker/PolyTerra PLA+ @FF C5P.json"
+        },
+        {
+            "name": "PolyTerra PLA @FF C5",
+            "sub_path": "filament/Polymaker/PolyTerra PLA @FF C5.json"
+        },
+        {
+            "name": "PolyTerra PLA @FF C5P",
+            "sub_path": "filament/Polymaker/PolyTerra PLA @FF C5P.json"
+        },
+        {
+            "name": "Polymaker ABS Pro Galaxy @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker ABS Pro Galaxy @FF C5.json"
+        },
+        {
+            "name": "Polymaker ABS Pro Galaxy @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker ABS Pro Galaxy @FF C5P.json"
+        },
+        {
+            "name": "Polymaker ABS Pro @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker ABS Pro @FF C5.json"
+        },
+        {
+            "name": "Polymaker ABS Pro @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker ABS Pro @FF C5P.json"
+        },
+        {
+            "name": "Polymaker HT-PLA Pro @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker HT-PLA Pro @FF C5.json"
+        },
+        {
+            "name": "Polymaker HT-PLA Pro @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker HT-PLA Pro @FF C5P.json"
+        },
+        {
+            "name": "Polymaker HT-PLA-GF @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker HT-PLA-GF @FF C5.json"
+        },
+        {
+            "name": "Polymaker HT-PLA-GF @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker HT-PLA-GF @FF C5P.json"
+        },
+        {
+            "name": "Polymaker HT-PLA @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker HT-PLA @FF C5.json"
+        },
+        {
+            "name": "Polymaker HT-PLA @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker HT-PLA @FF C5P.json"
+        },
+        {
+            "name": "Polymaker PETG Galaxy @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker PETG Galaxy @FF C5.json"
+        },
+        {
+            "name": "Polymaker PETG Galaxy @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker PETG Galaxy @FF C5P.json"
+        },
+        {
+            "name": "Polymaker PETG @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker PETG @FF C5.json"
+        },
+        {
+            "name": "Polymaker PETG @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker PETG @FF C5P.json"
+        },
+        {
+            "name": "Polymaker PLA Pro Metallic @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker PLA Pro Metallic @FF C5.json"
+        },
+        {
+            "name": "Polymaker PLA Pro Metallic @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker PLA Pro Metallic @FF C5P.json"
+        },
+        {
+            "name": "Polymaker PLA Pro @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker PLA Pro @FF C5.json"
+        },
+        {
+            "name": "Polymaker PLA Pro @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker PLA Pro @FF C5P.json"
+        },
+        {
+            "name": "Polymaker PLA @FF C5",
+            "sub_path": "filament/Polymaker/Polymaker PLA @FF C5.json"
+        },
+        {
+            "name": "Polymaker PLA @FF C5P",
+            "sub_path": "filament/Polymaker/Polymaker PLA @FF C5P.json"
         }
     ],
     "machine_list": [
