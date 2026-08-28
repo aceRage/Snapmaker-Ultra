@@ -96,7 +96,12 @@ indexed_triangle_set remesh_by_voxels(const indexed_triangle_set &mesh, double v
         auto grid = mesh_to_grid(mesh, {}, voxel_scale, 3.0f, 3.0f);
         if (!grid)
             return {};
-        return grid_to_mesh(*grid, 0.0, 0.0);
+        indexed_triangle_set its = grid_to_mesh(*grid, 0.0, 0.0);
+        // OpenVDB's volumeToMesh emits faces wound for inward normals (which is what
+        // the SLA hollowing interior wants); an exterior surface must be flipped or
+        // it renders dark and confuses ray picking.
+        its_flip_triangles(its);
+        return its;
     } catch (const std::exception &) {
         return {};
     }
