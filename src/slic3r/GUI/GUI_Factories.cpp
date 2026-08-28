@@ -1458,6 +1458,11 @@ void MenuFactory::create_part_menu()
     append_menu_item_export_stl(menu);
     append_menu_item_fix_through_netfabb(menu);
     append_menu_items_mirror(menu);
+    // "Separate": extract this one part into its own object, keeping its position
+    // (single-part variant of Assemble Separately; same implementation).
+    append_menu_item(menu, wxID_ANY, _L("Separate"), _L("Move this part into a new object, keeping its position in space"),
+        [](wxCommandEvent&) { obj_list()->assemble_separately(); }, "", nullptr,
+        []() { return obj_list()->can_assemble_separately(); }, m_parent);
     append_menu_item_merge_parts_to_single_part(menu);
 
     append_menu_item(menu, wxID_ANY, _L("Split"), _L("Split the selected object into multiple parts"),

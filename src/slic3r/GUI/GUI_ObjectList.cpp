@@ -3090,7 +3090,8 @@ void ObjectList::assemble_separately()
     // Add the extracted parts to the model as a new object
     Model& model = wxGetApp().plater()->model();
     ModelObject* new_object = model.add_object();
-    new_object->name = _u8L("Assembly");
+    // A single extracted part keeps its own name; several become an "Assembly".
+    new_object->name = sel_volumes.size() == 1 ? sel_volumes.front()->name : _u8L("Assembly");
     new_object->add_instance();
     int min_extruder = (int) EnforcerBlockerType::ExtruderMax;
     for (ModelVolume* mv : sel_volumes) {
