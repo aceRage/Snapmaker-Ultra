@@ -954,6 +954,19 @@ int ConfigBase::load_from_json(const std::string &file, ConfigSubstitutionContex
                     if (valid)
                         this->set_deserialize(opt_key, value_str, substitution_context);
                 }
+                else if (it.value().is_boolean() || it.value().is_number()) {
+                    // Port of OrcaSlicer PR #15370: a bare JSON number or boolean used to be
+                    // silently discarded here, leaving the option at its compiled-in default
+                    // (e.g. "precise_outer_wall": 0 *enabled* the feature). Convert to the
+                    // serialized textual form instead; anything unconvertible still errors.
+                    if (it.value().is_boolean())
+                        value_str = it.value().get<bool>() ? "1" : "0";
+                    else if (it.value().is_number_integer())
+                        value_str = std::to_string(it.value().get<int64_t>());
+                    else
+                        value_str = float_to_string_decimal_point(it.value().get<double>());
+                    this->set_deserialize(opt_key, value_str, substitution_context);
+                }
                 else {
                     //should not happen
                     BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": parse "<<file<<" error, invalid json type for " << it.key();
