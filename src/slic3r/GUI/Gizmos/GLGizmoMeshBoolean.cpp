@@ -265,6 +265,35 @@ void GLGizmoMeshBoolean::on_render_input_window(float x, float y, float bottom_l
         return res;
     };
 
+    // Pick a part from a dropdown of the object's volumes - clicking in the 3D view is
+    // impossible for fully embedded parts. Mirrors what a click assigns (mv, idx, trafo).
+    ModelObject* boolean_mo = nullptr;
+    if (m_c != nullptr && m_c->selection_info() != nullptr)
+        boolean_mo = m_c->selection_info()->model_object();
+    auto part_picker = [this, boolean_mo](const char* id, VolumeInfo& slot, bool is_src) {
+        if (boolean_mo == nullptr || boolean_mo->volumes.size() < 2)
+            return;
+        ImGui::SameLine();
+        ImGui::PushItemWidth(ImGui::GetFrameHeight() * 6.0f);
+        std::string preview = slot.mv != nullptr ? slot.mv->name : _u8L("Pick from list");
+        if (ImGui::BeginCombo(id, preview.c_str())) {
+            for (size_t i = 0; i < boolean_mo->volumes.size(); ++i) {
+                ModelVolume* mv = boolean_mo->volumes[i];
+                std::string  label = mv->name + "##pick" + std::to_string(i);
+                if (ImGui::Selectable(label.c_str(), slot.mv == mv)) {
+                    slot.trafo      = mv->get_matrix();
+                    slot.volume_idx = int(i);
+                    if (is_src)
+                        set_src_volume(mv);
+                    else
+                        set_tool_volume(mv);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PopItemWidth();
+    };
+
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0);
     if (selectable(_u8L("Union"), m_operation_mode == MeshBooleanOperation::Union, ImVec2(max_tab_length, 0.0f))) {
         m_operation_mode = MeshBooleanOperation::Union;
@@ -306,6 +335,7 @@ void GLGizmoMeshBoolean::on_render_input_window(float x, float y, float bottom_l
         }
         ImGui::PopStyleColor(5);
     }
+    part_picker("##pick_src", m_src, true);
 
     ImGui::AlignTextToFramePadding();
     std::string cap_str2 = m_operation_mode != MeshBooleanOperation::Difference ? _u8L("Part 2") : _u8L("Subtract with");
@@ -334,6 +364,7 @@ void GLGizmoMeshBoolean::on_render_input_window(float x, float y, float bottom_l
         }
         ImGui::PopStyleColor(5);
     }
+    part_picker("##pick_tool", m_tool, false);
 
     bool enable_button = m_src.mv && m_tool.mv;
     if (m_operation_mode == MeshBooleanOperation::Union)
