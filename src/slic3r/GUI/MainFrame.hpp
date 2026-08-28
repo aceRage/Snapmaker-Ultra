@@ -319,6 +319,7 @@ public:
     void        jump_to_monitor(std::string dev_id = "");
     // Ultra: Flashforge device stack (Orca-Flashforge port)
     void        jump_to_monitor(int evt_type, int conn_id = 0);
+    void        show_flashforge_device();
     void        jump_to_monitor_exit(const std::string& dev_id = "");
     ProgressDialog* createLogProgress();
     void        jump_to_multipage();

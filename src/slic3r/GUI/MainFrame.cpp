@@ -41,6 +41,7 @@
 #include "GLCanvas3D.hpp"
 #include "Plater.hpp"
 #include "BambuCamRelay.hpp"
+#include "FlashForge/FFDeviceTab.hpp"
 #include "WebViewDialog.hpp"
 #include "../Utils/Process.hpp"
 #include "format.hpp"
@@ -1317,6 +1318,11 @@ void MainFrame::init_tabpanel() {
 // SoftFever
 void MainFrame::show_device(bool bBBLPrinter) {
     auto idx = -1;
+    // Ultra: leaving a Flashforge printer - unmount its device tab first
+    if (m_ff_device != nullptr && (idx = m_tabpanel->FindPage(m_ff_device)) != wxNOT_FOUND) {
+        m_ff_device->Show(false);
+        m_tabpanel->RemovePage(idx);
+    }
     if (bBBLPrinter) {
         if (m_tabpanel->FindPage(m_monitor) != wxNOT_FOUND)
             return;
@@ -1386,6 +1392,39 @@ void MainFrame::show_device(bool bBBLPrinter) {
         m_tabpanel->InsertPage(tpMonitor, m_printer_view, _L("Device"), std::string("tab_monitor_active"),
                                std::string("tab_monitor_active"));
     }
+}
+
+// Ultra: Flashforge device tab (Orca-Flashforge port) - third Device-tab mode
+void MainFrame::show_flashforge_device()
+{
+    if (m_ff_device != nullptr && m_tabpanel->FindPage(m_ff_device) != wxNOT_FOUND)
+        return;
+    int idx;
+    if (m_calibration && (idx = m_tabpanel->FindPage(m_calibration)) != wxNOT_FOUND) {
+        m_calibration->Show(false);
+        m_tabpanel->RemovePage(idx);
+    }
+    if (m_multi_machine && (idx = m_tabpanel->FindPage(m_multi_machine)) != wxNOT_FOUND) {
+        m_multi_machine->Show(false);
+        m_tabpanel->RemovePage(idx);
+    }
+    if (m_monitor && (idx = m_tabpanel->FindPage(m_monitor)) != wxNOT_FOUND) {
+        m_monitor->Show(false);
+        m_tabpanel->RemovePage(idx);
+    }
+    if (m_printer_view && (idx = m_tabpanel->FindPage(m_printer_view)) != wxNOT_FOUND) {
+        m_printer_view->Show(false);
+        m_tabpanel->RemovePage(idx);
+    }
+    if (m_ff_device == nullptr)
+        m_ff_device = new FFDeviceTab(m_tabpanel);
+    m_ff_device->Show(false);
+    m_tabpanel->InsertPage(tpMonitor, m_ff_device, _L("Device"), std::string("tab_monitor_active"),
+                           std::string("tab_monitor_active"));
+    static_cast<FFDeviceTab*>(m_ff_device)->OnActivate();
+#ifdef _MSW_DARK_MODE
+    wxGetApp().UpdateDarkUIWin(this);
+#endif
 }
 
 bool MainFrame::preview_only_hint()

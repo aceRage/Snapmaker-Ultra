@@ -403,6 +403,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/SpoolmanDialog.cpp
     GUI/SpoolmanDialog.hpp
     # Ultra: Flashforge device stack (port of Orca-Flashforge beta)
+    GUI/FlashForge/FFDeviceTab.cpp
+    GUI/FlashForge/FFDeviceTab.hpp
     GUI/FlashForge/FFConnectPrinter.cpp
     GUI/FlashForge/FFConnectPrinter.hpp
     GUI/FFUtils.cpp

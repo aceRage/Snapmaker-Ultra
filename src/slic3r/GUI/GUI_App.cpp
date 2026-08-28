@@ -2470,6 +2470,9 @@ bool GUI_App::OnInit()
 
 int GUI_App::OnExit()
 {
+    // Ultra: Flashforge device stack - shut their network lib down first
+    MultiComMgr::inst()->uninitalize();
+
     stop_sync_user_preset();
 
     if (m_device_manager) {
@@ -3347,6 +3350,23 @@ __retry:
     }
 
     profiler.note(std::string("create_network_agent=") + (create_network_agent ? "true" : "false"));
+
+    // Ultra: Flashforge device stack - initialize their network lib when the
+    // user has dropped FlashNetwork.dll (from a Flash Studio install) beside the
+    // executable. Without it the Flashforge Device tab simply lists no devices.
+    {
+        wxFileName appFileName(wxStandardPaths::Get().GetExecutablePath());
+        const wxString dllPathW = appFileName.GetPathWithSep() + "FlashNetwork.dll";
+        const std::string dllPath = std::string(dllPathW.ToUTF8());
+        if (wxFileName::FileExists(dllPathW)) {
+            if (MultiComMgr::inst()->initalize(dllPath, data_dir()))
+                BOOST_LOG_TRIVIAL(info) << "FlashNetwork initialized from " << dllPath;
+            else
+                BOOST_LOG_TRIVIAL(error) << "FlashNetwork found but failed to initialize: " << dllPath;
+        } else {
+            BOOST_LOG_TRIVIAL(info) << "FlashNetwork.dll not present; Flashforge device connectivity disabled";
+        }
+    }
 
     return true;
 }

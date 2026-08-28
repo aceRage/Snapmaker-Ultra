@@ -3821,7 +3821,19 @@ void Sidebar::update_all_preset_comboboxes(bool reload_printer_view)
         update_printer_thumbnail();
     }
         
-    p_mainframe->show_device(preset_bundle.use_bbl_device_tab() && !use_new_connection);
+    // Ultra: Flashforge printers get the ported Orca-Flashforge device tab
+    bool is_flashforge = false;
+    {
+        const Preset& printer_preset = preset_bundle.printers.get_edited_preset();
+        if (printer_preset.vendor != nullptr)
+            is_flashforge = printer_preset.vendor->id == "Flashforge";
+        else if (const Preset* parent = preset_bundle.printers.get_selected_preset_parent(); parent != nullptr && parent->vendor != nullptr)
+            is_flashforge = parent->vendor->id == "Flashforge";
+    }
+    if (is_flashforge)
+        p_mainframe->show_flashforge_device();
+    else
+        p_mainframe->show_device(preset_bundle.use_bbl_device_tab() && !use_new_connection);
     p_mainframe->m_tabpanel->SetSelection(p_mainframe->m_tabpanel->GetSelection());
 }
 
