@@ -1048,6 +1048,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat, internal_solid_infill_speed))
     // Detect thin walls.
     ((ConfigOptionBool, detect_thin_wall))
+    // Ultra: offset layers (interlocked half-layer-shifted odd walls)
+    ((ConfigOptionBool, offset_layers))
     ((ConfigOptionFloatOrPercent, top_surface_line_width))
     ((ConfigOptionInt, top_shell_layers))
     ((ConfigOptionFloat, top_shell_thickness))

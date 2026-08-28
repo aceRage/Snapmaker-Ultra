@@ -158,6 +158,11 @@ public:
     // Height of the extrusion, used for visualization purposes.
     float height;
 
+    // Ultra: offset-layers support. z_offset is a fraction of the layer height added
+    // to the nominal Z; extrusion_multiplier scales the flow of this path.
+    float z_offset { 0.f };
+    float extrusion_multiplier { 1.f };
+
     ExtrusionPath() : mm3_per_mm(-1), width(-1), height(-1), m_role(erNone), m_no_extrusion(false) {}
     ExtrusionPath(ExtrusionRole role) : mm3_per_mm(-1), width(-1), height(-1), m_role(role), m_no_extrusion(false) {}
     ExtrusionPath(ExtrusionRole role, double mm3_per_mm, float width, float height, bool no_extrusion = false) : mm3_per_mm(mm3_per_mm), width(width), height(height), m_role(role), m_no_extrusion(no_extrusion) {}
@@ -172,6 +177,8 @@ public:
         , m_no_extrusion(rhs.m_no_extrusion)
     {
         this->inset_idx = rhs.inset_idx;
+        this->z_offset = rhs.z_offset;
+        this->extrusion_multiplier = rhs.extrusion_multiplier;
     }
     ExtrusionPath(ExtrusionPath &&rhs)
         : polyline(std::move(rhs.polyline))
@@ -183,6 +190,8 @@ public:
         , m_no_extrusion(rhs.m_no_extrusion)
     {
         this->inset_idx = rhs.inset_idx;
+        this->z_offset = rhs.z_offset;
+        this->extrusion_multiplier = rhs.extrusion_multiplier;
     }
     ExtrusionPath(const Polyline &polyline, const ExtrusionPath &rhs)
         : polyline(polyline)
@@ -194,6 +203,8 @@ public:
         , m_no_extrusion(rhs.m_no_extrusion)
     {
         this->inset_idx = rhs.inset_idx;
+        this->z_offset = rhs.z_offset;
+        this->extrusion_multiplier = rhs.extrusion_multiplier;
     }
     ExtrusionPath(Polyline &&polyline, const ExtrusionPath &rhs)
         : polyline(std::move(polyline))
@@ -205,6 +216,8 @@ public:
         , m_no_extrusion(rhs.m_no_extrusion)
     {
         this->inset_idx = rhs.inset_idx;
+        this->z_offset = rhs.z_offset;
+        this->extrusion_multiplier = rhs.extrusion_multiplier;
     }
 
     ExtrusionPath& operator=(const ExtrusionPath& rhs) {
@@ -216,6 +229,8 @@ public:
         this->height = rhs.height;
         this->polyline = rhs.polyline;
         this->inset_idx = rhs.inset_idx;
+        this->z_offset = rhs.z_offset;
+        this->extrusion_multiplier = rhs.extrusion_multiplier;
         return *this;
     }
     ExtrusionPath& operator=(ExtrusionPath&& rhs) {
@@ -227,6 +242,8 @@ public:
         this->height = rhs.height;
         this->polyline = std::move(rhs.polyline);
         this->inset_idx = rhs.inset_idx;
+        this->z_offset = rhs.z_offset;
+        this->extrusion_multiplier = rhs.extrusion_multiplier;
         return *this;
     }
 

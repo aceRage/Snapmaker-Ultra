@@ -5513,6 +5513,16 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<SupportMaterialStyle>(smsDefault));
 
+    // Ultra: offset layers (interlocked half-layer-shifted odd walls)
+    def           = this->add("offset_layers", coBool);
+    def->label    = L("Offset layers (experimental)");
+    def->category = L("Strength");
+    def->tooltip  = L("Print odd-numbered walls shifted by half a layer height so layers interlock, improving layer adhesion and part strength. "
+                      "Experimental: requires the Arachne wall generator, equal first layer and layer heights, and matching top surface / outer wall line widths. "
+                      "Adaptive layer height is not supported.");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     // BBS port: give top-z-distance priority over xy distance under overhangs
     def           = this->add("top_z_overrides_xy_distance", coBool);
     def->label    = L("Z overrides X/Y");

@@ -166,6 +166,15 @@ void fuzzy_extrusion_line(Arachne::ExtrusionJunctions& ext_lines, coordf_t slice
     }
 
     if (ext_lines.back().p == ext_lines.front().p) { // Connect endpoints.
+        // Ultra fix: the closing segment is the only one that can violate the
+        // resampler's minimum point spacing (the seam junction passes through
+        // unfuzzied and the last sampled point may land arbitrarily close to it).
+        // A near-zero-length closing segment with a large random width step prints
+        // as a blob right at the seam. Drop trailing points until the closure
+        // respects the same spacing floor as the rest of the loop.
+        const double min_closing_dist = min_dist_between_points;
+        while (out.size() > 3 && (out.back().p - out[1].p).cast<double>().norm() < min_closing_dist)
+            out.pop_back();
         out.front().p = out.back().p;
         out.front().w = out.back().w;
     }
