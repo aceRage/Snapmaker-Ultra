@@ -88,6 +88,7 @@ public:
 
     void      create();
     wxWindow *create_tab_button(int id, wxString text);
+    wxWindow *create_ultra_page();
 
     // debug mode
     ::CheckBox * m_developer_mode_ckeckbox   = {nullptr};

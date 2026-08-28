@@ -112,6 +112,11 @@ public:
     // Whether using bbl's device tab
     bool use_bbl_device_tab();
 
+    // Ultra: last print profile the user worked with, keyed by layer_height_key();
+    // consulted by update_compatible() when the active print preset turns incompatible.
+    std::map<std::string, std::string> preferred_print_profiles_by_height;
+    static std::string layer_height_key(double layer_height);
+
     bool backup_user_folder() const;
 
     //BBS: project embedded preset logic

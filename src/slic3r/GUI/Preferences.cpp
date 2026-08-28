@@ -1182,12 +1182,42 @@ void PreferencesDialog::create()
     m_sizer_body->Add(m_top_line, 0, wxEXPAND, 0);
 
     auto general_page = create_general_page();
+    auto ultra_page   = create_ultra_page();
 #if !BBL_RELEASE_TO_PUBLIC
     auto debug_page   = create_debug_page();
 #endif
 
-    m_sizer_body->Add(0, 0, 0, wxTOP, FromDIP(28));
+    // Tab bar switching between the pages (BambuStudio-style tabbed preferences).
+    std::vector<std::pair<wxString, wxWindow*>> pages = { { _L("General"), general_page }, { _L("Ultra"), ultra_page } };
+#if !BBL_RELEASE_TO_PUBLIC
+    pages.emplace_back(_L("Develop"), debug_page);
+#endif
+    auto* tab_bar = new wxBoxSizer(wxHORIZONTAL);
+    auto* tab_buttons = new std::vector<Button*>();
+    for (size_t i = 0; i < pages.size(); ++i) {
+        auto* btn = new Button(m_scrolledWindow, pages[i].first);
+        btn->SetStyle(i == 0 ? ButtonStyle::Confirm : ButtonStyle::Regular, ButtonType::Compact);
+        tab_buttons->push_back(btn);
+        tab_bar->Add(btn, 0, wxRIGHT, FromDIP(8));
+        wxWindow* page = pages[i].second;
+        page->Show(i == 0);
+        btn->Bind(wxEVT_BUTTON, [this, i, pages, tab_buttons](wxCommandEvent&) {
+            for (size_t j = 0; j < pages.size(); ++j) {
+                pages[j].second->Show(j == i);
+                (*tab_buttons)[j]->SetStyle(j == i ? ButtonStyle::Confirm : ButtonStyle::Regular, ButtonType::Compact);
+            }
+            m_scrolledWindow->Layout();
+            m_sizer_body->Layout();
+            Layout();
+            Refresh();
+        });
+    }
+
+    m_sizer_body->Add(0, 0, 0, wxTOP, FromDIP(14));
+    m_sizer_body->Add(tab_bar, 0, wxLEFT | wxRIGHT, FromDIP(38));
+    m_sizer_body->Add(0, 0, 0, wxTOP, FromDIP(14));
     m_sizer_body->Add(general_page, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(38));
+    m_sizer_body->Add(ultra_page, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(38));
 #if !BBL_RELEASE_TO_PUBLIC
     m_sizer_body->Add(debug_page, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(38));
 #endif
@@ -1366,10 +1396,6 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_save_presets = create_item_button(_L("Clear my choice on the unsaved presets."), _L("Clear"), page, L"", _L("Clear my choice on the unsaved presets."), []() {
         wxGetApp().app_config->set("save_preset_choise", "");
     });
-    auto item_keep_printer = create_item_checkbox(_L("Keep my printer when opening project files"), page,
-        _L("When opening a project made for another printer, switch back to the last printer you selected or sliced with, instead of the printer embedded in the file."), 50, "keep_printer_on_open");
-    auto item_skip_mapping_warnings = create_item_checkbox(_L("Skip Settings Mapping Warnings"), page,
-        _L("Don't show warnings about unrecognized or invalid settings replaced while loading project files; the defaults or automatic fixes are applied silently."), 50, "skip_settings_mapping_warnings");
 
 #ifdef _WIN32
     auto title_associate_file = create_item_title(_L("Associate files to Snapmaker Orca"), page, _L("Associate files to Snapmaker Orca"));
@@ -1414,8 +1440,6 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_gcodes_warning = create_item_checkbox(_L("No warnings when loading 3MF with modified G-code"), page, _L("No warnings when loading 3MF with modified G-code"), 50, "no_warn_when_modified_gcodes");
     auto item_backup  = create_item_checkbox(_L("Auto-Backup"), page,_L("Backup your project periodically for restoring from the occasional crash."), 50, "backup_switch");
     auto item_backup_interval = create_item_backup_input(_L("every"), page, _L("The period of backup in seconds."), "backup_interval");
-    auto item_autosave = create_item_checkbox(_L("Auto-Save project"), page, _L("Periodically save the project to its own file. Only projects that have already been saved once are auto-saved."), 50, "autosave_switch");
-    auto item_autosave_interval = create_item_autosave_input(_L("every"), page, _L("The period of auto-save in seconds."), "autosave_interval");
 
     //downloads
     auto title_downloads = create_item_title(_L("Downloads"), page, _L("Downloads"));
@@ -1472,8 +1496,6 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_system_sync, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_remember_printer_config, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_save_presets, 0, wxTOP, FromDIP(3));
-    sizer_page->Add(item_keep_printer, 0, wxTOP, FromDIP(3));
-    sizer_page->Add(item_skip_mapping_warnings, 0, wxTOP, FromDIP(3));
     //sizer_page->Add(title_network, 0, wxTOP | wxEXPAND, FromDIP(20));
     //sizer_page->Add(item_check_stable_version_only, 0, wxTOP, FromDIP(3));
 
@@ -1513,8 +1535,6 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_gcodes_warning, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_backup, 0, wxTOP,FromDIP(3));
     item_backup->Add(item_backup_interval, 0, wxLEFT, 0);
-    sizer_page->Add(item_autosave, 0, wxTOP, FromDIP(3));
-    item_autosave->Add(item_autosave_interval, 0, wxLEFT, 0);
 
     sizer_page->Add(title_downloads, 0, wxTOP| wxEXPAND, FromDIP(20));
     sizer_page->Add(item_downloads, 0, wxEXPAND, FromDIP(3));
@@ -1531,6 +1551,43 @@ wxWindow* PreferencesDialog::create_general_page()
 
     sizer_page->Add(title_user_experience, 0, wxTOP, FromDIP(20));
     sizer_page->Add(item_priv_policy, 0, wxTOP, FromDIP(3));
+
+    page->SetSizer(sizer_page);
+    page->Layout();
+    sizer_page->Fit(page);
+    return page;
+}
+
+// Ultra: page collecting all fork-specific options in one place.
+wxWindow* PreferencesDialog::create_ultra_page()
+{
+    auto page = new wxWindow(m_scrolledWindow, wxID_ANY);
+    page->SetBackgroundColour(*wxWHITE);
+    wxBoxSizer* sizer_page = new wxBoxSizer(wxVERTICAL);
+
+    auto title_project = create_item_title(_L("Project"), page, _L("Project"));
+    auto item_autosave = create_item_checkbox(_L("Auto-Save project"), page,
+        _L("Periodically save the project to its own file. Only projects that have already been saved once are auto-saved."), 50, "autosave_switch");
+    auto item_autosave_interval = create_item_autosave_input(_L("every"), page, _L("The period of auto-save in seconds."), "autosave_interval");
+    auto item_keep_printer = create_item_checkbox(_L("Keep my printer when opening project files"), page,
+        _L("When opening a project made for another printer, switch back to the last printer you selected or sliced with, instead of the printer embedded in the file."), 50, "keep_printer_on_open");
+    auto item_skip_mapping_warnings = create_item_checkbox(_L("Skip Settings Mapping Warnings"), page,
+        _L("Don't show warnings about unrecognized or invalid settings replaced while loading project files; the defaults or automatic fixes are applied silently."), 50, "skip_settings_mapping_warnings");
+
+    auto title_presets = create_item_title(_L("Presets"), page, _L("Presets"));
+    auto item_prefer_last_print = create_item_checkbox(_L("Prefer Last Used Print Profile"), page,
+        _L("When a project's print profile is not available, pick the profile you last used at the same layer height instead of the first compatible one."), 50, "prefer_last_print_profile");
+    auto item_auto_shadow = create_item_checkbox(_L("Save system preset edits to a Custom copy automatically"), page,
+        _L("Saving a modified system preset silently saves and selects \"<name> - Custom\" instead of asking for a new name every time."), 50, "auto_shadow_system_presets");
+
+    sizer_page->Add(title_project, 0, wxTOP | wxEXPAND, FromDIP(20));
+    sizer_page->Add(item_autosave, 0, wxTOP, FromDIP(3));
+    item_autosave->Add(item_autosave_interval, 0, wxLEFT, 0);
+    sizer_page->Add(item_keep_printer, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_skip_mapping_warnings, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(title_presets, 0, wxTOP | wxEXPAND, FromDIP(20));
+    sizer_page->Add(item_prefer_last_print, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_auto_shadow, 0, wxTOP, FromDIP(3));
 
     page->SetSizer(sizer_page);
     page->Layout();

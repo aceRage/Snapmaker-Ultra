@@ -14917,6 +14917,8 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
 
     // update plater with new config
     q->on_config_change(wxGetApp().preset_bundle->full_config());
+    if (preset_type == Preset::TYPE_PRINT)
+        q->record_preferred_print_profile();
     if (preset_type == Preset::TYPE_PRINTER) {
         // Remember the user's manual printer choice so project files can restore it on open.
         wxGetApp().app_config->set("preferred_printer", wxGetApp().preset_bundle->printers.get_selected_preset_name());
@@ -15282,9 +15284,11 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
     if (!this->background_process.empty())
         this->background_process.get_current_plate()->update_slice_result_valid_state(evt.success());
 
-    // A successful slice confirms the current printer as the user's working setup.
-    if (evt.success())
+    // A successful slice confirms the current printer and print profile as the user's working setup.
+    if (evt.success()) {
         wxGetApp().app_config->set("preferred_printer", wxGetApp().preset_bundle->printers.get_selected_preset_name());
+        q->record_preferred_print_profile();
+    }
 
     //BBS: update the action button according to the current plate's status
     bool ready_to_slice = !this->partplate_list.get_curr_plate()->is_slice_result_valid();
@@ -24111,6 +24115,20 @@ int Plater::delete_plate(int plate_index)
     //need to call update
     update();
     return ret;
+}
+
+// Ultra: remember the selected print profile keyed by its layer height, so
+// PresetBundle::update_compatible can prefer it when a project's profile is incompatible.
+void Plater::record_preferred_print_profile()
+{
+    if (wxGetApp().app_config->get("prefer_last_print_profile") != "true")
+        return;
+    const Preset& print_preset = wxGetApp().preset_bundle->prints.get_selected_preset();
+    if (print_preset.is_default)
+        return;
+    const std::string key = PresetBundle::layer_height_key(print_preset.config.opt_float("layer_height"));
+    wxGetApp().app_config->set("last_print_profiles", key, print_preset.name);
+    wxGetApp().preset_bundle->preferred_print_profiles_by_height[key] = print_preset.name;
 }
 
 //BBS: set bed positions

@@ -413,6 +413,14 @@ void AppConfig::set_defaults()
         set_bool("keep_printer_on_open", true);
     }
 
+    if (get("prefer_last_print_profile").empty()) {
+        set_bool("prefer_last_print_profile", true);
+    }
+
+    if (get("auto_shadow_system_presets").empty()) {
+        set_bool("auto_shadow_system_presets", true);
+    }
+
     if (get("autosave_switch").empty()) {
         set_bool("autosave_switch", false);
     }

@@ -1891,8 +1891,20 @@ void PresetBundle::update_selections(AppConfig &config)
 
 // Load selections (current print, current filaments, current printer) from config.ini
 // This is done on application start up or after updates are applied.
+std::string PresetBundle::layer_height_key(double layer_height)
+{
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%.2f", layer_height);
+    return buf;
+}
+
 void PresetBundle::load_selections(AppConfig &config, const PresetPreferences& preferred_selection/* = PresetPreferences()*/)
 {
+    // Ultra: restore the per-layer-height print profile memory (only when the feature is on).
+    preferred_print_profiles_by_height.clear();
+    if (config.get("prefer_last_print_profile") == "true" && config.has_section("last_print_profiles"))
+        preferred_print_profiles_by_height = config.get_section("last_print_profiles");
+
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": enter, preferred printer_model_id %1%")%preferred_selection.printer_model_id;
 	// Update visibility of presets based on application vendor / model / variant configuration.
 	this->load_installed_printers(config);
@@ -4006,8 +4018,17 @@ void PresetBundle::update_compatible(PresetSelectCompatibleType select_other_pri
     class PreferedPrintProfileMatch : public PreferedProfileMatch
     {
     public:
-        PreferedPrintProfileMatch(const Preset *preset, const std::string &prefered_name) :
-            PreferedProfileMatch(preset ? preset->alias : std::string(), prefered_name), m_prefered_layer_height(preset ? preset->config.opt_float("layer_height") : 0) {}
+        PreferedPrintProfileMatch(const Preset *preset, const std::string &prefered_name,
+                                  const std::map<std::string, std::string> &remembered_by_height) :
+            PreferedProfileMatch(preset ? preset->alias : std::string(), prefered_name), m_prefered_layer_height(preset ? preset->config.opt_float("layer_height") : 0)
+        {
+            // Ultra: the profile the user last used at this layer height (see preferred_print_profiles_by_height).
+            if (m_prefered_layer_height > 0.) {
+                auto it = remembered_by_height.find(PresetBundle::layer_height_key(m_prefered_layer_height));
+                if (it != remembered_by_height.end())
+                    m_remembered_name = it->second;
+            }
+        }
 
         int operator()(const Preset &preset) const
         {
@@ -4016,6 +4037,10 @@ void PresetBundle::update_compatible(PresetSelectCompatibleType select_other_pri
                 return 0;
             int match_quality = PreferedProfileMatch::operator()(preset);
             if (match_quality < std::numeric_limits<int>::max()) {
+                // The remembered profile for this layer height outranks any generic
+                // layer-height match, but not an exact alias match.
+                if (!m_remembered_name.empty() && preset.name == m_remembered_name)
+                    return std::numeric_limits<int>::max() - 1;
                 match_quality += 1;
                 if (m_prefered_layer_height > 0. && std::abs(preset.config.opt_float("layer_height") - m_prefered_layer_height) < 0.0005)
                     match_quality *= 10;
@@ -4025,6 +4050,7 @@ void PresetBundle::update_compatible(PresetSelectCompatibleType select_other_pri
 
     private:
         const double m_prefered_layer_height;
+        std::string  m_remembered_name;
     };
 
     // Matching by the layer height in addition.
@@ -4091,7 +4117,8 @@ void PresetBundle::update_compatible(PresetSelectCompatibleType select_other_pri
 		assert(printer_preset.config.has("default_filament_profile"));
         const std::vector<std::string> &prefered_filament_profiles = printer_preset.config.option<ConfigOptionStrings>("default_filament_profile")->values;
         this->prints.update_compatible(printer_preset_with_vendor_profile, nullptr, select_other_print_if_incompatible,
-            PreferedPrintProfileMatch(this->prints.get_selected_idx() == size_t(-1) ? nullptr : &this->prints.get_edited_preset(), printer_preset.config.opt_string("default_print_profile")));
+            PreferedPrintProfileMatch(this->prints.get_selected_idx() == size_t(-1) ? nullptr : &this->prints.get_edited_preset(), printer_preset.config.opt_string("default_print_profile"),
+                                      this->preferred_print_profiles_by_height));
         const PresetWithVendorProfile   print_preset_with_vendor_profile = this->prints.get_edited_preset_with_vendor_profile();
         // Remember whether the filament profiles were compatible before updating the filament compatibility.
         std::vector<char> 				filament_preset_was_compatible(this->filament_presets.size(), false);

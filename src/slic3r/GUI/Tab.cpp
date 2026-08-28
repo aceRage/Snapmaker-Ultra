@@ -6168,6 +6168,13 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
         name = input_name;
     }
 
+    // Ultra: instead of prompting for a name when saving a modified system preset,
+    // silently save to (and select) a "<name> - Custom" shadow preset.
+    if (name.empty() && !detach && m_presets->get_edited_preset().is_system &&
+        wxGetApp().app_config->get("auto_shadow_system_presets") == "true") {
+        name = m_presets->get_edited_preset().name + " - Custom";
+    }
+
     if (name.empty()) {
         SavePresetDialog dlg(m_parent, m_type, detach ? _u8L("Detached") : "");
         if (!m_just_edit) {
