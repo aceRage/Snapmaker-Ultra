@@ -9761,30 +9761,42 @@ void Sidebar::update_printer_thumbnail()
 
     auto        inherit    = selected_preset.inherits();
     std::string model_name = inherit == "" ? selected_preset.name : inherit;
-    std::string png_name   = "";
-    std::string vendor     = model_name.substr(0, model_name.find_first_of(" "));
+
+    // Snapmaker printers ship their covers in resources/images (bundled icon names).
     if (model_name.find("Snapmaker") != std::string::npos) {
-        png_name = model_name.substr(0, model_name.find_last_of("(") - 1);
-    } else {
-        png_name = "printer_placeholder";
+        std::string png_name = model_name.substr(0, model_name.find_last_of("(") - 1) + "_cover.png";
+        try {
+            p->image_printer->SetBitmap(create_scaled_bitmap(png_name, this, 48));
+            return;
+        } catch (std::exception&) {}
     }
-    png_name += "_cover.png";
 
-    boost::filesystem::path(resources_dir()) / "profile" / vendor / png_name;
-    std::string printer_type    = selected_preset.get_current_printer_type(preset_bundle);
-
-    try {
-        p->image_printer->SetBitmap(create_scaled_bitmap(png_name, this, 48));
+    // Ultra: every other vendor keeps a "<printer_model>_cover.png" next to its
+    // profiles - load it directly so third-party printers get a real thumbnail.
+    const std::string model = selected_preset.config.opt_string("printer_model");
+    if (!model.empty()) {
+        std::string vendor_dir;
+        if (selected_preset.vendor != nullptr)
+            vendor_dir = selected_preset.vendor->id;
+        else if (const Preset* parent = preset_bundle->printers.get_selected_preset_parent(); parent != nullptr && parent->vendor != nullptr)
+            vendor_dir = parent->vendor->id;
+        if (vendor_dir.empty())
+            vendor_dir = model.substr(0, model.find_first_of(" "));
+        const boost::filesystem::path cover = boost::filesystem::path(resources_dir()) / "profiles" / vendor_dir / (model + "_cover.png");
+        wxImage img;
+        if (boost::filesystem::exists(cover) && img.LoadFile(wxString::FromUTF8(cover.string()), wxBITMAP_TYPE_PNG)) {
+            const int box = FromDIP(48);
+            const int w = img.GetWidth(), h = img.GetHeight();
+            if (w > 0 && h > 0) {
+                const double scale = std::min(double(box) / w, double(box) / h);
+                img.Rescale(std::max(1, int(w * scale)), std::max(1, int(h * scale)), wxIMAGE_QUALITY_HIGH);
+                p->image_printer->SetBitmap(wxBitmap(img));
+                return;
+            }
+        }
     }
-    catch (std::exception& e) {
-        p->image_printer->SetBitmap(create_scaled_bitmap("printer_placeholder", this, 48));
-    }
-    
 
-    /*if (printer_thumbnails.find(printer_type) != printer_thumbnails.end())
-        p->image_printer->SetBitmap(create_scaled_bitmap(, this, 48));
-    else
-        p->image_printer->SetBitmap(create_scaled_bitmap("printer_placeholder", this, 48));*/
+    p->image_printer->SetBitmap(create_scaled_bitmap("printer_placeholder", this, 48));
 }
 
 void Sidebar::auto_calc_flushing_volumes(const int modify_id)
