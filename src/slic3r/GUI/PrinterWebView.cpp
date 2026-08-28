@@ -134,11 +134,28 @@ static const char* hd_camera_script()
         if (window.__snorca_hd_cam) return;
         window.__snorca_hd_cam = true;
         var printerHost = null, btn = null, overlay = null;
+        // Device IPs known to the slicer; probed for a reachable camera-streamer.
+        var candidates = __SNORCA_IPS__;
+        function adopt(host) {
+            if (!printerHost && host) { printerHost = host; ensureBtn(); }
+        }
+        function probe() {
+            if (printerHost) return;
+            candidates.forEach(function(ip) {
+                if (printerHost || !ip) return;
+                var im = new Image();
+                im.onload = function() { adopt(ip); };
+                im.src = 'http://' + ip + '/webcam/snapshot.jpg?t=' + Date.now();
+            });
+        }
+        setTimeout(probe, 1000);
+        setInterval(probe, 10000);
+        // Fallback: sniff the app's own monitor.jpg polling to discover the IP.
         function onUrl(u) {
             try {
                 if (printerHost || typeof u !== 'string') return;
                 var m = u.match(/^https?:\/\/([^\/]+)\/server\/files\/camera\/monitor\.jpg/i);
-                if (m) { printerHost = m[1]; ensureBtn(); }
+                if (m) adopt(m[1]);
             } catch (e) {}
         }
         try {
@@ -197,10 +214,41 @@ void PrinterWebView::InjectHdCameraScript()
 {
     if (m_browser == nullptr)
         return;
+    // Pass candidate printer addresses to the script; it probes them for a reachable
+    // camera-streamer, so the button only shows on LAN. Sources, in priority order:
+    // the manual preference, the printer preset's print host, and registered devices.
+    std::vector<std::string> hosts;
+    hosts.emplace_back(wxGetApp().app_config->get("hd_camera_host"));
+    {
+        std::string host = wxGetApp().preset_bundle->printers.get_edited_preset().config.opt_string("print_host");
+        if (size_t pos = host.find("//"); pos != std::string::npos)
+            host = host.substr(pos + 2);
+        if (size_t pos = host.find('/'); pos != std::string::npos)
+            host = host.substr(0, pos);
+        if (size_t pos = host.find(':'); pos != std::string::npos)
+            host = host.substr(0, pos);
+        hosts.emplace_back(host);
+    }
+    for (const DeviceInfo& dev : wxGetApp().app_config->get_devices())
+        hosts.emplace_back(dev.ip);
+    wxString ips = "[";
+    for (const std::string& host : hosts) {
+        if (host.empty())
+            continue;
+        // Restrict to safe hostname characters (also keeps the JS literal uninjectable).
+        if (host.find_first_not_of("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.:-_") != std::string::npos)
+            continue;
+        if (ips.length() > 1)
+            ips += ",";
+        ips += "'" + host + "'";
+    }
+    ips += "]";
+    wxString script = hd_camera_script();
+    script.Replace("__SNORCA_IPS__", ips);
     // Inject into the current page and persist for future navigations (idempotent JS guard).
-    WebView::RunScript(m_browser, hd_camera_script());
+    WebView::RunScript(m_browser, script);
 #ifndef __WXMAC__
-    m_browser->AddUserScript(hd_camera_script());
+    m_browser->AddUserScript(script);
 #endif
 }
 
@@ -266,8 +314,8 @@ void PrinterWebView::SendAPIKey()
     // Do NOT call Reload() — the current page is already handled by RunScript above.
     m_browser->RemoveAllUserScripts();
     m_browser->AddUserScript(script);
-    // RemoveAllUserScripts above also dropped the HD camera script; re-add it.
-    m_browser->AddUserScript(hd_camera_script());
+    // Note: RemoveAllUserScripts also drops the HD camera script; OnLoaded calls
+    // InjectHdCameraScript() right after SendAPIKey(), which re-adds it substituted.
 #endif
 }
 

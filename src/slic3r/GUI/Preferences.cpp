@@ -472,6 +472,35 @@ wxBoxSizer *PreferencesDialog::create_item_multiple_combobox(
     return m_sizer_tcombox;
 }
 
+// Free-text variant of create_item_input (no digits-only validator).
+wxBoxSizer *PreferencesDialog::create_item_text_input(wxString title, wxWindow *parent, wxString tooltip, std::string param)
+{
+    wxBoxSizer *sizer_input = new wxBoxSizer(wxHORIZONTAL);
+    auto        input_title = new wxStaticText(parent, wxID_ANY, title);
+    input_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    input_title->SetFont(::Label::Body_13);
+    input_title->SetToolTip(tooltip);
+    input_title->Wrap(-1);
+
+    auto       input = new ::TextInput(parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, DESIGN_INPUT_SIZE, wxTE_PROCESS_ENTER);
+    StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled), std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
+    input->SetBackgroundColor(input_bg);
+    input->GetTextCtrl()->SetValue(app_config->get(param));
+
+    sizer_input->Add(0, 0, 0, wxEXPAND | wxLEFT, 23);
+    sizer_input->Add(input_title, 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    sizer_input->Add(input, 0, wxALIGN_CENTER_VERTICAL, 0);
+
+    std::function<void()> commit = [this, param, input]() {
+        app_config->set(param, std::string(input->GetTextCtrl()->GetValue().ToUTF8().data()));
+        app_config->save();
+    };
+    input->GetTextCtrl()->Bind(wxEVT_TEXT_ENTER, [commit](wxCommandEvent &e) { commit(); e.Skip(); });
+    input->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [commit](wxFocusEvent &e) { commit(); e.Skip(); });
+
+    return sizer_input;
+}
+
 wxBoxSizer *PreferencesDialog::create_item_input(wxString title, wxString title2, wxWindow *parent, wxString tooltip, std::string param, std::function<void(wxString)> onchange)
 {
     wxBoxSizer *sizer_input = new wxBoxSizer(wxHORIZONTAL);
@@ -1339,6 +1368,8 @@ wxWindow* PreferencesDialog::create_general_page()
     });
     auto item_keep_printer = create_item_checkbox(_L("Keep my printer when opening project files"), page,
         _L("When opening a project made for another printer, switch back to the last printer you selected or sliced with, instead of the printer embedded in the file."), 50, "keep_printer_on_open");
+    auto item_hd_camera_host = create_item_text_input(_L("Printer camera LAN address"), page,
+        _L("IP address or hostname of the printer on your local network, used by the HD camera button on the Device page (e.g. 10.0.0.106). Leave empty to auto-detect."), "hd_camera_host");
     auto item_skip_mapping_warnings = create_item_checkbox(_L("Skip Settings Mapping Warnings"), page,
         _L("Don't show warnings about unrecognized or invalid settings replaced while loading project files; the defaults or automatic fixes are applied silently."), 50, "skip_settings_mapping_warnings");
 
@@ -1444,6 +1475,7 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_remember_printer_config, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_save_presets, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_keep_printer, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_hd_camera_host, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_skip_mapping_warnings, 0, wxTOP, FromDIP(3));
     //sizer_page->Add(title_network, 0, wxTOP | wxEXPAND, FromDIP(20));
     //sizer_page->Add(item_check_stable_version_only, 0, wxTOP, FromDIP(3));
