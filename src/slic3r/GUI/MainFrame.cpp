@@ -4301,6 +4301,36 @@ void MainFrame::export_logs()
             }
         }
 
+        // Ultra: include the FlashNetwork logs (Flashforge device stack) and the
+        // go2rtc relay config so one zip carries everything a report needs.
+        auto add_tree = [&zipper](const boost::filesystem::path& root, const std::string& prefix) {
+            if (!boost::filesystem::exists(root))
+                return;
+            for (auto& entry : boost::filesystem::recursive_directory_iterator(root)) {
+                if (!boost::filesystem::is_regular_file(entry.path()))
+                    continue;
+                if (boost::filesystem::file_size(entry.path()) > 64 * 1024 * 1024)
+                    continue; // don't ship runaway files
+                std::ifstream file(entry.path().string(), std::ios::binary);
+                if (!file.is_open())
+                    continue;
+                std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                const std::string rel = boost::filesystem::relative(entry.path(), root).generic_string();
+                zipper.add_entry(prefix + rel, content.c_str(), content.size());
+            }
+        };
+        add_tree(boost::filesystem::path(data_dir()) / "FlashNetwork", "FlashNetwork/");
+        {
+            const auto go2rtc_cfg = boost::filesystem::path(data_dir()) / "go2rtc.yaml";
+            if (boost::filesystem::exists(go2rtc_cfg)) {
+                std::ifstream file(go2rtc_cfg.string(), std::ios::binary);
+                if (file.is_open()) {
+                    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                    zipper.add_entry("go2rtc.yaml", content.c_str(), content.size());
+                }
+            }
+        }
+
         zipper.finalize();
 
         // 5. Show success message
