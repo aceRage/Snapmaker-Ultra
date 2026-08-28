@@ -12349,7 +12349,8 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 return empty_result;
             }
 
-            if (!model_object->instances.empty())
+            // Ultra: optional - keep imported Z positions instead of dropping to the bed
+            if (!model_object->instances.empty() && wxGetApp().app_config->get("auto_drop_on_import") == "true")
                 model_object->ensure_on_bed(is_project_file);
         }
 
@@ -12624,7 +12625,9 @@ std::vector<size_t> Plater::priv::load_model_objects(const ModelObjectPtrs& mode
             }
         }
 
-        object->ensure_on_bed(allow_negative_z);
+        // Ultra: optional - keep imported Z positions instead of dropping to the bed
+        if (wxGetApp().app_config->get("auto_drop_on_import") == "true")
+            object->ensure_on_bed(allow_negative_z);
         if (!split_object) {
             //BBS initial assemble transformation
             for (ModelObject* model_object : model.objects) {

@@ -847,6 +847,19 @@ void GizmoObjectManipulation::do_render_move_window(ImGuiWrapper *imgui_wrapper,
         original_position = this->m_new_position;
     Vec3d display_position = m_buffered_position;
 
+    // Ultra: bottom-referenced Z - show the object's bottom height above the bed
+    // instead of its center Z (display-only; internal state stays center-based).
+    const bool bottom_ref_z = m_coordinates_type == ECoordinatesType::World &&
+                              wxGetApp().app_config->get("bottom_referenced_z") == "true";
+    double bottom_shift = 0.;
+    if (bottom_ref_z) {
+        bottom_shift = m_new_size.z() / 2.;
+        if (this->m_imperial_units)
+            bottom_shift *= this->mm_to_in;
+        display_position.z() -= bottom_shift;
+        original_position.z() -= bottom_shift;
+    }
+
     // Rotation
     float unit_size = imgui_wrapper->calc_text_size(MAX_SIZE).x + space_size;
     int   index      = 1;
@@ -900,6 +913,11 @@ void GizmoObjectManipulation::do_render_move_window(ImGuiWrapper *imgui_wrapper,
     ImGui::BBLInputDouble(label_values[0][2], &display_position[2], 0.0f, 0.0f, "%.2f");
     ImGui::SameLine(caption_max + (++index_unit) * unit_size + (++index) * space_size);
     imgui_wrapper->text(this->m_new_unit_string);
+    // Ultra: convert the bottom-referenced display back to internal center space.
+    if (bottom_ref_z) {
+        display_position.z() += bottom_shift;
+        original_position.z() += bottom_shift;
+    }
     bool is_avoid_one_update{false};
     if (combox_changed) {
         combox_changed = false;

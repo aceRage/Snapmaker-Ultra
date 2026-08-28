@@ -1576,6 +1576,11 @@ wxWindow* PreferencesDialog::create_ultra_page()
     auto item_skip_mapping_warnings = create_item_checkbox(_L("Skip Settings Mapping Warnings"), page,
         _L("Don't show warnings about unrecognized or invalid settings replaced while loading project files; the defaults or automatic fixes are applied silently."), 50, "skip_settings_mapping_warnings");
 
+    auto item_auto_drop = create_item_checkbox(_L("Drop imported models to the bed"), page,
+        _L("When off, imported models keep the Z position stored in the file instead of being dropped onto the build plate."), 50, "auto_drop_on_import");
+    auto item_bottom_z = create_item_checkbox(_L("Bottom-referenced Z position"), page,
+        _L("Show and edit the Move panel's Z as the height of the object's bottom above the bed (world coordinates), instead of the object center."), 50, "bottom_referenced_z");
+
     auto title_presets = create_item_title(_L("Presets"), page, _L("Presets"));
     auto item_prefer_last_print = create_item_checkbox(_L("Prefer Last Used Print Profile"), page,
         _L("When a project's print profile is not available, pick the profile you last used at the same layer height instead of the first compatible one."), 50, "prefer_last_print_profile");
@@ -1587,6 +1592,8 @@ wxWindow* PreferencesDialog::create_ultra_page()
     item_autosave->Add(item_autosave_interval, 0, wxLEFT, 0);
     sizer_page->Add(item_keep_printer, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_skip_mapping_warnings, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_auto_drop, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_bottom_z, 0, wxTOP, FromDIP(3));
     sizer_page->Add(title_presets, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_prefer_last_print, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_auto_shadow, 0, wxTOP, FromDIP(3));

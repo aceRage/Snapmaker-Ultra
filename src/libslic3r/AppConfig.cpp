@@ -417,6 +417,14 @@ void AppConfig::set_defaults()
         set_bool("prefer_last_print_profile", true);
     }
 
+    if (get("auto_drop_on_import").empty()) {
+        set_bool("auto_drop_on_import", true);
+    }
+
+    if (get("bottom_referenced_z").empty()) {
+        set_bool("bottom_referenced_z", false);
+    }
+
     if (get("auto_shadow_system_presets").empty()) {
         set_bool("auto_shadow_system_presets", true);
     }
