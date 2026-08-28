@@ -1557,7 +1557,7 @@ void Choice::set_value(const boost::any& value, bool change_event)
         if (m_opt_id.compare("host_type") == 0 && val != 0 &&
 			m_opt.enum_values.size() > field->GetCount()) // for case, when PrusaLink isn't used as a HostType
 			val--;
-        if (m_opt_id == "top_surface_pattern" || m_opt_id == "bottom_surface_pattern" ||
+        if (m_opt_id == "top_surface_pattern" || m_opt_id == "undertop_surface_pattern" || m_opt_id == "bottom_surface_pattern" ||
             m_opt_id == "internal_solid_infill_pattern" || m_opt_id == "sparse_infill_pattern" ||
             m_opt_id == "support_base_pattern" || m_opt_id == "support_interface_pattern" ||
             m_opt_id == "ironing_pattern" || m_opt_id == "support_ironing_pattern" ||
@@ -1648,7 +1648,7 @@ boost::any& Choice::get_value()
     {
         if (m_opt.nullable && field->GetSelection() == -1)
             m_value = ConfigOptionEnumsGenericNullable::nil_value();
-        else if (   m_opt_id == "top_surface_pattern" || m_opt_id == "bottom_surface_pattern" ||
+        else if (   m_opt_id == "top_surface_pattern" || m_opt_id == "undertop_surface_pattern" || m_opt_id == "bottom_surface_pattern" ||
                     m_opt_id == "internal_solid_infill_pattern" || m_opt_id == "sparse_infill_pattern" ||
                     m_opt_id == "support_base_pattern" || m_opt_id == "support_interface_pattern" ||
                     m_opt_id == "ironing_pattern" || m_opt_id == "support_ironing_pattern" ||

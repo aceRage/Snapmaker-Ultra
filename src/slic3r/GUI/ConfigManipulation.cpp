@@ -637,6 +637,10 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
     bool has_bottom_shell = config->opt_int("bottom_shell_layers") > 0;
     bool has_solid_infill = has_top_shell || has_bottom_shell;
     toggle_field("top_surface_pattern", has_top_shell);
+    toggle_field("undertop_surface_pattern", has_top_shell);
+    // Orca: undertop infill only applies when the top surface is not 100% dense and there is a solid layer under it
+    toggle_line("undertop_surface_pattern",
+                config->option<ConfigOptionPercent>("top_surface_density")->value < 100 && config->opt_int("top_shell_layers") > 2);
     toggle_field("bottom_surface_pattern", has_bottom_shell);
     toggle_field("top_surface_density", has_top_shell);
     toggle_field("bottom_surface_density", has_bottom_shell);
