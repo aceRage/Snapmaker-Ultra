@@ -1432,6 +1432,8 @@ void ObjectList::list_manipulation(const wxPoint& mouse_pos, bool evt_context_me
         ColumnNumber col_num = (ColumnNumber)col->GetModelColumn();
 	    if (col_num == colPrint)
 	        toggle_printable_state();
+        else if (col_num == colVisibility)
+            toggle_visibility_state(item);
         else if (col_num == colSupportPaint) {
             ObjectDataViewModelNode* node = (ObjectDataViewModelNode*)item.GetID();
             if (node && node->HasSupportPainting()) {

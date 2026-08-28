@@ -534,6 +534,12 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
             for (ExtrusionPath &path : paths)
                 path.inset_idx = inset_idx;
 
+            // Ultra: offset layers - odd walls are raised by half the layer height.
+            // Applied to the flat path list so every loop/multipath built from it inherits it.
+            if (extrusion->inset_idx % 2 == 1 && perimeter_generator.config->offset_layers)
+                for (ExtrusionPath &path : paths)
+                    check_and_offset_path(path);
+
             if (extrusion->is_closed) {
                 ExtrusionLoop extrusion_loop(std::move(paths), pg_extrusion.is_contour ? elrDefault : elrHole);
                 extrusion_loop.make_counter_clockwise();
@@ -544,12 +550,6 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
                     assert(std::prev(it)->polyline.last_point() == it->polyline.first_point());
                 }
                 assert(extrusion_loop.paths.front().first_point() == extrusion_loop.paths.back().last_point());
-
-                // Ultra: offset layers - odd walls are raised by half the layer height
-                if (extrusion->inset_idx % 2 == 1 && perimeter_generator.config->offset_layers) {
-                    for (ExtrusionPath& cur_path : extrusion_loop.paths)
-                        check_and_offset_path(cur_path);
-                }
 
                 extrusion_loop.inset_idx = inset_idx;
                 extrusion_coll.append(std::move(extrusion_loop));
@@ -573,12 +573,6 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
                         multi_path.inset_idx = inset_idx;
                     }
                     multi_path.paths.emplace_back(std::move(*it_path));
-                }
-
-                // Ultra: offset layers - odd walls are raised by half the layer height
-                if (extrusion->inset_idx % 2 == 1 && perimeter_generator.config->offset_layers) {
-                    for (ExtrusionPath& cur_path : multi_path.paths)
-                        check_and_offset_path(cur_path);
                 }
 
                 extrusion_coll.append(ExtrusionMultiPath(std::move(multi_path)));

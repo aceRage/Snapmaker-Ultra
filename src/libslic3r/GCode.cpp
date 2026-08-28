@@ -7324,6 +7324,11 @@ std::string GCode::_extrude(const ExtrusionPath& path, std::string description, 
     if (sloped != nullptr && !sloped->is_flat()) {
         auto target_z       = get_sloped_z(sloped->slope_begin.z_ratio);
         slope_need_z_travel = m_writer.will_move_z(target_z);
+    } else if (sloped == nullptr) {
+        // Ultra: offset-layers paths must get their Z travel even when the XY start
+        // point coincides with the previous path's end point (raised path after a
+        // flat one, or a flat path after a raised one).
+        slope_need_z_travel = m_writer.will_move_z(path.z_offset != 0.f ? m_nominal_z + path.z_offset * path.height : m_nominal_z);
     }
     // Move to first point of extrusion path
     // path is 2D. But in slope lift case, lift z is done in travel_to function.

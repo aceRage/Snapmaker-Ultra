@@ -1562,6 +1562,8 @@ void MenuFactory::create_bbl_part_menu()
     append_menu_item_center(menu);
     append_menu_item_drop(menu);
     append_menu_items_mirror(menu);
+    // Ultra: per-part visibility inside assemblies
+    append_menu_items_visibility(menu);
     wxMenu* split_menu = new wxMenu();
     if (!split_menu)
         return;
