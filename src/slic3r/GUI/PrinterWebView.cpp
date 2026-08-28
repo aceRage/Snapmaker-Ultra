@@ -14,6 +14,7 @@
 
 #include <slic3r/GUI/Widgets/WebView.hpp>
 #include <wx/webview.h>
+#include <boost/algorithm/string.hpp>
 #include "slic3r/GUI/SSWCP.hpp"
 #include "sentry_wrapper/SentryWrapper.hpp"
 
@@ -133,52 +134,92 @@ static const char* hd_camera_script()
     (function() {
         if (window.__snorca_hd_cam) return;
         window.__snorca_hd_cam = true;
-        var printerHost = null, btn = null, overlay = null;
-        // Device IPs known to the slicer; probed for a reachable camera-streamer.
+        // Candidate printer addresses injected by the slicer; more can be sniffed at runtime.
         var candidates = __SNORCA_IPS__;
-        function adopt(host) {
-            if (!printerHost && host) { printerHost = host; ensureBtn(); }
+        var reachable = [];    // hosts with a responding camera-streamer
+        var activeHost = null; // host the device page is currently polling (sniffed)
+        var btn = null, overlay = null, frame = null, picker = null;
+
+        function addReachable(host) {
+            if (reachable.indexOf(host) === -1) {
+                reachable.push(host);
+                ensureBtn();
+                refreshPicker();
+            }
         }
-        function probe() {
-            if (printerHost) return;
-            candidates.forEach(function(ip) {
-                if (printerHost || !ip) return;
-                var im = new Image();
-                im.onload = function() { adopt(ip); };
-                im.src = 'http://' + ip + '/webcam/snapshot.jpg?t=' + Date.now();
-            });
-        }
-        setTimeout(probe, 1000);
-        setInterval(probe, 10000);
-        // Fallback: sniff the app's own monitor.jpg polling to discover the IP.
-        function onUrl(u) {
+        function sniff(u) {
             try {
-                if (printerHost || typeof u !== 'string') return;
+                if (typeof u !== 'string') return;
                 var m = u.match(/^https?:\/\/([^\/]+)\/server\/files\/camera\/monitor\.jpg/i);
-                if (m) adopt(m[1]);
+                if (!m) return;
+                var host = m[1].replace(/:\d+$/, '');
+                if (candidates.indexOf(host) === -1) candidates.push(host);
+                activeHost = host;
             } catch (e) {}
         }
+        // Resource-timing observer sees every subresource the page loads, regardless of API.
         try {
-            var d = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-            if (d && d.set) Object.defineProperty(HTMLImageElement.prototype, 'src', {
-                configurable: true,
-                get: d.get,
-                set: function(v) { onUrl(v); return d.set.call(this, v); }
-            });
+            new PerformanceObserver(function(list) {
+                list.getEntries().forEach(function(e) { sniff(e.name); });
+            }).observe({ type: 'resource', buffered: true });
         } catch (e) {}
         try {
             if (window.fetch) {
                 var of = window.fetch;
-                window.fetch = function(input, init) {
-                    onUrl(typeof input === 'string' ? input : (input && input.url));
+                window.fetch = function(input) {
+                    sniff(typeof input === 'string' ? input : (input && input.url));
                     return of.apply(this, arguments);
                 };
             }
         } catch (e) {}
         try {
             var oo = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) { onUrl(url); return oo.apply(this, arguments); };
+            XMLHttpRequest.prototype.open = function(method, url) { sniff(url); return oo.apply(this, arguments); };
         } catch (e) {}
+
+        function probe() {
+            candidates.forEach(function(ip) {
+                if (!ip || reachable.indexOf(ip) !== -1) return;
+                var im = new Image();
+                im.onload = function() { addReachable(ip); };
+                im.src = 'http://' + ip + '/webcam/snapshot.jpg?t=' + Date.now();
+            });
+        }
+        setTimeout(probe, 1000);
+        setInterval(probe, 10000);
+
+        function pickHost() {
+            if (activeHost && reachable.indexOf(activeHost) !== -1) return activeHost;
+            var last = null;
+            try { last = localStorage.getItem('snorca_hd_last'); } catch (e) {}
+            if (last && reachable.indexOf(last) !== -1) return last;
+            return reachable.length ? reachable[0] : null;
+        }
+        function currentHost() {
+            if (!frame) return null;
+            var m = String(frame.src).match(/^https?:\/\/([^\/]+)\//);
+            return m ? m[1] : null;
+        }
+        function setStream(host) {
+            try { localStorage.setItem('snorca_hd_last', host); } catch (e) {}
+            if (frame) frame.src = 'http://' + host + '/webcam/webrtc';
+            refreshPicker();
+        }
+        function refreshPicker() {
+            if (!picker) return;
+            picker.innerHTML = '';
+            if (reachable.length < 2) { picker.style.display = 'none'; return; }
+            picker.style.display = 'flex';
+            var cur = currentHost();
+            reachable.forEach(function(h) {
+                var b = document.createElement('div');
+                b.textContent = h;
+                b.style.cssText = 'padding:6px 12px;margin-right:8px;border-radius:16px;color:#fff;font:13px sans-serif;cursor:pointer;user-select:none;background:' +
+                                  (h === cur ? 'rgba(0,150,80,0.85)' : 'rgba(255,255,255,0.15)') + ';';
+                b.onclick = function() { setStream(h); };
+                picker.appendChild(b);
+            });
+        }
         function ensureBtn() {
             if (btn) return;
             if (!document.body) { setTimeout(ensureBtn, 1000); return; }
@@ -190,14 +231,18 @@ static const char* hd_camera_script()
             document.body.appendChild(btn);
         }
         function toggleOverlay() {
-            if (overlay) { overlay.remove(); overlay = null; return; }
+            if (overlay) { overlay.remove(); overlay = null; frame = null; picker = null; return; }
+            var host = pickHost();
+            if (!host) return;
             overlay = document.createElement('div');
             overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:#000;';
-            var frame = document.createElement('iframe');
-            frame.src = 'http://' + printerHost + '/webcam/webrtc';
+            frame = document.createElement('iframe');
             frame.allow = 'autoplay';
             frame.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;border:0;';
             overlay.appendChild(frame);
+            picker = document.createElement('div');
+            picker.style.cssText = 'position:absolute;left:16px;top:16px;z-index:2;display:none;';
+            overlay.appendChild(picker);
             var close = document.createElement('div');
             close.textContent = '✕';
             close.title = 'Close';
@@ -205,9 +250,10 @@ static const char* hd_camera_script()
             close.onclick = toggleOverlay;
             overlay.appendChild(close);
             document.body.appendChild(overlay);
+            setStream(host);
         }
     })();
-    )JS";
+)JS";
 }
 
 void PrinterWebView::InjectHdCameraScript()
@@ -218,7 +264,12 @@ void PrinterWebView::InjectHdCameraScript()
     // camera-streamer, so the button only shows on LAN. Sources, in priority order:
     // the manual preference, the printer preset's print host, and registered devices.
     std::vector<std::string> hosts;
-    hosts.emplace_back(wxGetApp().app_config->get("hd_camera_host"));
+    {
+        // The preference accepts several printers, separated by comma/semicolon/space.
+        std::vector<std::string> manual;
+        boost::split(manual, wxGetApp().app_config->get("hd_camera_host"), boost::is_any_of(",; "), boost::token_compress_on);
+        hosts.insert(hosts.end(), manual.begin(), manual.end());
+    }
     {
         std::string host = wxGetApp().preset_bundle->printers.get_edited_preset().config.opt_string("print_host");
         if (size_t pos = host.find("//"); pos != std::string::npos)
