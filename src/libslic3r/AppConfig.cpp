@@ -708,6 +708,10 @@ std::string AppConfig::load()
                         local_machine.dev_ip = p["dev_ip"].get<std::string>();
                     if (p.contains("printer_type"))
                         local_machine.printer_type = p["printer_type"].get<std::string>();
+                    if (p.contains("dev_placement"))
+                        local_machine.dev_placement = p["dev_placement"].get<std::string>();
+                    if (p.contains("dev_pid"))
+                        local_machine.dev_pid = p["dev_pid"].get<std::string>();
                     m_local_machines[local_machine.dev_id] = local_machine;
                 }
             } else {
@@ -925,6 +929,10 @@ void AppConfig::save()
         m_json["dev_name"]         = local_machine.second.dev_name;
         m_json["dev_ip"]           = local_machine.second.dev_ip;
         m_json["printer_type"]     = local_machine.second.printer_type;
+        if (!local_machine.second.dev_placement.empty())
+            m_json["dev_placement"] = local_machine.second.dev_placement;
+        if (!local_machine.second.dev_pid.empty())
+            m_json["dev_pid"]       = local_machine.second.dev_pid;
 
         j["local_machines"][local_machine.first] = m_json;
     }
@@ -1418,6 +1426,50 @@ bool AppConfig::is_engineering_region(){
         ||sel == ENV_PRE_HOST)
         return true;
     return false;
+}
+
+// Ultra: Flashforge device stack (Orca-Flashforge port)
+void AppConfig::get_local_mahcines(LocalMacInfo& local_machines)
+{
+    local_machines.clear();
+    local_machines.reserve(m_local_machines.size());
+    for (const auto& [dev_id, machine] : m_local_machines) {
+        MacInfoMap info;
+        info.emplace("dev_id", dev_id);
+        info.emplace("dev_name", machine.dev_name);
+        if (!machine.dev_placement.empty())
+            info.emplace("dev_placement", machine.dev_placement);
+        if (!machine.dev_pid.empty())
+            info.emplace("dev_pid", machine.dev_pid);
+        local_machines.emplace_back(std::move(info));
+    }
+}
+
+void AppConfig::save_bind_machine_to_config(const std::string& dev_id, const std::string& dev_name, const std::string& placement, const unsigned short& pid, bool modifyPlacement)
+{
+    if (dev_id.empty())
+        return;
+
+    BBLocalMachine machine;
+    auto it = m_local_machines.find(dev_id);
+    if (it != m_local_machines.end())
+        machine = it->second;
+
+    machine.dev_id = dev_id;
+    machine.dev_name = dev_name;
+    if (modifyPlacement)
+        machine.dev_placement = placement;
+    machine.dev_pid = std::to_string(pid);
+    update_local_machine(machine);
+}
+
+void AppConfig::erase_local_machine(const std::string& dev_id, const std::string& dev_name)
+{
+    auto it = m_local_machines.find(dev_id);
+    if (it != m_local_machines.end() && (dev_name.empty() || it->second.dev_name == dev_name)) {
+        m_local_machines.erase(it);
+        m_dirty = true;
+    }
 }
 
 void AppConfig::save_custom_color_to_config(const std::vector<std::string> &colors)

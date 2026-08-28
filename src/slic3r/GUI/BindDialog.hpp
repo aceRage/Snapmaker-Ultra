@@ -145,6 +145,8 @@ public:
     wxString get_print_error(wxString str);
 };
 
+struct BindInfo; // Ultra: Flashforge device stack (defined in FlashForge/DeviceData.hpp)
+
 class UnBindMachineDialog : public DPIDialog
 {
 protected:
@@ -166,7 +168,12 @@ public:
     void on_unbind_printer(wxCommandEvent &event);
     void on_dpi_changed(const wxRect &suggested_rect) override;
     void update_machine_info(MachineObject *info) { m_machine_info = info; };
+    // Ultra: Flashforge device stack (Orca-Flashforge port) - FF unbind flow lands with Phase B login
+    void update_device_info2(BindInfo *info) { m_unbind_info = info; }
     void on_show(wxShowEvent &event);
+
+protected:
+    BindInfo *m_unbind_info{nullptr}; // Ultra: Flashforge device stack
 };
 
 }} // namespace Slic3r::GUI

@@ -33,7 +33,8 @@ public:
     wxColour m_progress_colour            = {0, 150, 136};
     wxColour m_progress_colour_disable    = {255, 111, 0};
     wxString m_disable_text;
-    
+    int      m_verticalSpace              = {0}; // Ultra: Flashforge device stack
+
 
 public:
     void         ShowNumber(bool shown);
@@ -49,6 +50,14 @@ public:
         m_minHeight = height;
         m_radius    = m_minHeight / 2;
         SetSize(GetSize().x,  height);
+    }
+    // Ultra: Flashforge device stack (Orca-Flashforge port)
+    void         SetVerticalSpace(int space) {
+        if (space * 2 >= m_miniHeight)
+            return;
+        m_verticalSpace = space;
+        m_radius        = m_miniHeight / 2 - space;
+        Refresh();
     }
     virtual void SetMinSize(const wxSize &size) override;
 

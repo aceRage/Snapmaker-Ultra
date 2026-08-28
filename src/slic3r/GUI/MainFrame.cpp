@@ -3652,6 +3652,39 @@ void MainFrame::jump_to_monitor(std::string dev_id)
     ((MonitorPanel*)m_monitor)->select_machine(dev_id);
 }
 
+// Ultra: Flashforge device stack (Orca-Flashforge port)
+void MainFrame::jump_to_monitor(int evt_type, int conn_id)
+{
+    // Routed to the Flashforge device tab once it is mounted (FFDeviceTab);
+    // until then fall back to selecting the Device tab.
+    wxWindow* target = m_ff_device != nullptr ? (wxWindow*) m_ff_device : (wxWindow*) m_monitor;
+    if (target == nullptr)
+        return;
+    m_tabpanel->SetSelection(tpMonitor);
+    wxCommandEvent event((wxEventType) evt_type, target->GetId());
+    event.SetEventObject(target);
+    event.SetInt(conn_id);
+    wxPostEvent(target, event);
+}
+
+void MainFrame::jump_to_monitor_exit(const std::string& /*dev_id*/)
+{
+    if (!m_monitor)
+        return;
+    m_tabpanel->SetSelection(tpMonitor);
+    ((MonitorPanel*)m_monitor)->update_all();
+}
+
+ProgressDialog* MainFrame::createLogProgress()
+{
+    if (m_log_progress_dlg != nullptr) {
+        m_log_progress_dlg->Destroy();
+        m_log_progress_dlg = nullptr;
+    }
+    m_log_progress_dlg = new ProgressDialog(_L("Upload log"), "", 100, this, wxPD_AUTO_HIDE);
+    return m_log_progress_dlg;
+}
+
 void MainFrame::jump_to_multipage()
 {
     if(!m_multi_machine)

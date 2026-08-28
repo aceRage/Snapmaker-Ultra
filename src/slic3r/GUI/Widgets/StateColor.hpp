@@ -68,7 +68,7 @@ public:
 public:
     wxColour defaultColor();
 
-    wxColour colorForStates(int states);
+    wxColour colorForStates(int states) const;
 
     wxColour colorForStatesNoDark(int states);
 

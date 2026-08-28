@@ -279,7 +279,7 @@ wxColour StateColor::defaultColor() {
     return colorForStates(0);
 }
 
-wxColour StateColor::colorForStates(int states)
+wxColour StateColor::colorForStates(int states) const
 {
     bool focused = takeFocusedAsHovered_ && (states & Focused);
     for (int i = 0; i < statesList_.size(); ++i) {

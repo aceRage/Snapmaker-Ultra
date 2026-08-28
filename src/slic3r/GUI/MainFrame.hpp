@@ -40,6 +40,7 @@
 class Notebook;
 class wxBookCtrlBase;
 class wxProgressDialog;
+namespace Slic3r { namespace GUI { class ProgressDialog; } }
 
 namespace Slic3r {
 
@@ -316,6 +317,10 @@ public:
     void        load_config(const DynamicPrintConfig& config);
     //BBS: jump to monitor
     void        jump_to_monitor(std::string dev_id = "");
+    // Ultra: Flashforge device stack (Orca-Flashforge port)
+    void        jump_to_monitor(int evt_type, int conn_id = 0);
+    void        jump_to_monitor_exit(const std::string& dev_id = "");
+    ProgressDialog* createLogProgress();
     void        jump_to_multipage();
     //BBS: hint when jump to 3Deditor under preview only mode
     bool        preview_only_hint();
@@ -390,6 +395,8 @@ public:
     CalibrationPanel*     m_calibration{ nullptr };
     WebViewPanel*         m_webview { nullptr };
     PrinterWebView*       m_printer_view{nullptr};
+    ProgressDialog*       m_log_progress_dlg{nullptr}; // Ultra: Flashforge log-export progress
+    wxPanel*              m_ff_device{nullptr};        // Ultra: Flashforge device tab (FFDeviceTab)
     wxLogWindow*          m_log_window { nullptr };
     // BBS
     //wxBookCtrlBase*       m_tabpanel { nullptr };

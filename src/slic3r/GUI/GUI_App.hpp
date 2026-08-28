@@ -87,6 +87,7 @@ class ObjectSettings;
 class ObjectList;
 class ObjectLayers;
 class Plater;
+class DeviceObjectOpr; // Ultra: Flashforge device stack
 class ParamsPanel;
 class NotificationManager;
 class Downloader;
@@ -313,6 +314,9 @@ private:
     Slic3r::UserManager* m_user_manager { nullptr };
     Slic3r::TaskManager* m_task_manager { nullptr };
     NetworkAgent* m_agent { nullptr };
+    // Ultra: Flashforge device stack (Orca-Flashforge port)
+    DeviceObjectOpr* m_device_opr { nullptr };
+    wxImage          m_usr_pic_image;
     std::vector<std::string> need_delete_presets;   // store setting ids of preset
     std::vector<bool> m_create_preset_blocked { false, false, false, false, false, false }; // excceed limit
     bool m_networking_compatible { false };
@@ -540,6 +544,13 @@ private:
     bool            check_login();
     void            get_login_info();
     bool            is_user_login();
+    // Ultra: Flashforge device stack (Orca-Flashforge port) - FF cloud login lands in Phase B, LAN-only until then
+    bool            is_flashforge_login() { return false; }
+    DeviceObjectOpr* getDeviceObjectOpr();
+    wxString        get_homepage_url();
+    std::string     handle_web_request(std::string cmd, const std::vector<std::string>& limitCmds);
+    void            get_uds_id(std::string& uid, std::string& did, std::string& sid);
+    const wxImage&  getUsrPic() { return m_usr_pic_image; }
 
     wxString get_international_url(const wxString& origin_url);
     wxString flutter_web_base_url(const wxString& path);
@@ -971,6 +982,9 @@ private:
 
 DECLARE_APP(GUI_App)
 wxDECLARE_EVENT(EVT_CONNECT_LAN_MODE_PRINT, wxCommandEvent);
+// Ultra: Flashforge device stack (Orca-Flashforge port)
+wxDECLARE_EVENT(EVT_BANNER_UPDATE, wxCommandEvent);
+wxDECLARE_EVENT(EVT_USER_HEAD_IMAGE_UPDATED, wxCommandEvent);
 
 bool is_support_filament(int extruder_id);
 } // namespace GUI

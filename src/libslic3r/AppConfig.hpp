@@ -67,10 +67,14 @@ struct BBLocalMachine
     std::string dev_ip;
     std::string dev_id; /* serial number */
     std::string printer_type; /* model_id */
+    // Ultra: Flashforge device stack (Orca-Flashforge port)
+    std::string dev_placement;
+    std::string dev_pid;
 
     bool operator==(const BBLocalMachine& other) const
     {
-        return dev_name == other.dev_name && dev_ip == other.dev_ip && dev_id == other.dev_id && printer_type == other.printer_type;
+        return dev_name == other.dev_name && dev_ip == other.dev_ip && dev_id == other.dev_id && printer_type == other.printer_type &&
+            dev_placement == other.dev_placement && dev_pid == other.dev_pid;
     }
     bool operator!=(const BBLocalMachine& other) const { return !operator==(other); }
 };
@@ -279,6 +283,14 @@ public:
             m_dirty = true;
         }
     }
+
+    // Ultra: Flashforge device stack (Orca-Flashforge port)
+    typedef std::map<std::string, std::string> MacInfoMap;
+    typedef std::vector<MacInfoMap>            LocalMacInfo;
+    void get_local_mahcines(LocalMacInfo& local_machines);
+    void save_bind_machine_to_config(const std::string& dev_id, const std::string& dev_name, const std::string& placement,
+                                     const unsigned short& pid, bool modifyPlacement = true);
+    void erase_local_machine(const std::string& dev_id, const std::string& dev_name);
 
     const std::vector<std::string> &get_filament_presets() const { return m_filament_presets; }
     void set_filament_presets(const std::vector<std::string> &filament_presets){

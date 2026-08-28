@@ -53,6 +53,10 @@
 namespace Slic3r {
 namespace GUI {
 
+// Ultra: Flashforge device stack (Orca-Flashforge port) - routed by FFDeviceTab
+wxDECLARE_EVENT(EVT_SWITCH_TO_DEVICE_LIST, wxCommandEvent);
+wxDECLARE_EVENT(EVT_SWITCH_TO_DEVICE_STATUS, wxCommandEvent);
+
 class MediaFilePanel;
 
 class AddMachinePanel : public wxPanel

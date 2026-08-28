@@ -32,6 +32,10 @@
 namespace Slic3r {
 namespace GUI {
 
+// Ultra: Flashforge device stack (Orca-Flashforge port)
+wxDEFINE_EVENT(EVT_SWITCH_TO_DEVICE_LIST, wxCommandEvent);
+wxDEFINE_EVENT(EVT_SWITCH_TO_DEVICE_STATUS, wxCommandEvent);
+
 #define REFRESH_INTERVAL       1000
 
 AddMachinePanel::AddMachinePanel(wxWindow* parent, wxWindowID id, const wxPoint& pos, const wxSize& size, long style, const wxString& name)

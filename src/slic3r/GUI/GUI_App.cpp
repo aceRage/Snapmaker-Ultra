@@ -86,6 +86,8 @@
 #include "GUI_Utils.hpp"
 #include "3DScene.hpp"
 #include "MainFrame.hpp"
+#include "slic3r/GUI/FlashForge/DeviceData.hpp"
+#include "slic3r/GUI/FlashForge/MultiComMgr.hpp"
 #include "Plater.hpp"
 #include "GLCanvas3D.hpp"
 #include "GeneratedConfig.hpp"
@@ -4410,6 +4412,39 @@ int GUI_App::request_user_unbind(std::string dev_id)
     }
     return result;
 }
+
+// Ultra: Flashforge device stack (Orca-Flashforge port) ------------------------------
+wxDEFINE_EVENT(EVT_BANNER_UPDATE, wxCommandEvent);
+wxDEFINE_EVENT(EVT_USER_HEAD_IMAGE_UPDATED, wxCommandEvent);
+
+DeviceObjectOpr* GUI_App::getDeviceObjectOpr()
+{
+    if (m_device_opr == nullptr)
+        m_device_opr = new DeviceObjectOpr();
+    return m_device_opr;
+}
+
+wxString GUI_App::get_homepage_url()
+{
+    wxString url = wxString::FromUTF8(app_config != nullptr ? app_config->get("ff_home_page_url") : std::string());
+    if (url.empty())
+        url = wxString::FromUTF8(MultiComMgr::inst()->homePageUrl());
+    return url;
+}
+
+std::string GUI_App::handle_web_request(std::string cmd, const std::vector<std::string>& /*limitCmds*/)
+{
+    // The Orca-Flashforge variant filters commands for embedded pages; Phase A delegates unfiltered.
+    return handle_web_request(cmd);
+}
+
+void GUI_App::get_uds_id(std::string& uid, std::string& did, std::string& sid)
+{
+    uid = app_config != nullptr ? app_config->get("usr_uid") : std::string();
+    did.clear(); // FF cloud session ids arrive with Phase B login
+    sid.clear();
+}
+// -------------------------------------------------------------------------------------
 
 std::string GUI_App::handle_web_request(std::string cmd)
 {

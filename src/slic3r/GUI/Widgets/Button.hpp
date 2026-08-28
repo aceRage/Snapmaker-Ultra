@@ -41,11 +41,22 @@ class Button : public StaticBox
     bool canFocus  = true;
     bool isCenter = true;
 
+    // Ultra: Flashforge device stack (Orca-Flashforge port) - style flags read by their panels
+    bool m_flashforge_selected = false;
+    bool m_flashforge = false;
+    bool m_pure_text = false;
+
     static const int buttonWidth = 200;
     static const int buttonHeight = 50;
 
 public:
     Button();
+
+    // Ultra: Flashforge device stack (Orca-Flashforge port)
+    void SetFlashForgeSelected(bool selected) { m_flashforge_selected = selected; }
+    bool GetFlashForgeSelected() { return m_flashforge_selected; }
+    void SetFlashForge(bool bFlashForge = false) { m_flashforge = bFlashForge; }
+    void SetPureText(bool bPureText = false) { m_pure_text = bPureText; }
 
     Button(wxWindow* parent, wxString text, wxString icon = "", long style = 0, int iconSize = 0, wxWindowID btn_id = wxID_ANY);
 
