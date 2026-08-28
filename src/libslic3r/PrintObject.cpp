@@ -1152,6 +1152,7 @@ bool PrintObject::invalidate_state_by_config_options(
         } else if (
                opt_key == "outer_wall_line_width"
             || opt_key == "wall_filament"
+            || opt_key == "outer_wall_filament"
             || opt_key == "fuzzy_skin"
             || opt_key == "fuzzy_skin_thickness"
             || opt_key == "fuzzy_skin_point_distance"
@@ -3217,6 +3218,9 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
             out.sparse_infill_filament.value = extruder;
             out.solid_infill_filament.value  = extruder;
             out.wall_filament.value          = extruder;
+            // Ultra: outer walls follow the assigned extruder too, unless specifically
+            // overridden below (0 = follow wall_filament).
+            out.outer_wall_filament.value    = 0;
         }
     // 2) Copy the rest of the values.
     for (auto it = in.cbegin(); it != in.cend(); ++ it)
@@ -3253,6 +3257,9 @@ PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &defau
     // Clamp invalid extruders to the default extruder (with index 1).
     clamp_exturder_to_default(config.sparse_infill_filament,       num_extruders);
     clamp_exturder_to_default(config.wall_filament,    num_extruders);
+    // Ultra: 0 = follow wall_filament, so an out-of-range value falls back to 0, not 1
+    if (config.outer_wall_filament.value > (int) num_extruders)
+        config.outer_wall_filament.value = 0;
     clamp_exturder_to_default(config.solid_infill_filament, num_extruders);
     if (config.sparse_infill_density.value < 0.00011f)
         // Switch of infill for very low infill rates, also avoid division by zero in infill generator for these very low rates.

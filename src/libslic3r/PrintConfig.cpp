@@ -4171,6 +4171,16 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(1));
 
+    // Ultra: outer walls can use their own filament; 0 (Default) follows the Walls filament.
+    def = this->add("outer_wall_filament", coInt);
+    def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
+    def->label = L("Outer wall");
+    def->category = L("Extruders");
+    def->tooltip = L("Filament to print outer walls. \"Default\" uses the Walls filament.");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(0));
+
     def = this->add("inner_wall_line_width", coFloatOrPercent);
     def->label = L("Inner wall");
     def->category = L("Quality");
@@ -7445,6 +7455,9 @@ void DynamicPrintConfig::normalize_fdm(int used_filaments)
                 this->option("sparse_infill_filament", true)->setInt(extruder);
             if (!this->has("wall_filament"))
                 this->option("wall_filament", true)->setInt(extruder);
+            // Ultra: outer walls follow the assigned extruder unless specifically overridden
+            if (!this->has("outer_wall_filament"))
+                this->option("outer_wall_filament", true)->setInt(0);
             // Don't propagate the current extruder to support.
             // For non-soluble supports, the default "0" extruder means to use the active extruder,
             // for soluble supports one certainly does not want to set the extruder to non-soluble.
@@ -7526,6 +7539,9 @@ void DynamicPrintConfig::normalize_fdm_1()
                 this->option("sparse_infill_filament", true)->setInt(extruder);
             if (!this->has("wall_filament"))
                 this->option("wall_filament", true)->setInt(extruder);
+            // Ultra: outer walls follow the assigned extruder unless specifically overridden
+            if (!this->has("outer_wall_filament"))
+                this->option("outer_wall_filament", true)->setInt(0);
             // Don't propagate the current extruder to support.
             // For non-soluble supports, the default "0" extruder means to use the active extruder,
             // for soluble supports one certainly does not want to set the extruder to non-soluble.

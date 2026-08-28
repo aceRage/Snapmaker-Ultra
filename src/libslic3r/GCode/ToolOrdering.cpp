@@ -291,6 +291,17 @@ unsigned int LayerTools::wall_filament(const PrintRegion &region) const
 	return resolve_mixed_1based(id) - 1;
 }
 
+// Ultra: zero based extruder for outer walls (falls back to wall_filament when unset).
+unsigned int LayerTools::outer_wall_filament(const PrintRegion &region) const
+{
+	if (this->extruder_override != 0)
+		return resolve_mixed_1based(this->extruder_override) - 1;
+	const int outer = region.config().outer_wall_filament.value;
+	if (outer <= 0)
+		return wall_filament(region);
+	return resolve_mixed_1based(unsigned(outer)) - 1;
+}
+
 unsigned int LayerTools::sparse_infill_filament(const PrintRegion &region) const
 {
 	assert(region.config().wall_filament.value > 0);
@@ -772,6 +783,15 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                         layer_tools.extruders.emplace_back(wall_ext);
                         if (layerCount == 0)
                             firstLayerExtruders.emplace_back(wall_ext);
+                    }
+
+                    // Ultra: outer walls may use their own filament
+                    if (extruder_override == 0 && region.config().outer_wall_filament.value > 0) {
+                        const unsigned int outer_ext = resolve_mixed(unsigned(region.config().outer_wall_filament.value),
+                                                                     layerCount, float(layer->print_z), float(layer->height), &object);
+                        layer_tools.extruders.emplace_back(outer_ext);
+                        if (layerCount == 0)
+                            firstLayerExtruders.emplace_back(outer_ext);
                     }
                 }
 

@@ -189,6 +189,8 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     const PrintObjectConfig& object_config = this->layer()->object()->config();
     PrintRegionConfig        perimeter_config = region_config;
     perimeter_config.wall_filament.value = int(effective_layer_filament_id(*this->layer(), unsigned(std::max(0, region_config.wall_filament.value))));
+    if (region_config.outer_wall_filament.value > 0)
+        perimeter_config.outer_wall_filament.value = int(effective_layer_filament_id(*this->layer(), unsigned(region_config.outer_wall_filament.value)));
     perimeter_config.sparse_infill_filament.value = int(effective_layer_filament_id(*this->layer(), unsigned(std::max(0, region_config.sparse_infill_filament.value))));
     perimeter_config.solid_infill_filament.value = int(effective_layer_filament_id(*this->layer(), unsigned(std::max(0, region_config.solid_infill_filament.value))));
     // This needs to be in sync with PrintObject::_slice() slicing_mode_normal_below_layer!

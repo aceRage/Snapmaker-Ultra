@@ -501,11 +501,9 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
         //    event.Veto();
         //    return;
         //}
-        auto check = [](bool yes_or_no) {
-            if (yes_or_no)
-                return true;
-            return wxGetApp().check_and_save_current_preset_changes(_L("Application is closing"), _L("Closing Application while some presets are modified."));
-        };
+        // Ultra: never prompt about modified presets on exit - the project 3mf
+        // carries the live settings, so unsaved preset edits are simply dropped.
+        auto check = [](bool /*yes_or_no*/) { return true; };
 
         // BBS: close save project
         int result;

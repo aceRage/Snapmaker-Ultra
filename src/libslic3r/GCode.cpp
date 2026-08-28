@@ -5658,6 +5658,66 @@ LayerResult GCode::process_layer(const Print& print,
 
                         // This extrusion is part of certain Region, which tells us which extruder should be used for it:
                         int correct_extruder_id = configured_extruder_id(entity_type, *filtered_extrusions, region);
+
+                        // Ultra: outer walls may print with their own filament - split the island's
+                        // perimeter collection into outer/inner sub-collections, one per extruder.
+                        if (!is_anything_overridden &&
+                            entity_type == ObjectByExtruder::Island::Region::PERIMETERS &&
+                            layer_tools.outer_wall_filament(region) != layer_tools.wall_filament(region)) {
+                            auto entity_is_outer = [](const ExtrusionEntity* e) -> bool {
+                                auto paths_outer = [](const ExtrusionPaths& paths, int inset_idx) -> bool {
+                                    if (inset_idx == 0)
+                                        return true;
+                                    if (inset_idx > 0)
+                                        return false;
+                                    for (const ExtrusionPath& p : paths)
+                                        if (p.role() == erExternalPerimeter)
+                                            return true;
+                                    return false;
+                                };
+                                if (const auto* loop = dynamic_cast<const ExtrusionLoop*>(e))
+                                    return paths_outer(loop->paths, loop->inset_idx);
+                                if (const auto* mp = dynamic_cast<const ExtrusionMultiPath*>(e))
+                                    return paths_outer(mp->paths, mp->inset_idx);
+                                return e->role() == erExternalPerimeter;
+                            };
+                            auto outer_coll = std::make_unique<ExtrusionEntityCollection>();
+                            auto inner_coll = std::make_unique<ExtrusionEntityCollection>();
+                            outer_coll->no_sort = filtered_extrusions->no_sort;
+                            inner_coll->no_sort = filtered_extrusions->no_sort;
+                            for (const ExtrusionEntity* e : filtered_extrusions->entities)
+                                (entity_is_outer(e) ? outer_coll : inner_coll)->append(*e);
+                            if (!outer_coll->entities.empty() && !inner_coll->entities.empty()) {
+                                const std::pair<ExtrusionEntityCollection*, unsigned int> split_parts[] = {
+                                    { inner_coll.get(), layer_tools.wall_filament(region) },
+                                    { outer_coll.get(), layer_tools.outer_wall_filament(region) },
+                                };
+                                for (const auto& [split_ptr, split_extruder] : split_parts) {
+                                    unsigned int extruder = split_extruder;
+                                    if (!layer_tools.has_extruder(extruder))
+                                        extruder = layer_tools.extruders.back();
+                                    std::vector<ObjectByExtruder::Island>& islands =
+                                        object_islands_by_extruder(by_extruder, extruder, layer_to_print_idx, layers.size(), n_slices + 1);
+                                    for (size_t i = 0; i <= n_slices; ++i) {
+                                        const bool   last       = i == n_slices;
+                                        const size_t island_idx = last ? n_slices : slices_test_order[i];
+                                        if (last || entity_matches_surface(island_idx, *split_ptr)) {
+                                            if (islands[island_idx].by_region.empty())
+                                                islands[island_idx].by_region.assign(print.num_print_regions(), ObjectByExtruder::Island::Region());
+                                            islands[island_idx].by_region[region.print_region_id()].append(entity_type, split_ptr, nullptr);
+                                            break;
+                                        }
+                                    }
+                                }
+                                local_z_clipped_collections.emplace_back(std::move(outer_coll));
+                                local_z_clipped_collections.emplace_back(std::move(inner_coll));
+                                continue;
+                            }
+                            // Homogeneous island: keep the original collection, just pick the right extruder.
+                            correct_extruder_id = int(inner_coll->entities.empty() ? layer_tools.outer_wall_filament(region)
+                                                                                   : layer_tools.wall_filament(region));
+                        }
+
                         if (!is_anything_overridden &&
                             entity_type == ObjectByExtruder::Island::Region::PERIMETERS &&
                             layer_tools.mixed_mgr != nullptr &&

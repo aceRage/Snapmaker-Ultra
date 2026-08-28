@@ -1158,27 +1158,41 @@ void MenuFactory::append_menu_item_merge_to_multipart_object(wxMenu* menu)
         []() { return obj_list()->can_merge_to_multipart_object(); }, m_parent);
 }
 
-// Ultra: per-object Normal/Ghost/Hidden view modes for the Prepare view.
+// Ultra: per-object/per-part Normal/Ghost/Hidden view modes for the Prepare view.
 void MenuFactory::append_menu_items_visibility(wxMenu* menu)
 {
-    // Resolves to a ModelVolume id when a part is selected, else the ModelObject id.
-    auto selected_object_id = []() -> std::pair<bool, size_t> {
-        std::vector<int> obj_idxs, vol_idxs;
-        obj_list()->get_selection_indexes(obj_idxs, vol_idxs);
+    // Every selected row resolves to a ModelVolume id (part rows) or ModelObject id.
+    auto selected_object_ids = []() -> std::vector<size_t> {
+        std::vector<size_t> ids;
+        wxDataViewItemArray sels;
+        obj_list()->GetSelections(sels);
         const auto& objects = plater()->model().objects;
-        if (!vol_idxs.empty() && obj_idxs.size() == 1 && obj_idxs.front() >= 0 && obj_idxs.front() < (int) objects.size() &&
-            vol_idxs.front() >= 0 && vol_idxs.front() < (int) objects[obj_idxs.front()]->volumes.size())
-            return { true, objects[obj_idxs.front()]->volumes[vol_idxs.front()]->id().id };
-        if (!obj_idxs.empty() && obj_idxs.front() >= 0 && obj_idxs.front() < (int) objects.size())
-            return { true, objects[obj_idxs.front()]->id().id };
-        return { false, 0 };
-    };
-    auto set_mode = [selected_object_id](GLCanvas3D::ObjectViewMode mode) {
-        auto sel = selected_object_id();
-        if (sel.first) {
-            plater()->canvas3D()->set_object_view_mode(sel.second, mode);
-            obj_list()->update_visibility_icons();
+        for (const wxDataViewItem& item : sels) {
+            const ItemType type = list_model()->GetItemType(item);
+            const int obj_idx = list_model()->GetObjectIdByItem(item);
+            if (obj_idx < 0 || obj_idx >= (int) objects.size())
+                continue;
+            if (type & itVolume) {
+                const int vol_idx = list_model()->GetVolumeIdByItem(item);
+                if (vol_idx >= 0 && vol_idx < (int) objects[obj_idx]->volumes.size())
+                    ids.push_back(objects[obj_idx]->volumes[vol_idx]->id().id);
+            } else if (type & (itObject | itInstance))
+                ids.push_back(objects[obj_idx]->id().id);
         }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        return ids;
+    };
+    auto set_mode = [selected_object_ids](GLCanvas3D::ObjectViewMode mode) {
+        const std::vector<size_t> ids = selected_object_ids();
+        for (size_t id : ids)
+            plater()->canvas3D()->set_object_view_mode(id, mode);
+        if (!ids.empty())
+            obj_list()->update_visibility_icons();
+    };
+    auto selected_object_id = [selected_object_ids]() -> std::pair<bool, size_t> {
+        const std::vector<size_t> ids = selected_object_ids();
+        return { !ids.empty(), ids.empty() ? 0 : ids.front() };
     };
     wxMenu* vis = new wxMenu();
     append_menu_item(vis, wxID_ANY, _L("Normal"), _L("Show this object normally"),
@@ -1935,6 +1949,8 @@ wxMenu* MenuFactory::multi_selection_menu()
 
         append_menu_item_set_printable(menu);
         append_menu_item_per_object_process(menu);
+        // Ultra: visibility for multi-object selections
+        append_menu_items_visibility(menu);
         menu->AppendSeparator();
         append_menu_items_convert_unit(menu);
         //BBS
@@ -1946,6 +1962,8 @@ wxMenu* MenuFactory::multi_selection_menu()
         append_menu_item_center(menu);
         append_menu_item_drop(menu);
         append_menu_item_assemble_separately(menu);
+        // Ultra: visibility for multi-part selections
+        append_menu_items_visibility(menu);
         append_menu_item_fix_through_netfabb(menu);
         //append_menu_item_simplify(menu);
         append_menu_item_delete(menu);
