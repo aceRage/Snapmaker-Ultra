@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stream</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 100%; height: 100%; background: #2b2b2b; font-family: 'Segoe UI', Roboto, sans-serif; overflow: hidden; }
+#topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 12px; background: #1f1f1f; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 16px; background: #4a4a4a; color: #fff; font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }
+.chip.active { background: #0a9e50; }
+.chip .icon { opacity: 0.7; font-size: 12px; padding: 0 2px; }
+.chip .icon:hover { opacity: 1; }
+#addchip { background: #3a3a3a; border: 1px dashed #777; }
+#spacer { flex: 1; }
+select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+#grid { position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; display: grid; gap: 4px; padding: 4px; background: #2b2b2b; }
+.cell { position: relative; background: #000; border-radius: 4px; overflow: hidden; }
+.cell iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+.cell .label { position: absolute; left: 8px; top: 6px; z-index: 2; padding: 2px 8px; border-radius: 10px; background: rgba(0,0,0,0.55); color: #fff; font-size: 12px; pointer-events: none; }
+.cell.empty { border: 1px dashed #555; background: #262626; }
+#note { color: #999; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <span id="chips"></span>
+  <span class="chip" id="addchip">+ Add</span>
+  <span id="spacer"></span>
+  <span id="note"></span>
+  <select id="layout" title="Grid layout">
+    <option value="1x1">1 stream</option>
+    <option value="2x1">2 side by side</option>
+    <option value="1x2">2 stacked</option>
+    <option value="2x2">2 x 2</option>
+    <option value="3x2">3 x 2</option>
+    <option value="3x3">3 x 3</option>
+    <option value="4x3">4 x 3</option>
+    <option value="4x4">4 x 4</option>
+  </select>
+</div>
+<div id="grid"></div>
+<script>
+(function() {
+    var KEY = 'snorca_streams_v1';
+    var state = { hosts: [], active: [], layout: '1x1' };
+
+    function load() {
+        try {
+            var s = JSON.parse(localStorage.getItem(KEY));
+            if (s && Array.isArray(s.hosts)) state = s;
+        } catch (e) {}
+        if (!Array.isArray(state.active)) state.active = [];
+        if (!state.layout) state.layout = '1x1';
+        // Merge hosts handed over by the slicer (?seed=ip1,ip2)
+        try {
+            var seed = new URLSearchParams(location.search).get('seed');
+            if (seed) seed.split(',').forEach(function(ip) {
+                ip = ip.trim();
+                if (ip && !state.hosts.some(function(h) { return h.ip === ip; }))
+                    state.hosts.push({ ip: ip, alias: '' });
+            });
+        } catch (e) {}
+    }
+    function save() {
+        try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+    }
+    function validHost(ip) {
+        // bare host, or a full stream URL used verbatim (e.g. a go2rtc/WebRTC relay for Bambu cams)
+        return /^https?:\/\/\S+$/i.test(ip) || /^[A-Za-z0-9.:\-_]+$/.test(ip);
+    }
+    function streamSrc(ip) {
+        return /^https?:\/\//i.test(ip) ? ip : 'http://' + ip + '/webcam/webrtc';
+    }
+    function cellCount(layout) {
+        var p = layout.split('x');
+        return { cols: +p[0], rows: +p[1], n: (+p[0]) * (+p[1]) };
+    }
+    function render() {
+        var chips = document.getElementById('chips');
+        chips.innerHTML = '';
+        state.hosts.forEach(function(h) {
+            var c = document.createElement('span');
+            c.className = 'chip' + (state.active.indexOf(h.ip) !== -1 ? ' active' : '');
+            var name = document.createElement('span');
+            name.textContent = h.alias || h.ip;
+            name.title = h.alias ? h.ip : 'Click to show/hide this stream';
+            c.appendChild(name);
+            var edit = document.createElement('span');
+            edit.className = 'icon';
+            edit.textContent = '✎';
+            edit.title = 'Set alias';
+            edit.onclick = function(e) {
+                e.stopPropagation();
+                var a = prompt('Alias for ' + h.ip + ' (empty to clear):', h.alias || '');
+                if (a !== null) { h.alias = a.trim(); save(); render(); }
+            };
+            c.appendChild(edit);
+            var del = document.createElement('span');
+            del.className = 'icon';
+            del.textContent = '✕';
+            del.title = 'Remove';
+            del.onclick = function(e) {
+                e.stopPropagation();
+                if (!confirm('Remove ' + (h.alias ? h.alias + ' (' + h.ip + ')' : h.ip) + ' from the list?')) return;
+                state.hosts = state.hosts.filter(function(x) { return x.ip !== h.ip; });
+                state.active = state.active.filter(function(x) { return x !== h.ip; });
+                save(); render();
+            };
+            c.appendChild(del);
+            c.onclick = function() {
+                var i = state.active.indexOf(h.ip);
+                if (i === -1) state.active.push(h.ip); else state.active.splice(i, 1);
+                save(); render();
+            };
+            chips.appendChild(c);
+        });
+        document.getElementById('layout').value = state.layout;
+
+        var lay = cellCount(state.layout);
+        var grid = document.getElementById('grid');
+        var barH = document.getElementById('topbar').offsetHeight;
+        grid.style.setProperty('--bar-h', barH + 'px');
+        grid.style.top = barH + 'px';
+        grid.style.gridTemplateColumns = 'repeat(' + lay.cols + ', 1fr)';
+        grid.style.gridTemplateRows = 'repeat(' + lay.rows + ', 1fr)';
+
+        var shown = state.active.slice(0, lay.n);
+        var note = document.getElementById('note');
+        note.textContent = state.active.length > lay.n
+            ? (state.active.length - lay.n) + ' selected stream(s) hidden by layout'
+            : (state.hosts.length === 0 ? 'Add a printer IP to start' : '');
+
+        // Reuse existing iframes where the host has not changed to avoid reconnecting.
+        var existing = {};
+        Array.prototype.slice.call(grid.children).forEach(function(cell) {
+            if (cell.dataset.ip) existing[cell.dataset.ip] = cell;
+        });
+        grid.innerHTML = '';
+        for (var i = 0; i < lay.n; i++) {
+            var ip = shown[i];
+            if (ip) {
+                var cell = existing[ip];
+                if (!cell) {
+                    cell = document.createElement('div');
+                    cell.className = 'cell';
+                    cell.dataset.ip = ip;
+                    var f = document.createElement('iframe');
+                    f.allow = 'autoplay';
+                    f.src = streamSrc(ip);
+                    cell.appendChild(f);
+                    var lab = document.createElement('span');
+                    lab.className = 'label';
+                    cell.appendChild(lab);
+                }
+                var h = state.hosts.filter(function(x) { return x.ip === ip; })[0];
+                cell.querySelector('.label').textContent = (h && h.alias) ? h.alias : ip;
+                grid.appendChild(cell);
+            } else {
+                var empty = document.createElement('div');
+                empty.className = 'cell empty';
+                grid.appendChild(empty);
+            }
+        }
+    }
+    document.getElementById('addchip').onclick = function() {
+        var ip = prompt('Printer IP address, or a full stream URL (http…):');
+        if (ip === null) return;
+        ip = ip.trim();
+        if (!ip || !validHost(ip)) { alert('Invalid address'); return; }
+        if (state.hosts.some(function(h) { return h.ip === ip; })) return;
+        var alias = prompt('Alias (optional):') || '';
+        state.hosts.push({ ip: ip, alias: alias.trim() });
+        state.active.push(ip);
+        save(); render();
+    };
+    document.getElementById('layout').onchange = function() {
+        state.layout = this.value;
+        save(); render();
+    };
+    window.addEventListener('resize', function() { render(); });
+
+    load();
+    // Default: first host active in the default single-stream layout.
+    if (state.active.length === 0 && state.hosts.length > 0) state.active = [state.hosts[0].ip];
+    save();
+    render();
+})();
+</script>
+</body>
+</html>

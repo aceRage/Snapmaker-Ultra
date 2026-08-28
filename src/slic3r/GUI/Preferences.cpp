@@ -1368,8 +1368,6 @@ wxWindow* PreferencesDialog::create_general_page()
     });
     auto item_keep_printer = create_item_checkbox(_L("Keep my printer when opening project files"), page,
         _L("When opening a project made for another printer, switch back to the last printer you selected or sliced with, instead of the printer embedded in the file."), 50, "keep_printer_on_open");
-    auto item_hd_camera_host = create_item_text_input(_L("Printer camera LAN address"), page,
-        _L("IP address or hostname of the printer on your local network, used by the HD camera button on the Device page (e.g. 10.0.0.106). Leave empty to auto-detect."), "hd_camera_host");
     auto item_skip_mapping_warnings = create_item_checkbox(_L("Skip Settings Mapping Warnings"), page,
         _L("Don't show warnings about unrecognized or invalid settings replaced while loading project files; the defaults or automatic fixes are applied silently."), 50, "skip_settings_mapping_warnings");
 
@@ -1475,7 +1473,6 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_remember_printer_config, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_save_presets, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_keep_printer, 0, wxTOP, FromDIP(3));
-    sizer_page->Add(item_hd_camera_host, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_skip_mapping_warnings, 0, wxTOP, FromDIP(3));
     //sizer_page->Add(title_network, 0, wxTOP | wxEXPAND, FromDIP(20));
     //sizer_page->Add(item_check_stable_version_only, 0, wxTOP, FromDIP(3));

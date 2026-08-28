@@ -31,6 +31,7 @@
 // BBS
 #include "BBLTopbar.hpp"
 #include "PrinterWebView.hpp"
+#include "StreamPanel.hpp"
 #include "calib_dlg.hpp"
 #include "MultiMachinePage.hpp"
 
@@ -214,11 +215,12 @@ public:
         tp3DEditor      = 1,
         tpPreview       = 2,
         tpMonitor       = 3,
-        tpMultiDevice   = 4,
-        tpProject       = 5,
-        tpCalibration   = 6,
-        tpAuxiliary     = 7,
-        toDebugTool     = 8,
+        tpStream        = 4,
+        tpMultiDevice   = 5,
+        tpProject       = 6,
+        tpCalibration   = 7,
+        tpAuxiliary     = 8,
+        toDebugTool     = 9,
     };
 
     //BBS: add slice&&print status update logic
@@ -378,6 +380,7 @@ public:
     Plater*               m_plater { nullptr };
     //BBS: GUI refactor
     MonitorPanel*         m_monitor{ nullptr };
+    StreamPanel*          m_stream{ nullptr };
 
     //AuxiliaryPanel*       m_auxiliary{ nullptr };
     MultiMachinePage*     m_multi_machine{ nullptr };

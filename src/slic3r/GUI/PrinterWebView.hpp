@@ -50,7 +50,6 @@ public:
 
 private:
     void SendAPIKey();
-    void InjectHdCameraScript();
 
     wxWebView* m_browser;
     long m_zoomFactor;

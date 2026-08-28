@@ -7097,6 +7097,7 @@ std::unordered_map<std::string, int> SSWCP::m_tab_map = {
     {"3DEditor", MainFrame::TabPosition::tp3DEditor},
     {"Preview", MainFrame::TabPosition::tpPreview},
     {"Monitor", MainFrame::TabPosition::tpMonitor},
+    {"Stream", MainFrame::TabPosition::tpStream},
     {"MultiDevice", MainFrame::TabPosition::tpMultiDevice},
     {"Project", MainFrame::TabPosition::tpProject},
     {"Calibration", MainFrame::TabPosition::tpCalibration},
