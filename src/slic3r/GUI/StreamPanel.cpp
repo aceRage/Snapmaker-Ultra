@@ -28,9 +28,22 @@ StreamPanel::StreamPanel(wxWindow* parent)
     if (m_browser == nullptr)
         return;
 
+    // The page asks for the go2rtc relay (RTSPS cameras) on demand via
+    // window.snorca.postMessage('start_go2rtc'), so the process only runs when needed.
+    m_browser->AddScriptMessageHandler("snorca");
+    m_browser->Bind(wxEVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED, &StreamPanel::OnScriptMessage, this, m_browser->GetId());
+
     auto* sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(m_browser, wxSizerFlags().Expand().Proportion(1));
     SetSizer(sizer);
+}
+
+void StreamPanel::OnScriptMessage(wxWebViewEvent& evt)
+{
+    if (evt.GetString() == "start_go2rtc") {
+        const int port = Go2RtcLauncher::get().port();
+        WebView::RunScript(m_browser, wxString::Format("if (window.__go2rtcReady) window.__go2rtcReady(%d);", port));
+    }
 }
 
 } // namespace GUI

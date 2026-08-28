@@ -83,11 +83,41 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
     }
     var relayPort = 0;
     try { relayPort = parseInt(new URLSearchParams(location.search).get('relay')) || 0; } catch (e) {}
-    function isBambu(h) { return !!(h && h.code); }
+    function kindOf(h) {
+        if (h.kind === 'rtsps') return 'rtsps';
+        if (h.kind === 'p1' || (h.code && h.kind !== 'auto-url')) return 'p1';
+        return 'url';
+    }
+    function isBambu(h) { return kindOf(h) === 'p1'; }
     function streamSrc(h) {
         if (isBambu(h))
             return 'http://127.0.0.1:' + relayPort + '/bambu?ip=' + encodeURIComponent(h.ip) + '&code=' + encodeURIComponent(h.code);
         return /^https?:\/\//i.test(h.ip) ? h.ip : 'http://' + h.ip + '/webcam/webrtc';
+    }
+
+    // go2rtc relay for RTSPS printers (X1/H2 family): started by the slicer on request.
+    var go2rtcPort = 0, go2rtcRequested = false, go2rtcStreams = {};
+    window.__go2rtcReady = function(p) {
+        go2rtcPort = p || 0;
+        render();
+    };
+    function ensureGo2rtc() {
+        if (go2rtcPort || go2rtcRequested) return;
+        go2rtcRequested = true;
+        try { window.snorca.postMessage('start_go2rtc'); } catch (e) {}
+    }
+    function go2rtcCell(h, cell) {
+        var name = h.ip.replace(/[^A-Za-z0-9]/g, '_');
+        var src  = 'rtspx://bblp:' + encodeURIComponent(h.code) + '@' + h.ip + ':322/streaming/live/1';
+        if (!go2rtcStreams[name]) {
+            go2rtcStreams[name] = true;
+            fetch('http://127.0.0.1:' + go2rtcPort + '/api/streams?name=' + name + '&src=' + encodeURIComponent(src), { method: 'PUT' })
+                .catch(function() { go2rtcStreams[name] = false; });
+        }
+        var f = document.createElement('iframe');
+        f.allow = 'autoplay';
+        f.src = 'http://127.0.0.1:' + go2rtcPort + '/stream.html?src=' + name + '&mode=mse';
+        cell.appendChild(f);
     }
     // In-page modal: the embedded WebView does not service prompt()/confirm() dialogs.
     // opts = { title, message, fields: [{key,label,value,placeholder}] }; cb(null | {key:value})
@@ -111,9 +141,22 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             var lab = document.createElement('label');
             lab.textContent = f.label;
             wrap.appendChild(lab);
-            var inp = document.createElement('input');
-            inp.value = f.value || '';
-            inp.placeholder = f.placeholder || '';
+            var inp;
+            if (f.type === 'select') {
+                inp = document.createElement('select');
+                inp.style.cssText = 'width:100%;background:#222;color:#fff;border:1px solid #555;border-radius:5px;padding:7px 9px;font-size:13px;';
+                (f.options || []).forEach(function(o) {
+                    var opt = document.createElement('option');
+                    opt.value = o.value;
+                    opt.textContent = o.label;
+                    inp.appendChild(opt);
+                });
+                if (f.value) inp.value = f.value;
+            } else {
+                inp = document.createElement('input');
+                inp.value = f.value || '';
+                inp.placeholder = f.placeholder || '';
+            }
             wrap.appendChild(inp);
             modal.appendChild(wrap);
             inputs[f.key] = inp;
@@ -225,17 +268,31 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
                     cell = document.createElement('div');
                     cell.className = 'cell';
                     cell.dataset.ip = ip;
-                    var f;
-                    if (isBambu(h)) {
+                    var hh   = h || { ip: ip };
+                    var kind = kindOf(hh);
+                    if (kind === 'rtsps') {
+                        if (go2rtcPort) {
+                            go2rtcCell(hh, cell);
+                        } else {
+                            ensureGo2rtc();
+                            var wait = document.createElement('div');
+                            wait.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:13px;';
+                            wait.textContent = 'Starting stream relay…';
+                            cell.appendChild(wait);
+                            cell.dataset.ip = ''; // rebuild this cell once the relay reports in
+                        }
+                    } else if (kind === 'p1') {
                         // The relay serves MJPEG, which renders in a plain <img>.
-                        f = document.createElement('img');
-                        f.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
+                        var im = document.createElement('img');
+                        im.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
+                        im.src = streamSrc(hh);
+                        cell.appendChild(im);
                     } else {
-                        f = document.createElement('iframe');
+                        var f = document.createElement('iframe');
                         f.allow = 'autoplay';
+                        f.src = streamSrc(hh);
+                        cell.appendChild(f);
                     }
-                    f.src = streamSrc(h || { ip: ip });
-                    cell.appendChild(f);
                     var lab = document.createElement('span');
                     lab.className = 'label';
                     cell.appendChild(lab);
@@ -255,12 +312,18 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             fields: [
                 { key: 'ip', label: 'IP address, hostname, or full stream URL', placeholder: 'e.g. 10.0.0.106' },
                 { key: 'alias', label: 'Alias (optional)', placeholder: 'e.g. U1 Left' },
+                { key: 'kind', label: 'Printer type', type: 'select', options: [
+                    { value: 'auto',  label: 'Snapmaker / direct stream URL' },
+                    { value: 'p1',    label: 'Bambu P1 / A1 (needs access code)' },
+                    { value: 'rtsps', label: 'Bambu X1 / H2 (needs access code + LAN Liveview on)' }
+                ] },
                 { key: 'code', label: 'LAN access code (Bambu printers only)', placeholder: 'leave empty for Snapmaker / URLs' }
             ]
         }, function(r) {
             if (r === null || !r.ip) return;
             if (!validHost(r.ip) || state.hosts.some(function(h) { return h.ip === r.ip; })) return;
-            state.hosts.push({ ip: r.ip, alias: r.alias || '', code: r.code || '' });
+            if ((r.kind === 'p1' || r.kind === 'rtsps') && !r.code) return;
+            state.hosts.push({ ip: r.ip, alias: r.alias || '', code: r.code || '', kind: r.kind || 'auto' });
             state.active.push(r.ip);
             save(); render();
         });

@@ -3,6 +3,7 @@
 #include <wx/panel.h>
 
 class wxWebView;
+class wxWebViewEvent;
 
 namespace Slic3r {
 namespace GUI {
@@ -14,6 +15,8 @@ public:
     StreamPanel(wxWindow* parent);
 
 private:
+    void OnScriptMessage(wxWebViewEvent& evt);
+
     wxWebView* m_browser { nullptr };
 };
 

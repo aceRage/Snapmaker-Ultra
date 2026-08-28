@@ -40,6 +40,7 @@
 #include "I18N.hpp"
 #include "GLCanvas3D.hpp"
 #include "Plater.hpp"
+#include "BambuCamRelay.hpp"
 #include "WebViewDialog.hpp"
 #include "../Utils/Process.hpp"
 #include "format.hpp"
@@ -1019,6 +1020,7 @@ void MainFrame::shutdown(bool isRecreate)
     Slic3r::set_backup_callback(nullptr);
     if (m_autosave_timer != nullptr)
         m_autosave_timer->Stop();
+    Go2RtcLauncher::get().stop();
 #ifdef _WIN32
 	if (m_hDeviceNotify) {
 		::UnregisterDeviceNotification(HDEVNOTIFY(m_hDeviceNotify));

@@ -1,0 +1,1 @@
+go2rtc v1.9.14 (https://github.com/AlexxIT/go2rtc), MIT License. Bundled unmodified for RTSPS camera relay (Bambu X1/H2 LAN Liveview).
