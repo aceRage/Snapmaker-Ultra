@@ -884,7 +884,7 @@ wxMenuItem* MenuFactory::append_menu_item_fix_through_netfabb(wxMenu* menu)
     // Ultra: local OpenVDB voxel repair - always available, works on any platform,
     // and handles meshes the Windows repair service rejects. The original Windows
     // "Fix model" stays below as the conservative alternative.
-    append_menu_item(menu, wxID_ANY, _L("Repair/Fix"), _L("Rebuild the selected parts as watertight meshes (detail below ~0.1mm may be lost)"),
+    append_menu_item(menu, wxID_ANY, _L("Repair/Remesh"), _L("Rebuild the selected parts as watertight meshes (detail below ~0.1mm may be lost)"),
         [](wxCommandEvent&) { obj_list()->repair_by_remesh(); }, "", menu,
         []() {
             std::vector<int> obj_idxs, vol_idxs;
