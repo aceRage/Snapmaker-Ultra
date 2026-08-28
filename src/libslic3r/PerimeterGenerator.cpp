@@ -507,6 +507,27 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
             extrusion_paths_append(paths, *extrusion, role, is_external ? perimeter_generator.ext_perimeter_flow : perimeter_generator.perimeter_flow);
         }
 
+        // Ultra: offset layers - odd walls print raised by half a layer; the first
+        // offset layer over-extrudes to bond down, the second-to-last under-extrudes
+        // so the (flat) top layers close cleanly.
+        auto check_and_offset_path = [&perimeter_generator](ExtrusionPath& cur_path) {
+            bool was_offset = false;
+            if (perimeter_generator.layer_id == 1 && perimeter_generator.number_of_layers >= 4) {
+                cur_path.extrusion_multiplier = 1.5f;
+                was_offset = true;
+            } else if (perimeter_generator.layer_id == int(perimeter_generator.number_of_layers) - 2 &&
+                       perimeter_generator.number_of_layers >= 4) {
+                cur_path.extrusion_multiplier = 0.5f;
+                was_offset = true;
+            }
+            if (perimeter_generator.layer_id != int(perimeter_generator.number_of_layers) - 2 &&
+                perimeter_generator.number_of_layers >= 4) {
+                cur_path.z_offset = 0.5f;
+                was_offset = true;
+            }
+            return was_offset;
+        };
+
         // Append paths to collection.
         if (!paths.empty()) {
             const int inset_idx = int(extrusion->inset_idx);
@@ -523,6 +544,12 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
                     assert(std::prev(it)->polyline.last_point() == it->polyline.first_point());
                 }
                 assert(extrusion_loop.paths.front().first_point() == extrusion_loop.paths.back().last_point());
+
+                // Ultra: offset layers - odd walls are raised by half the layer height
+                if (extrusion->inset_idx % 2 == 1 && perimeter_generator.config->offset_layers) {
+                    for (ExtrusionPath& cur_path : extrusion_loop.paths)
+                        check_and_offset_path(cur_path);
+                }
 
                 extrusion_loop.inset_idx = inset_idx;
                 extrusion_coll.append(std::move(extrusion_loop));
@@ -546,6 +573,12 @@ static ExtrusionEntityCollection traverse_extrusions(const PerimeterGenerator& p
                         multi_path.inset_idx = inset_idx;
                     }
                     multi_path.paths.emplace_back(std::move(*it_path));
+                }
+
+                // Ultra: offset layers - odd walls are raised by half the layer height
+                if (extrusion->inset_idx % 2 == 1 && perimeter_generator.config->offset_layers) {
+                    for (ExtrusionPath& cur_path : multi_path.paths)
+                        check_and_offset_path(cur_path);
                 }
 
                 extrusion_coll.append(ExtrusionMultiPath(std::move(multi_path)));
@@ -2350,8 +2383,16 @@ void PerimeterGenerator::process_arachne()
             }
         }
 
+        // Ultra: offset layers - raised (odd) walls must print after the flat ones.
+        if (this->config->offset_layers) {
+            std::sort(ordered_extrusions.begin(), ordered_extrusions.end(),
+                [](const PerimeterGeneratorArachneExtrusion& a, const PerimeterGeneratorArachneExtrusion& b) -> bool {
+                    return a.extrusion->inset_idx % 2 <= b.extrusion->inset_idx % 2;
+                });
+        }
+
        // printf("New Layer: Layer ID %d\n",layer_id); //debug - new layer
-        if (this->config->wall_sequence == WallSequence::InnerOuterInner && layer_id > 0) { // only enable inner outer inner algorithm after first layer
+        if (this->config->wall_sequence == WallSequence::InnerOuterInner && layer_id > 0 && !this->config->offset_layers) { // only enable inner outer inner algorithm after first layer
             if (ordered_extrusions.size() > 2) { // 3 walls minimum needed to do inner outer inner ordering
                 int position = 0; // index to run the re-ordering for multiple external perimeters in a single island.
                 int arr_i, arr_j = 0;    // indexes to run through the walls in the for loops

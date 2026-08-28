@@ -488,6 +488,35 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
     }
     
     bool have_arachne = config->opt_enum<PerimeterGeneratorType>("wall_generator") == PerimeterGeneratorType::Arachne;
+
+    // Ultra: offset layers has strict prerequisites (Arachne, equal first/layer height,
+    // matching top-surface/outer-wall line widths, no spiral mode).
+    if (!is_plate_config && config->opt_bool("offset_layers") &&
+        (std::abs(config->opt_float("initial_layer_print_height") - config->opt_float("layer_height")) > EPSILON ||
+         !(*config->option<ConfigOptionFloatOrPercent>("top_surface_line_width") == *config->option<ConfigOptionFloatOrPercent>("outer_wall_line_width")) ||
+         !have_arachne || config->opt_bool("spiral_mode"))) {
+        wxString msg_text = _(L("Offset layers is experimental and requires: first layer height equal to layer height, "
+                                "top surface line width equal to outer wall line width, the Arachne wall generator, and spiral mode off."));
+        msg_text += "\n\n" + _(L("Change these settings automatically?\n"
+                                 "Yes - Adjust the settings and enable offset layers\n"
+                                 "No  - Keep the settings and disable offset layers"));
+        MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxYES | wxNO);
+        DynamicPrintConfig new_conf = *config;
+        is_msg_dlg_already_exist = true;
+        auto answer = dialog.ShowModal();
+        if (answer == wxID_YES) {
+            new_conf.set_key_value("initial_layer_print_height", config->option<ConfigOptionFloat>("layer_height")->clone());
+            new_conf.set_key_value("top_surface_line_width", config->option<ConfigOptionFloatOrPercent>("outer_wall_line_width")->clone());
+            new_conf.set_key_value("wall_generator", new ConfigOptionEnum<PerimeterGeneratorType>(PerimeterGeneratorType::Arachne));
+            new_conf.set_key_value("spiral_mode", new ConfigOptionBool(false));
+        } else {
+            new_conf.set_key_value("offset_layers", new ConfigOptionBool(false));
+        }
+        apply(config, &new_conf);
+        is_msg_dlg_already_exist = false;
+        have_arachne = config->opt_enum<PerimeterGeneratorType>("wall_generator") == PerimeterGeneratorType::Arachne;
+    }
+
     if (config->opt_enum<FuzzySkinMode>("fuzzy_skin_mode") != FuzzySkinMode::Displacement && !have_arachne) {
         wxString msg_text = _(L("Both [Extrusion] and [Combined] modes of Fuzzy Skin require the Arachne Wall Generator to be enabled."));
         msg_text += "\n\n" + _(L("Change these settings automatically?\n"
