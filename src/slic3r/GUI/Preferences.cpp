@@ -1334,9 +1334,8 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_enable_plugin = create_item_checkbox(_L("Enable network plugin"), page, _L("Enable network plugin"), 50, "installed_networking");
     auto item_legacy_network_plugin = create_item_checkbox(_L("Use legacy network plugin (Takes effect after restarting Orca)"), page, _L("Disable to use latest network plugin that supports new BambuLab firmwares."), 50, "legacy_networking");
     */
-    app_config->set_bool("stealth_mode", true);
-    app_config->set_bool("installed_networking", false);
-    app_config->save();
+    // Ultra: the SM Beta force-off of the Bambu network plugin is lifted; both
+    // switches now live on the Ultra tab (Bambu Network section) as opt-ins.
 
 
     //auto item_check_stable_version_only = create_item_checkbox(_L("Check for stable updates only"), page, _L("Check for stable updates only"), 50, "check_stable_update_only");
@@ -1587,6 +1586,14 @@ wxWindow* PreferencesDialog::create_ultra_page()
     auto item_auto_shadow = create_item_checkbox(_L("Seamless System Filament Edits"), page,
         _L("Saving a modified system preset silently saves and selects \"<name> - Custom\" instead of asking for a new name every time."), 50, "auto_shadow_system_presets");
 
+    auto title_bambu = create_item_title(_L("Bambu Network"), page, _L("Bambu Network"));
+    auto item_bambu_plugin = create_item_checkbox(_L("Enable Bambu network plugin"), page,
+        _L("Connect to Bambu Lab printers (cloud login or LAN). The plug-in is downloaded from Bambu on first use; takes effect after restarting."), 50, "installed_networking");
+    auto item_bambu_stealth = create_item_checkbox(_L("Stealth mode (no Bambu cloud telemetry)"), page,
+        _L("Stops data transmission to Bambu's cloud services. Safe to enable for LAN-only use; disable it to sign in to a Bambu account."), 50, "stealth_mode");
+    auto item_bambu_legacy = create_item_checkbox(_L("Use legacy network plugin"), page,
+        _L("Use the older plug-in for printers on old Bambu firmware. Takes effect after restarting."), 50, "legacy_networking");
+
     auto title_spoolman = create_item_title(_L("Spool Manager"), page, _L("Spool Manager"));
     auto item_spoolman_enabled = create_item_checkbox(_L("Enable Spoolman integration"), page,
         _L("Connect to a self-hosted Spoolman server for spool inventory and filament-usage tracking."), 50, "spoolman_enabled");
@@ -1605,6 +1612,10 @@ wxWindow* PreferencesDialog::create_ultra_page()
     sizer_page->Add(title_presets, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_prefer_last_print, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_auto_shadow, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(title_bambu, 0, wxTOP | wxEXPAND, FromDIP(20));
+    sizer_page->Add(item_bambu_plugin, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_bambu_stealth, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_bambu_legacy, 0, wxTOP, FromDIP(3));
     sizer_page->Add(title_spoolman, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_spoolman_enabled, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_spoolman_url, 0, wxTOP, FromDIP(3));
