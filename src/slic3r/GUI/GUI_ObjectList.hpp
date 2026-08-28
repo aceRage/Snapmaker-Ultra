@@ -426,6 +426,8 @@ public:
     void rename_item();
     void fix_through_netfabb();
     void repair_by_remesh();
+    void toggle_visibility_state(const wxDataViewItem& item);
+    void update_visibility_icons();
     void simplify();
     void update_item_error_icon(const int obj_idx, int vol_idx) const ;
 

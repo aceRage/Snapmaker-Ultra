@@ -409,6 +409,7 @@ void ObjectList::create_objects_ctrl()
     m_columns_width.resize(colCount);
     m_columns_width[colName] = 22;
     m_columns_width[colPrint] = 3;
+    m_columns_width[colVisibility] = 3;
     m_columns_width[colFilament] = 5;
     m_columns_width[colSupportPaint] = 3;
     m_columns_width[colSinking] = 3;
@@ -431,6 +432,10 @@ void ObjectList::create_objects_ctrl()
 
     // column PrintableProperty (Icon) of the view control:
     AppendBitmapColumn(" ", colPrint, wxOSX ? wxDATAVIEW_CELL_EDITABLE : wxDATAVIEW_CELL_INERT, m_columns_width[colPrint]*em,
+        wxALIGN_CENTER_HORIZONTAL, 0);
+
+    // Ultra: per-item view mode (Normal/Ghost/Hidden) eye toggle
+    AppendBitmapColumn(" ", colVisibility, wxOSX ? wxDATAVIEW_CELL_EDITABLE : wxDATAVIEW_CELL_INERT, m_columns_width[colVisibility]*em,
         wxALIGN_CENTER_HORIZONTAL, 0);
 
     // column Extruder of the view control:
@@ -5640,6 +5645,60 @@ void ObjectList::rename_item()
         update_name_in_model(item);
 }
 
+// Ultra: cycle the clicked row's view mode Normal -> Ghost -> Hidden -> Normal.
+void ObjectList::toggle_visibility_state(const wxDataViewItem& item)
+{
+    if (!item.IsOk())
+        return;
+    const ItemType type = m_objects_model->GetItemType(item);
+    if (!(type & (itObject | itVolume)))
+        return;
+    const int obj_idx = m_objects_model->GetObjectIdByItem(item);
+    if (obj_idx < 0 || obj_idx >= (int) m_objects->size())
+        return;
+    ModelObject* mo = object(obj_idx);
+    size_t target_id = mo->id().id;
+    if (type & itVolume) {
+        const int vol_idx = m_objects_model->GetVolumeIdByItem(item);
+        if (vol_idx < 0 || vol_idx >= (int) mo->volumes.size())
+            return;
+        target_id = mo->volumes[vol_idx]->id().id;
+    }
+    GLCanvas3D* canvas = wxGetApp().plater()->get_view3D_canvas3D();
+    if (canvas == nullptr)
+        return;
+    const int next = (int(canvas->get_object_view_mode(target_id)) + 1) % 3;
+    canvas->set_object_view_mode(target_id, GLCanvas3D::ObjectViewMode(next));
+    ObjectDataViewModelNode* node = static_cast<ObjectDataViewModelNode*>(item.GetID());
+    node->set_visibility_icon(next);
+    m_objects_model->ItemChanged(item);
+}
+
+// Ultra: resync every row's eye icon with the canvas view-mode map.
+void ObjectList::update_visibility_icons()
+{
+    GLCanvas3D* canvas = wxGetApp().plater() != nullptr ? wxGetApp().plater()->get_view3D_canvas3D() : nullptr;
+    if (canvas == nullptr || m_objects == nullptr)
+        return;
+    for (size_t obj_idx = 0; obj_idx < m_objects->size(); ++obj_idx) {
+        ModelObject* mo = (*m_objects)[obj_idx];
+        wxDataViewItem obj_item = m_objects_model->GetItemById(int(obj_idx));
+        if (obj_item.IsOk()) {
+            auto* node = static_cast<ObjectDataViewModelNode*>(obj_item.GetID());
+            node->set_visibility_icon(int(canvas->get_object_view_mode(mo->id().id)));
+            m_objects_model->ItemChanged(obj_item);
+        }
+        for (size_t vol_idx = 0; vol_idx < mo->volumes.size(); ++vol_idx) {
+            wxDataViewItem vol_item = m_objects_model->GetItemByVolumeId(int(obj_idx), int(vol_idx));
+            if (vol_item.IsOk()) {
+                auto* node = static_cast<ObjectDataViewModelNode*>(vol_item.GetID());
+                node->set_visibility_icon(int(canvas->get_object_view_mode(mo->volumes[vol_idx]->id().id)));
+                m_objects_model->ItemChanged(vol_item);
+            }
+        }
+    }
+}
+
 // Ultra: robust local repair - rebuild each selected part from its signed distance
 // field (OpenVDB voxel remesh). Always produces a watertight manifold mesh; detail
 // below the voxel size is lost. Complements the Windows-only "Fix model".
@@ -5943,6 +6002,9 @@ void ObjectList::OnEditingStarted(wxDataViewEvent &event)
     auto item = event.GetItem();
     if (col == colPrint) {
         toggle_printable_state();
+        return;
+    } else if (col == colVisibility) {
+        toggle_visibility_state(item);
         return;
     } else if (col == colSupportPaint) {
         ObjectDataViewModelNode* node = (ObjectDataViewModelNode*)item.GetID();

@@ -1161,17 +1161,24 @@ void MenuFactory::append_menu_item_merge_to_multipart_object(wxMenu* menu)
 // Ultra: per-object Normal/Ghost/Hidden view modes for the Prepare view.
 void MenuFactory::append_menu_items_visibility(wxMenu* menu)
 {
+    // Resolves to a ModelVolume id when a part is selected, else the ModelObject id.
     auto selected_object_id = []() -> std::pair<bool, size_t> {
-        const int idx = obj_list()->get_selected_obj_idx();
+        std::vector<int> obj_idxs, vol_idxs;
+        obj_list()->get_selection_indexes(obj_idxs, vol_idxs);
         const auto& objects = plater()->model().objects;
-        if (idx < 0 || idx >= (int) objects.size())
-            return { false, 0 };
-        return { true, objects[idx]->id().id };
+        if (!vol_idxs.empty() && obj_idxs.size() == 1 && obj_idxs.front() >= 0 && obj_idxs.front() < (int) objects.size() &&
+            vol_idxs.front() >= 0 && vol_idxs.front() < (int) objects[obj_idxs.front()]->volumes.size())
+            return { true, objects[obj_idxs.front()]->volumes[vol_idxs.front()]->id().id };
+        if (!obj_idxs.empty() && obj_idxs.front() >= 0 && obj_idxs.front() < (int) objects.size())
+            return { true, objects[obj_idxs.front()]->id().id };
+        return { false, 0 };
     };
     auto set_mode = [selected_object_id](GLCanvas3D::ObjectViewMode mode) {
         auto sel = selected_object_id();
-        if (sel.first)
+        if (sel.first) {
             plater()->canvas3D()->set_object_view_mode(sel.second, mode);
+            obj_list()->update_visibility_icons();
+        }
     };
     wxMenu* vis = new wxMenu();
     append_menu_item(vis, wxID_ANY, _L("Normal"), _L("Show this object normally"),
@@ -1185,7 +1192,7 @@ void MenuFactory::append_menu_items_visibility(wxMenu* menu)
         [selected_object_id]() { return selected_object_id().first; }, m_parent);
     vis->AppendSeparator();
     append_menu_item(vis, wxID_ANY, _L("Show all objects"), _L("Reset every object back to normal visibility"),
-        [](wxCommandEvent&) { plater()->canvas3D()->clear_object_view_modes(); }, "", nullptr,
+        [](wxCommandEvent&) { plater()->canvas3D()->clear_object_view_modes(); obj_list()->update_visibility_icons(); }, "", nullptr,
         []() { return plater()->canvas3D()->has_object_view_modes(); }, m_parent);
     append_submenu(menu, vis, wxID_ANY, _L("Visibility"), _L("Per-object view mode in the Prepare view"), "",
         []() { return true; }, m_parent);
@@ -1493,6 +1500,8 @@ void MenuFactory::create_part_menu()
     append_menu_item_export_stl(menu);
     append_menu_item_fix_through_netfabb(menu);
     append_menu_items_mirror(menu);
+    // Ultra: per-part visibility inside assemblies
+    append_menu_items_visibility(menu);
     // "Separate": extract this one part into its own object, keeping its position
     // (single-part variant of Assemble Separately; same implementation).
     append_menu_item(menu, wxID_ANY, _L("Separate"), _L("Move this part into a new object, keeping its position in space"),

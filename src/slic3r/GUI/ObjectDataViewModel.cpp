@@ -209,6 +209,12 @@ void ObjectDataViewModelNode::set_printable_icon(PrintIndicator printable)
                        create_scaled_bitmap(m_printable == piPrintable ? "check_on" : "check_off_focused");
 }
 
+void ObjectDataViewModelNode::set_visibility_icon(int mode)
+{
+    m_visibility = mode;
+    m_visibility_icon = create_scaled_bitmap(mode == 2 ? "eye_closed" : mode == 1 ? "eye_ghost" : "eye_open");
+}
+
 void ObjectDataViewModelNode::set_action_icon(bool enable)
 {
     if (m_action_enable == enable)
@@ -318,6 +324,9 @@ bool ObjectDataViewModelNode::SetValue(const wxVariant& variant, unsigned col)
     {
     case colPrint:
         m_printable_icon << variant;
+        return true;
+    case colVisibility:
+        m_visibility_icon << variant;
         return true;
     case colName: {
         DataViewBitmapText data;
@@ -1765,6 +1774,11 @@ void ObjectDataViewModel::GetValue(wxVariant &variant, const wxDataViewItem &ite
 	{
 	case colPrint:
 		variant << node->m_printable_icon;
+		break;
+	case colVisibility:
+		if (!node->m_visibility_icon.IsOk())
+			node->set_visibility_icon(node->m_visibility);
+		variant << node->m_visibility_icon;
 		break;
 	case colName:
         variant << DataViewBitmapText(node->m_name, node->m_bmp);

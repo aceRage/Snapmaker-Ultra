@@ -39,6 +39,7 @@ enum ColumnNumber
 {
     colName         = 0,    // item name
     colPrint           ,    // printable property
+    colVisibility      ,    // Ultra: Normal/Ghost/Hidden view mode
     colFilament        ,    // extruder selection
     // BBS
     colSupportPaint    ,
@@ -94,6 +95,9 @@ class ObjectDataViewModelNode
     wxBitmap                        m_sinking_icon;
     PrintIndicator                  m_printable {piUndef};
     wxBitmap                        m_printable_icon;
+    // Ultra: 0=Normal 1=Ghost 2=Hidden (mirrors GLCanvas3D::ObjectViewMode)
+    int                             m_visibility { 0 };
+    wxBitmap                        m_visibility_icon;
     std::string                     m_warning_icon_name{ "" };
     bool                            m_has_lock{false};  // for cut object icon
 
@@ -285,6 +289,8 @@ public:
     void        set_extruder_icon();
 	// Set printable icon for node
     void        set_printable_icon(PrintIndicator printable);
+    void        set_visibility_icon(int mode);
+    int         get_visibility() const { return m_visibility; }
     void        set_action_icon(bool enable);
     // BBS
     void        set_color_icon(bool enable);

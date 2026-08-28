@@ -1469,11 +1469,18 @@ void GLCanvas3D::set_object_view_mode(size_t object_id, ObjectViewMode mode)
         m_object_view_modes.erase(object_id);
     else
         m_object_view_modes[object_id] = mode;
-    // Reset this object's volumes so a downgrade (Hidden -> Ghost/Normal) takes effect.
+    // Reset affected volumes so a downgrade (Hidden -> Ghost/Normal) takes effect.
+    // The id may name a whole ModelObject or a single ModelVolume (shared id space).
     if (m_model != nullptr) {
         for (GLVolume* v : m_volumes.volumes) {
             const int oi = v->object_idx();
-            if (oi >= 0 && oi < (int) m_model->objects.size() && m_model->objects[oi]->id().id == object_id) {
+            if (oi < 0 || oi >= (int) m_model->objects.size())
+                continue;
+            const ModelObject* mo = m_model->objects[oi];
+            const int vi = v->volume_idx();
+            const bool match = mo->id().id == object_id ||
+                               (vi >= 0 && vi < (int) mo->volumes.size() && mo->volumes[vi]->id().id == object_id);
+            if (match) {
                 v->is_active = true;
                 v->ghost     = false;
             }
@@ -1505,18 +1512,29 @@ void GLCanvas3D::apply_object_view_modes()
 {
     if (m_object_view_modes.empty() || m_model == nullptr)
         return;
-    // Drop entries whose objects no longer exist.
+    // Drop entries whose objects/volumes no longer exist.
     for (auto it = m_object_view_modes.begin(); it != m_object_view_modes.end();) {
         bool live = false;
-        for (const ModelObject* mo : m_model->objects)
+        for (const ModelObject* mo : m_model->objects) {
             if (mo->id().id == it->first) { live = true; break; }
+            for (const ModelVolume* mv : mo->volumes)
+                if (mv->id().id == it->first) { live = true; break; }
+            if (live) break;
+        }
         it = live ? std::next(it) : m_object_view_modes.erase(it);
     }
     for (GLVolume* v : m_volumes.volumes) {
         const int oi = v->object_idx();
         if (oi < 0 || oi >= (int) m_model->objects.size())
             continue;
-        auto it = m_object_view_modes.find(m_model->objects[oi]->id().id);
+        const ModelObject* mo = m_model->objects[oi];
+        // A volume-specific entry wins over the object-level one.
+        auto it = m_object_view_modes.end();
+        const int vi = v->volume_idx();
+        if (vi >= 0 && vi < (int) mo->volumes.size())
+            it = m_object_view_modes.find(mo->volumes[vi]->id().id);
+        if (it == m_object_view_modes.end())
+            it = m_object_view_modes.find(mo->id().id);
         if (it == m_object_view_modes.end()) {
             v->ghost = false; // never force is_active here: gizmos own scope-hiding
             continue;
