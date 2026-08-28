@@ -116,7 +116,12 @@ void fuzzy_extrusion_line(Arachne::ExtrusionJunctions& ext_lines, coordf_t slice
 
     const double min_dist_between_points = cfg.point_distance * 3. / 4.; // hardcoded: the point distance may vary between 3/4 and 5/4 the supplied value
     const double range_random_point_dist = cfg.point_distance / 2.;
-    const double min_extrusion_width = 0.01; // workaround for many print options. Need overwrite formula with the layer height parameter. The width must more than >>> layer_height * (1 - 0.25 * PI) * 1.05 <<< (last num is the coeff of overlay error case)
+    // Ultra fix: this floor is applied to SCALED widths, so it must be a scaled value.
+    // The previous raw 0.01 (four orders of magnitude below SCALED_EPSILON) allowed
+    // negative noise excursions to clamp junction widths to effectively zero,
+    // producing degenerate near-zero-flow segments that print as distinct dots on
+    // outer walls in Extrusion/Combined mode. Matches BambuStudio's fixed port.
+    const double min_extrusion_width = scaled<double>(0.01);
     double dist_left_over = random_value() * (min_dist_between_points / 2.); // the distance to be traversed on the line before making the first new point
 
     auto* p0 = &ext_lines.front();
