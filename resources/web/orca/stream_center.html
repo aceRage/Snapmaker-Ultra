@@ -259,11 +259,40 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             var edit = document.createElement('span');
             edit.className = 'icon';
             edit.textContent = '✎';
-            edit.title = 'Set alias';
+            edit.title = 'Edit printer';
             edit.onclick = function(e) {
                 e.stopPropagation();
-                showModal({ title: 'Alias for ' + h.ip, fields: [{ key: 'alias', label: 'Alias (empty to clear)', value: h.alias || '' }] }, function(r) {
-                    if (r !== null) { h.alias = r.alias; save(); render(); }
+                showModal({
+                    title: 'Edit ' + (h.alias || h.ip),
+                    fields: [
+                        { key: 'ip', label: 'IP address, hostname, or full stream URL (http/rtsp)', value: h.ip },
+                        { key: 'alias', label: 'Alias (empty to clear)', value: h.alias || '' },
+                        { key: 'kind', label: 'Printer type', type: 'select', value: h.kind || 'auto', options: [
+                            { value: 'auto',  label: 'Snapmaker / direct stream URL' },
+                            { value: 'p1',    label: 'Bambu P1 / A1 (needs access code)' },
+                            { value: 'rtsps', label: 'Bambu X1 / H2 (needs access code + LAN Liveview on)' },
+                            { value: 'flashforge', label: 'Flashforge (Creator 5 / Adventurer 5M family)' }
+                        ] },
+                        { key: 'code', label: 'LAN access code (Bambu printers only)', value: h.code || '' }
+                    ]
+                }, function(r) {
+                    if (r === null || !r.ip || !validHost(r.ip)) return;
+                    if (r.ip !== h.ip && state.hosts.some(function(x) { return x.ip === r.ip; })) return;
+                    if ((r.kind === 'p1' || r.kind === 'rtsps') && !r.code) return;
+                    var oldIp = h.ip;
+                    h.ip = r.ip; h.alias = r.alias; h.kind = r.kind; h.code = r.code;
+                    if (oldIp !== h.ip) {
+                        var ai = state.active.indexOf(oldIp);
+                        if (ai !== -1) state.active[ai] = h.ip;
+                    }
+                    // Drop cached probe/relay state and the live cell so the new settings take effect.
+                    delete ffUrls[oldIp]; delete ffUrls[h.ip];
+                    delete go2rtcStreams[oldIp.replace(/[^A-Za-z0-9]/g, '_')];
+                    delete go2rtcStreams[h.ip.replace(/[^A-Za-z0-9]/g, '_')];
+                    document.querySelectorAll('#grid .cell').forEach(function(cell) {
+                        if (cell.dataset.ip === oldIp || cell.dataset.ip === h.ip) cell.remove();
+                    });
+                    save(); render();
                 });
             };
             c.appendChild(edit);
