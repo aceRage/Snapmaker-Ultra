@@ -25,6 +25,7 @@
 #include "MainFrame.hpp"
 #include "GUI_App.hpp"
 #include "GUI_ObjectList.hpp"
+#include "ParamsPanel.hpp"
 #include "GUI_Colors.hpp"
 #include "Mouse3DController.hpp"
 #include "I18N.hpp"
@@ -4695,6 +4696,37 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
                     m_gizmos.open_gizmo(GLGizmosManager::EType::Svg);
                 wxGetApp().obj_list()->update_selections();
                 return;
+            }
+        }
+
+        // BBS-style double click: select the individual part under the cursor (switching
+        // to volume selection mode inside multi-part objects) and bring up the object list.
+        if (m_hover_volume_idxs.size() == 1 && m_canvas_type == ECanvasType::CanvasView3D) {
+            const int hover_volume_id = get_first_hover_volume_idx();
+            if (hover_volume_id >= 0 && static_cast<size_t>(hover_volume_id) < m_volumes.volumes.size()) {
+                const GLVolume &hover_gl_volume = *m_volumes.volumes[hover_volume_id];
+                const int       object_idx      = hover_gl_volume.object_idx();
+                if (object_idx >= 0 && static_cast<size_t>(object_idx) < m_model->objects.size()) {
+                    const ModelObject *hover_object     = m_model->objects[object_idx];
+                    const int          hover_volume_idx = hover_gl_volume.volume_idx();
+                    if (hover_volume_idx >= 0 && static_cast<size_t>(hover_volume_idx) < hover_object->volumes.size()) {
+                        const size_t part_count = hover_object->volumes.size();
+                        if (!(part_count == 1 && m_selection.is_single_full_object())) {
+                            m_selection.add_volumes(Selection::EMode::Volume, {(unsigned) hover_volume_id});
+                            if (part_count >= 2) {
+                                m_selection.unlock_volume_selection_mode();
+                                m_selection.set_volume_selection_mode(Selection::Volume);
+                            }
+                            m_gizmos.refresh_on_off_state();
+                            m_gizmos.update_data();
+                            post_event(SimpleEvent(EVT_GLCANVAS_OBJECT_SELECT));
+                            wxGetApp().obj_list()->update_selections();
+                            wxGetApp().params_panel()->switch_to_object();
+                            m_dirty = true;
+                            return;
+                        }
+                    }
+                }
             }
         }
     }
