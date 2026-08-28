@@ -301,7 +301,7 @@ public:
     void                split();
     void                merge(bool to_multipart_object);
     void                assemble_separately(); // extract selected parts into a new object, keeping world positions
-    // void                merge_volumes(); // BBS: merge parts to single part
+    void                merge_volumes(); // BBS: merge parts to single part
     void                layers_editing();
 
     void                boolean();    // BBS: Boolean Operation of parts
