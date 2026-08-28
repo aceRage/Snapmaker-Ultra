@@ -1461,6 +1461,76 @@ void GLCanvas3D::toggle_sla_auxiliaries_visibility(bool visible, const ModelObje
     }
 }
 
+// Ultra: per-object Normal/Ghost/Hidden view modes -------------------------------------
+
+void GLCanvas3D::set_object_view_mode(size_t object_id, ObjectViewMode mode)
+{
+    if (mode == ObjectViewMode::Normal)
+        m_object_view_modes.erase(object_id);
+    else
+        m_object_view_modes[object_id] = mode;
+    // Reset this object's volumes so a downgrade (Hidden -> Ghost/Normal) takes effect.
+    if (m_model != nullptr) {
+        for (GLVolume* v : m_volumes.volumes) {
+            const int oi = v->object_idx();
+            if (oi >= 0 && oi < (int) m_model->objects.size() && m_model->objects[oi]->id().id == object_id) {
+                v->is_active = true;
+                v->ghost     = false;
+            }
+        }
+    }
+    apply_object_view_modes();
+    m_dirty = true;
+    request_extra_frame();
+}
+
+GLCanvas3D::ObjectViewMode GLCanvas3D::get_object_view_mode(size_t object_id) const
+{
+    auto it = m_object_view_modes.find(object_id);
+    return it == m_object_view_modes.end() ? ObjectViewMode::Normal : it->second;
+}
+
+void GLCanvas3D::clear_object_view_modes()
+{
+    for (GLVolume* v : m_volumes.volumes) {
+        v->is_active = true;
+        v->ghost     = false;
+    }
+    m_object_view_modes.clear();
+    m_dirty = true;
+    request_extra_frame();
+}
+
+void GLCanvas3D::apply_object_view_modes()
+{
+    if (m_object_view_modes.empty() || m_model == nullptr)
+        return;
+    // Drop entries whose objects no longer exist.
+    for (auto it = m_object_view_modes.begin(); it != m_object_view_modes.end();) {
+        bool live = false;
+        for (const ModelObject* mo : m_model->objects)
+            if (mo->id().id == it->first) { live = true; break; }
+        it = live ? std::next(it) : m_object_view_modes.erase(it);
+    }
+    for (GLVolume* v : m_volumes.volumes) {
+        const int oi = v->object_idx();
+        if (oi < 0 || oi >= (int) m_model->objects.size())
+            continue;
+        auto it = m_object_view_modes.find(m_model->objects[oi]->id().id);
+        if (it == m_object_view_modes.end()) {
+            v->ghost = false; // never force is_active here: gizmos own scope-hiding
+            continue;
+        }
+        if (it->second == ObjectViewMode::Hidden) {
+            v->is_active = false;
+            v->ghost     = false;
+        } else if (it->second == ObjectViewMode::Ghost) {
+            v->ghost = true;
+        }
+    }
+    m_dirty = true;
+}
+
 void GLCanvas3D::toggle_model_objects_visibility(bool visible, const ModelObject* mo, int instance_idx, const ModelVolume* mv)
 {
     std::vector<std::shared_ptr<SceneRaycasterItem>>* raycasters = get_raycasters_for_picking(SceneRaycaster::EType::Volume);
@@ -1514,6 +1584,9 @@ void GLCanvas3D::toggle_model_objects_visibility(bool visible, const ModelObject
 
     if (!mo && visible)
         _set_warning_notification(EWarning::SomethingNotShown, false);
+
+    // Ultra: re-assert Ghost/Hidden view modes after gizmo scope-hiding changes.
+    apply_object_view_modes();
 }
 
 void GLCanvas3D::update_instance_printable_state_for_object(const size_t obj_idx)
@@ -2975,6 +3048,9 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
     m_scene_raycaster.remove_raycasters(SceneRaycaster::EType::FallbackGizmo);
     if (curr_gizmo != nullptr && !m_selection.is_empty())
         curr_gizmo->register_raycasters_for_picking();
+
+    // Ultra: volumes were rebuilt; re-apply Ghost/Hidden view modes.
+    apply_object_view_modes();
 
     // and force this canvas to be redrawn.
     m_dirty = true;
@@ -7989,7 +8065,7 @@ void GLCanvas3D::_render_volumes_for_picking(const Camera& camera) const
     for (size_t type = 0; type < 2; ++ type) {
         GLVolumeWithIdAndZList to_render = volumes_to_render(m_volumes.volumes, (type == 0) ? GLVolumeCollection::ERenderType::Opaque : GLVolumeCollection::ERenderType::Transparent, view_matrix);
         for (const GLVolumeWithIdAndZ& volume : to_render)
-	        if (!volume.first->disabled && (volume.first->composite_id.volume_id >= 0 || m_render_sla_auxiliaries)) {
+	        if (!volume.first->disabled && !volume.first->ghost && (volume.first->composite_id.volume_id >= 0 || m_render_sla_auxiliaries)) {
 		        // Object picking mode. Render the object with a color encoding the object index.
                 // we reserve color = (0,0,0) for occluders (as the printbed)
                 // so we shift volumes' id by 1 to get the proper color

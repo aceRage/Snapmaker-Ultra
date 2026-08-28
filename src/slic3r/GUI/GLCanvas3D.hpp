@@ -591,6 +591,8 @@ private:
     // Following variable is obsolete and it should be safe to remove it.
     // I just don't want to do it now before a release (Lukas Matena 24.3.2019)
     bool m_render_sla_auxiliaries;
+    // Ultra: per-object view modes (Normal entries are not stored)
+    std::map<size_t, ObjectViewMode> m_object_view_modes;
 
     std::string m_color_by;
 
@@ -760,6 +762,14 @@ public:
         CanvasDestruction
     };
     void reset_volumes(ResetVolumesMode mode = ResetVolumesMode::Normal);
+
+    // Ultra: per-object view modes in the Prepare view (session-only, keyed by ModelObject id).
+    enum class ObjectViewMode : int { Normal = 0, Ghost = 1, Hidden = 2 };
+    void set_object_view_mode(size_t object_id, ObjectViewMode mode);
+    ObjectViewMode get_object_view_mode(size_t object_id) const;
+    bool has_object_view_modes() const { return !m_object_view_modes.empty(); }
+    void clear_object_view_modes();
+    void apply_object_view_modes();
     ModelInstanceEPrintVolumeState check_volumes_outside_state() const;
     bool is_all_plates_selected() { return m_sel_plate_toolbar.m_all_plates_stats_item && m_sel_plate_toolbar.m_all_plates_stats_item->selected; }
     const float get_scale() const;

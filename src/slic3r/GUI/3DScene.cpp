@@ -221,6 +221,7 @@ GLVolume::GLVolume(float r, float g, float b, float a)
     , force_native_color(false)
     , force_neutral_color(false)
     , force_sinking_contours(false)
+    , ghost(false)
     , picking(false)
     , tverts_range(0, size_t(-1))
 {
@@ -290,6 +291,10 @@ void GLVolume::set_render_color()
     if (!visible) {
         render_color = MODEL_HIDDEN_COL;
     }
+
+    // Ultra: Ghost view mode renders see-through
+    if (ghost)
+        render_color.a(0.35f);
 }
 
 ColorRGBA color_from_model_volume(const ModelVolume& model_volume)

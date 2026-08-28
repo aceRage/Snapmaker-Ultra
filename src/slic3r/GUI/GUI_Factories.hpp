@@ -151,6 +151,7 @@ private:
     void        append_menu_items_flush_options(wxMenu* menu);
     void        append_menu_item_merge_to_multipart_object(wxMenu *menu);
     void        append_menu_item_assemble_separately(wxMenu *menu);
+    void        append_menu_items_visibility(wxMenu *menu);
     void        append_menu_item_merge_to_single_object(wxMenu* menu);
     void        append_menu_item_merge_parts_to_single_part(wxMenu *menu);
     void        append_menu_items_mirror(wxMenu *menu);

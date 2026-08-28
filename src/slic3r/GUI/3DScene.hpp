@@ -202,6 +202,8 @@ public:
         bool                force_neutral_color : 1;
         // Whether or not to force rendering of sinking contours
         bool                force_sinking_contours : 1;
+        // Ultra: render semi-transparent and excluded from picking (per-object Ghost view mode)
+        bool                ghost : 1;
         // Is render for picking
         bool                picking : 1;
     };

@@ -1158,6 +1158,39 @@ void MenuFactory::append_menu_item_merge_to_multipart_object(wxMenu* menu)
         []() { return obj_list()->can_merge_to_multipart_object(); }, m_parent);
 }
 
+// Ultra: per-object Normal/Ghost/Hidden view modes for the Prepare view.
+void MenuFactory::append_menu_items_visibility(wxMenu* menu)
+{
+    auto selected_object_id = []() -> std::pair<bool, size_t> {
+        const int idx = obj_list()->get_selected_obj_idx();
+        const auto& objects = plater()->model().objects;
+        if (idx < 0 || idx >= (int) objects.size())
+            return { false, 0 };
+        return { true, objects[idx]->id().id };
+    };
+    auto set_mode = [selected_object_id](GLCanvas3D::ObjectViewMode mode) {
+        auto sel = selected_object_id();
+        if (sel.first)
+            plater()->canvas3D()->set_object_view_mode(sel.second, mode);
+    };
+    wxMenu* vis = new wxMenu();
+    append_menu_item(vis, wxID_ANY, _L("Normal"), _L("Show this object normally"),
+        [set_mode](wxCommandEvent&) { set_mode(GLCanvas3D::ObjectViewMode::Normal); }, "", nullptr,
+        [selected_object_id]() { return selected_object_id().first; }, m_parent);
+    append_menu_item(vis, wxID_ANY, _L("Ghost (X-ray)"), _L("Render this object see-through; clicks pass through to objects behind it"),
+        [set_mode](wxCommandEvent&) { set_mode(GLCanvas3D::ObjectViewMode::Ghost); }, "", nullptr,
+        [selected_object_id]() { return selected_object_id().first; }, m_parent);
+    append_menu_item(vis, wxID_ANY, _L("Hidden"), _L("Hide this object in the 3D view (it still slices and prints)"),
+        [set_mode](wxCommandEvent&) { set_mode(GLCanvas3D::ObjectViewMode::Hidden); }, "", nullptr,
+        [selected_object_id]() { return selected_object_id().first; }, m_parent);
+    vis->AppendSeparator();
+    append_menu_item(vis, wxID_ANY, _L("Show all objects"), _L("Reset every object back to normal visibility"),
+        [](wxCommandEvent&) { plater()->canvas3D()->clear_object_view_modes(); }, "", nullptr,
+        []() { return plater()->canvas3D()->has_object_view_modes(); }, m_parent);
+    append_submenu(menu, vis, wxID_ANY, _L("Visibility"), _L("Per-object view mode in the Prepare view"), "",
+        []() { return true; }, m_parent);
+}
+
 // Ported from BambuStudio's "Sub merge": extract the selected parts into a new assembly.
 void MenuFactory::append_menu_item_assemble_separately(wxMenu* menu)
 {
@@ -1379,6 +1412,8 @@ void MenuFactory::create_extra_object_menu()
     //append_menu_item_fill_bed(&m_object_menu);
     // Object Clone
     append_menu_item_clone(&m_object_menu);
+    // Ultra: per-object visibility (Normal / Ghost / Hidden)
+    append_menu_items_visibility(&m_object_menu);
     // Object Repair
     append_menu_item_fix_through_netfabb(&m_object_menu);
     // Object Simplify
