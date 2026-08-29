@@ -143,3 +143,41 @@ TEST_CASE("diff_layers honest about unequal layer heights", "[slice_compare]")
     LayerDiff d = diff_layers(a, b);
     CHECK(d.matched == 0); CHECK(d.a_only == 2); CHECK(d.b_only == 1);
 }
+
+// NOTE: adapted from the task-5 brief, which calls `make_result()` by value
+// and passes the result straight into build_snapshot(). The file-static
+// helper above takes an out-param (`make_result(r)`) because
+// GCodeProcessorResult holds a mutex and is not copyable/movable — same
+// intent as the brief, different call shape (see the task-4 note above).
+
+TEST_CASE("diff_segments: identical layers are all both", "[slice_compare]")
+{
+    GCodeProcessorResult result;
+    make_result(result);
+    Snapshot s = build_snapshot(result, {}, "A", "s");
+    const LayerRec& l = s.layers.at(20);
+    SegDiff d = diff_segments(l, l);
+    CHECK(d.both.size() == 4);
+    CHECK(d.a_only.empty()); CHECK(d.b_only.empty()); CHECK(d.jitter.empty());
+}
+
+TEST_CASE("diff_segments: direction-insensitive", "[slice_compare]")
+{
+    LayerRec a, b;
+    a.segs.push_back({0,0, 10,0, 1});
+    b.segs.push_back({10,0, 0,0, 1});          // reversed
+    SegDiff d = diff_segments(a, b);
+    CHECK(d.both.size() == 1); CHECK(d.a_only.empty()); CHECK(d.b_only.empty());
+}
+
+TEST_CASE("diff_segments: 0.2mm shift is jitter, 2mm is real", "[slice_compare]")
+{
+    LayerRec a, b1, b2;
+    a.segs.push_back({0,0, 10,0, 1});
+    b1.segs.push_back({0,0.2f, 10,0.2f, 1});
+    b2.segs.push_back({0,2.f,  10,2.f,  1});
+    SegDiff d1 = diff_segments(a, b1);
+    CHECK(d1.jitter.size() == 1); CHECK(d1.a_only.empty()); CHECK(d1.b_only.empty());
+    SegDiff d2 = diff_segments(a, b2);
+    CHECK(d2.a_only.size() == 1); CHECK(d2.b_only.size() == 1); CHECK(d2.jitter.empty());
+}

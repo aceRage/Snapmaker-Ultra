@@ -32,6 +32,13 @@ struct LayerDiff {
 };
 LayerDiff diff_layers(const Snapshot& a, const Snapshot& b);
 
+struct SegDiff { std::vector<Seg> both, a_only, b_only, jitter; };
+// Compare one matched layer pair's segments. Endpoints are quantized to 10 um
+// and matched direction-insensitively; segments that don't match exactly are
+// rescued as `jitter` if a same-length unclaimed counterpart lies within
+// rescue_radius (mm) of the midpoint, otherwise they land in a_only/b_only.
+SegDiff diff_segments(const LayerRec& a, const LayerRec& b, double rescue_radius = 0.3);
+
     } // SliceCompare
 } // Slic3r
 

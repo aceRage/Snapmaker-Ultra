@@ -5,6 +5,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <utility>
 
 namespace Slic3r { namespace SliceCompare {
 
@@ -79,6 +80,36 @@ double cell_overlap(const LayerRec& la, const LayerRec& lb)
             ++inter;
     const size_t uni = la.cells.size() + lb.cells.size() - inter;
     return uni > 0 ? (double)inter / (double)uni : 1.0;
+}
+
+// Quantize a coordinate (mm) to 10 um integer resolution.
+inline int64_t quantize10um(float v)
+{
+    return static_cast<int64_t>(std::lround((double)v * 100.0));
+}
+
+// Direction-insensitive segment key: both endpoints quantized to 10 um, with
+// the lesser (x,y) tuple ordered first so a segment and its reverse collide.
+struct SegKey {
+    int64_t x0, y0, x1, y1;
+    bool operator<(const SegKey& o) const
+    {
+        if (x0 != o.x0) return x0 < o.x0;
+        if (y0 != o.y0) return y0 < o.y0;
+        if (x1 != o.x1) return x1 < o.x1;
+        return y1 < o.y1;
+    }
+};
+
+SegKey make_seg_key(const Seg& s)
+{
+    int64_t qx0 = quantize10um(s.x0), qy0 = quantize10um(s.y0);
+    int64_t qx1 = quantize10um(s.x1), qy1 = quantize10um(s.y1);
+    if (std::make_pair(qx1, qy1) < std::make_pair(qx0, qy0)) {
+        std::swap(qx0, qx1);
+        std::swap(qy0, qy1);
+    }
+    return SegKey{qx0, qy0, qx1, qy1};
 }
 
 } // anonymous namespace
@@ -224,6 +255,101 @@ LayerDiff diff_layers(const Snapshot& a, const Snapshot& b)
             out.biggest_zkey_a = row.zkey_a;
         }
     }
+
+    return out;
+}
+
+SegDiff diff_segments(const LayerRec& a, const LayerRec& b, double rescue_radius)
+{
+    SegDiff out;
+
+    // Exact match pass: dedupe each side to one representative Seg per
+    // canonical (direction-insensitive, 10 um quantized) key, then intersect.
+    std::map<SegKey, Seg> mapA, mapB;
+    for (const auto& s : a.segs)
+        mapA.emplace(make_seg_key(s), s);
+    for (const auto& s : b.segs)
+        mapB.emplace(make_seg_key(s), s);
+
+    std::vector<SegKey> a_only_keys, b_only_keys;
+    for (const auto& kv : mapA) {
+        if (mapB.count(kv.first))
+            out.both.push_back(kv.second);
+        else
+            a_only_keys.push_back(kv.first);
+    }
+    for (const auto& kv : mapB) {
+        if (!mapA.count(kv.first))
+            b_only_keys.push_back(kv.first);
+    }
+
+    // Rescue pass: index unclaimed B-only segments by midpoint in a 1 mm grid,
+    // then for each unclaimed A-only segment search the 3x3 neighborhood of
+    // its midpoint cell for a same-length, nearby, unclaimed B partner.
+    auto midpoint = [](const Seg& s) {
+        return std::make_pair((double)(s.x0 + s.x1) * 0.5, (double)(s.y0 + s.y1) * 0.5);
+    };
+    auto seg_len = [](const Seg& s) {
+        return std::hypot((double)s.x1 - s.x0, (double)s.y1 - s.y0);
+    };
+    auto cell_of = [](double x, double y) {
+        return std::make_pair((int)std::floor(x), (int)std::floor(y)); // 1 mm grid
+    };
+
+    std::map<std::pair<int, int>, std::vector<SegKey>> grid;
+    for (const SegKey& k : b_only_keys) {
+        const auto mid = midpoint(mapB.at(k));
+        grid[cell_of(mid.first, mid.second)].push_back(k);
+    }
+
+    std::set<SegKey> claimed_b;
+    std::vector<SegKey> a_only_remaining;
+    for (const SegKey& ka : a_only_keys) {
+        const Seg& sa = mapA.at(ka);
+        const auto mid_a = midpoint(sa);
+        const auto cell = cell_of(mid_a.first, mid_a.second);
+        const double len_a = seg_len(sa);
+
+        bool found = false;
+        double best_dist = 0.0;
+        SegKey best{};
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                auto it = grid.find({cell.first + dx, cell.second + dy});
+                if (it == grid.end())
+                    continue;
+                for (const SegKey& kb : it->second) {
+                    if (claimed_b.count(kb))
+                        continue;
+                    const Seg& sb = mapB.at(kb);
+                    if (std::abs(len_a - seg_len(sb)) >= 0.2)
+                        continue;
+                    const auto mid_b = midpoint(sb);
+                    const double dist = std::hypot(mid_a.first - mid_b.first, mid_a.second - mid_b.second);
+                    if (dist > rescue_radius)
+                        continue;
+                    if (!found || dist < best_dist) {
+                        found = true;
+                        best_dist = dist;
+                        best = kb;
+                    }
+                }
+            }
+        }
+
+        if (found) {
+            claimed_b.insert(best);
+            out.jitter.push_back(sa);
+        } else {
+            a_only_remaining.push_back(ka);
+        }
+    }
+
+    for (const SegKey& ka : a_only_remaining)
+        out.a_only.push_back(mapA.at(ka));
+    for (const SegKey& kb : b_only_keys)
+        if (!claimed_b.count(kb))
+            out.b_only.push_back(mapB.at(kb));
 
     return out;
 }
