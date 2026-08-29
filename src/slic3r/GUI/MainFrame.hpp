@@ -206,6 +206,10 @@ public:
     MainFrame();
     ~MainFrame() = default;
 
+    // Ultra: populate the given menu contextually for the current printer's brand
+    // (login/logout). Called by the topbar's Account button just before it pops the menu.
+    void        refresh_account_menu(wxMenu* menu);
+
     // BBS: auto-save the project to its own file on a timer, in addition to auto-backup
     void update_autosave_timer();
 

@@ -544,6 +544,8 @@ private:
     bool            check_login();
     void            get_login_info();
     bool            is_user_login();
+    // Ultra: public Bambu account display name (from the network agent), for the Account menu.
+    std::string     get_bambu_user_name();
     // Ultra: Flashforge device stack (Orca-Flashforge port) - FF cloud login lands in Phase B, LAN-only until then
     bool            is_flashforge_login() { return false; }
     DeviceObjectOpr* getDeviceObjectOpr();

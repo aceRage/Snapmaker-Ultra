@@ -4425,6 +4425,11 @@ bool GUI_App::is_user_login()
     return false;
 }
 
+std::string GUI_App::get_bambu_user_name()
+{
+    return m_agent ? m_agent->get_user_name() : std::string();
+}
+
 
 bool GUI_App::check_login()
 {

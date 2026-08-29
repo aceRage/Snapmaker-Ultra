@@ -28,6 +28,7 @@ enum CUSTOM_ID
     ID_MODEL_STORE,
     ID_PUBLISH,
     ID_CALIB,
+    ID_ACCOUNT,
     ID_TOOL_BAR = 3200,
     ID_AMS_NOTEBOOK,
 };
@@ -220,6 +221,16 @@ void BBLTopbar::Init(wxFrame* parent)
     m_dropdown_menu_item = this->AddTool(ID_TOP_DROPDOWN_MENU, "",
         dropdown_bitmap, wxEmptyString);
 
+    // Ultra: contextual Account button (login/logout for the current printer's brand). Pops
+    // a menu rebuilt on click by MainFrame::refresh_account_menu(). Placed after the Options
+    // dropdown so it's easy to find.
+    this->AddSpacer(FromDIP(5));
+    wxBitmap account_bitmap = create_scaled_bitmap("topbar_account", nullptr, TOPBAR_ICON_SIZE);
+    m_account_item = this->AddTool(ID_ACCOUNT, _L("Account"), account_bitmap);
+    // NB: do NOT SetHasDropDown(true) - that routes the label through the base art provider
+    // (black text) instead of BBLTopbarArt::DrawLabel (white). Calibration models this: the
+    // toolbar fires wxEVT_AUITOOLBAR_TOOL_DROPDOWN on click without a dropdown split.
+
     this->AddSpacer(FromDIP(5));
     this->AddSeparator();
     this->AddSpacer(FromDIP(5));
@@ -309,6 +320,7 @@ void BBLTopbar::Init(wxFrame* parent)
     this->Bind(wxEVT_AUITOOLBAR_TOOL_DROPDOWN, &BBLTopbar::OnFileToolItem, this, ID_TOP_FILE_MENU);
     this->Bind(wxEVT_AUITOOLBAR_TOOL_DROPDOWN, &BBLTopbar::OnDropdownToolItem, this, ID_TOP_DROPDOWN_MENU);
     this->Bind(wxEVT_AUITOOLBAR_TOOL_DROPDOWN, &BBLTopbar::OnCalibToolItem, this, ID_CALIB);
+    this->Bind(wxEVT_AUITOOLBAR_TOOL_DROPDOWN, &BBLTopbar::OnAccountToolItem, this, ID_ACCOUNT);
     this->Bind(wxEVT_AUITOOLBAR_TOOL_DROPDOWN, &BBLTopbar::OnIconize, this, wxID_ICONIZE_FRAME);
     this->Bind(wxEVT_AUITOOLBAR_TOOL_DROPDOWN, &BBLTopbar::OnFullScreen, this, wxID_MAXIMIZE_FRAME);
     this->Bind(wxEVT_AUITOOLBAR_TOOL_DROPDOWN, &BBLTopbar::OnCloseFrame, this, wxID_CLOSE_FRAME);
@@ -612,6 +624,23 @@ void BBLTopbar::OnCalibToolItem(wxAuiToolBarEvent &evt)
     }
 
     // make sure the button is "un-stuck"
+    tb->SetToolSticky(evt.GetId(), false);
+}
+
+void BBLTopbar::OnAccountToolItem(wxAuiToolBarEvent &evt)
+{
+    wxAuiToolBar *tb = static_cast<wxAuiToolBar *>(evt.GetEventObject());
+    tb->SetToolSticky(evt.GetId(), true);
+
+    if (!m_skip_popup_account_menu) {
+        // Rebuild contextually (current printer brand + signed-in account) before showing.
+        Slic3r::GUI::wxGetApp().mainframe->refresh_account_menu(&m_account_menu);
+        auto rec = this->GetToolRect(ID_ACCOUNT);
+        GetParent()->PopupMenu(&m_account_menu, wxPoint(rec.GetLeft(), this->GetSize().GetHeight() - 2));
+    } else {
+        m_skip_popup_account_menu = false;
+    }
+
     tb->SetToolSticky(evt.GetId(), false);
 }
 

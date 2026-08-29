@@ -6,7 +6,10 @@
 class WebView
 {
 public:
-    static wxWebView *CreateWebView(wxWindow *parent, wxString const &url);
+    // Ultra: brand_tag prefixes the User-Agent ("SM-Slicer" by default). The Bambu account
+    // login must use "BBL-Slicer" or bambulab.com's sign-in won't run the slicer login flow
+    // (it just redirects to the marketing home and never posts the token back).
+    static wxWebView *CreateWebView(wxWindow *parent, wxString const &url, wxString const &brand_tag = "SM-Slicer");
 #if wxUSE_WEBVIEW_EDGE
     static bool CheckWebViewRuntime();
     static bool DownloadAndInstallWebViewRuntime();

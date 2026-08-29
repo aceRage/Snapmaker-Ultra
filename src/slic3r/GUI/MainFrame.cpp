@@ -2545,6 +2545,58 @@ static void add_common_view_menu_items(wxMenu* view_menu, MainFrame* mainFrame, 
         "", nullptr, [can_change_view]() { return can_change_view(); }, mainFrame);
 }
 
+// Ultra: rebuild the contextual Account menu for the currently-selected printer's vendor.
+// Snapmaker / Bambu Lab get real login+logout (shows the signed-in account name); Flashforge
+// is a placeholder until FF cloud login (Phase B); other vendors fall back to Snapmaker.
+void MainFrame::refresh_account_menu(wxMenu* menu)
+{
+    if (!menu) return;
+    while (menu->GetMenuItemCount() > 0)
+        menu->Destroy(menu->FindItemByPosition(0));
+    wxMenu* m_account_menu = menu; // keep the body below unchanged
+
+    auto& app = wxGetApp();
+    int brand = 0; // 0 = Snapmaker/other, 1 = Bambu, 2 = Flashforge
+    if (app.preset_bundle) {
+        if (app.preset_bundle->is_bbl_vendor()) {
+            brand = 1;
+        } else {
+            const Preset&        pp = app.preset_bundle->printers.get_edited_preset();
+            const VendorProfile* v  = pp.vendor;
+            if (!v) { const Preset* parent = app.preset_bundle->printers.get_selected_preset_parent(); if (parent) v = parent->vendor; }
+            if (v && v->id == "Flashforge") brand = 2;
+        }
+    }
+
+    if (brand == 1) { // Bambu Lab
+        if (app.is_user_login()) {
+            std::string nm = app.get_bambu_user_name();
+            wxMenuItem* who = m_account_menu->Append(wxID_ANY, _L("Bambu Lab") + ": " + from_u8(nm.empty() ? "signed in" : nm));
+            who->Enable(false);
+            append_menu_item(m_account_menu, wxID_ANY, _L("Log out of Bambu Account"), _L("Sign out of your Bambu Lab account"),
+                [](wxCommandEvent&) { wxGetApp().request_user_logout(); });
+        } else {
+            append_menu_item(m_account_menu, wxID_ANY, _L("Log in to Bambu Account..."), _L("Sign in to your Bambu Lab account to see your cloud printers"),
+                [](wxCommandEvent&) { wxGetApp().request_login(true); });
+        }
+    } else if (brand == 2) { // Flashforge
+        wxMenuItem* soon = m_account_menu->Append(wxID_ANY, _L("Flashforge account (coming soon)"));
+        soon->Enable(false);
+    } else { // Snapmaker / default
+        auto* ui = app.sm_get_userinfo();
+        if (ui && ui->is_user_login()) {
+            std::string nm = ui->get_user_name();
+            wxMenuItem* who = m_account_menu->Append(wxID_ANY, _L("Snapmaker") + ": " + from_u8(nm.empty() ? "signed in" : nm));
+            who->Enable(false);
+            append_menu_item(m_account_menu, wxID_ANY, _L("Log out of Snapmaker Account"), _L("Sign out of your Snapmaker account"),
+                [](wxCommandEvent&) { wxGetApp().sm_request_user_logout(); });
+        } else {
+            append_menu_item(m_account_menu, wxID_ANY, _L("Log in to Snapmaker Account..."), _L("Sign in to your Snapmaker account"),
+                [](wxCommandEvent&) { wxGetApp().sm_request_login(true); });
+        }
+    }
+}
+
 void MainFrame::init_menubar_as_editor()
 {
 #ifdef __APPLE__
@@ -3277,6 +3329,8 @@ void MainFrame::init_menubar_as_editor()
         [this]() {return m_plater->is_view3D_shown();; }, this);
 
     m_menubar->Append(calib_menu,wxString::Format("&%s", _L("Calibration")));
+    // Ultra: the Account entry lives in the custom top bar (BBLTopbar), not this native
+    // menubar (which the fork hides) - see BBLTopbar's ID_ACCOUNT tool + refresh_account_menu.
     if (helpMenu)
         m_menubar->Append(helpMenu, wxString::Format("&%s", _L("Help")));
     SetMenuBar(m_menubar);

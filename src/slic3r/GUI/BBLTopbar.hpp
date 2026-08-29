@@ -24,6 +24,7 @@ public:
     void OnFileToolItem(wxAuiToolBarEvent& evt);
     void OnDropdownToolItem(wxAuiToolBarEvent& evt);
     void OnCalibToolItem(wxAuiToolBarEvent &evt);
+    void OnAccountToolItem(wxAuiToolBarEvent &evt);   // Ultra: contextual account login/logout
     void OnMouseLeftDClock(wxMouseEvent& mouse);
     void OnMouseLeftDown(wxMouseEvent& event);
     void OnMouseLeftUp(wxMouseEvent& event);
@@ -65,6 +66,7 @@ private:
     wxMenu m_top_menu;
     wxMenu* m_file_menu;
     wxMenu m_calib_menu;
+    wxMenu m_account_menu;   // Ultra: contextual per-brand account menu
     wxAuiToolBarItem* m_title_item;
     wxAuiToolBarItem* m_account_item;
     wxAuiToolBarItem* m_model_store_item;
@@ -85,4 +87,5 @@ private:
     bool m_skip_popup_file_menu;
     bool m_skip_popup_dropdown_menu;
     bool m_skip_popup_calib_menu;
+    bool m_skip_popup_account_menu{false};
 };

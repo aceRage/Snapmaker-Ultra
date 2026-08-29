@@ -241,7 +241,7 @@ public:
     wxWebView *m_webView;
 };
 
-wxWebView* WebView::CreateWebView(wxWindow * parent, wxString const & url)
+wxWebView* WebView::CreateWebView(wxWindow * parent, wxString const & url, wxString const & brand_tag)
 {
 #if wxUSE_WEBVIEW_EDGE
     // Check if a fixed version of edge is present in
@@ -271,8 +271,8 @@ wxWebView* WebView::CreateWebView(wxWindow * parent, wxString const & url)
     if (webView) {
         webView->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
 #ifdef __WIN32__
-        webView->SetUserAgent(wxString::Format("SM-Slicer/v%s (%s) Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.52", SLIC3R_VERSION, 
+        webView->SetUserAgent(wxString::Format("%s/v%s (%s) Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.52", brand_tag, SLIC3R_VERSION,
             Slic3r::GUI::wxGetApp().dark_mode() ? "dark" : "light"));
         webView->Create(parent, wxID_ANY, url2, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
         // We register the wxfs:// protocol for testing purposes

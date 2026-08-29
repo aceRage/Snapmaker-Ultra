@@ -91,8 +91,10 @@ ZUserLogin::ZUserLogin() : wxDialog((wxWindow *) (wxGetApp().mainframe), wxID_AN
 
         // set the frame icon
 
-        // Create the webview
-        m_browser = WebView::CreateWebView(this, TargetUrl);
+        // Create the webview. Ultra: use the BBL-Slicer UA so bambulab.com/sign-in runs the
+        // slicer login flow and posts the token back via script message (see OnScriptMessage);
+        // the default SM-Slicer UA gets a normal web login that just redirects to the home page.
+        m_browser = WebView::CreateWebView(this, TargetUrl, "BBL-Slicer");
         if (m_browser == nullptr) {
             wxLogError("Could not init m_browser");
             return;
@@ -279,6 +281,11 @@ void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
         }
         if (strCmd == "user_login") {
             j["data"]["autotest_token"] = m_AutotestToken;
+            // Ultra: the fork previously just Close()d here and dropped the Bambu login payload.
+            // Forward it to the network agent (Ultra Net) so it stores the token / user info and
+            // reports is_user_login()=true; the Account menu then shows the signed-in account.
+            if (auto agent = wxGetApp().getAgent())
+                agent->change_user(j.dump());
             Close();
         }
         else if (strCmd == "get_localhost_url") {
