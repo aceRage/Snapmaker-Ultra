@@ -1,5 +1,6 @@
 #include <catch2/catch.hpp>
 #include "libslic3r/SliceCompare/Snapshot.hpp"
+#include "libslic3r/SliceCompare/Diff.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 
 using namespace Slic3r;
@@ -65,4 +66,37 @@ TEST_CASE("SnapshotStore ring buffer evicts oldest", "[slice_compare]")
     CHECK(st.get(ids[9]) != nullptr);
     CHECK(st.list().front().second == "snap9"); // newest first
     st.clear();
+}
+
+TEST_CASE("diff_configs ignores volatile keys, reports changes", "[slice_compare]")
+{
+    Snapshot a, b;
+    a.config = {{"layer_height","0.2"}, {"wall_loops","2"}, {"print_host","x"}};
+    b.config = {{"layer_height","0.16"},{"wall_loops","2"}, {"extra","1"}};
+    auto rows = diff_configs(a, b);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].key == "extra");            // sorted by key; absent in a
+    CHECK(rows[0].a.empty());
+    CHECK(rows[1].key == "layer_height");
+    CHECK(rows[1].a == "0.2"); CHECK(rows[1].b == "0.16");
+    // print_host filtered out entirely (volatile)
+}
+
+TEST_CASE("diff_features aggregates per role", "[slice_compare]")
+{
+    // NOTE: make_result here takes an out-param (GCodeProcessorResult&) rather
+    // than returning by value — see the file-static helper above; it was
+    // changed in commit 061958a1a8 because GCodeProcessorResult holds a mutex
+    // and is not copyable/movable, so `build_snapshot(make_result(), ...)` as
+    // written in the task brief does not compile against the current helper.
+    GCodeProcessorResult result_a, result_b;
+    make_result(result_a);
+    make_result(result_b);
+    Snapshot a = build_snapshot(result_a, {}, "A", "session");
+    Snapshot b = build_snapshot(result_b, {}, "B", "session");
+    auto rows = diff_features(a, b);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].role == (uint8_t)erExternalPerimeter);
+    CHECK(rows[0].sec_a == Approx(rows[0].sec_b));
+    CHECK(rows[0].mm_a == Approx(4.0));
 }

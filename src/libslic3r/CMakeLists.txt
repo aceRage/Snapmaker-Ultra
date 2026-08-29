@@ -217,6 +217,8 @@ set(lisbslic3r_sources
     GCode/GCodeProcessor.hpp
     SliceCompare/Snapshot.cpp
     SliceCompare/Snapshot.hpp
+    SliceCompare/Diff.cpp
+    SliceCompare/Diff.hpp
     GCode.hpp
     GCode/PchipInterpolatorHelper.cpp
     GCode/PchipInterpolatorHelper.hpp
