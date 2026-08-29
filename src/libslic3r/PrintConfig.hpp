@@ -246,6 +246,9 @@ enum BrimType {
     btNoBrim,
 };
 
+// Chameleon brim: which filament a brim extrusion is printed with.
+enum BrimFilamentSource { bfsObject = 0, bfsNearestWall };
+
 enum TimelapseType : int {
     tlTraditional = 0,
     tlSmooth
@@ -477,6 +480,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SeamScarfType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLADisplayOrientation)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLAPillarConnectionMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimType)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimFilamentSource)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TimelapseType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BedType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SkirtType)
@@ -1397,6 +1401,8 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionFloat,              resolution))
     ((ConfigOptionFloats,             retraction_minimum_travel))
     ((ConfigOptionBools,              retract_when_changing_layer))
+    // Chameleon brim: which filament a brim extrusion is printed with.
+    ((ConfigOptionEnum<BrimFilamentSource>, brim_filament_source))
     ((ConfigOptionFloat,              skirt_distance))
     ((ConfigOptionInt,                skirt_height))
     ((ConfigOptionInt,                skirt_loops))

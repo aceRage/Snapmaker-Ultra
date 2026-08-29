@@ -349,6 +349,12 @@ static const t_config_enum_values s_keys_map_BrimType = {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(BrimType)
 
+static t_config_enum_values s_keys_map_BrimFilamentSource {
+    { "object",       int(BrimFilamentSource::bfsObject) },
+    { "nearest_wall", int(BrimFilamentSource::bfsNearestWall) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(BrimFilamentSource)
+
 // using 0,1 to compatible with old files
 static const t_config_enum_values s_keys_map_TimelapseType = {
     {"0",       tlTraditional},
@@ -1374,6 +1380,20 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.emplace_back(L("No-brim"));
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionEnum<BrimType>(btAutoBrim));
+
+    def = this->add("brim_filament_source", coEnum);
+    def->label = L("Brim filament");
+    def->category = L("Support");
+    def->tooltip = L("object: brim uses each object's filament (default). nearest_wall: each brim "
+                     "extrusion uses the filament of the nearest first-layer wall, so brims match "
+                     "what they touch (multi-filament prints only).");
+    def->enum_keys_map = &ConfigOptionEnum<BrimFilamentSource>::get_enum_values();
+    def->enum_values.emplace_back("object");
+    def->enum_values.emplace_back("nearest_wall");
+    def->enum_labels.emplace_back(L("Object"));
+    def->enum_labels.emplace_back(L("Nearest wall"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<BrimFilamentSource>(bfsObject));
 
     def = this->add("brim_object_gap", coFloat);
     def->label = L("Brim-object gap");

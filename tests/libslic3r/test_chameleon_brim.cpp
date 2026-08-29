@@ -2,6 +2,7 @@
 #include "libslic3r/WallSampleIndex.hpp"
 #include "libslic3r/BrimFilament.hpp"
 #include "libslic3r/libslic3r.h"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
 
 using namespace Slic3r;
 
@@ -95,4 +96,37 @@ TEST_CASE("guard coalesces to max_runs", "[chameleon]")
     // full coverage: concatenated pts span whole line
     CHECK(runs.front().pts.front() == Point(scale_(0), scale_(5)));
     CHECK(runs.back().pts.back()   == Point(scale_(40), scale_(5)));
+}
+
+static ExtrusionEntityCollection one_loop_brim(double cx, double half, float w = 0.5f)
+{
+    Polygon sq({ Point(scale_(cx-half), scale_(-half)), Point(scale_(cx+half), scale_(-half)),
+                 Point(scale_(cx+half), scale_(half)),  Point(scale_(cx-half), scale_(half)) });
+    ExtrusionEntityCollection c;
+    ExtrusionPath path(erBrim, 1.0, w, 0.2f);
+    path.polyline = Polyline(sq.points); path.polyline.points.push_back(sq.points.front());
+    auto* loop = new ExtrusionLoop();
+    loop->paths.push_back(path);
+    c.entities.push_back(loop);
+    return c;
+}
+
+TEST_CASE("partition keeps own-extruder loop intact, splits contested loop", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(-5, 0, -5, 0), 0, 1);     // own wall left
+    BrimVoteParams p; p.fallback_extruder = 0;
+    ExtrusionEntityCollection kept;
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_brim_by_wall(one_loop_brim(0, 10), 0, idx, p, kept, out);
+    CHECK(kept.entities.size() == 1);                  // all votes = 0 -> untouched entity
+    CHECK(out.empty());
+
+    idx.add_polyline(segment(25, 0, 25, 0), 1, 2);     // foreign wall right
+    ExtrusionEntityCollection kept2;
+    std::map<unsigned, ExtrusionEntityCollection> out2;
+    partition_brim_by_wall(one_loop_brim(10, 10), 0, idx, p, kept2, out2);
+    CHECK(!kept2.entities.empty());                     // left portion stays
+    REQUIRE(out2.count(1) == 1);                        // right portion -> extruder 1
+    CHECK(!out2.at(1).entities.empty());
 }

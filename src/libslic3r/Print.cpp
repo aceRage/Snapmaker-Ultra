@@ -3,6 +3,7 @@
 #include "Print.hpp"
 #include "BoundingBox.hpp"
 #include "Brim.hpp"
+#include "BrimFilament.hpp"
 #include "ClipperUtils.hpp"
 #include "Extruder.hpp"
 #include "Flow.hpp"
@@ -2311,6 +2312,54 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
     return bbox;
 }
 
+// Chameleon brim: walk one LayerRegion's perimeters (recursing into nested
+// collections and unwrapping loops/multipaths to their leaf paths), adding
+// every wall sample - shifted into plate coordinates - to wall_idx. The
+// per-path extruder follows the same override rules PrintRegion::extruder()
+// uses (1-based config values), converted to the 0-based scheme used
+// throughout the chameleon-brim code (see task-3 report for the analysis).
+static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const PrintRegionConfig& region_config,
+                                            unsigned own_extruder_0based, const Point& shift,
+                                            size_t object_key, WallSampleIndex& wall_idx)
+{
+    if (entity == nullptr)
+        return;
+    if (entity->is_collection()) {
+        const auto* coll = static_cast<const ExtrusionEntityCollection*>(entity);
+        for (const ExtrusionEntity* child : coll->entities)
+            chameleon_collect_wall_samples(child, region_config, own_extruder_0based, shift, object_key, wall_idx);
+        return;
+    }
+
+    auto add_path = [&](const ExtrusionPath& path) {
+        if (path.polyline.points.empty())
+            return;
+        unsigned extruder;
+        if (path.role() == erExternalPerimeter && region_config.outer_wall_filament.value > 0)
+            extruder = unsigned(region_config.outer_wall_filament.value - 1);
+        else if (region_config.wall_filament.value > 0)
+            extruder = unsigned(region_config.wall_filament.value - 1);
+        else
+            extruder = own_extruder_0based;
+
+        Points shifted;
+        shifted.reserve(path.polyline.points.size());
+        for (const Point& pt : path.polyline.points)
+            shifted.push_back(pt + shift);
+        wall_idx.add_polyline(shifted, extruder, object_key);
+    };
+
+    if (const auto* path = dynamic_cast<const ExtrusionPath*>(entity)) {
+        add_path(*path);
+    } else if (const auto* multipath = dynamic_cast<const ExtrusionMultiPath*>(entity)) {
+        for (const ExtrusionPath& path : multipath->paths)
+            add_path(path);
+    } else if (const auto* loop = dynamic_cast<const ExtrusionLoop*>(entity)) {
+        for (const ExtrusionPath& path : loop->paths)
+            add_path(path);
+    }
+}
+
 // BBS: map print object with its first layer's first extruder
 std::map<ObjectID, unsigned int> getObjectExtruderMap(const Print& print) {
     std::map<ObjectID, unsigned int> objectExtruderMap;
@@ -2625,11 +2674,67 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         // BBS: m_brimMap and m_supportBrimMap are used instead of m_brim to generate brim of objs and supports seperately
         m_brimMap.clear();
         m_supportBrimMap.clear();
+        m_brimMapByExtruder.clear();
         m_first_layer_convex_hull.points.clear();
         if (this->has_brim()) {
             Polygons islands_area;
             make_brim(*this, this->make_try_cancel(), islands_area, m_brimMap,
                 m_supportBrimMap, objPrintVec, printExtruders);
+
+            // Chameleon brim: reassign brim extrusions to whichever extruder
+            // printed the nearest first-layer wall. Off by default (bfsObject),
+            // and skipped outright on single-extruder prints so the default
+            // path stays byte-identical to pre-chameleon behavior.
+            if (m_config.brim_filament_source == bfsNearestWall && this->extruders().size() > 1) {
+                WallSampleIndex wall_idx;
+                std::map<size_t, double> object_area;
+
+                for (const auto& objIDPair : objPrintVec) {
+                    const PrintObject* object = this->get_object(objIDPair.first);
+                    if (object == nullptr || object->layers().empty())
+                        continue;
+                    const size_t object_key = objIDPair.first.id;
+                    const Layer* layer0     = object->layers().front();
+
+                    double area_sum = 0.0;
+                    for (const ExPolygon& ex : layer0->lslices)
+                        area_sum += ex.area() * SCALING_FACTOR * SCALING_FACTOR;
+                    object_area[object_key] = area_sum;
+
+                    // objPrintVec extruders are 1-based (PrintRegion::extruder()'s
+                    // convention); convert to the 0-based scheme used by
+                    // WallSampleIndex / BrimVoteParams / m_brimMapByExtruder.
+                    const unsigned own_extruder_0based = objIDPair.second > 0 ? objIDPair.second - 1 : 0;
+
+                    for (const PrintInstance& instance : object->instances())
+                        for (const LayerRegion* lr : layer0->regions())
+                            chameleon_collect_wall_samples(&lr->perimeters, lr->region().config(),
+                                own_extruder_0based, instance.shift, object_key, wall_idx);
+                }
+
+                BrimVoteParams vote_params;
+                vote_params.object_area = object_area;
+
+                for (auto& brimEntry : m_brimMap) {
+                    const auto obj_it = std::find_if(objPrintVec.begin(), objPrintVec.end(),
+                        [&brimEntry](const std::pair<ObjectID, unsigned int>& pr) { return pr.first == brimEntry.first; });
+                    if (obj_it == objPrintVec.end())
+                        continue;
+                    const unsigned own_extruder_0based = obj_it->second > 0 ? obj_it->second - 1 : 0;
+                    vote_params.fallback_extruder = own_extruder_0based;
+
+                    ExtrusionEntityCollection kept;
+                    std::map<unsigned, ExtrusionEntityCollection> foreign;
+                    partition_brim_by_wall(brimEntry.second, own_extruder_0based, wall_idx, vote_params, kept, foreign);
+                    brimEntry.second = std::move(kept);
+                    for (auto& foreignEntry : foreign) {
+                        if (foreignEntry.second.entities.empty())
+                            continue;
+                        m_brimMapByExtruder[brimEntry.first][foreignEntry.first] = std::move(foreignEntry.second);
+                    }
+                }
+            }
+
             for (Polygon& poly_ex : islands_area)
                 poly_ex.douglas_peucker(SCALED_RESOLUTION);
             for (Polygon &poly : union_(this->first_layer_islands(), islands_area))

@@ -115,7 +115,80 @@ void guard_max_runs(std::vector<BrimRun> &runs, size_t max_runs)
     }
 }
 
+// Return a representative source path to copy flow attributes (mm3_per_mm,
+// width, height) from, mirroring how ExtrusionLoop/ExtrusionMultiPath::role()
+// resolve to their first path. Returns nullptr for an empty loop/multipath.
+const ExtrusionPath *first_path_of(const ExtrusionEntity &entity)
+{
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return path;
+    if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+        return multipath->paths.empty() ? nullptr : &multipath->paths.front();
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+        return loop->paths.empty() ? nullptr : &loop->paths.front();
+    return nullptr;
+}
+
+// Partition a single non-collection entity (path/multipath/loop). Recursion
+// into nested ExtrusionEntityCollections happens in the caller.
+void partition_leaf_entity(const ExtrusionEntity &entity, unsigned own_extruder,
+                            const WallSampleIndex &idx, const BrimVoteParams &p,
+                            ExtrusionEntityCollection &kept,
+                            std::map<unsigned, ExtrusionEntityCollection> &out)
+{
+    const bool     is_loop = entity.is_loop();
+    const Polyline as_pl   = entity.as_polyline();
+    Points         chain   = as_pl.points;
+    if (is_loop && chain.size() > 1 && chain.front() == chain.back())
+        chain.pop_back(); // split_polyline_by_vote closes loops itself
+
+    if (chain.empty())
+        return; // guard: never call split_polyline_by_vote on an empty polyline
+
+    std::vector<BrimRun> runs = split_polyline_by_vote(chain, is_loop, idx, p);
+
+    // Fast path: every sample voted for our own extruder -> keep the ORIGINAL
+    // entity untouched (byte-identical geometry, preserves loop-ness).
+    if (runs.size() == 1 && runs.front().extruder == own_extruder) {
+        kept.entities.push_back(entity.clone());
+        return;
+    }
+
+    const ExtrusionPath *source = first_path_of(entity);
+    const double mm3_per_mm = source ? source->mm3_per_mm : 0.0;
+    const float  width      = source ? source->width      : 0.f;
+    const float  height     = source ? source->height     : 0.f;
+
+    for (const BrimRun &run : runs) {
+        if (run.pts.empty())
+            continue;
+        auto *new_path      = new ExtrusionPath(erBrim, mm3_per_mm, width, height);
+        new_path->polyline  = Polyline(run.pts);
+        if (run.extruder == own_extruder)
+            kept.entities.push_back(new_path);
+        else
+            out[run.extruder].entities.push_back(new_path);
+    }
+}
+
 } // namespace
+
+void partition_brim_by_wall(const ExtrusionEntityCollection &brim, unsigned own_extruder,
+                             const WallSampleIndex &idx, const BrimVoteParams &p,
+                             ExtrusionEntityCollection &kept,
+                             std::map<unsigned, ExtrusionEntityCollection> &out)
+{
+    for (const ExtrusionEntity *entity : brim.entities) {
+        if (entity == nullptr)
+            continue;
+        if (entity->is_collection()) {
+            const auto *sub = static_cast<const ExtrusionEntityCollection *>(entity);
+            partition_brim_by_wall(*sub, own_extruder, idx, p, kept, out);
+            continue;
+        }
+        partition_leaf_entity(*entity, own_extruder, idx, p, kept, out);
+    }
+}
 
 unsigned brim_vote(const WallSampleIndex &idx, const Point &pt, const BrimVoteParams &p)
 {

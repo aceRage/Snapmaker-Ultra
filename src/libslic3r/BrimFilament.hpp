@@ -2,6 +2,7 @@
 #define slic3r_BrimFilament_hpp_
 #include "WallSampleIndex.hpp"
 #include "ExtrusionEntity.hpp"
+#include "ExtrusionEntityCollection.hpp"
 #include <map>
 namespace Slic3r {
 
@@ -29,5 +30,16 @@ struct BrimRun { unsigned extruder; Points pts; };
 std::vector<BrimRun> split_polyline_by_vote(const Points& poly, bool is_loop,
                                             const WallSampleIndex& idx,
                                             const BrimVoteParams& p);
+
+// Partition `brim` (one object's collection, plate coords): entities whose
+// dominant vote == own_extruder stay in `kept`; others land in out[extruder].
+// Loop/path entities are split via split_polyline_by_vote; runs become
+// ExtrusionPaths (erBrim) copying the source entity's flow attributes.
+void partition_brim_by_wall(const ExtrusionEntityCollection& brim,
+                            unsigned own_extruder,
+                            const WallSampleIndex& idx,
+                            const BrimVoteParams& p,
+                            ExtrusionEntityCollection& kept,
+                            std::map<unsigned, ExtrusionEntityCollection>& out);
 } // namespace Slic3r
 #endif
