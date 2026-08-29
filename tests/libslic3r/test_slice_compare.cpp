@@ -8,9 +8,8 @@ using namespace Slic3r::SliceCompare;
 // Build a synthetic result: two layers (z=0.2, z=0.4), each one 10mm
 // external-perimeter square drawn as 4 extrude moves at 60 mm/s,
 // preceded by a travel move to the start corner.
-static GCodeProcessorResult make_result(float y_shift = 0.f)
+static void make_result(GCodeProcessorResult& r, float y_shift = 0.f)
 {
-    GCodeProcessorResult r;
     auto add = [&r](EMoveType t, float x, float y, float z, float de, float f,
                     ExtrusionRole role) {
         GCodeProcessorResult::MoveVertex m;
@@ -28,12 +27,13 @@ static GCodeProcessorResult make_result(float y_shift = 0.f)
     r.filament_diameters = {1.75f};
     r.filament_densities = {1.24f};
     r.print_statistics.modes[(size_t)PrintEstimatedStatistics::ETimeMode::Normal].time = 123.f;
-    return r;
 }
 
 TEST_CASE("build_snapshot captures layers, segments, cells", "[slice_compare]")
 {
-    Snapshot s = build_snapshot(make_result(), {{"layer_height", "0.2"}}, "A", "session");
+    GCodeProcessorResult result;
+    make_result(result);
+    Snapshot s = build_snapshot(result, {{"layer_height", "0.2"}}, "A", "session");
     REQUIRE(s.layer_count == 2);
     REQUIRE(s.layers.size() == 2);
     REQUIRE(s.layers.count(20) == 1);   // z=0.20 -> key 20
