@@ -6541,18 +6541,20 @@ LayerResult GCode::process_layer(const Print& print,
                             // extruder, emits the rest, switches back. Answers: does the
                             // pipeline tolerate a mid-feature set_extruder (R1-R3)?
                             {
-                                const auto& brim_ents = print.m_brimMap.at(instance_to_print.print_object.id()).entities;
-                                const size_t nb = brim_ents.size();
+                                // Flatten: per-object brim is typically ONE collection entity
+                                // wrapping all concentric loops; split needs atomic entities.
+                                ExtrusionEntityCollection spike_flat = print.m_brimMap.at(instance_to_print.print_object.id()).flatten();
+                                const size_t nb = spike_flat.entities.size();
                                 const unsigned cur_ext = m_writer.extruder() ? (unsigned) m_writer.extruder()->id() : 0;
                                 const unsigned other_ext = cur_ext == 0 ? 1 : 0;
                                 bool switched = false;
                                 size_t bi = 0;
-                                BOOST_LOG_TRIVIAL(warning) << "[SPIKE] brim split: entities=" << nb
-                                    << " cur_ext=" << cur_ext << " other=" << other_ext;
-                                for (const ExtrusionEntity* ee : brim_ents) {
+                                gcode += ";SPIKE brim entities=" + std::to_string(nb) +
+                                         " cur=" + std::to_string(cur_ext) + "\n";
+                                for (const ExtrusionEntity* ee : spike_flat.entities) {
                                     if (!switched && nb >= 2 && bi >= nb / 2) {
-                                        BOOST_LOG_TRIVIAL(warning) << "[SPIKE] brim toolchange -> " << other_ext
-                                            << " at entity " << bi << "/" << nb;
+                                        gcode += ";SPIKE brim toolchange -> " + std::to_string(other_ext) +
+                                                 " at entity " + std::to_string(bi) + "/" + std::to_string(nb) + "\n";
                                         gcode += this->set_extruder(other_ext, layer.print_z);
                                         switched = true;
                                     }
@@ -6560,7 +6562,7 @@ LayerResult GCode::process_layer(const Print& print,
                                     ++bi;
                                 }
                                 if (switched) {
-                                    BOOST_LOG_TRIVIAL(warning) << "[SPIKE] brim toolchange back -> " << cur_ext;
+                                    gcode += ";SPIKE brim toolchange back -> " + std::to_string(cur_ext) + "\n";
                                     gcode += this->set_extruder(cur_ext, layer.print_z);
                                 }
                             }
@@ -6770,7 +6772,21 @@ void GCode::append_full_config(const Print& print, std::string& str)
 
 void GCode::set_extruders(const std::vector<unsigned int>& extruder_ids)
 {
+#ifdef SPIKE_SPLIT_BRIM
+    // SPIKE: ensure a second extruder is registered so the injected mid-feature
+    // switch exercises the REAL toolchange path (multiple_extruders=true, M620
+    // machinery). This mirrors what the actual feature does: extruders used by
+    // spatial assignment join the print's used-extruder set.
+    {
+        std::vector<unsigned int> ids = extruder_ids;
+        if (std::find(ids.begin(), ids.end(), 1u) == ids.end()) ids.push_back(1u);
+        if (std::find(ids.begin(), ids.end(), 0u) == ids.end()) ids.push_back(0u);
+        std::sort(ids.begin(), ids.end());
+        m_writer.set_extruders(ids);
+    }
+#else
     m_writer.set_extruders(extruder_ids);
+#endif
 
     // enable wipe path generation if any extruder has wipe enabled
     m_wipe.enable = false;
@@ -7308,14 +7324,15 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection& support_fill
         static int spike_iface_layer_done = -1;
         bool spike_split_here = false;
         size_t spike_half = 0;
-        if (support_extrusion_role == erSupportMaterialInterface && extrusions.size() >= 10 && m_layer != nullptr) {
+        if ((support_extrusion_role == erSupportMaterialInterface || support_extrusion_role == erMixed) &&
+            extrusions.size() >= 2 && m_layer != nullptr && m_layer->id() > 0) {
             const int lid = (int) m_layer->id();
             if (spike_iface_layer_done < 0 || spike_iface_layer_done == lid) {
                 spike_iface_layer_done = lid;
                 spike_split_here = true;
                 spike_half = extrusions.size() / 2;
-                BOOST_LOG_TRIVIAL(warning) << "[SPIKE] interface split on layer " << lid
-                    << " (" << extrusions.size() << " extrusions), z=" << m_layer->print_z;
+                gcode += ";SPIKE interface split layer " + std::to_string(lid) +
+                         " extrusions=" + std::to_string(extrusions.size()) + "\n";
             }
         }
         size_t spike_idx = 0;
@@ -7326,9 +7343,8 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection& support_fill
         for (const ExtrusionEntity* ee : extrusions) {
 #ifdef SPIKE_SPLIT_BRIM
             if (spike_split_here && !spike_switched && spike_idx >= spike_half) {
-                BOOST_LOG_TRIVIAL(warning) << "[SPIKE] interface toolchange -> " << spike_other
-                    << " at extrusion " << spike_idx << "/" << extrusions.size()
-                    << " z=" << (m_layer ? m_layer->print_z : -1.0);
+                gcode += ";SPIKE interface toolchange -> " + std::to_string(spike_other) +
+                         " at " + std::to_string(spike_idx) + "/" + std::to_string(extrusions.size()) + "\n";
                 gcode += this->set_extruder(spike_other, m_layer ? m_layer->print_z : 0.0);
                 spike_switched = true;
             }
@@ -7362,7 +7378,7 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection& support_fill
         }
 #ifdef SPIKE_SPLIT_BRIM
         if (spike_switched) {
-            BOOST_LOG_TRIVIAL(warning) << "[SPIKE] interface toolchange back -> " << spike_cur;
+            gcode += ";SPIKE interface toolchange back -> " + std::to_string(spike_cur) + "\n";
             gcode += this->set_extruder(spike_cur, m_layer ? m_layer->print_z : 0.0);
         }
 #endif
