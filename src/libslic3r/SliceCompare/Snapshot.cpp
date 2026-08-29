@@ -1,11 +1,240 @@
 #include "Snapshot.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/miniz_extension.hpp"
 #include <cmath>
+#include <cctype>
+#include <atomic>
+#include <chrono>
+#include <sstream>
+#include <fstream>
+#include <filesystem>
+#include <algorithm>
 
 namespace Slic3r { namespace SliceCompare {
 
 double LayerRec::seconds() const {
     double t = 0; for (auto& kv : feature_seconds) t += kv.second; return t;
+}
+
+namespace {
+
+std::string to_lower_copy(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
+bool ends_with_ci(const std::string& s, const std::string& suffix)
+{
+    const std::string ls = to_lower_copy(s);
+    const std::string lsuf = to_lower_copy(suffix);
+    return ls.size() >= lsuf.size() &&
+           ls.compare(ls.size() - lsuf.size(), lsuf.size(), lsuf) == 0;
+}
+
+void trim(std::string& s)
+{
+    const size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) { s.clear(); return; }
+    const size_t b = s.find_last_not_of(" \t\r\n");
+    s = s.substr(a, b - a + 1);
+}
+
+// Parses a "; key = value" comment line. Returns false (and leaves key/value
+// untouched) if the line isn't such a comment, the key is empty, or the key
+// contains whitespace (used to reject prose comments picked up by the
+// first/last-400-lines fallback scan).
+bool parse_kv_comment(const std::string& line, std::string& key, std::string& value)
+{
+    size_t i = 0;
+    while (i < line.size() && std::isspace((unsigned char)line[i])) ++i;
+    if (i >= line.size() || line[i] != ';') return false;
+    std::string rest = line.substr(i + 1);
+    const size_t eq = rest.find('=');
+    if (eq == std::string::npos) return false;
+    std::string k = rest.substr(0, eq);
+    std::string v = rest.substr(eq + 1);
+    trim(k);
+    trim(v);
+    if (k.empty()) return false;
+    if (k.find_first_of(" \t") != std::string::npos) return false; // skip keys with spaces
+    key = std::move(k);
+    value = std::move(v);
+    return true;
+}
+
+std::filesystem::path make_temp_gcode_path()
+{
+    static std::atomic<uint64_t> s_counter{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::ostringstream name;
+    name << "sc_plate_" << now << "_" << s_counter.fetch_add(1) << ".gcode";
+    return std::filesystem::temp_directory_path() / name.str();
+}
+
+} // anonymous namespace
+
+std::map<std::string, std::string> parse_gcode_config(const std::string& gcode_path)
+{
+    std::map<std::string, std::string> cfg;
+    std::ifstream f(gcode_path);
+    if (!f.is_open())
+        return cfg;
+
+    constexpr size_t kFallbackWindow = 400;
+    std::vector<std::string> first_lines;
+    std::deque<std::string> last_lines;
+    first_lines.reserve(kFallbackWindow);
+
+    bool in_block = false;
+    bool found_block = false;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.find("CONFIG_BLOCK_START") != std::string::npos) {
+            in_block = true;
+            found_block = true;
+            continue;
+        }
+        if (line.find("CONFIG_BLOCK_END") != std::string::npos) {
+            in_block = false;
+            continue;
+        }
+        if (in_block) {
+            std::string k, v;
+            if (parse_kv_comment(line, k, v))
+                cfg[k] = v;
+            continue;
+        }
+        if (!found_block) {
+            // Keep a bounded window of the first/last N lines in case no
+            // CONFIG_BLOCK is ever found (PrusaSlicer-style header/footer).
+            if (first_lines.size() < kFallbackWindow)
+                first_lines.push_back(line);
+            last_lines.push_back(line);
+            if (last_lines.size() > kFallbackWindow)
+                last_lines.pop_front();
+        }
+    }
+
+    if (found_block)
+        return cfg;
+
+    for (const auto& l : first_lines) {
+        std::string k, v;
+        if (parse_kv_comment(l, k, v))
+            cfg[k] = v;
+    }
+    for (const auto& l : last_lines) {
+        std::string k, v;
+        if (parse_kv_comment(l, k, v))
+            cfg[k] = v;
+    }
+    return cfg;
+}
+
+namespace {
+
+FileLoadResult load_snapshot_from_gcode_file(const std::string& path)
+{
+    FileLoadResult out;
+    if (!std::filesystem::exists(path)) {
+        out.error = "File not found: " + path;
+        return out;
+    }
+
+    GCodeProcessor processor;
+    processor.process_file(path);
+    const GCodeProcessorResult& result = processor.extract_result();
+
+    std::map<std::string, std::string> config = parse_gcode_config(path);
+    const std::string label = std::filesystem::path(path).stem().string();
+    Snapshot snap = build_snapshot(result, std::move(config), label, path);
+
+    if (snap.layers.empty()) {
+        out.error = "No extrusion moves found in: " + path;
+        return out;
+    }
+    out.snapshot = std::move(snap);
+    return out;
+}
+
+FileLoadResult load_snapshot_from_3mf(const std::string& original_path)
+{
+    FileLoadResult out;
+
+    mz_zip_archive archive;
+    mz_zip_zero_struct(&archive);
+    if (!open_zip_reader(&archive, original_path)) {
+        out.error = "Unable to open 3mf archive: " + original_path;
+        return out;
+    }
+
+    bool found = false;
+    mz_uint found_index = 0;
+    std::string found_name;
+    const mz_uint num_entries = mz_zip_reader_get_num_files(&archive);
+    mz_zip_archive_file_stat stat;
+    for (mz_uint i = 0; i < num_entries; ++i) {
+        if (!mz_zip_reader_file_stat(&archive, i, &stat))
+            continue;
+        std::string name(stat.m_filename);
+        std::replace(name.begin(), name.end(), '\\', '/');
+        const std::string lname = to_lower_copy(name);
+        if (lname.find("metadata/plate_") != std::string::npos && ends_with_ci(lname, ".gcode")) {
+            found = true;
+            found_index = i;
+            found_name = name;
+            break;
+        }
+    }
+
+    if (!found) {
+        close_zip_reader(&archive);
+        out.error = "No plate gcode found in 3mf: " + original_path;
+        return out;
+    }
+
+    const std::filesystem::path tmp_path = make_temp_gcode_path();
+    const bool extracted = mz_zip_reader_extract_to_file(&archive, found_index, tmp_path.string().c_str(), 0);
+    close_zip_reader(&archive);
+
+    if (!extracted) {
+        out.error = "Failed to extract " + found_name + " from " + original_path;
+        return out;
+    }
+
+    FileLoadResult inner = load_snapshot_from_gcode_file(tmp_path.string());
+
+    std::error_code ec;
+    std::filesystem::remove(tmp_path, ec); // best-effort cleanup
+
+    if (!inner.snapshot.has_value()) {
+        out.error = inner.error;
+        return out;
+    }
+
+    out.snapshot = std::move(inner.snapshot);
+    out.snapshot->label = std::filesystem::path(original_path).stem().string();
+    out.snapshot->source = original_path;
+    return out;
+}
+
+} // anonymous namespace
+
+FileLoadResult load_snapshot_from_file(const std::string& path)
+{
+    FileLoadResult out;
+    try {
+        if (ends_with_ci(path, ".3mf"))
+            return load_snapshot_from_3mf(path);
+        return load_snapshot_from_gcode_file(path);
+    } catch (const std::exception& e) {
+        out.error = std::string("Exception while loading ") + path + ": " + e.what();
+    } catch (...) {
+        out.error = "Unknown exception while loading " + path;
+    }
+    return out;
 }
 
 Snapshot build_snapshot(const GCodeProcessorResult& result,

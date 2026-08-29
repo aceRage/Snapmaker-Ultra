@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <optional>
 
 namespace Slic3r {
     class GCodeProcessorResult;  // forward declaration
@@ -43,6 +44,21 @@ Snapshot build_snapshot(const GCodeProcessorResult& result,
                         std::map<std::string, std::string> config,
                         const std::string& label,
                         const std::string& source);
+
+// Parse "; key = value" lines between CONFIG_BLOCK_START/END (Orca/Bambu),
+// falling back to scanning "; key = value" lines in the first/last 400 lines
+// of the file (PrusaSlicer-style config headers/footers) when no block is found.
+std::map<std::string, std::string> parse_gcode_config(const std::string& gcode_path);
+
+// .gcode: GCodeProcessor::process_file -> build_snapshot.
+// .3mf / .gcode.3mf: extract Metadata/plate_*.gcode (miniz) to a temp file first,
+// then recurse; label/source are taken from the ORIGINAL 3mf path.
+// Returns nullopt + error message on failure.
+struct FileLoadResult {
+    std::optional<Snapshot> snapshot;
+    std::string error;
+};
+FileLoadResult load_snapshot_from_file(const std::string& path);
 
 class SnapshotStore {
 public:

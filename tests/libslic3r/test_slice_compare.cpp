@@ -3,6 +3,8 @@
 #include "libslic3r/SliceCompare/Diff.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 
 using namespace Slic3r;
 using namespace Slic3r::SliceCompare;
@@ -180,4 +182,31 @@ TEST_CASE("diff_segments: 0.2mm shift is jitter, 2mm is real", "[slice_compare]"
     CHECK(d1.jitter.size() == 1); CHECK(d1.a_only.empty()); CHECK(d1.b_only.empty());
     SegDiff d2 = diff_segments(a, b2);
     CHECK(d2.a_only.size() == 1); CHECK(d2.b_only.size() == 1); CHECK(d2.jitter.empty());
+}
+
+TEST_CASE("load_snapshot_from_file parses gcode + config block", "[slice_compare]")
+{
+    auto tmp = std::filesystem::temp_directory_path() / "sc_test.gcode";
+    std::ofstream f(tmp);
+    f << "; CONFIG_BLOCK_START\n; layer_height = 0.2\n; wall_loops = 2\n; CONFIG_BLOCK_END\n"
+      << "G21\nG90\nM83\n"
+      << "G1 Z0.2 F600\n"
+      << "G1 X0 Y0 F6000\n"
+      << ";TYPE:Outer wall\n"
+      << "G1 X10 Y0 E0.5 F3600\nG1 X10 Y10 E0.5\nG1 X0 Y10 E0.5\nG1 X0 Y0 E0.5\n";
+    f.close();
+    FileLoadResult r = load_snapshot_from_file(tmp.string());
+    REQUIRE(r.snapshot.has_value());
+    CHECK(r.snapshot->config.at("layer_height") == "0.2");
+    CHECK(r.snapshot->layers.size() == 1);
+    CHECK(r.snapshot->layers.begin()->second.segs.size() >= 4);
+    CHECK(r.snapshot->source == tmp.string());
+    std::filesystem::remove(tmp);
+}
+
+TEST_CASE("load_snapshot_from_file reports missing file", "[slice_compare]")
+{
+    FileLoadResult r = load_snapshot_from_file("Z:/definitely/not/here.gcode");
+    CHECK(!r.snapshot.has_value());
+    CHECK(!r.error.empty());
 }
