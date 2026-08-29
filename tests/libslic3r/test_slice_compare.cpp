@@ -50,3 +50,19 @@ TEST_CASE("build_snapshot captures layers, segments, cells", "[slice_compare]")
     // grams: mm of 1.75 filament -> volume*density: pi*(0.0875cm)^2 * 0.4cm... just require > 0
     CHECK(s.filament_g > 0.0);
 }
+
+TEST_CASE("SnapshotStore ring buffer evicts oldest", "[slice_compare]")
+{
+    auto& st = SnapshotStore::instance();
+    st.clear();
+    std::vector<int> ids;
+    for (int i = 0; i < 10; ++i) {
+        Snapshot s; s.label = "snap" + std::to_string(i);
+        ids.push_back(st.add(std::move(s)));
+    }
+    CHECK(st.list().size() == 8);
+    CHECK(st.get(ids[0]) == nullptr);          // evicted
+    CHECK(st.get(ids[9]) != nullptr);
+    CHECK(st.list().front().second == "snap9"); // newest first
+    st.clear();
+}

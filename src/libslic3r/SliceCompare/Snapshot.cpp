@@ -50,4 +50,45 @@ Snapshot build_snapshot(const GCodeProcessorResult& result,
     return s;
 }
 
+SnapshotStore& SnapshotStore::instance()
+{
+    static SnapshotStore s;
+    return s;
+}
+
+int SnapshotStore::add(Snapshot snap)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const int id = m_next_id++;
+    m_items.push_front({id, std::make_shared<Snapshot>(std::move(snap))});
+    while (m_items.size() > 8)
+        m_items.pop_back();
+    return id;
+}
+
+std::shared_ptr<const Snapshot> SnapshotStore::get(int id) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& item : m_items)
+        if (item.first == id)
+            return item.second;
+    return nullptr;
+}
+
+std::vector<std::pair<int, std::string>> SnapshotStore::list() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<std::pair<int, std::string>> out;
+    out.reserve(m_items.size());
+    for (const auto& item : m_items)
+        out.push_back({item.first, item.second->label});
+    return out;
+}
+
+void SnapshotStore::clear()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_items.clear();
+}
+
 }} // namespaces

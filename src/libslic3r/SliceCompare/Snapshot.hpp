@@ -6,6 +6,10 @@
 #include <set>
 #include <vector>
 #include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <utility>
 
 namespace Slic3r {
     class GCodeProcessorResult;  // forward declaration
@@ -38,6 +42,20 @@ Snapshot build_snapshot(const GCodeProcessorResult& result,
                         std::map<std::string, std::string> config,
                         const std::string& label,
                         const std::string& source);
+
+class SnapshotStore {
+public:
+    static SnapshotStore& instance();
+    // returns id of the stored snapshot; evicts oldest beyond capacity (8)
+    int  add(Snapshot snap);
+    std::shared_ptr<const Snapshot> get(int id) const;             // null if evicted
+    std::vector<std::pair<int, std::string>> list() const;         // (id, label), newest first
+    void clear();
+private:
+    mutable std::mutex m_mutex;
+    int m_next_id = 1;
+    std::deque<std::pair<int, std::shared_ptr<Snapshot>>> m_items; // capacity 8
+};
 
     } // SliceCompare
 } // Slic3r
