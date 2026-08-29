@@ -306,6 +306,17 @@ std::vector<BrimRun> split_polyline_by_vote(const Points &poly, bool is_loop,
     absorb_short_runs(runs, p.min_run_mm);
     guard_max_runs(runs, p.max_runs);
 
+    // Close the connecting gap between runs: as partitioned above (and after
+    // absorb/guard merges, which only ever combine adjacent partition segments and
+    // so preserve this invariant), run k-1's last point and run k's first point are
+    // two DIFFERENT, adjacent chain samples (~sample_mm apart) - the travel between
+    // them is not extruded, leaving a small unextruded gap at every boundary. Make
+    // each run after the first start at the previous run's last point instead, so
+    // consecutive runs share that boundary vertex and the extruded geometry is
+    // continuous end to end.
+    for (size_t k = 1; k < runs.size(); ++k)
+        runs[k].pts.insert(runs[k].pts.begin(), runs[k - 1].pts.back());
+
     return runs;
 }
 

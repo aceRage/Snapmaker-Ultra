@@ -787,6 +787,11 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             || opt_key == "purge_in_prime_tower"
             || opt_key == "z_offset"
             || opt_key == "support_multi_bed_types"
+            // Chameleon brim: changes which extruder each brim run prints under
+            // (Print::process's psSkirtBrim partition pass) and, when it fires, which
+            // extruders psWipeTower's ToolOrdering must know about for layer 0 - both
+            // steps need to rerun together, same as the other options in this branch.
+            || opt_key == "brim_filament_source"
             ) {
             steps.emplace_back(psWipeTower);
             steps.emplace_back(psSkirtBrim);
@@ -2718,6 +2723,13 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
 
                 WallSampleIndex wall_idx;
                 std::map<size_t, double> object_area;
+                // Chameleon brim fallback (spec-mandated): an object that contributes zero
+                // layer-0 wall samples (e.g. its first layer is entirely support, no walls of
+                // its own) has no basis for a nearest-wall vote. Rather than let it fall through
+                // to whatever an empty-candidate vote produces, keep its brim on the object's own
+                // filament for its whole run - tracked here via a wall_idx size delta per object,
+                // acted on below by skipping the partition pass for these objects entirely.
+                std::map<ObjectID, bool> zero_sample_objects;
 
                 for (const auto& objIDPair : objPrintVec) {
                     const PrintObject* object = this->get_object(objIDPair.first);
@@ -2736,16 +2748,25 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                     // WallSampleIndex / BrimVoteParams / m_brimMapByExtruder.
                     const unsigned own_extruder_0based = objIDPair.second > 0 ? objIDPair.second - 1 : 0;
 
+                    const size_t samples_before = wall_idx.size();
                     for (const PrintInstance& instance : object->instances())
                         for (const LayerRegion* lr : layer0->regions())
                             chameleon_collect_wall_samples(&lr->perimeters, lr->region().config(),
                                 own_extruder_0based, instance.shift, object_key, wall_idx);
+                    if (wall_idx.size() == samples_before) {
+                        zero_sample_objects[objIDPair.first] = true;
+                        BOOST_LOG_TRIVIAL(warning) << "Chameleon brim: object id " << objIDPair.first.id
+                            << " contributed zero layer-0 wall samples; keeping its brim on the "
+                               "object's own filament instead of nearest-wall assignment.";
+                    }
                 }
 
                 BrimVoteParams vote_params;
                 vote_params.object_area = object_area;
 
                 for (auto& brimEntry : m_brimMap) {
+                    if (zero_sample_objects.count(brimEntry.first))
+                        continue; // fallback: leave this object's brim on its own filament, untouched
                     const auto obj_it = std::find_if(objPrintVec.begin(), objPrintVec.end(),
                         [&brimEntry](const std::pair<ObjectID, unsigned int>& pr) { return pr.first == brimEntry.first; });
                     if (obj_it == objPrintVec.end())
@@ -2756,12 +2777,66 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                     ExtrusionEntityCollection kept;
                     std::map<unsigned, ExtrusionEntityCollection> foreign;
                     partition_brim_by_wall(brimEntry.second, own_extruder_0based, wall_idx, vote_params, kept, foreign);
+                    // I2: release the original entities before the move-assign below replaces
+                    // them - ExtrusionEntityCollection::operator=(&&) just overwrites the
+                    // raw-pointer `entities` vector without deleting what it pointed to (unlike
+                    // the copy-assign operator, which does call clear() first), so skipping this
+                    // leaks every original brim entity on every nearest_wall slice. `kept`/`foreign`
+                    // above already hold independent entities (new paths, or the original pointers
+                    // themselves reassigned into `kept` - never both), so this clear() cannot
+                    // double-free anything partition_brim_by_wall handed back to us.
+                    brimEntry.second.clear();
                     brimEntry.second = std::move(kept);
                     for (auto& foreignEntry : foreign) {
                         if (foreignEntry.second.entities.empty())
                             continue;
                         m_brimMapByExtruder[brimEntry.first][foreignEntry.first] = std::move(foreignEntry.second);
                     }
+                }
+            }
+
+            // Chameleon brim: union foreign-extruder brim partitions into the first layer's
+            // LayerTools.extruders of the ToolOrdering object GCode actually consumes
+            // (m_tool_ordering; m_wipe_tower_data.tool_ordering is a reference to this same
+            // object - see WipeTowerData's private ctor above). This MUST run here, after the
+            // partition pass above has populated m_brimMapByExtruder, rather than inside
+            // ToolOrdering's own constructor: psWipeTower - which constructs/assigns
+            // m_tool_ordering, both via _make_wipe_tower() and the plain-ToolOrdering(*this, ...)
+            // branch - runs BEFORE psSkirtBrim, so a ctor-time hook always observed an empty map
+            // on a fresh slice.
+            if (!m_brimMapByExtruder.empty()) {
+                if (m_tool_ordering.empty()) {
+                    // Belt-and-braces: the ToolOrdering GCode consumes isn't available on this
+                    // path (should not happen given the ByObject gate above, but brim geometry
+                    // must never be silently dropped) - fold every foreign partition back into
+                    // its object's own-extruder brim collection instead of leaving it stranded
+                    // and unregistered (which GCode::process_layer would then never visit).
+                    for (auto& brimEntry : m_brimMapByExtruder) {
+                        ExtrusionEntityCollection& own = m_brimMap[brimEntry.first];
+                        for (auto& foreignEntry : brimEntry.second)
+                            own.append(std::move(foreignEntry.second.entities));
+                    }
+                    BOOST_LOG_TRIVIAL(warning) << "Chameleon brim: ToolOrdering unavailable after brim "
+                        "partitioning; merged all foreign-extruder brim runs back into their "
+                        "object's own extruder instead of dropping them.";
+                    m_brimMapByExtruder.clear();
+                } else {
+                    // Do NOT sort/dedup this vector with sort_remove_duplicates(): by this point
+                    // its order is semantically load-bearing, not incidental - reorder_extruders()
+                    // has already picked which extruder leads (the requested first_extruder, or a
+                    // soluble-first swap ahead of the prime tower) and, for layer 0 specifically,
+                    // applied apply_first_layer_order()'s user-configured sequence. A numeric sort
+                    // here would silently discard all of that ordering. Instead, append any brim
+                    // extruder not already present to the end (dedup via linear find,
+                    // order-preserving) so it simply prints last on layer 0.
+                    LayerTools& first_layer_tools = m_tool_ordering.tools_for_layer(m_tool_ordering.front().print_z);
+                    for (const auto& obj_entry : m_brimMapByExtruder)
+                        for (const auto& per_extruder : obj_entry.second) {
+                            unsigned int extruder_id = per_extruder.first;
+                            if (std::find(first_layer_tools.extruders.begin(), first_layer_tools.extruders.end(), extruder_id)
+                                == first_layer_tools.extruders.end())
+                                first_layer_tools.extruders.push_back(extruder_id);
+                        }
                 }
             }
 

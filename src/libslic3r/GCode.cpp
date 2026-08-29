@@ -6306,21 +6306,6 @@ LayerResult GCode::process_layer(const Print& print,
             gcode += generate_skirt(print, print.skirt(), Point(0, 0), layer.object()->config().skirt_start_angle, layer_tools, layer,
                                     extruder_id);
 
-        // Chameleon brim: print this extruder's foreign brim partitions (layer 0 only).
-        if (first_layer && !print.get_brimMapByExtruder().empty()) {
-            for (const auto& obj_entry : print.get_brimMapByExtruder()) {
-                auto it = obj_entry.second.find(extruder_id);
-                if (it == obj_entry.second.end() || it->second.entities.empty())
-                    continue;
-                this->set_origin(0., 0.);
-                m_avoid_crossing_perimeters.use_external_mp();
-                for (const ExtrusionEntity* ee : it->second.entities)
-                    gcode += this->extrude_entity(*ee, "brim", m_config.support_speed.value);
-                m_avoid_crossing_perimeters.use_external_mp(false);
-                m_avoid_crossing_perimeters.disable_once();
-            }
-        }
-
         std::string gcode_toolchange;
         if (has_wipe_tower) {
             if (!m_wipe_tower->is_empty_wipe_tower_gcode(*this, extruder_id, extruder_id == layer_extruders.back())) {
@@ -6356,6 +6341,34 @@ LayerResult GCode::process_layer(const Print& print,
         // let analyzer tag generator aware of a role type change
         if (layer_tools.has_wipe_tower && m_wipe_tower)
             m_last_processor_extrusion_role = erWipeTower;
+
+        // Chameleon brim: print this extruder's foreign brim partitions (layer 0 only).
+        // MUST run after the toolchange gcode above: this extruder isn't actually
+        // active (loaded/primed) until gcode_toolchange has been appended, so emitting
+        // here - rather than before the toolchange block - avoids extruding a foreign
+        // partition while the previous extruder is still selected.
+        // Iterate print.objects() (stable, model-derived order) rather than the
+        // ObjectID-keyed map directly: ObjectID is an allocation-order id, not stable
+        // across runs (see Print.cpp's object_ordinal comment), so iterating the map
+        // by its own key order would make emission order - and thus travel moves/seams -
+        // run-unstable even though the underlying geometry ordering is deterministic.
+        if (first_layer && !print.get_brimMapByExtruder().empty()) {
+            const auto& brim_map_by_extruder = print.get_brimMapByExtruder();
+            for (const PrintObject* obj : print.objects()) {
+                auto obj_entry = brim_map_by_extruder.find(obj->id());
+                if (obj_entry == brim_map_by_extruder.end())
+                    continue;
+                auto it = obj_entry->second.find(extruder_id);
+                if (it == obj_entry->second.end() || it->second.entities.empty())
+                    continue;
+                this->set_origin(0., 0.);
+                m_avoid_crossing_perimeters.use_external_mp();
+                for (const ExtrusionEntity* ee : it->second.entities)
+                    gcode += this->extrude_entity(*ee, "brim", m_config.support_speed.value);
+                m_avoid_crossing_perimeters.use_external_mp(false);
+                m_avoid_crossing_perimeters.disable_once();
+            }
+        }
 
         auto objects_by_extruder_it = by_extruder.find(extruder_id);
         if (objects_by_extruder_it == by_extruder.end())

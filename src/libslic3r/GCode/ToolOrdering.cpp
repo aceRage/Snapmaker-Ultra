@@ -515,30 +515,12 @@ ToolOrdering::ToolOrdering(const Print &print, unsigned int first_extruder, bool
         this->fill_wipe_tower_partitions(print.config(), object_bottom_z, max_layer_height);
     }
 
-    // Chameleon brim: the extruders map above is keyed 0-based (Print::extruders() convention),
-    // matching lt.extruders at this point (reorder_extruders() has already reindexed it back to
-    // 0-based). Union any foreign-extruder brim partitions into the first layer's extruder set so
-    // the per-extruder G-code loop (GCode::process_layer) actually visits them, even when no other
-    // object extrusion on layer 0 already uses that extruder. No-op when the map is empty (off mode
-    // or single-extruder prints), preserving byte-identical output.
-    //
-    // Do NOT sort/dedup this vector with sort_remove_duplicates(): by this point its order is
-    // semantically load-bearing, not incidental - reorder_extruders() has already picked which
-    // extruder leads (the requested first_extruder, or a soluble-first swap ahead of the prime
-    // tower, see reorder_extruders() above) and, for layer 0 specifically, applied
-    // apply_first_layer_order()'s user-configured sequence. A numeric sort here would silently
-    // discard all of that ordering. Instead, append any brim extruder not already present to the
-    // end (dedup via linear find, order-preserving) so it simply prints last on layer 0.
-    if (!m_layer_tools.empty() && !print.get_brimMapByExtruder().empty()) {
-        LayerTools& first_layer_tools = this->tools_for_layer(m_layer_tools.front().print_z);
-        for (const auto& obj_entry : print.get_brimMapByExtruder())
-            for (const auto& per_extruder : obj_entry.second) {
-                unsigned int extruder_id = per_extruder.first;
-                if (std::find(first_layer_tools.extruders.begin(), first_layer_tools.extruders.end(), extruder_id)
-                    == first_layer_tools.extruders.end())
-                    first_layer_tools.extruders.push_back(extruder_id);
-            }
-    }
+    // Chameleon brim: the union of foreign-extruder brim partitions into the first
+    // layer's LayerTools.extruders used to happen here (ctor-time). It was moved to
+    // Print::process() (psSkirtBrim, right after the partition pass fills
+    // m_brimMapByExtruder) because this constructor runs during psWipeTower, which
+    // executes BEFORE psSkirtBrim populates m_brimMapByExtruder - so a ctor-time hook
+    // always observed an empty map on a fresh slice. See Print.cpp for the replacement.
 
     this->collect_extruder_statistics(prime_multi_material);
 

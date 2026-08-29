@@ -83,6 +83,32 @@ TEST_CASE("split_polyline_by_vote yields two runs at the midline", "[chameleon]"
     // boundary within 0.5mm of x=20
     const Point& last0 = runs[0].pts.back();
     CHECK(std::abs(unscale<double>(last0.x()) - 20.0) < 0.5 + p.sample_mm);
+    // I1: adjacent runs must share the boundary vertex (no unextruded connecting
+    // gap between the last point of one run and the first point of the next).
+    REQUIRE(!runs[1].pts.empty());
+    CHECK(runs[1].pts.front() == runs[0].pts.back());
+}
+
+TEST_CASE("split_polyline_by_vote runs are boundary-continuous end to end", "[chameleon]")
+{
+    // Four walls in a row -> forces several run boundaries so we can check every
+    // consecutive pair, not just a single split.
+    WallSampleIndex idx;
+    idx.add_polyline(segment(2, -1, 2, -1),   0, 1);
+    idx.add_polyline(segment(12, -1, 12, -1), 1, 2);
+    idx.add_polyline(segment(22, -1, 22, -1), 2, 3);
+    idx.add_polyline(segment(32, -1, 32, -1), 3, 4);
+    BrimVoteParams p; p.min_run_mm = 0.0;
+    auto runs = split_polyline_by_vote(segment(0, 5, 40, 5), false, idx, p);
+    REQUIRE(runs.size() > 1);
+    for (size_t k = 1; k < runs.size(); ++k) {
+        REQUIRE(!runs[k].pts.empty());
+        REQUIRE(!runs[k - 1].pts.empty());
+        CHECK(runs[k].pts.front() == runs[k - 1].pts.back());
+    }
+    // Coverage still holds end to end despite the added boundary overlap points.
+    CHECK(runs.front().pts.front() == Point(scale_(0), scale_(5)));
+    CHECK(runs.back().pts.back()   == Point(scale_(40), scale_(5)));
 }
 
 TEST_CASE("guard coalesces to max_runs", "[chameleon]")
@@ -96,6 +122,12 @@ TEST_CASE("guard coalesces to max_runs", "[chameleon]")
     // full coverage: concatenated pts span whole line
     CHECK(runs.front().pts.front() == Point(scale_(0), scale_(5)));
     CHECK(runs.back().pts.back()   == Point(scale_(40), scale_(5)));
+    // I1: no gaps at any surviving run boundary, even after guard merges.
+    for (size_t k = 1; k < runs.size(); ++k) {
+        REQUIRE(!runs[k].pts.empty());
+        REQUIRE(!runs[k - 1].pts.empty());
+        CHECK(runs[k].pts.front() == runs[k - 1].pts.back());
+    }
 }
 
 static ExtrusionEntityCollection one_loop_brim(double cx, double half, float w = 0.5f)
