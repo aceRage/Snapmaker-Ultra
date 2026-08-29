@@ -2685,7 +2685,19 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
             // printed the nearest first-layer wall. Off by default (bfsObject),
             // and skipped outright on single-extruder prints so the default
             // path stays byte-identical to pre-chameleon behavior.
-            if (m_config.brim_filament_source == bfsNearestWall && this->extruders().size() > 1) {
+            // Also restricted to by-layer printing: in PrintSequence::ByObject mode,
+            // GCode::process_layers() builds a separate per-object ToolOrdering for
+            // each object in turn (which never runs the whole-print union hook in
+            // ToolOrdering.cpp), so GCode::process_layer's foreign-brim emission block
+            // would see a populated m_brimMapByExtruder without the matching extruder
+            // having been registered for that object's layer - risking a double-emit
+            // (once via the normal per-object m_brimMap path, once foreign) or a
+            // missed/mis-sequenced foreign run. Keep m_brimMapByExtruder empty in
+            // sequential (by-object) mode so both the union hook and the emission
+            // block stay no-ops there and by-object prints keep the plain per-object
+            // brim behavior (each object's brim prints in its own filament).
+            if (m_config.brim_filament_source == bfsNearestWall && this->extruders().size() > 1
+                && m_config.print_sequence != PrintSequence::ByObject) {
                 WallSampleIndex wall_idx;
                 std::map<size_t, double> object_area;
 

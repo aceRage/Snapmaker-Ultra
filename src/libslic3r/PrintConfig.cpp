@@ -1386,7 +1386,8 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Support");
     def->tooltip = L("object: brim uses each object's filament (default). nearest_wall: each brim "
                      "extrusion uses the filament of the nearest first-layer wall, so brims match "
-                     "what they touch (multi-filament prints only).");
+                     "what they touch (multi-filament prints only). Applies to by-layer printing; "
+                     "by-object (sequential) prints use the object's filament.");
     def->enum_keys_map = &ConfigOptionEnum<BrimFilamentSource>::get_enum_values();
     def->enum_values.emplace_back("object");
     def->enum_values.emplace_back("nearest_wall");
