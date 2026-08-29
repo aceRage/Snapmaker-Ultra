@@ -692,6 +692,10 @@ std::shared_ptr<HttpServer::Response> HttpServer::bbl_auth_handle_request(const 
             agent->change_user(j.dump());
             if (agent->is_user_login()) {
                 //wxGetApp().request_user_login(1);
+                // Ultra P4: the stock post-login trigger is gone, so kick cloud device
+                // discovery ourselves so My Devices populates after OAuth login. (Kept in
+                // GUI_App to avoid pulling DeviceManager.hpp -> libslic3r/I18N.hpp here.)
+                wxGetApp().kick_user_device_refresh();
             }
             GUI::wxGetApp().CallAfter([] { wxGetApp().ShowUserLogin(false); });
             std::string location_str = (boost::format("%1%?result=success") % redirect_url).str();

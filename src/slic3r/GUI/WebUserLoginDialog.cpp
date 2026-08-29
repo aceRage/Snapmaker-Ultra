@@ -301,12 +301,15 @@ void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
         }
         else if (strCmd == "get_localhost_url") {
             BOOST_LOG_TRIVIAL(info) << "thirdparty_login: get_localhost_url";
-            //wxGetApp().start_http_server();
+            // Ultra P4: actually start the loopback OAuth-callback server (was gutted) so
+            // the third-party sign-in redirect to 127.0.0.1:<port> is caught. Advertise the
+            // REAL bound port in case LOCALHOST_PORT was busy.
+            wxGetApp().start_http_server();
             std::string sequence_id = j["sequence_id"].get<std::string>();
             CallAfter([this, sequence_id] {
                 json ack_j;
                 ack_j["command"] = "get_localhost_url";
-                ack_j["response"]["base_url"] = std::string(LOCALHOST_URL) + std::to_string(LOCALHOST_PORT);
+                ack_j["response"]["base_url"] = std::string(LOCALHOST_URL) + std::to_string(wxGetApp().get_http_port());
                 ack_j["response"]["result"] = "success";
                 ack_j["sequence_id"] = sequence_id;
                 wxString str_js = wxString::Format("window.postMessage(%s)", ack_j.dump());

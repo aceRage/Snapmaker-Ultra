@@ -2073,6 +2073,7 @@ GUI_App::~GUI_App()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": exit");
 
     stop_page_http_server();
+    stop_http_server();
 }
 
 // If formatted for github, plaintext with OpenGL extensions enclosed into <details>.
@@ -5706,15 +5707,26 @@ void GUI_App::stop_sync_user_preset()
     }
 }
 
-//void GUI_App::start_http_server()
-//{
-//    if (!m_http_server.is_started())
-//        m_http_server.start();
-//}
-//void GUI_App::stop_http_server()
-//{
-//    m_http_server.stop();
-//}
+void GUI_App::start_http_server()
+{
+    if (!m_http_server.is_started())
+        m_http_server.start();
+}
+void GUI_App::stop_http_server()
+{
+    m_http_server.stop();
+}
+
+void GUI_App::kick_user_device_refresh()
+{
+    // Ultra P4: after a login (esp. the third-party OAuth callback in HttpServer, which
+    // can't include DeviceManager.hpp), refresh the cloud device list off the UI thread —
+    // update_user_machine_list_info() does a blocking HTTPS GET + parse.
+    std::thread([] {
+        if (auto* dev = Slic3r::GUI::wxGetApp().getDeviceManager())
+            dev->update_user_machine_list_info();
+    }).detach();
+}
 
 void GUI_App::start_page_http_server()
 {

@@ -347,7 +347,10 @@ private:
     bool             m_side_popup_status{false};
     bool             m_show_http_errpr_msgdlg{false};
     wxString         m_info_dialog_content;
-    //HttpServer       m_http_server;
+    // Ultra P4: OAuth (Google/third-party) login callback server, bound to
+    // 127.0.0.1:LOCALHOST_PORT with the default bbl_auth_handle_request handler. The
+    // fork had gutted this, so third-party sign-in redirects hit a dead loopback (404).
+    HttpServer       m_http_server;
 
 public:
     HttpServer       m_page_http_server;
@@ -645,8 +648,11 @@ private:
     void            sync_preset(Preset* preset);
     void            start_sync_user_preset(bool with_progress_dlg = false);
     void            stop_sync_user_preset();
-    //void            start_http_server();
-    //void            stop_http_server();
+    void            start_http_server();
+    void            stop_http_server();
+    void            kick_user_device_refresh(); // off-thread cloud device-list refresh after login
+    /// Actual OAuth-callback listen port (may differ from LOCALHOST_PORT if it was in use).
+    boost::asio::ip::port_type get_http_port() const { return m_http_server.get_port(); }
 
     // page loading http server
     void            start_page_http_server();
