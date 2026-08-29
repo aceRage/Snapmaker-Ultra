@@ -194,8 +194,8 @@ void SliceCompareFrame::build_ui()
     wxPanel* feat_page = new wxPanel(m_notebook);
     m_feat_table = new wxDataViewListCtrl(feat_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxDV_ROW_LINES);
     m_feat_table->AppendTextColumn(_L("Feature"), wxDATAVIEW_CELL_INERT, 140);
-    m_feat_table->AppendTextColumn(wxString::FromUTF8("\xCE\x94 Time"), wxDATAVIEW_CELL_INERT, 90);
-    m_feat_table->AppendTextColumn(wxString::FromUTF8("\xCE\x94 Grams"), wxDATAVIEW_CELL_INERT, 90);
+    m_feat_table->AppendTextColumn(_L("Δ Time"), wxDATAVIEW_CELL_INERT, 90);
+    m_feat_table->AppendTextColumn(_L("Δ Grams"), wxDATAVIEW_CELL_INERT, 90);
     m_feat_table->AppendTextColumn(_L("B Time"), wxDATAVIEW_CELL_INERT, 90);
     wxBoxSizer* feat_sizer = new wxBoxSizer(wxVERTICAL);
     feat_sizer->Add(m_feat_table, 1, wxEXPAND);
