@@ -13,7 +13,7 @@
 #include <optional>
 
 namespace Slic3r {
-    class GCodeProcessorResult;  // forward declaration
+    struct GCodeProcessorResult;  // forward declaration (matches struct GCodeProcessorResult in GCode/GCodeProcessor.hpp)
     namespace SliceCompare {
 
 struct Seg { float x0, y0, x1, y1; uint8_t role; };
