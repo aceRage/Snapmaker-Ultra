@@ -3044,6 +3044,17 @@ void MainFrame::init_menubar_as_editor()
             [this](wxCommandEvent&) { m_plater->toggle_show_wireframe(); m_plater->get_current_canvas3D()->post_event(SimpleEvent(wxEVT_PAINT)); }, this,
             [this]() { return m_plater->is_wireframe_enabled(); }, [this]() { return m_plater->is_show_wireframe(); }, this);*/
 
+        // Slice Compare: viewMenu is populated here unconditionally (before the
+        // __APPLE__ / topbar platform split below), so these items reach both
+        // the Windows/Linux topbar dropdown (m_topbar->AddDropDownSubMenu) and
+        // the native macOS menu bar (m_menubar->Append).
+        viewMenu->AppendSeparator();
+        append_menu_item(viewMenu, wxID_ANY, _L("Compare Slices") + dots, _L("Compare two sliced results visually"),
+            [this](wxCommandEvent&) { Slic3r::GUI::open_slice_compare_frame(this, false); }, "", nullptr,
+            []() { return true; }, this);
+        append_menu_item(viewMenu, wxID_ANY, _L("Compare with Previous Slice"), _L("Compare the last two slices of this session"),
+            [this](wxCommandEvent&) { Slic3r::GUI::open_slice_compare_frame(this, true); }, "", nullptr,
+            []() { return true; }, this);
     }
 
     wxWindowID config_id_base = wxWindow::NewControlId(int(ConfigMenuCnt));
@@ -3219,15 +3230,6 @@ void MainFrame::init_menubar_as_editor()
     m_menubar->Append(fileMenu, wxString::Format("&%s", _L("File")));
     if (editMenu)
         m_menubar->Append(editMenu, wxString::Format("&%s", _L("Edit")));
-    if (viewMenu) {
-        viewMenu->AppendSeparator();
-        append_menu_item(viewMenu, wxID_ANY, _L("Compare Slices") + dots, _L("Compare two sliced results visually"),
-            [this](wxCommandEvent&) { Slic3r::GUI::open_slice_compare_frame(this, false); }, "", nullptr,
-            []() { return true; }, this);
-        append_menu_item(viewMenu, wxID_ANY, _L("Compare with Previous Slice"), _L("Compare the last two slices of this session"),
-            [this](wxCommandEvent&) { Slic3r::GUI::open_slice_compare_frame(this, true); }, "", nullptr,
-            []() { return true; }, this);
-    }
     if (viewMenu)
         m_menubar->Append(viewMenu, wxString::Format("&%s", _L("View")));
     /*if (publishMenu)
