@@ -15337,9 +15337,10 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
     if (!has_error && !evt.cancelled()) {
         try {
             GCodeProcessorResult* res = partplate_list.get_current_slice_result();
-            if (res != nullptr && !res->moves.empty()) {
+            const Print* fff = this->background_process.fff_print();
+            if (res != nullptr && !res->moves.empty() && fff != nullptr) {
                 std::map<std::string, std::string> cfg;
-                const DynamicPrintConfig full_cfg = this->background_process.fff_print()->full_print_config();
+                const DynamicPrintConfig full_cfg = fff->full_print_config();
                 for (const std::string& key : full_cfg.keys())
                     if (const ConfigOption* opt = full_cfg.option(key); opt != nullptr)
                         cfg[key] = opt->serialize();
