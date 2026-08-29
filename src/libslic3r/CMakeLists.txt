@@ -80,6 +80,8 @@ set(lisbslic3r_sources
     Brim.cpp
     BrimEarsPoint.hpp
     Brim.hpp
+    WallSampleIndex.cpp
+    WallSampleIndex.hpp
     BuildVolume.cpp
     BuildVolume.hpp
     calib.cpp
