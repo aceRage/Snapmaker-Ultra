@@ -1,7 +1,3 @@
-// SPIKE (feat/color-matched-supports): mid-feature extruder-switch feasibility probe.
-// Remove this define (and all SPIKE_SPLIT_BRIM blocks) before any feature work lands.
-#define SPIKE_SPLIT_BRIM 1
-
 #include "BoundingBox.hpp"
 #include "Config.hpp"
 #include "Polygon.hpp"
@@ -6535,42 +6531,9 @@ LayerResult GCode::process_layer(const Print& print,
                             !print_wipe_extrusions) {
                             this->set_origin(0., 0.);
                             m_avoid_crossing_perimeters.use_external_mp();
-#ifdef SPIKE_SPLIT_BRIM
-                            // ===== SPIKE Experiment 1: force a mid-brim extruder switch =====
-                            // Emits half the object's brim entities, switches to the "other"
-                            // extruder, emits the rest, switches back. Answers: does the
-                            // pipeline tolerate a mid-feature set_extruder (R1-R3)?
-                            {
-                                // Flatten: per-object brim is typically ONE collection entity
-                                // wrapping all concentric loops; split needs atomic entities.
-                                ExtrusionEntityCollection spike_flat = print.m_brimMap.at(instance_to_print.print_object.id()).flatten();
-                                const size_t nb = spike_flat.entities.size();
-                                const unsigned cur_ext = m_writer.extruder() ? (unsigned) m_writer.extruder()->id() : 0;
-                                const unsigned other_ext = cur_ext == 0 ? 1 : 0;
-                                bool switched = false;
-                                size_t bi = 0;
-                                gcode += ";SPIKE brim entities=" + std::to_string(nb) +
-                                         " cur=" + std::to_string(cur_ext) + "\n";
-                                for (const ExtrusionEntity* ee : spike_flat.entities) {
-                                    if (!switched && nb >= 2 && bi >= nb / 2) {
-                                        gcode += ";SPIKE brim toolchange -> " + std::to_string(other_ext) +
-                                                 " at entity " + std::to_string(bi) + "/" + std::to_string(nb) + "\n";
-                                        gcode += this->set_extruder(other_ext, layer.print_z);
-                                        switched = true;
-                                    }
-                                    gcode += this->extrude_entity(*ee, "brim", m_config.support_speed.value);
-                                    ++bi;
-                                }
-                                if (switched) {
-                                    gcode += ";SPIKE brim toolchange back -> " + std::to_string(cur_ext) + "\n";
-                                    gcode += this->set_extruder(cur_ext, layer.print_z);
-                                }
-                            }
-#else
                             for (const ExtrusionEntity* ee : print.m_brimMap.at(instance_to_print.print_object.id()).entities) {
                                 gcode += this->extrude_entity(*ee, "brim", m_config.support_speed.value);
                             }
-#endif
                             m_avoid_crossing_perimeters.use_external_mp(false);
                             // Allow a straight travel move to the first object point.
                             m_avoid_crossing_perimeters.disable_once();
@@ -6772,21 +6735,7 @@ void GCode::append_full_config(const Print& print, std::string& str)
 
 void GCode::set_extruders(const std::vector<unsigned int>& extruder_ids)
 {
-#ifdef SPIKE_SPLIT_BRIM
-    // SPIKE: ensure a second extruder is registered so the injected mid-feature
-    // switch exercises the REAL toolchange path (multiple_extruders=true, M620
-    // machinery). This mirrors what the actual feature does: extruders used by
-    // spatial assignment join the print's used-extruder set.
-    {
-        std::vector<unsigned int> ids = extruder_ids;
-        if (std::find(ids.begin(), ids.end(), 1u) == ids.end()) ids.push_back(1u);
-        if (std::find(ids.begin(), ids.end(), 0u) == ids.end()) ids.push_back(0u);
-        std::sort(ids.begin(), ids.end());
-        m_writer.set_extruders(ids);
-    }
-#else
     m_writer.set_extruders(extruder_ids);
-#endif
 
     // enable wipe path generation if any extruder has wipe enabled
     m_wipe.enable = false;
@@ -7317,39 +7266,7 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection& support_fill
 
         const double support_speed           = m_config.support_speed.value;
         const double support_interface_speed = m_config.get_abs_value("support_interface_speed");
-#ifdef SPIKE_SPLIT_BRIM
-        // ===== SPIKE Experiment 2: force a mid-interface extruder switch on ONE layer =====
-        // First layer with >= 10 pure-interface extrusions gets split half/half across two
-        // extruders. Answers: mid-print (not layer 0) tool change sanity + next-layer state.
-        static int spike_iface_layer_done = -1;
-        bool spike_split_here = false;
-        size_t spike_half = 0;
-        if ((support_extrusion_role == erSupportMaterialInterface || support_extrusion_role == erMixed) &&
-            extrusions.size() >= 2 && m_layer != nullptr && m_layer->id() > 0) {
-            const int lid = (int) m_layer->id();
-            if (spike_iface_layer_done < 0 || spike_iface_layer_done == lid) {
-                spike_iface_layer_done = lid;
-                spike_split_here = true;
-                spike_half = extrusions.size() / 2;
-                gcode += ";SPIKE interface split layer " + std::to_string(lid) +
-                         " extrusions=" + std::to_string(extrusions.size()) + "\n";
-            }
-        }
-        size_t spike_idx = 0;
-        bool spike_switched = false;
-        unsigned spike_cur = m_writer.extruder() ? (unsigned) m_writer.extruder()->id() : 0;
-        unsigned spike_other = spike_cur == 0 ? 1 : 0;
-#endif
         for (const ExtrusionEntity* ee : extrusions) {
-#ifdef SPIKE_SPLIT_BRIM
-            if (spike_split_here && !spike_switched && spike_idx >= spike_half) {
-                gcode += ";SPIKE interface toolchange -> " + std::to_string(spike_other) +
-                         " at " + std::to_string(spike_idx) + "/" + std::to_string(extrusions.size()) + "\n";
-                gcode += this->set_extruder(spike_other, m_layer ? m_layer->print_z : 0.0);
-                spike_switched = true;
-            }
-            ++spike_idx;
-#endif
             ExtrusionRole role = ee->role();
             assert(role == erSupportMaterial || role == erSupportMaterialInterface || role == erSupportTransition || role == erIroning);
             const char* label = (role == erSupportMaterial) ?
@@ -7376,12 +7293,6 @@ std::string GCode::extrude_support(const ExtrusionEntityCollection& support_fill
                 throw Slic3r::InvalidArgument("Unknown extrusion type");
             }
         }
-#ifdef SPIKE_SPLIT_BRIM
-        if (spike_switched) {
-            gcode += ";SPIKE interface toolchange back -> " + std::to_string(spike_cur) + "\n";
-            gcode += this->set_extruder(spike_cur, m_layer ? m_layer->print_z : 0.0);
-        }
-#endif
     }
     return gcode;
 }
@@ -8618,12 +8529,6 @@ std::string GCode::retract(bool toolchange, bool is_last_retraction, LiftType li
 
 std::string GCode::set_extruder(unsigned int extruder_id, double print_z, bool by_object)
 {
-#ifdef SPIKE_SPLIT_BRIM
-    BOOST_LOG_TRIVIAL(warning) << "[SPIKE] set_extruder(" << extruder_id << ") z=" << print_z
-        << " layer=" << (m_layer ? (int) m_layer->id() : -1)
-        << " prev=" << (m_writer.extruder() ? (int) m_writer.extruder()->id() : -1)
-        << " wipe_tower=" << (m_wipe_tower ? 1 : 0);
-#endif
     if (!m_writer.need_toolchange(extruder_id))
         return "";
 
