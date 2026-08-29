@@ -93,6 +93,7 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/SLAPrint.hpp"
+#include "libslic3r/SliceCompare/Snapshot.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -15331,6 +15332,27 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
         has_error = true;
         is_finished = true;
     }
+
+    // Ultra: capture a Slice Compare snapshot of every successful slice.
+    if (!has_error && !evt.cancelled()) {
+        try {
+            GCodeProcessorResult* res = partplate_list.get_current_slice_result();
+            if (res != nullptr && !res->moves.empty()) {
+                std::map<std::string, std::string> cfg;
+                const DynamicPrintConfig full_cfg = this->background_process.fff_print()->full_print_config();
+                for (const std::string& key : full_cfg.keys())
+                    if (const ConfigOption* opt = full_cfg.option(key); opt != nullptr)
+                        cfg[key] = opt->serialize();
+                const std::string label = (boost::format("P%1% · %2% · %3%")
+                    % (partplate_list.get_curr_plate_index() + 1)
+                    % wxGetApp().preset_bundle->printers.get_selected_preset_name()
+                    % wxDateTime::Now().FormatTime().ToStdString()).str();
+                SliceCompare::SnapshotStore::instance().add(
+                    SliceCompare::build_snapshot(*res, std::move(cfg), label, "session"));
+            }
+        } catch (...) { BOOST_LOG_TRIVIAL(warning) << "slice-compare snapshot capture failed"; }
+    }
+
     if (evt.cancelled()) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", cancel event, status: %1%") % evt.status();
         this->notification_manager->set_slicing_progress_canceled(_u8L("Slicing Canceled"));
