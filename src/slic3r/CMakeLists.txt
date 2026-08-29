@@ -304,6 +304,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/MonitorBasePanel.h
     GUI/Monitor.cpp
     GUI/Monitor.hpp
+    GUI/SliceCompare/SliceCompareFrame.cpp
+    GUI/SliceCompare/SliceCompareFrame.hpp
     GUI/MonitorPage.cpp
     GUI/MonitorPage.hpp
     GUI/Mouse3DController.cpp

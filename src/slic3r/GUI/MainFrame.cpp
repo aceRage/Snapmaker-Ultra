@@ -70,6 +70,7 @@
 #include "ConfigWizard.hpp"
 #include "Widgets/WebView.hpp"
 #include "DailyTips.hpp"
+#include "SliceCompare/SliceCompareFrame.hpp"
 
 #ifdef _WIN32
 #include <dbt.h>
@@ -3218,6 +3219,15 @@ void MainFrame::init_menubar_as_editor()
     m_menubar->Append(fileMenu, wxString::Format("&%s", _L("File")));
     if (editMenu)
         m_menubar->Append(editMenu, wxString::Format("&%s", _L("Edit")));
+    if (viewMenu) {
+        viewMenu->AppendSeparator();
+        append_menu_item(viewMenu, wxID_ANY, _L("Compare Slices") + dots, _L("Compare two sliced results visually"),
+            [this](wxCommandEvent&) { Slic3r::GUI::open_slice_compare_frame(this, false); }, "", nullptr,
+            []() { return true; }, this);
+        append_menu_item(viewMenu, wxID_ANY, _L("Compare with Previous Slice"), _L("Compare the last two slices of this session"),
+            [this](wxCommandEvent&) { Slic3r::GUI::open_slice_compare_frame(this, true); }, "", nullptr,
+            []() { return true; }, this);
+    }
     if (viewMenu)
         m_menubar->Append(viewMenu, wxString::Format("&%s", _L("View")));
     /*if (publishMenu)
