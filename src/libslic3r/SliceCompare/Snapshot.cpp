@@ -73,6 +73,19 @@ std::filesystem::path make_temp_gcode_path()
     return std::filesystem::temp_directory_path() / name.str();
 }
 
+// Best-effort cleanup of a temp file on every exit path (success, early
+// return on extraction failure, or exception unwinding) — extraction can
+// leave a partial/empty file behind even when it reports failure, since
+// mz_zip_reader_extract_to_file opens the destination before it starts
+// writing.
+struct TempFileGuard {
+    std::filesystem::path path;
+    ~TempFileGuard() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+};
+
 } // anonymous namespace
 
 std::map<std::string, std::string> parse_gcode_config(const std::string& gcode_path)
@@ -196,6 +209,11 @@ FileLoadResult load_snapshot_from_3mf(const std::string& original_path)
     }
 
     const std::filesystem::path tmp_path = make_temp_gcode_path();
+    TempFileGuard tmp_guard{tmp_path}; // removes tmp_path on every exit below,
+                                       // including the !extracted early return
+                                       // (extraction opens the file before it
+                                       // writes, so a failure can still leave
+                                       // a partial/empty orphan on disk)
     const bool extracted = mz_zip_reader_extract_to_file(&archive, found_index, tmp_path.string().c_str(), 0);
     close_zip_reader(&archive);
 
@@ -205,9 +223,6 @@ FileLoadResult load_snapshot_from_3mf(const std::string& original_path)
     }
 
     FileLoadResult inner = load_snapshot_from_gcode_file(tmp_path.string());
-
-    std::error_code ec;
-    std::filesystem::remove(tmp_path, ec); // best-effort cleanup
 
     if (!inner.snapshot.has_value()) {
         out.error = inner.error;
