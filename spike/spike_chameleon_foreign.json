@@ -1,0 +1,17 @@
+{
+    "type": "process",
+    "name": "spike overrides",
+    "from": "User",
+    "inherits": "0.20mm Standard @BBL X1C",
+    "compatible_printers": [
+        "Bambu Lab X1 Carbon 0.4 nozzle"
+    ],
+    "brim_type": "outer_only",
+    "brim_width": "5",
+    "enable_prime_tower": "0",
+    "wall_loops": "2",
+    "use_relative_e_distances": "0",
+    "brim_filament_source": "nearest_wall",
+    "brim_object_gap": "0",
+    "wall_filament": "2"
+}
