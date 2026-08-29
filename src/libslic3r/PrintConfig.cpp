@@ -427,6 +427,16 @@ static t_config_enum_values s_keys_map_NozzleType {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(NozzleType)
 
+// Ultra: nozzle flow variant. Names match Bambu's ("Standard"/"High Flow") and the ints
+// match their NozzleVolumeType (Standard=0, High Flow=1) so the value we emit into the
+// gcode CONFIG_BLOCK and slice_info.config is what modern Bambu firmware validates.
+// nvtNormal maps to "Standard", nvtBigTraffic to "High Flow".
+static t_config_enum_values s_keys_map_NozzleVolumeType {
+    { "Standard",  int(NozzleVolumeType::nvtNormal) },
+    { "High Flow", int(NozzleVolumeType::nvtBigTraffic) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(NozzleVolumeType)
+
 static t_config_enum_values s_keys_map_PrinterStructure {
     {"undefine",        int(PrinterStructure::psUndefine)},
     {"corexy",          int(PrinterStructure::psCoreXY)},
@@ -3142,6 +3152,23 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back(L("Brass"));
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<NozzleType>(ntUndefine));
+
+    // Ultra: nozzle flow variant (Standard / High Flow). Project-scoped, metadata only in
+    // this fork (our presets aren't per-variant, so it drives no slicing math). Emitted into
+    // the gcode CONFIG_BLOCK and slice_info.config so a Bambu print declares the installed
+    // nozzle's flow type; auto-matched to the connected printer at print-send time.
+    def = this->add("nozzle_volume_type", coEnum);
+    def->label = L("Nozzle flow type");
+    def->tooltip = L("The flow variant of the nozzle (Standard or High Flow). Declared to the "
+                     "printer so the sliced file matches the installed nozzle. Matched to the "
+                     "connected printer automatically; has no effect on non-Bambu printers.");
+    def->enum_keys_map = &ConfigOptionEnum<NozzleVolumeType>::get_enum_values();
+    def->enum_values.push_back("Standard");
+    def->enum_values.push_back("High Flow");
+    def->enum_labels.push_back(L("Standard"));
+    def->enum_labels.push_back(L("High Flow"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<NozzleVolumeType>(nvtNormal));
 
 
     def                = this->add("nozzle_hrc", coInt);

@@ -311,6 +311,8 @@ static constexpr const char* PLATER_NAME_ATTR = "plater_name";
 static constexpr const char* PLATE_IDX_ATTR = "index";
 static constexpr const char* PRINTER_MODEL_ID_ATTR = "printer_model_id";
 static constexpr const char* NOZZLE_DIAMETERS_ATTR = "nozzle_diameters";
+// Ultra: nozzle flow variant as an int (0=Standard, 1=High Flow) - what Bambu firmware validates.
+static constexpr const char* NOZZLE_VOLUME_TYPE_ATTR = "nozzle_volume_type";
 static constexpr const char* SLICE_PREDICTION_ATTR = "prediction";
 static constexpr const char* SLICE_WEIGHT_ATTR = "weight";
 static constexpr const char* TIMELAPSE_TYPE_ATTR = "timelapse_type";
@@ -7881,6 +7883,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 }
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PRINTER_MODEL_ID_ATTR       << "\" " << VALUE_ATTR << "=\"" << plate_data->printer_model_id << "\"/>\n";
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << NOZZLE_DIAMETERS_ATTR       << "\" " << VALUE_ATTR << "=\"" << plate_data->nozzle_diameters << "\"/>\n";
+                // Ultra: declare the nozzle flow variant as an int so Bambu firmware can validate it
+                // against the installed nozzle (auto-matched to the connected printer at send time).
+                {
+                    int nozzle_vol_type = 0; // default Standard
+                    if (const auto* nvt = config.option<ConfigOptionEnum<NozzleVolumeType>>("nozzle_volume_type"))
+                        nozzle_vol_type = int(nvt->value);
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << NOZZLE_VOLUME_TYPE_ATTR << "\" " << VALUE_ATTR << "=\"" << nozzle_vol_type << "\"/>\n";
+                }
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << TIMELAPSE_TYPE_ATTR << "\" " << VALUE_ATTR << "=\"" << timelapse_type << "\"/>\n";
                 //stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << TIMELAPSE_ERROR_CODE_ATTR << "\" " << VALUE_ATTR << "=\"" << plate_data->timelapse_warning_code << "\"/>\n";
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << SLICE_PREDICTION_ATTR << "\" " << VALUE_ATTR << "=\"" << plate_data->get_gcode_prediction_str() << "\"/>\n";

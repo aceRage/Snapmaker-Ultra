@@ -109,6 +109,9 @@
 #include "GUI_Factories.hpp"
 #include "wxExtensions.hpp"
 #include "MainFrame.hpp"
+// Ultra: needed to stop the LAN camera around the modal send flow (see ultra_pause_device_camera).
+#include "Monitor.hpp"
+#include "MediaPlayCtrl.h"
 #include "format.hpp"
 #include "3DScene.hpp"
 #include "GLCanvas3D.hpp"
@@ -2214,7 +2217,10 @@ Sidebar::Sidebar(Plater *parent)
                                         p->m_nozzle_diameter_lists[i]->SetValue(diameter + "mm");
                                     }
 
-                                    wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preset->name);
+                                    // Ultra: device-driven nozzle sync, not a manual preset change -
+                                    // force_select=true so it never pops the save/transfer/discard dialog
+                                    // when switching between U1 devices.
+                                    wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preset->name, false, "", true);
                                     wxGetApp().plater()->sidebar().update_all_preset_comboboxes(true);
                                     wxGetApp().plater()->sidebar().update_nozzle_settings(true);
                                 }
@@ -2242,7 +2248,9 @@ Sidebar::Sidebar(Plater *parent)
                         for (size_t i = 0; i < p->m_nozzle_diameter_lists.size(); ++i)
                             p->m_nozzle_diameter_lists[i]->SetValue(diameter + "mm");
 
-                        wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preset->name);
+                        // Ultra: device-driven nozzle sync (uniform diameter) - force_select=true
+                        // to stay silent on U1->U1 device switches (no save/transfer/discard dialog).
+                        wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preset->name, false, "", true);
                         wxGetApp().plater()->sidebar().update_all_preset_comboboxes(true);
                         wxGetApp().plater()->sidebar().update_nozzle_settings(true);
 
@@ -15618,6 +15626,23 @@ void Plater::priv::on_action_publish(wxCommandEvent &event)
     }
 }
 
+// Ultra: stop/resume the LAN camera around the modal send flow. The Bambu camera
+// (wxMediaCtrl2 -> DirectShow -> wmp.dll) renders into the MonitorPanel hwnd; a modal
+// send dialog that COVERS but doesn't HIDE that panel leaves the video graph pointing
+// at a stale hwnd, which access-violates in wmp.dll during the send (dump-confirmed;
+// camera-off => no crash). Stopping it before ShowModal and resuming after avoids it.
+// No-ops safely when there's no MonitorPanel/camera (guards) or for non-Bambu printers.
+static void ultra_pause_device_camera(bool pause)
+{
+    auto* mf = wxGetApp().mainframe;
+    if (!mf || !mf->m_monitor) return;
+    auto* sp = mf->m_monitor->get_status_panel();
+    if (!sp) return;
+    auto* cam = sp->get_media_play_ctrl();
+    if (!cam) return;
+    cam->ultra_pause(pause);
+}
+
 void Plater::priv::on_action_print_plate(SimpleEvent&)
 {
     if (q != nullptr) {
@@ -15631,6 +15656,7 @@ void Plater::priv::on_action_print_plate(SimpleEvent&)
             m_select_machine_dlg = new SelectMachineDialog(q);
         m_select_machine_dlg->set_print_type(PrintFromType::FROM_NORMAL);
         m_select_machine_dlg->prepare(partplate_list.get_curr_plate_index());
+        ultra_pause_device_camera(true);   // stop camera for the send; no auto-resume (rebuild crashes)
         m_select_machine_dlg->ShowModal();
         record_start_print_preset("print_plate");
     } else {
@@ -15656,6 +15682,7 @@ void Plater::priv::on_action_print_plate_from_sdcard(SimpleEvent&)
     if (!m_select_machine_dlg) m_select_machine_dlg = new SelectMachineDialog(q);
     m_select_machine_dlg->set_print_type(PrintFromType::FROM_SDCARD_VIEW);
     m_select_machine_dlg->prepare(0);
+    ultra_pause_device_camera(true);   // stop camera for the send; no auto-resume (rebuild crashes)
     m_select_machine_dlg->ShowModal();
 }
 
@@ -15734,6 +15761,7 @@ void Plater::priv::on_action_print_all(SimpleEvent&)
             m_select_machine_dlg = new SelectMachineDialog(q);
         m_select_machine_dlg->set_print_type(PrintFromType::FROM_NORMAL);
         m_select_machine_dlg->prepare(PLATE_ALL_IDX);
+        ultra_pause_device_camera(true);   // stop camera for the send; no auto-resume (rebuild crashes)
         m_select_machine_dlg->ShowModal();
         record_start_print_preset("print_all");
     } else {
@@ -21146,7 +21174,28 @@ bool Plater::reslice()
     // and notify user that he should leave it first.
     if (get_view3D_canvas3D()->get_gizmos_manager().is_in_editing_mode(true))
         return true;
-    
+
+    // Ultra: auto-match the sliced nozzle flow variant to the connected Bambu printer's
+    // installed nozzle, so the exported 3mf/gcode declares the correct nozzle_volume_type and
+    // never trips the firmware flow-mismatch nag (e.g. High Flow nozzle installed). Bambu-vendor
+    // prints only; a disconnected printer or non-Bambu preset is left untouched (keeps default).
+    try {
+        PresetBundle* pb = wxGetApp().preset_bundle;
+        DeviceManager* dev = wxGetApp().getDeviceManager();
+        if (pb && dev && pb->is_bbl_vendor()) {
+            if (MachineObject* obj = dev->get_selected_machine()) {
+                if (obj->is_connected() && !obj->m_extder_data.extders.empty()) {
+                    NozzleVolumeType flow = obj->m_extder_data.extders[0].current_nozzle_flow;
+                    auto* cur = pb->project_config.option<ConfigOptionEnum<NozzleVolumeType>>("nozzle_volume_type");
+                    if (!cur || cur->value != flow) {
+                        pb->project_config.set_key_value("nozzle_volume_type", new ConfigOptionEnum<NozzleVolumeType>(flow));
+                        BOOST_LOG_TRIVIAL(info) << "[UltraNet] auto-matched nozzle_volume_type to printer flow=" << int(flow);
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+
     // Stop the running (and queued) UI jobs and only proceed if they actually
     // get stopped.
     unsigned timeout_ms = 10000;

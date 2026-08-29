@@ -274,7 +274,8 @@ void AppConfig::set_defaults()
         set_bool("stealth_mode", false);
     }
     if (get("legacy_networking").empty()) {
-        set_bool("legacy_networking", true);
+        // Ultra Net targets current Bambu firmware (non-legacy ABI); was true upstream.
+        set_bool("legacy_networking", false);
     }
 
     if(get("check_stable_update_only").empty()) {

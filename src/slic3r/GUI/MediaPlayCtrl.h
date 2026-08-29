@@ -44,6 +44,11 @@ public:
 
     void jump_to_play();
 
+    // Ultra: public stop/resume so the print-send flow can quiesce the DirectShow
+    // video graph before a modal covers (but doesn't hide) the panel, which otherwise
+    // AV-crashes wmp.dll on a stale hwnd. pause=true -> Stop(), false -> Play().
+    void ultra_pause(bool pause);
+
 protected:
     void onStateChanged(wxMediaEvent & event);
 

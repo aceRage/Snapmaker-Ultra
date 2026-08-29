@@ -2900,6 +2900,46 @@ bool GUI_App::on_init_inner()
     std::map<std::string, std::string> extra_headers = get_extra_header();
     Slic3r::Http::set_extra_headers(extra_headers);
 
+    // Ultra Net: first-run install of the bundled clean-room network plugin. The host loads
+    // the plugin from data_dir/plugins, not from the app folder, so a released build ships the
+    // DLLs in an "ultranet" subfolder beside the exe and we copy them in on first run (only if
+    // absent - never clobber a user/CDN-updated copy). BambuSource is kept in that subfolder so
+    // the host doesn't LoadLibrary it as the media filter from the exe dir.
+    try {
+        namespace fs = boost::filesystem;
+        fs::path pf = fs::path(data_dir()) / "plugins";
+        if (!fs::exists(pf / "bambu_networking.dll")) {
+            fs::path exe_dir = fs::path(wxStandardPaths::Get().GetExecutablePath().ToUTF8().data()).parent_path();
+            fs::path bundled = exe_dir / "ultranet";
+            if (fs::exists(bundled / "bambu_networking.dll")) {
+                boost::system::error_code ec;
+                fs::create_directories(pf, ec);
+                for (const char* name : {"bambu_networking.dll", "BambuSource.dll"}) {
+                    if (fs::exists(bundled / name))
+                        fs::copy_file(bundled / name, pf / name, fs::copy_option::overwrite_if_exists, ec);
+                }
+                BOOST_LOG_TRIVIAL(info) << "[UltraNet] installed bundled network plugin to " << pf.string();
+            }
+        }
+    } catch (...) {}
+
+    // Ultra Net: the clean-room network plugin is bundled with the app. If it's present in
+    // data_dir/plugins, networking is effectively "installed" - force the flag on so a reset
+    // or never-set config can't disable the device tab, and the user never needs the Bambu
+    // CDN download dialog. Self-healing: does nothing if the plugin file isn't there.
+    try {
+        namespace fs = boost::filesystem;
+        fs::path pf = fs::path(data_dir()) / "plugins";
+        const bool have_ultranet =
+            fs::exists(pf / "bambu_networking.dll") ||
+            fs::exists(pf / "libbambu_networking.so") ||
+            fs::exists(pf / "libbambu_networking.dylib");
+        if (have_ultranet && !app_config->get_bool("installed_networking")) {
+            BOOST_LOG_TRIVIAL(info) << "[UltraNet] bundled plugin present; forcing installed_networking=true";
+            app_config->set_bool("installed_networking", true);
+        }
+    } catch (...) {}
+
     // Orca: select network plugin version
     NetworkAgent::use_legacy_network = app_config->get_bool("legacy_networking");
     // Force legacy network plugin if debugger attached

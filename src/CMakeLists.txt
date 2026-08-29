@@ -86,6 +86,12 @@ if (SLIC3R_GUI)
     add_subdirectory(slic3r)
 endif()
 
+# Ultra Net - clean-room Bambu/multi-vendor network plugin (drop-in bambu_networking).
+# Private component: absent from public clones, so guard on its presence.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ultranet/CMakeLists.txt")
+    add_subdirectory(ultranet)
+endif()
+
 if(ORCA_TOOLS)
     # Snapmaker_Orca_profile_validator
     if(APPLE)

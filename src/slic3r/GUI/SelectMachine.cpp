@@ -1829,7 +1829,12 @@ void SelectMachineDialog::on_ok_btn(wxCommandEvent &event)
         confirm_text.push_back(ConfirmBeforeSendInfo(_L("There are some unknown filaments in the AMS mappings. Please check whether they are the required filaments. If they are okay, press \"Confirm\" to start printing.")));
     }
 
-    if (!obj_->m_extder_data.extders[0].current_nozzle_type != ntUndefine && (m_print_type == PrintFromType::FROM_NORMAL))
+    // Ultra: fixed operator-precedence bug. This was `(!type) != ntUndefine`, which ran the
+    // nozzle checks ONLY when the printer reported NO nozzle type (ntUndefine) - inverted from
+    // the intent. With type==ntUndefine the hardness compare used HRC 0 and flagged/blocked
+    // essentially every filament ("nozzle mismatch" on every send). Run the checks only when
+    // the printer actually reported a usable nozzle type.
+    if (obj_->m_extder_data.extders[0].current_nozzle_type != ntUndefine && (m_print_type == PrintFromType::FROM_NORMAL))
     {
         float nozzle_diameter = 0;
         if (!is_same_nozzle_diameters(nozzle_diameter))

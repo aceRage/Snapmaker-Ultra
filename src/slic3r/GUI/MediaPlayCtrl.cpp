@@ -173,8 +173,11 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
     }
     Enable(obj && obj->is_connected() && obj->m_push_count > 0);
     if (machine == m_machine) {
-        if (m_last_state == MEDIASTATE_IDLE && IsEnabled())
-            Play();
+        if (m_last_state == MEDIASTATE_IDLE && IsEnabled()) {
+            // Ultra: no auto-play. The Bambu camera (WMP/DirectShow via the closed
+            // BambuSource filter) AV-crashes when its graph rebuilds around a print
+            // send. The user starts the stream manually via the Play button.
+        }
         else if (m_last_state == MEDIASTATE_LOADING && m_tutk_state == "disable"
                 && m_last_user_play + wxTimeSpan::Seconds(3) < wxDateTime::Now()) {
             // resend ttcode to printer
@@ -576,6 +579,13 @@ void MediaPlayCtrl::jump_to_play()
     TogglePlay();
 }
 
+void MediaPlayCtrl::ultra_pause(bool pause)
+{
+    // Ultra: quiesce the DirectShow video graph around the modal print-send flow.
+    if (pause) Stop();
+    else       Play();
+}
+
 void MediaPlayCtrl::onStateChanged(wxMediaEvent &event)
 {
     auto last_state = m_last_state;
@@ -673,7 +683,11 @@ void MediaPlayCtrl::on_show_hide(wxShowEvent &evt)
     m_failed_retry = 0;
     if (m_next_retry.IsValid()) // Try open 2 seconds later, to avoid quick play/stop
         m_next_retry = wxDateTime::Now() + wxTimeSpan::Seconds(2);
-    IsShownOnScreen() ? Play() : Stop();
+    // Ultra: do NOT auto-play on show. The Bambu camera's WMP/DirectShow graph rebuild
+    // AV-crashes around print sends (closed MS/BambuSource code we can't patch). Stop the
+    // graph when the panel is hidden; require an explicit Play click when it's shown.
+    if (!IsShownOnScreen())
+        Stop();
 }
 
 void MediaPlayCtrl::media_proc()

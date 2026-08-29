@@ -192,6 +192,8 @@ static std::vector<std::string> s_project_options {
     "wipe_tower_rotation_angle",
     "curr_bed_type",
     "flush_multiplier",
+    // Ultra: nozzle flow variant declared to the printer (metadata only; auto-matched at send)
+    "nozzle_volume_type",
     // Mixed filament / local-Z settings
     "mixed_filament_gradient_mode",
     "mixed_filament_height_lower_bound",

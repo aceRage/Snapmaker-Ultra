@@ -488,6 +488,8 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PrintHostType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(AuthorizationType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WipeTowerWallType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PerimeterGeneratorType)
+// Ultra: nozzle flow variant declared to Bambu printers (metadata only in this fork).
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(NozzleVolumeType)
 
 #undef CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS
 

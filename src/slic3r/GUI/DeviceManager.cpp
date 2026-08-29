@@ -3778,7 +3778,30 @@ int MachineObject::parse_json(std::string payload, bool key_field_only)
                                             m_extder_data.extders[MAIN_NOZZLE_ID].current_nozzle_type = NozzleType::ntUndefine;
                                         }
                                         else {
-                                            m_extder_data.extders[MAIN_NOZZLE_ID].current_nozzle_type = NozzleTypeStrToEumn[nozzle_type];
+                                            // Ultra: newer Bambu firmware reports nozzle codes like "HX01" that
+                                            // are NOT keys in NozzleTypeStrToEumn; the old operator[] lookup then
+                                            // default-inserted ntUndefine (HRC 0), causing a FALSE nozzle-hardness
+                                            // mismatch that blocked/annoyed prints for any real filament. Resolve
+                                            // via the map first, else fall back to the 2-char hardness suffix
+                                            // convention used for the nozzle.info parse ("00"=stainless,"01"=hardened).
+                                            NozzleType nt = NozzleType::ntUndefine;
+                                            auto itnt = NozzleTypeStrToEumn.find(nozzle_type);
+                                            if (itnt != NozzleTypeStrToEumn.end()) {
+                                                nt = itnt->second;
+                                            } else if (nozzle_type.length() >= 4) {
+                                                std::string hw = nozzle_type.substr(2, 2);
+                                                if (hw == "00")      nt = NozzleType::ntStainlessSteel;
+                                                else if (hw == "01") nt = NozzleType::ntHardenedSteel;
+                                            }
+                                            m_extder_data.extders[MAIN_NOZZLE_ID].current_nozzle_type = nt;
+                                            // Ultra: derive flow variant from the 2nd char of the code
+                                            // ('H'/'E' = High Flow, else Standard) to auto-match nozzle_volume_type.
+                                            NozzleVolumeType nflow = NozzleVolumeType::nvtNormal;
+                                            if (nozzle_type.length() >= 2) {
+                                                char fc = (char) std::toupper((unsigned char) nozzle_type[1]);
+                                                if (fc == 'H' || fc == 'E') nflow = NozzleVolumeType::nvtBigTraffic;
+                                            }
+                                            m_extder_data.extders[MAIN_NOZZLE_ID].current_nozzle_flow = nflow;
                                         }
                                     }
                                 }
@@ -5631,6 +5654,12 @@ void MachineObject::parse_new_info(json print)
                 } else {
                     nozzle_obj.nozzle_type = NozzleType::ntUndefine;
                 }
+                // Ultra: flow variant from the 2nd char ('H'/'E' = High Flow, else Standard).
+                if (type.length() >= 2) {
+                    char fc = (char) std::toupper((unsigned char) type[1]);
+                    nozzle_obj.nozzle_flow = (fc == 'H' || fc == 'E') ? NozzleVolumeType::nvtBigTraffic
+                                                                      : NozzleVolumeType::nvtNormal;
+                }
 
                 nozzle_obj.diameter     = njon["diameter"].get<float>();
                 nozzle_obj.max_temp     = njon["tm"].get<int>();
@@ -5705,6 +5734,7 @@ void MachineObject::parse_new_info(json print)
                         if (m_nozzle_data.nozzles[i].id == extder_obj.nozzle_id) {
                             extder_obj.current_nozzle_type      = m_nozzle_data.nozzles[i].nozzle_type;
                             extder_obj.current_nozzle_diameter  = m_nozzle_data.nozzles[i].diameter;
+                            extder_obj.current_nozzle_flow      = m_nozzle_data.nozzles[i].nozzle_flow; // Ultra
                         }
                     }
                 }

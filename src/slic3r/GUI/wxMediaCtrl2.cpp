@@ -134,18 +134,10 @@ void wxMediaCtrl2::Load(wxURI url)
             return;
         }
         if (path != dll_path) {
-            static bool notified = false;
-            if (!notified) CallAfter([dll_path] {
-                int res = wxMessageBox(_L("Using a BambuSource from a different install, video play may not work correctly! Press Yes to fix it."), _L("Warning"), wxYES_NO | wxICON_WARNING);
-                if (res == wxYES) {
-                    auto path = dll_path.wstring();
-                    if (path.find(L' ') != std::wstring::npos)
-                        path = L"\"" + path + L"\"";
-                    SHELLEXECUTEINFO info{sizeof(info), 0, NULL, L"open", L"regsvr32", path.c_str(), SW_HIDE};
-                    ::ShellExecuteEx(&info);
-                }
-            });
-            notified = true;
+            // Ultra: the registered BambuSource DirectShow filter comes from another install
+            // (e.g. OrcaSlicer/BambuStudio) rather than our bundled stub, but video plays fine
+            // through it. Suppress the confusing "different install" warning nag; do NOT
+            // regsvr32 our stub (it has no DllRegisterServer, so it can only fail).
         }
         wxRegKey keyWmp(wxRegKey::HKCU, "SOFTWARE\\Microsoft\\MediaPlayer\\Player\\Extensions\\.");
         keyWmp.Create();
