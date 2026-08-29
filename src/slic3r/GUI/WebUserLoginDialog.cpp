@@ -1,10 +1,12 @@
 #include "WebUserLoginDialog.hpp"
 
 #include <string.h>
+#include <thread>
 #include "I18N.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "slic3r/GUI/wxExtensions.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/DeviceManager.hpp"   // Ultra P4: post-login cloud device discovery
 #include "sentry_wrapper/SentryWrapper.hpp"
 
 #include <wx/sizer.h>
@@ -284,8 +286,17 @@ void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
             // Ultra: the fork previously just Close()d here and dropped the Bambu login payload.
             // Forward it to the network agent (Ultra Net) so it stores the token / user info and
             // reports is_user_login()=true; the Account menu then shows the signed-in account.
-            if (auto agent = wxGetApp().getAgent())
+            if (auto agent = wxGetApp().getAgent()) {
                 agent->change_user(j.dump());
+                // Ultra P4: the fork gutted the post-login handler, so kick cloud device
+                // discovery ourselves. update_user_machine_list_info() does a blocking HTTPS
+                // GET + parse, so run it off the UI thread; the SelectMachine/device page then
+                // shows the cloud printers (My Devices).
+                std::thread([] {
+                    if (auto dev = Slic3r::GUI::wxGetApp().getDeviceManager())
+                        dev->update_user_machine_list_info();
+                }).detach();
+            }
             Close();
         }
         else if (strCmd == "get_localhost_url") {
