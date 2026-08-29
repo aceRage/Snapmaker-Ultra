@@ -6306,6 +6306,21 @@ LayerResult GCode::process_layer(const Print& print,
             gcode += generate_skirt(print, print.skirt(), Point(0, 0), layer.object()->config().skirt_start_angle, layer_tools, layer,
                                     extruder_id);
 
+        // Chameleon brim: print this extruder's foreign brim partitions (layer 0 only).
+        if (first_layer && !print.get_brimMapByExtruder().empty()) {
+            for (const auto& obj_entry : print.get_brimMapByExtruder()) {
+                auto it = obj_entry.second.find(extruder_id);
+                if (it == obj_entry.second.end() || it->second.entities.empty())
+                    continue;
+                this->set_origin(0., 0.);
+                m_avoid_crossing_perimeters.use_external_mp();
+                for (const ExtrusionEntity* ee : it->second.entities)
+                    gcode += this->extrude_entity(*ee, "brim", m_config.support_speed.value);
+                m_avoid_crossing_perimeters.use_external_mp(false);
+                m_avoid_crossing_perimeters.disable_once();
+            }
+        }
+
         std::string gcode_toolchange;
         if (has_wipe_tower) {
             if (!m_wipe_tower->is_empty_wipe_tower_gcode(*this, extruder_id, extruder_id == layer_extruders.back())) {
