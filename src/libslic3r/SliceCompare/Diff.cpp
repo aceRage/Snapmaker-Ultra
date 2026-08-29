@@ -28,14 +28,10 @@ struct RoleAccum { double sec = 0.0, mm = 0.0, len = 0.0; };
 
 // Accumulate per-ExtrusionRole seconds/extrusion-mm/path-length for one snapshot.
 //
-// `feature_seconds` is already keyed by role, so seconds accumulate directly.
-// `segs` carry a role per segment, so path length (sum of hypot per seg) is
-// exact per role too. `LayerRec::extrusion_mm`, however, is only tracked as a
-// single per-layer total (see Snapshot.cpp) — there is no per-role extrusion
-// breakdown in the data model. We approximate a role's share of a layer's
-// extrusion by that role's fraction of the layer's total path length, which
-// matches the constant-cross-section assumption Snapshot.cpp already makes
-// when converting filament_mm to filament_g.
+// `feature_seconds` and `feature_extrusion_mm` are already keyed by role, so
+// seconds and extrusion mm accumulate directly and exactly. `segs` carry a
+// role per segment, so path length (sum of hypot per seg) is exact per role
+// too.
 std::map<uint8_t, RoleAccum> accumulate_features(const Snapshot& snap)
 {
     std::map<uint8_t, RoleAccum> out;
@@ -44,19 +40,10 @@ std::map<uint8_t, RoleAccum> accumulate_features(const Snapshot& snap)
 
         for (const auto& fs : layer.feature_seconds)
             out[fs.first].sec += fs.second;
-
-        std::map<uint8_t, double> role_len;
-        double layer_len = 0.0;
-        for (const auto& seg : layer.segs) {
-            const double len = std::hypot((double)seg.x1 - seg.x0, (double)seg.y1 - seg.y0);
-            role_len[seg.role] += len;
-            layer_len += len;
-        }
-        for (const auto& rl : role_len)
-            out[rl.first].len += rl.second;
-        if (layer_len > 0.0)
-            for (const auto& rl : role_len)
-                out[rl.first].mm += layer.extrusion_mm * (rl.second / layer_len);
+        for (const auto& fm : layer.feature_extrusion_mm)
+            out[fm.first].mm += fm.second;
+        for (const auto& seg : layer.segs)
+            out[seg.role].len += std::hypot((double)seg.x1 - seg.x0, (double)seg.y1 - seg.y0);
     }
     return out;
 }

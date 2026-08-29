@@ -21,6 +21,7 @@ struct LayerRec {
     double z = 0.0;                                   // representative z (mm)
     double extrusion_mm = 0.0;
     std::map<uint8_t, double> feature_seconds;        // key = ExtrusionRole
+    std::map<uint8_t, double> feature_extrusion_mm;   // key = ExtrusionRole
     std::set<std::pair<int16_t, int16_t>> cells;      // 10 mm grid fingerprint
     float bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
     bool  has_bbox = false;

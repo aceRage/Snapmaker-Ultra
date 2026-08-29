@@ -33,6 +33,7 @@ Snapshot build_snapshot(const GCodeProcessorResult& result,
             const float x1 = m.position.x(),    y1 = m.position.y();
             l.segs.push_back({x0, y0, x1, y1, (uint8_t)m.extrusion_role});
             l.extrusion_mm += m.delta_extruder;
+            l.feature_extrusion_mm[(uint8_t)m.extrusion_role] += m.delta_extruder;
             const double len = std::hypot((double)x1 - x0, (double)y1 - y0);
             if (m.feedrate > 0.f)
                 l.feature_seconds[(uint8_t)m.extrusion_role] += len / m.feedrate;
