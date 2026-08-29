@@ -1,4 +1,5 @@
 #include "Diff.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -8,6 +9,10 @@
 namespace Slic3r { namespace SliceCompare {
 
 namespace {
+
+constexpr int    Z_TOL_KEYS       = 5;     // 0.05 mm on the 10 um (lround(z*100)) key
+constexpr double MATCH_TOL        = 0.5;
+constexpr double IDENTICAL_OVERLAP = 0.85;
 
 bool is_volatile_key(const std::string& key)
 {
@@ -46,6 +51,34 @@ std::map<uint8_t, RoleAccum> accumulate_features(const Snapshot& snap)
             out[seg.role].len += std::hypot((double)seg.x1 - seg.x0, (double)seg.y1 - seg.y0);
     }
     return out;
+}
+
+// Sum of feature_seconds for both support roles (erSupportMaterial +
+// erSupportMaterialInterface); used for the SUPPORT-CHANGED flag.
+double support_seconds(const LayerRec& l)
+{
+    double s = 0.0;
+    auto it = l.feature_seconds.find((uint8_t)erSupportMaterial);
+    if (it != l.feature_seconds.end())
+        s += it->second;
+    it = l.feature_seconds.find((uint8_t)erSupportMaterialInterface);
+    if (it != l.feature_seconds.end())
+        s += it->second;
+    return s;
+}
+
+// Jaccard overlap of two cell fingerprints: |intersection| / |union|.
+// 1.0 if either set is empty (nothing to disagree about).
+double cell_overlap(const LayerRec& la, const LayerRec& lb)
+{
+    if (la.cells.empty() || lb.cells.empty())
+        return 1.0;
+    size_t inter = 0;
+    for (const auto& c : la.cells)
+        if (lb.cells.count(c))
+            ++inter;
+    const size_t uni = la.cells.size() + lb.cells.size() - inter;
+    return uni > 0 ? (double)inter / (double)uni : 1.0;
 }
 
 } // anonymous namespace
@@ -105,6 +138,94 @@ std::vector<FeatureRow> diff_features(const Snapshot& a, const Snapshot& b)
         return (x.sec_a + x.sec_b) > (y.sec_a + y.sec_b);
     });
     return rows;
+}
+
+LayerDiff diff_layers(const Snapshot& a, const Snapshot& b)
+{
+    LayerDiff out;
+
+    auto push_matched = [&](const LayerRec& la, const LayerRec& lb, int ka, int kb) {
+        LayerMatch m;
+        m.zkey_a = ka;
+        m.zkey_b = kb;
+        m.d_seconds   = lb.seconds() - la.seconds();
+        m.d_extrusion = lb.extrusion_mm - la.extrusion_mm;
+        m.overlap     = cell_overlap(la, lb);
+
+        const bool identical_like = std::abs(m.d_extrusion) <= MATCH_TOL &&
+                                     std::abs(m.d_seconds)   <= MATCH_TOL &&
+                                     m.overlap > IDENTICAL_OVERLAP;
+        m.changed = !identical_like;
+
+        if (m.overlap < 0.5 && std::abs(m.d_extrusion) < MATCH_TOL)
+            m.flags.push_back("RELOCATED");
+
+        if (la.has_bbox && lb.has_bbox) {
+            const double wa = la.bx1 - la.bx0, ha = la.by1 - la.by0;
+            const double wb = lb.bx1 - lb.bx0, hb = lb.by1 - lb.by0;
+            if (std::abs(wa - wb) > 5.0 || std::abs(ha - hb) > 5.0)
+                m.flags.push_back("GEOMETRY-CHANGED");
+        }
+
+        if (std::abs(support_seconds(lb) - support_seconds(la)) > MATCH_TOL)
+            m.flags.push_back("SUPPORT-CHANGED");
+
+        if (m.overlap < 0.5 && m.d_extrusion > MATCH_TOL)
+            m.flags.push_back("MATERIAL-ADDED-NEW-REGION");
+
+        out.rows.push_back(std::move(m));
+        ++out.matched;
+        if (out.rows.back().changed)
+            ++out.changed;
+        else
+            ++out.identical;
+    };
+
+    auto ia = a.layers.begin();
+    auto ib = b.layers.begin();
+    while (ia != a.layers.end() && ib != b.layers.end()) {
+        const int ka = ia->first, kb = ib->first;
+        if (std::abs(ka - kb) <= Z_TOL_KEYS) {
+            push_matched(ia->second, ib->second, ka, kb);
+            ++ia; ++ib;
+        } else if (ka < kb) {
+            LayerMatch m; m.zkey_a = ka; m.zkey_b = -1;
+            out.rows.push_back(std::move(m));
+            ++out.a_only;
+            ++ia;
+        } else {
+            LayerMatch m; m.zkey_a = -1; m.zkey_b = kb;
+            out.rows.push_back(std::move(m));
+            ++out.b_only;
+            ++ib;
+        }
+    }
+    for (; ia != a.layers.end(); ++ia) {
+        LayerMatch m; m.zkey_a = ia->first; m.zkey_b = -1;
+        out.rows.push_back(std::move(m));
+        ++out.a_only;
+    }
+    for (; ib != b.layers.end(); ++ib) {
+        LayerMatch m; m.zkey_a = -1; m.zkey_b = ib->first;
+        out.rows.push_back(std::move(m));
+        ++out.b_only;
+    }
+
+    // biggest_zkey_a: matched+changed row maximizing |d_seconds|, ties by |d_extrusion|.
+    double best_d_seconds = -1.0, best_d_extrusion = -1.0;
+    for (const auto& row : out.rows) {
+        if (row.zkey_a < 0 || row.zkey_b < 0 || !row.changed)
+            continue;
+        const double ads = std::abs(row.d_seconds);
+        const double ade = std::abs(row.d_extrusion);
+        if (ads > best_d_seconds || (ads == best_d_seconds && ade > best_d_extrusion)) {
+            best_d_seconds   = ads;
+            best_d_extrusion = ade;
+            out.biggest_zkey_a = row.zkey_a;
+        }
+    }
+
+    return out;
 }
 
 }} // namespaces

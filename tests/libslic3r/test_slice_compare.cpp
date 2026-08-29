@@ -2,6 +2,7 @@
 #include "libslic3r/SliceCompare/Snapshot.hpp"
 #include "libslic3r/SliceCompare/Diff.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include <algorithm>
 
 using namespace Slic3r;
 using namespace Slic3r::SliceCompare;
@@ -99,4 +100,46 @@ TEST_CASE("diff_features aggregates per role", "[slice_compare]")
     CHECK(rows[0].role == (uint8_t)erExternalPerimeter);
     CHECK(rows[0].sec_a == Approx(rows[0].sec_b));
     CHECK(rows[0].mm_a == Approx(4.0));
+}
+
+// NOTE: adapted from the task-4 brief, which calls `make_result()` by value.
+// The file-static helper above takes an out-param (`make_result(r)` /
+// `make_result(r, y_shift)`) because GCodeProcessorResult holds a mutex and
+// is not copyable/movable — same intent as the brief, different call shape.
+
+TEST_CASE("diff_layers matches equal heights, self-diff identical", "[slice_compare]")
+{
+    GCodeProcessorResult result;
+    make_result(result);
+    Snapshot a = build_snapshot(result, {}, "A", "s");
+    LayerDiff d = diff_layers(a, a);
+    CHECK(d.matched == 2); CHECK(d.identical == 2);
+    CHECK(d.changed == 0); CHECK(d.a_only == 0); CHECK(d.b_only == 0);
+}
+
+TEST_CASE("diff_layers flags relocation via cells", "[slice_compare]")
+{
+    GCodeProcessorResult result_a, result_b;
+    make_result(result_a, 0.f);
+    make_result(result_b, 60.f);
+    Snapshot a = build_snapshot(result_a, {}, "A", "s");
+    Snapshot b = build_snapshot(result_b, {}, "B", "s"); // same amount, moved 60mm
+    LayerDiff d = diff_layers(a, b);
+    REQUIRE(d.matched == 2);
+    CHECK(d.changed == 2);
+    const auto& row = d.rows.front();
+    CHECK(row.overlap < 0.5);
+    CHECK(std::find(row.flags.begin(), row.flags.end(), "RELOCATED") != row.flags.end());
+}
+
+TEST_CASE("diff_layers honest about unequal layer heights", "[slice_compare]")
+{
+    GCodeProcessorResult result;
+    make_result(result);
+    Snapshot a = build_snapshot(result, {}, "A", "s");       // z 0.2/0.4
+    Snapshot b = a;
+    b.layers.clear();
+    LayerRec l; l.z = 0.3; l.extrusion_mm = 1.0; b.layers[30] = l;  // z=0.30 only
+    LayerDiff d = diff_layers(a, b);
+    CHECK(d.matched == 0); CHECK(d.a_only == 2); CHECK(d.b_only == 1);
 }
