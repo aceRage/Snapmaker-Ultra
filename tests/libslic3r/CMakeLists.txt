@@ -1,6 +1,6 @@
 get_filename_component(_TEST_NAME ${CMAKE_CURRENT_LIST_DIR} NAME)
 
-add_executable(${_TEST_NAME}_tests 
+add_executable(${_TEST_NAME}_tests
 	${_TEST_NAME}_tests.cpp
 	test_3mf.cpp
 	test_aabbindirect.cpp
@@ -19,6 +19,7 @@ add_executable(${_TEST_NAME}_tests
 	test_profile_load_util.cpp
 	test_mutable_polygon.cpp
 	test_mutable_priority_queue.cpp
+	test_slice_compare.cpp
 	test_stl.cpp
 	test_meshboolean.cpp
 	# test_marchingsquares.cpp
