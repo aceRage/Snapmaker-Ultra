@@ -2698,6 +2698,24 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
             // brim behavior (each object's brim prints in its own filament).
             if (m_config.brim_filament_source == bfsNearestWall && this->extruders().size() > 1
                 && m_config.print_sequence != PrintSequence::ByObject) {
+                // Run-stable object key: objIDPair.first.id (the raw ObjectID) is NOT stable
+                // across process runs - confirmed empirically (Task 5 verification): two
+                // back-to-back runs of the identical command produced wildly different id
+                // values (e.g. 0 vs 2317700280585562421), because ObjectID is an
+                // allocation-order/address-derived counter, not a content hash. WallSampleIndex's
+                // k-NN tie-break and BrimVoteParams::object_area are both keyed by this value
+                // specifically for determinism (see WallSampleIndex.hpp's own comment), so an
+                // unstable key silently flips tie votes between otherwise-identical runs,
+                // shifting brim-run partition boundaries. Build a small dense ordinal
+                // (0, 1, 2, ...) from objPrintVec's own iteration order instead:
+                // print_object_instances_ordering (which objPrintVec is derived from) is itself
+                // deterministic - model order or chained/arranged layout order, never an
+                // address/allocation id - so this ordinal is stable run-to-run even though the
+                // underlying ObjectID is not.
+                std::map<ObjectID, size_t> object_ordinal;
+                for (size_t i = 0; i < objPrintVec.size(); ++i)
+                    object_ordinal[objPrintVec[i].first] = i;
+
                 WallSampleIndex wall_idx;
                 std::map<size_t, double> object_area;
 
@@ -2705,7 +2723,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                     const PrintObject* object = this->get_object(objIDPair.first);
                     if (object == nullptr || object->layers().empty())
                         continue;
-                    const size_t object_key = objIDPair.first.id;
+                    const size_t object_key = object_ordinal.at(objIDPair.first);
                     const Layer* layer0     = object->layers().front();
 
                     double area_sum = 0.0;
