@@ -4,6 +4,7 @@
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include <algorithm>
+#include <cmath>
 
 using namespace Slic3r;
 
@@ -377,6 +378,66 @@ TEST_CASE("split_polyline_by_resolver honors min_run_mm and max_runs like the vo
     CHECK(runs.size() <= 2);
     CHECK(runs.front().pts.front() == Point(scale_(0), scale_(5)));
     CHECK(runs.back().pts.back()   == Point(scale_(40), scale_(5)));
+}
+
+TEST_CASE("split_polyline_by_resolver (LOOP): seam sector counted once when first/last runs share an extruder (C7)", "[chameleon]")
+{
+    // v2.3 Task 2 (spec C7, root cause 8): a 4-sector ring whose SEAM (the array index
+    // where the sample chain wraps from its last sample back to poly.front() for a loop)
+    // sits INSIDE one color's angular range, not on a boundary between two colors.
+    // Without the C7 merge, the raw run-building pass (which only ever groups
+    // CONSECUTIVE same-vote chain samples) sees that one physical sector as TWO separate
+    // runs - one at the very start of the sample array, one at the very end - because
+    // array wraparound isn't "consecutive" to it. Colors are assigned by angle from the
+    // origin, in 90-degree bands offset so each of the ring's four corners sits at the
+    // MIDPOINT of its own color's range (never on a boundary, so no sample-precision
+    // flakiness): color 0 covers (-45,45], color 1 (45,135], color 2 (135,225], color 3
+    // (225,315]. The ring's four corners sit at exactly 0/90/180/270 degrees - color 0's
+    // corner (angle 0, poly.front()) is both the FIRST sample and, via the loop closure,
+    // the LAST sample too, so color 0 is exactly the seam-straddling sector.
+    auto resolver = [](const Point &pt) -> unsigned {
+        const double x = unscale<double>(pt.x());
+        const double y = unscale<double>(pt.y());
+        double deg = std::atan2(y, x) * 180.0 / PI;   // (-180, 180]
+        if (deg < 0.0)
+            deg += 360.0;                              // normalize to [0, 360)
+        return unsigned(std::floor(std::fmod(deg + 45.0, 360.0) / 90.0));
+    };
+
+    const double R = 20.0;
+    Points ring = { Point(scale_(R), scale_(0)), Point(scale_(0), scale_(R)),
+                    Point(scale_(-R), scale_(0)), Point(scale_(0), scale_(-R)) };
+
+    BrimVoteParams p;
+    p.min_run_mm = 0.0;   // isolate the C7 merge from absorb_short_runs
+    p.max_runs   = 8;     // isolate the C7 merge from guard_max_runs - must not let the
+                           // pre-fix 5-run case get trimmed down to 4 by coincidence
+
+    auto runs = split_polyline_by_resolver(ring, /*is_loop=*/true, resolver, p);
+
+    // Must FAIL pre-change: without the C7 merge this is 5 runs (0,1,2,3,0 - color 0
+    // counted twice, once at each end of the sample array).
+    REQUIRE(runs.size() == 4);
+    CHECK(runs[0].extruder == 0);
+    CHECK(runs[1].extruder == 1);
+    CHECK(runs[2].extruder == 2);
+    CHECK(runs[3].extruder == 3);
+
+    // Boundary-vertex invariant holds end to end (the ordinary inter-run gap-fix loop
+    // still runs on the post-merge run list).
+    for (size_t k = 1; k < runs.size(); ++k) {
+        REQUIRE(!runs[k].pts.empty());
+        REQUIRE(!runs[k - 1].pts.empty());
+        CHECK(runs[k].pts.front() == runs[k - 1].pts.back());
+    }
+
+    // The merged seam run really does contain the seam vertex itself (poly.front(),
+    // where the pre-merge first and last runs used to join) somewhere in its points -
+    // proof the merge actually glued the two color-0 fragments back together, not that
+    // guard_max_runs coincidentally discarded one of them down to the same count.
+    const bool seam_vertex_present = std::find(runs[0].pts.begin(), runs[0].pts.end(),
+                                                Point(scale_(R), scale_(0))) != runs[0].pts.end();
+    CHECK(seam_vertex_present);
 }
 
 TEST_CASE("partition_support_entities role_filter=base splits base, preserves erSupportMaterial role, leaves interfaces untouched", "[chameleon]")
@@ -1111,6 +1172,46 @@ TEST_CASE("chameleon_pick_projection_region: a lower layer's margin-ring hit mus
     size_t out_layer = 999, out_region = 999;
     REQUIRE(chameleon_pick_projection_region(layers, p, out_layer, out_region));
     CHECK(out_layer == 1);   // layer 1's raw containment, NOT layer 0's ring hit
+    CHECK(out_region == 0);
+}
+
+TEST_CASE("chameleon_pick_projection_region: PASS 2 scans the margin ring HIGHEST band layer first (C4)", "[chameleon]")
+{
+    // v2.3 Task 2 (spec C4, root cause 4): unlike the C1 test above (where layer 1
+    // genuinely raw-contains p, so PASS 1 alone already resolves it), THIS case makes
+    // BOTH layers miss on raw containment - p is only ever covered by either layer's
+    // margin ring - so PASS 1 finds nothing on either layer and this exercises PASS 2 in
+    // isolation. Layer 0 is the wall-only z-gap layer, layer 1 is the overhang one layer
+    // higher - the standard-configuration shape "surface above wins" is meant to
+    // restore. Pre-change (PASS 2 scanning lowest-first, the same direction as PASS 1)
+    // this resolves to layer 0's wall region - the exact inversion spec root cause 4
+    // describes ("the 1.2mm-grown contact rim resolves against the adjacent WALL layer
+    // below the overhang layer"). Post-change (PASS 2 scans highest-first) it must
+    // resolve to layer 1's overhang region instead.
+    Point p(0, 0);
+
+    ExPolygons layer0_raw      = { square_expoly(20, 0, 5) };   // wall geometry - doesn't cover p
+    ExPolygons layer0_expanded = { square_expoly(0, 0, 15) };   // grown ring - covers p
+    ExPolygons layer0_region0  = { square_expoly(20, 0, 5) };   // wall region's own raw slice, far from p
+
+    ProjectionLayerView layer0;
+    layer0.lslices            = &layer0_raw;
+    layer0.expanded_lslices   = layer0_expanded;
+    layer0.region_slice_polys = { { &layer0_region0[0] } };
+
+    ExPolygons layer1_raw      = { square_expoly(20, 0, 5) };   // overhang's raw slice also just misses p
+    ExPolygons layer1_expanded = { square_expoly(0, 0, 15) };   // grown ring - covers p
+    ExPolygons layer1_region0  = { square_expoly(3, 0, 1) };    // overhang region's own raw slice, near p
+
+    ProjectionLayerView layer1;
+    layer1.lslices            = &layer1_raw;
+    layer1.expanded_lslices   = layer1_expanded;
+    layer1.region_slice_polys = { { &layer1_region0[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer0, layer1 };  // caller-ordered lowest first, as always
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, p, out_layer, out_region));
+    CHECK(out_layer == 1);   // overhang layer, NOT the lower wall layer's ring hit
     CHECK(out_region == 0);
 }
 

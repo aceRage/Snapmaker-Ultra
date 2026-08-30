@@ -2346,42 +2346,48 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
 // throughout the chameleon-brim code (see task-3 report for the analysis).
 
 // Chameleon P2/P2.1: per-region "color" extruder derivation (0-based) for a WALL path -
-// wall_filament, then outer_wall_filament for the external perimeter, then
-// object_default_extruder as the last resort. `is_external` is the erExternalPerimeter
-// check for a wall PATH. Used by chameleon_collect_wall_samples' add_path lambda below
-// (both the Part 1 brim wall index and the v2.1 coplanar lateral wall index feed off
-// it). v2.1 final-review I3 fix: the projection (vertical-surface) path does NOT reuse
-// this chain any more - a projected surface sample has no erExternalPerimeter concept
-// and prints with the region's solid_infill_filament, not wall_filament - see
-// chameleon_projection_region_extruder's own comment below for that derivation.
-static unsigned chameleon_region_extruder(const PrintRegionConfig &region_config, bool is_external,
-                                           unsigned own_extruder_0based)
+// wall_filament, then outer_wall_filament for the external perimeter. `is_external` is
+// the erExternalPerimeter check for a wall PATH. Used by chameleon_collect_wall_samples'
+// add_path lambda below (both the Part 1 brim wall index and the v2.1 coplanar lateral
+// wall index feed off it). v2.1 final-review I3 fix: the projection (vertical-surface)
+// path does NOT reuse this chain any more - a projected surface sample has no
+// erExternalPerimeter concept and prints with the region's solid_infill_filament, not
+// wall_filament - see chameleon_projection_region_extruder's own comment below for that
+// derivation.
+//
+// v2.3 Task 2 (spec C8, root cause 6): calls PrintRegion::extruder() (PrintRegion.cpp:
+// 18-29) directly instead of re-reading the raw wall_filament/outer_wall_filament config
+// values by hand - a PrintRegion is reachable at every call site below (LayerRegion::
+// region()), so this can never drift from the engine's own outer_wall_filament>0?outer:
+// wall selection. extruder() never returns 0 for frExternalPerimeter/frPerimeter:
+// wall_filament has config min=1 (PrintConfig.cpp) and painted regions always set it
+// explicitly too (PrintApply.cpp:826-833) - outer_wall_filament's own min=0 is a REAL
+// sentinel ("0 = follow walls"), already handled by extruder()'s internal ternary, not a
+// gap. So the old own_extruder_0based fallback (reached only if wall_filament.value was
+// <= 0, which config guarantees never happens) was unreachable dead code - removed here
+// and threaded out of chameleon_collect_wall_samples/its three call sites below, since it
+// no longer has anything to feed.
+static unsigned chameleon_region_extruder(const PrintRegion &region, bool is_external)
 {
-    if (is_external && region_config.outer_wall_filament.value > 0)
-        return unsigned(region_config.outer_wall_filament.value - 1);
-    if (region_config.wall_filament.value > 0)
-        return unsigned(region_config.wall_filament.value - 1);
-    return own_extruder_0based;
+    return unsigned(region.extruder(is_external ? frExternalPerimeter : frPerimeter) - 1);
 }
 
-static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const PrintRegionConfig& region_config,
-                                            unsigned own_extruder_0based, const Point& shift,
-                                            size_t object_key, WallSampleIndex& wall_idx)
+static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const PrintRegion& region,
+                                            const Point& shift, size_t object_key, WallSampleIndex& wall_idx)
 {
     if (entity == nullptr)
         return;
     if (entity->is_collection()) {
         const auto* coll = static_cast<const ExtrusionEntityCollection*>(entity);
         for (const ExtrusionEntity* child : coll->entities)
-            chameleon_collect_wall_samples(child, region_config, own_extruder_0based, shift, object_key, wall_idx);
+            chameleon_collect_wall_samples(child, region, shift, object_key, wall_idx);
         return;
     }
 
     auto add_path = [&](const ExtrusionPath& path) {
         if (path.polyline.points.empty())
             return;
-        const unsigned extruder = chameleon_region_extruder(region_config,
-            path.role() == erExternalPerimeter, own_extruder_0based);
+        const unsigned extruder = chameleon_region_extruder(region, path.role() == erExternalPerimeter);
 
         Points shifted;
         shifted.reserve(path.polyline.points.size());
@@ -2409,24 +2415,29 @@ static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const 
 // PrintRegion::extruder(frSolidInfill|frTopSolidInfill), PrintRegion.cpp:18-35), not
 // wall_filament - painted regions set wall/solid/sparse together so the two only diverge
 // under a manual filament mapping (wall_filament != solid_infill_filament), exactly the
-// mismatch this feature exists to remove. Mirror PrintRegion::extruder's own fallback:
-// solid_infill_filament (if set), else sparse_infill_filament (PrintRegion::extruder
-// routes frSolidInfill through sparse_infill_filament when sparse_infill_density == 100%
-// - internal_solid_infill_uses_sparse_filament, PrintRegion.cpp:10-13 - so it is a real,
-// engine-consulted fallback for this surface, not an arbitrary substitute); grepped
-// PrintRegionConfig (PrintConfig.hpp) - solid_infill_filament and sparse_infill_filament
-// are the only two options that ever govern a solid/bottom shell's filament, there is no
-// more specific "bottom shell filament" option. wall_filament/outer_wall_filament are
-// NEVER consulted here - those stay chameleon_region_extruder's job, unchanged, for the
-// LATERAL (wall-sample) path only.
-static unsigned chameleon_projection_region_extruder(const PrintRegionConfig &region_config,
-                                                       unsigned own_extruder_0based)
+// mismatch this feature exists to remove. wall_filament/outer_wall_filament are NEVER
+// consulted here - those stay chameleon_region_extruder's job, unchanged, for the LATERAL
+// (wall-sample) path only.
+//
+// v2.3 Task 2 (spec C8, root cause 6): calls PrintRegion::extruder(frSolidInfill)
+// directly (PrintRegion.cpp:18-29) - a PrintRegion is reachable at the one call site
+// below (LayerRegion::region()) - instead of the old hand-rolled "solid_infill_filament
+// if set, else sparse_infill_filament" read. That raw read MISSED a real engine
+// behavior: PrintRegion::extruder(frSolidInfill) routes through sparse_infill_filament
+// whenever this region's sparse_infill_density == 100% (internal_solid_infill_uses_
+// sparse_filament, PrintRegion.cpp:10-13) - REGARDLESS of whether solid_infill_filament
+// is also set (it always is, see below), because the engine actually prints that
+// region's solid infill using sparse_infill_filament in that case. The old code's
+// "solid, else sparse" fallback chain only ever took the sparse branch when
+// solid_infill_filament read as 0, which - now that extruder() is called directly -
+// never happens anyway: both options have config min=1 (PrintConfig.cpp) and painted
+// regions always set both explicitly too (PrintApply.cpp:826-833), so the old
+// own_extruder_0based last-resort fallback (reached only if BOTH read <= 0) was also
+// unreachable dead code. Both issues are fixed by routing through the one canonical
+// PrintRegion::extruder() call instead of re-deriving its logic by hand.
+static unsigned chameleon_projection_region_extruder(const PrintRegion &region)
 {
-    if (region_config.solid_infill_filament.value > 0)
-        return unsigned(region_config.solid_infill_filament.value - 1);
-    if (region_config.sparse_infill_filament.value > 0)
-        return unsigned(region_config.sparse_infill_filament.value - 1);
-    return own_extruder_0based;
+    return unsigned(region.extruder(frSolidInfill) - 1);
 }
 
 // v2.2 Task 2 (spec C5, root cause 4): mirrors Support/SupportMaterial.cpp:57's
@@ -2529,19 +2540,17 @@ static void chameleon_build_projection_views(const PrintObject &object,
 // layer's lslices cover p - the caller (Task 3) then falls through to the lateral rule.
 //
 // Extruder resolution: v2.1 final-review I3 fix - chameleon_projection_region_extruder
-// above (solid_infill_filament -> sparse_infill_filament -> object default), NOT
+// above (routes through PrintRegion::extruder(frSolidInfill), v2.3 Task 2 spec C8), NOT
 // chameleon_region_extruder (wall_filament-based; still used unchanged by the lateral/
 // wall-sample path). A projected surface sample has no erExternalPerimeter concept
 // either way - "is this the region's external perimeter path" doesn't apply to a bare
 // fill surface - so outer_wall_filament was never, and is still never, consulted here.
 //
-// object_default_extruder is a plain parameter (not recomputed here via
-// chameleon_object_default_extruder, which needs Print::config() for its filament-count
-// sentinel) for the same reason chameleon_collect_wall_samples' own_extruder_0based is:
-// the caller computes it ONCE per object/support layer (chameleon_assign_support_
-// interfaces already does, at the object_default_extruder local above) rather than this
-// function recomputing it on every one of the many sample-point calls a single support
-// layer makes.
+// v2.3 Task 2 (spec C8): the object_default_extruder parameter this function used to take
+// is gone - it only ever fed chameleon_projection_region_extruder's own last-resort
+// fallback, which spec C8 established is unreachable dead code (PrintRegion::extruder()
+// never returns 0 for frSolidInfill; see that function's own comment above), so there is
+// nothing left here for a caller-supplied default to fall back to.
 //
 // Perf: O(band layers x regions) per call now that the view is prebuilt (was O(band
 // layers x regions x islands) per call before M1). Layer::lslices_bboxes is precomputed
@@ -2550,7 +2559,6 @@ static void chameleon_build_projection_views(const PrintObject &object,
 static bool chameleon_projection_extruder_from_view(const std::vector<ProjectionLayerView> &view,
                                                       const std::vector<const Layer *> &view_layers,
                                                       const Point &p,
-                                                      unsigned object_default_extruder,
                                                       unsigned &out_extruder)
 {
     size_t hit_layer = 0, hit_region = 0;
@@ -2564,7 +2572,7 @@ static bool chameleon_projection_extruder_from_view(const std::vector<Projection
         return false; // defensive: cannot happen (hit_region indexes the same regions() this view was built from)
 
     const LayerRegion &lr = *regions[hit_region];
-    out_extruder = chameleon_projection_region_extruder(lr.region().config(), object_default_extruder);
+    out_extruder = chameleon_projection_region_extruder(lr.region());
     return true;
 }
 
@@ -2592,11 +2600,13 @@ std::map<ObjectID, unsigned int> getObjectExtruderMap(const Print& print) {
     return objectExtruderMap;
 }
 
-// Chameleon P2: this object's default extruder (0-based) - the last-resort default
-// used for wall samples that carry no per-region filament override (mirrors
-// chameleon_collect_wall_samples' own_extruder_0based parameter above), and also the
-// fallback interface extruder when support_interface_filament is unset (0 = "current
-// filament"). Deliberately NOT read from PrintObject::object_first_layer_wall_extruders
+// Chameleon P2: this object's default extruder (0-based) - the fallback interface
+// extruder when support_interface_filament is unset (0 = "current filament"). v2.3
+// Task 2 (spec C8) removed this value's other former use, chameleon_collect_wall_
+// samples' own_extruder_0based last-resort parameter - PrintRegion::extruder() never
+// actually needs a caller-supplied default (see chameleon_region_extruder's own
+// comment above), so that use was unreachable dead code. Deliberately NOT read from
+// PrintObject::object_first_layer_wall_extruders
 // (getObjectExtruderMap's memoized path above): that field is only populated once
 // ToolOrdering::collect_extruders runs (ToolOrdering.cpp ~851), which for this pass is
 // always still in the future - see chameleon_assign_support_interfaces' call site in
@@ -3021,8 +3031,8 @@ static void chameleon_assign_support_interfaces(Print &print)
                 // scoring. No projection view is ever built in this mode.
                 for (size_t li : union_layer_indices(contact_idx, coplanar_idx))
                     for (const LayerRegion *lr : object->layers()[li]->regions())
-                        chameleon_collect_wall_samples(&lr->perimeters, lr->region().config(),
-                            object_default_extruder, no_shift, obj_idx, wall_union_idx);
+                        chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
+                            no_shift, obj_idx, wall_union_idx);
 
                 zero_sample = wall_union_idx.empty();
                 if (!zero_sample) {
@@ -3073,8 +3083,8 @@ static void chameleon_assign_support_interfaces(Print &print)
                 // nearest_surface: exactly today's (pre-Task-4) behavior, unchanged.
                 for (size_t li : coplanar_idx)
                     for (const LayerRegion *lr : object->layers()[li]->regions())
-                        chameleon_collect_wall_samples(&lr->perimeters, lr->region().config(),
-                            object_default_extruder, no_shift, obj_idx, coplanar_wall_idx);
+                        chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
+                            no_shift, obj_idx, coplanar_wall_idx);
 
                 zero_sample = contact_idx.empty() && coplanar_wall_idx.empty();
                 if (!zero_sample) {
@@ -3113,11 +3123,11 @@ static void chameleon_assign_support_interfaces(Print &print)
                     // the "else" branch; no other code needs to move, since both are
                     // already independent (p) -> unsigned expressions with no shared
                     // mutable state.
-                    interface_resolver = [&projection_view, &projection_view_layers, object_default_extruder,
+                    interface_resolver = [&projection_view, &projection_view_layers,
                                            &coplanar_wall_idx, interface_lateral_params](const Point &p) -> unsigned {
                         unsigned proj_extruder = 0;
                         if (chameleon_projection_extruder_from_view(projection_view, projection_view_layers, p,
-                                                                      object_default_extruder, proj_extruder))
+                                                                      proj_extruder))
                             return proj_extruder;
                         return brim_vote(coplanar_wall_idx, p, interface_lateral_params);
                     };
@@ -3618,16 +3628,11 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                         area_sum += ex.area() * SCALING_FACTOR * SCALING_FACTOR;
                     object_area[object_key] = area_sum;
 
-                    // objPrintVec extruders are 1-based (PrintRegion::extruder()'s
-                    // convention); convert to the 0-based scheme used by
-                    // WallSampleIndex / BrimVoteParams / m_brimMapByExtruder.
-                    const unsigned own_extruder_0based = objIDPair.second > 0 ? objIDPair.second - 1 : 0;
-
                     const size_t samples_before = wall_idx.size();
                     for (const PrintInstance& instance : object->instances())
                         for (const LayerRegion* lr : layer0->regions()) {
-                            chameleon_collect_wall_samples(&lr->perimeters, lr->region().config(),
-                                own_extruder_0based, instance.shift, object_key, wall_idx);
+                            chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
+                                instance.shift, object_key, wall_idx);
                         }
                     if (wall_idx.size() == samples_before) {
                         zero_sample_objects[objIDPair.first] = true;

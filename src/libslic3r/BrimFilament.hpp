@@ -187,12 +187,28 @@ struct ProjectionLayerView {
 // to a higher one.
 //
 // PASS 2 (margin ring; only reached when PASS 1 found NOTHING): scan every layer again,
-// lowest first, this time testing expanded_lslices (the margin ring) instead of raw
-// lslices. The first layer whose ring covers p is picked, resolved via the nearest-
-// region search (below) over ALL of that layer's regions. Reaching PASS 2 at all already
-// means no band layer anywhere raw-contains p, so there is no raw-containment region
-// scan to redo here - a region's own raw slice polys are always a subset of its layer's
-// raw lslices, which PASS 1 has already established as a global miss.
+// this time HIGHEST band layer FIRST (v2.3 Task 2, spec C4/root cause 4 - the OPPOSITE
+// direction from PASS 1), testing expanded_lslices (the margin ring) instead of raw
+// lslices. The first layer (in this reversed order) whose ring covers p is picked,
+// resolved via the nearest-region search (below) over ALL of that layer's regions.
+// Reaching PASS 2 at all already means no band layer anywhere raw-contains p, so there
+// is no raw-containment region scan to redo here - a region's own raw slice polys are
+// always a subset of its layer's raw lslices, which PASS 1 has already established as a
+// global miss.
+//
+// This scan-direction asymmetry between PASS 1 (lowest-first) and PASS 2 (highest-
+// first) is deliberate, not an oversight - the two passes answer different questions.
+// PASS 1 = "nearest surface above": the lowest band layer whose RAW geometry genuinely
+// contains p already IS the nearest one, by definition of "lowest that hits first", so
+// scanning upward on a miss is correct. PASS 2 = "prefer the overhang ring over the
+// wall-gap ring": a band's first (lowest) layer is typically wall-only (see the "SURFACE
+// ABOVE WINS" discussion above - it spans the z-gap between the support top and the
+// overhang bottom, so its raw lslices see only the laterally-adjacent wall, never the
+// overhang body one layer up), so a rim sample whose 1.2mm-grown margin ring is hit by
+// BOTH the lower wall layer and the higher overhang layer must resolve to the OVERHANG
+// layer - scanning lowest-first here would instead resolve it against the wall layer
+// below, inverting "surface above wins" for exactly the rim samples this rescue pass
+// exists to help.
 //
 // Nearest-region search (used both for PASS 1's same-layer degenerate case and for every
 // PASS 2 resolution): among the layer's regions, the one whose raw slice polys are

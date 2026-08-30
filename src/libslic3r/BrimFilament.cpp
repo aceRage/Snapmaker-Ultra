@@ -163,6 +163,43 @@ std::vector<BrimRun> split_polyline_core(const Points &poly, bool is_loop,
         i = j + 1;
     }
 
+    // v2.3 Task 2 (spec C7, root cause 8): LOOP inputs only. `chain`'s last sample is
+    // the SAME physical point as its first - for a loop, `working` above has
+    // poly.front() appended as an explicit closing point, so build_chain's last output
+    // sample is that same coordinate. If the array-index-FIRST and array-index-LAST
+    // runs built just above land on the SAME extruder, they are not two separate
+    // sectors - they are ONE sector artificially split by where the sample array
+    // happens to start/end (the seam). Left unmerged, that one sector is counted TWICE
+    // (once at each end of the array), inflating the effective run count into
+    // guard_max_runs' cap for no geometric reason (spec root cause 8: "Ring seam
+    // double-counts a sector... max_runs=4 trips on 4-sector rings"). Fold the last run
+    // into the first (prepend its points - the last run physically precedes the first
+    // one when the loop is read circularly, since `chain` wraps from its last sample
+    // back to its first) BEFORE absorb_short_runs/guard_max_runs run below, so both
+    // length-based passes see the seam sector as the single sector it actually is.
+    // The join point (the last run's last point == the first run's first point, both
+    // `poly.front()`) is a literal duplicate coordinate, not a gap - it's the SAME
+    // loop-closing vertex build_chain already produced, so this preserves the shared-
+    // boundary-vertex invariant across the seam exactly like the ordinary inter-run
+    // gap-fix loop below does for every OTHER pair of adjacent runs, without needing a
+    // separate fixup here. Only merges when there are >= 2 runs (a single-run loop, the
+    // whole chain one color, has no seam to speak of - and by construction adjacent
+    // array runs never share an extruder, so 2 runs are automatically each other's
+    // whole-array front/back and a genuine merge candidate) and only for loops - an
+    // OPEN polyline's first/last samples are its two distinct endpoints, not a seam, so
+    // merging on a color match there would wrongly join two unrelated ends of an open
+    // path. A single merge always suffices (never needs to repeat): the run that
+    // becomes the new "last" after popping is the ORIGINAL second-to-last run, which by
+    // the array's own adjacency invariant (no two array-adjacent runs ever share an
+    // extruder) already differs from the just-removed original last run's extruder -
+    // and the just-removed run's extruder is exactly what the merged run now carries.
+    if (is_loop && runs.size() >= 2 && runs.front().extruder == runs.back().extruder) {
+        BrimRun &first = runs.front();
+        BrimRun &last  = runs.back();
+        first.pts.insert(first.pts.begin(), last.pts.begin(), last.pts.end());
+        runs.pop_back();
+    }
+
     absorb_short_runs(runs, p.min_run_mm);
     guard_max_runs(runs, p.max_runs);
 
@@ -722,14 +759,31 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &la
         return true;
     }
 
-    // PASS 2 (spec C5 margin ring): reached only when NO band layer's raw lslices
-    // contain p anywhere. Scan again, lowest first, this time testing the margin ring
-    // (expanded_lslices) - a rescue for samples the grown contact polygon pushed outside
-    // all raw geometry, never a way to out-rank a higher layer's real containment (PASS
-    // 1 already ruled that out globally). No raw-containment region scan is repeated
-    // here: a region's own raw slice polys are always a subset of its layer's raw
-    // lslices, which PASS 1 has already established as a miss on every layer.
-    for (size_t li = 0; li < layers.size(); ++li) {
+    // PASS 2 (spec C5 margin ring; v2.3 Task 2 spec C4/root cause 4 changes the scan
+    // DIRECTION only): reached only when NO band layer's raw lslices contain p anywhere.
+    // Scan again, this time HIGHEST band layer FIRST - the OPPOSITE direction from PASS
+    // 1 above - testing the margin ring (expanded_lslices) instead of raw lslices. This
+    // asymmetry is deliberate, not an oversight, and the two passes are answering
+    // different questions: PASS 1 ("nearest surface above") scans lowest-first because
+    // the lowest layer whose RAW geometry genuinely contains p already IS "the surface
+    // above" by construction - real containment on a low layer is real containment, full
+    // stop, so escalating upward only on a miss is correct there. PASS 2 only ever
+    // triggers as a RESCUE for samples every layer's raw geometry missed, and a band's
+    // FIRST (lowest) layer is typically wall-only (see this function's own header
+    // comment: it spans the z-gap between the support top and the overhang bottom, so
+    // its raw lslices see only the laterally-adjacent wall, never the overhang body,
+    // which only starts one layer higher) - so scanning the RING lowest-first would
+    // resolve a rim sample against that lower wall layer's ring even when the actual
+    // overhang's own ring, one layer up, ALSO covers it, inverting "surface above wins"
+    // for exactly the rim samples this rescue exists to help (spec root cause 4: "the
+    // 1.2mm-grown contact rim resolves against the adjacent WALL layer below the
+    // overhang layer"). Scanning highest-first here restores that priority: whichever
+    // band layer's ring covers p, the HIGHEST one wins. No raw-containment region scan
+    // is repeated here: a region's own raw slice polys are always a subset of its
+    // layer's raw lslices, which PASS 1 has already established as a miss on every
+    // layer, regardless of scan order.
+    for (size_t idx = 0; idx < layers.size(); ++idx) {
+        const size_t li = layers.size() - 1 - idx; // highest layer first (opposite of PASS 1)
         const ProjectionLayerView &lv = layers[li];
         if (lv.expanded_lslices.empty())
             continue; // no margin-ring geometry on this layer at all
