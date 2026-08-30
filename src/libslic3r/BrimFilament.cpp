@@ -171,6 +171,59 @@ void partition_leaf_entity(const ExtrusionEntity &entity, unsigned own_extruder,
     }
 }
 
+// Partition a single support-interface entity (path/multipath/loop). `entity`
+// is still owned by support_fills at this point; the caller deletes it if
+// `replaced` comes back true. Fallback-voted runs are appended to
+// `new_fallback_paths` (the caller re-inserts them into support_fills once the
+// sweep over the original entities vector is finished, since it must not be
+// mutated mid-iteration); non-fallback runs land in `out[extruder]`. Returns
+// the number of switch boundaries this entity contributed.
+size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fallback_extruder,
+                                      const WallSampleIndex &idx, const BrimVoteParams &p,
+                                      std::vector<ExtrusionPath *> &new_fallback_paths,
+                                      std::map<unsigned, ExtrusionEntityCollection> &out,
+                                      bool &replaced)
+{
+    replaced = false;
+
+    const bool     is_loop = entity.is_loop();
+    const Polyline as_pl   = entity.as_polyline();
+    Points         chain   = as_pl.points;
+    if (is_loop && chain.size() > 1 && chain.front() == chain.back())
+        chain.pop_back(); // split_polyline_by_vote closes loops itself
+
+    if (chain.empty())
+        return 0; // guard: never call split_polyline_by_vote on an empty polyline; leave entity untouched
+
+    std::vector<BrimRun> runs = split_polyline_by_vote(chain, is_loop, idx, p);
+
+    // Fast path: every sample voted for the fallback extruder -> leave the
+    // ORIGINAL entity in support_fills untouched (byte-identical geometry, no
+    // entity churn).
+    if (runs.size() == 1 && runs.front().extruder == fallback_extruder)
+        return 0;
+
+    replaced = true;
+
+    const ExtrusionPath *source = first_path_of(entity);
+    const double mm3_per_mm = source ? source->mm3_per_mm : 0.0;
+    const float  width      = source ? source->width      : 0.f;
+    const float  height     = source ? source->height     : 0.f;
+
+    for (const BrimRun &run : runs) {
+        if (run.pts.empty())
+            continue;
+        auto *new_path      = new ExtrusionPath(erSupportMaterialInterface, mm3_per_mm, width, height);
+        new_path->polyline  = Polyline(run.pts);
+        if (run.extruder == fallback_extruder)
+            new_fallback_paths.push_back(new_path);
+        else
+            out[run.extruder].entities.push_back(new_path);
+    }
+
+    return runs.empty() ? 0 : runs.size() - 1;
+}
+
 } // namespace
 
 void partition_brim_by_wall(const ExtrusionEntityCollection &brim, unsigned own_extruder,
@@ -340,6 +393,49 @@ std::vector<size_t> select_contact_layers(const std::vector<double> &print_zs,
             result.push_back(i);
     }
     return result;
+}
+
+size_t partition_support_interfaces(ExtrusionEntityCollection &support_fills, unsigned fallback_extruder,
+                                     const WallSampleIndex &idx, const BrimVoteParams &p,
+                                     std::map<unsigned, ExtrusionEntityCollection> &out)
+{
+    size_t switch_boundaries = 0;
+    std::vector<ExtrusionPath *> new_fallback_paths;
+
+    // Rebuilt in place: base/unknown entities and untouched (fast-path)
+    // interface entities keep their original pointer and position; matched
+    // interface entities are deleted here and their fallback-voted runs are
+    // appended (as new entities) below, once the sweep is done.
+    ExtrusionEntitiesPtr kept;
+    kept.reserve(support_fills.entities.size());
+
+    for (ExtrusionEntity *entity : support_fills.entities) {
+        if (entity == nullptr)
+            continue;
+        // Only erSupportMaterialInterface leaf entities (path/multipath/loop)
+        // are ever partitioned. Base fills, other support roles, and any
+        // nested collection (whose role() could coincidentally aggregate to
+        // erSupportMaterialInterface but which as_polyline()/is_loop() cannot
+        // handle) are left exactly where they are.
+        if (entity->is_collection() || entity->role() != erSupportMaterialInterface) {
+            kept.push_back(entity);
+            continue;
+        }
+
+        bool replaced = false;
+        switch_boundaries += partition_support_leaf_entity(*entity, fallback_extruder, idx, p,
+                                                             new_fallback_paths, out, replaced);
+        if (replaced)
+            delete entity; // matched original removed; its runs were recorded above
+        else
+            kept.push_back(entity); // uniform-fallback fast path: original stays untouched
+    }
+
+    for (ExtrusionPath *path : new_fallback_paths)
+        kept.push_back(path);
+
+    support_fills.entities.swap(kept);
+    return switch_boundaries;
 }
 
 } // namespace Slic3r

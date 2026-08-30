@@ -176,3 +176,48 @@ TEST_CASE("select_contact_layers picks the 1-2 layers above", "[chameleon]")
     REQUIRE(vlh.size() == 1);
     CHECK(vlh[0] == 1);
 }
+
+static ExtrusionEntityCollection make_support_fills(float y_iface)
+{
+    ExtrusionEntityCollection c;
+    auto* base = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    base->polyline = Polyline({Point(scale_(0), scale_(-5)), Point(scale_(30), scale_(-5))});
+    c.entities.push_back(base);
+    for (int i = 0; i < 2; ++i) {
+        auto* p = new ExtrusionPath(erSupportMaterialInterface, 1.0, 0.4f, 0.2f);
+        p->polyline = Polyline({Point(scale_(0), scale_(y_iface + i)), Point(scale_(30), scale_(y_iface + i))});
+        c.entities.push_back(p);
+    }
+    return c;
+}
+
+TEST_CASE("partition_support_interfaces splits by contact walls, base untouched", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 14, 6), 1, 1);    // left wall above -> extruder 1
+    idx.add_polyline(segment(16, 6, 30, 6), 2, 2);   // right wall above -> extruder 2
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto fills = make_support_fills(5.0f);
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_interfaces(fills, 0, idx, p, out);
+    REQUIRE(out.count(1) == 1);
+    REQUIRE(out.count(2) == 1);
+    // base path remains; matched interface originals removed
+    size_t base_n = 0, iface_n = 0;
+    for (auto* e : fills.entities) (e->role() == erSupportMaterial ? base_n : iface_n)++;
+    CHECK(base_n == 1);
+    CHECK(iface_n == 0);
+}
+
+TEST_CASE("partition_support_interfaces uniform-fallback fast path keeps entities", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 30, 6), 0, 1);    // only fallback-extruder walls
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto fills = make_support_fills(5.0f);
+    const size_t before = fills.entities.size();
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_interfaces(fills, 0, idx, p, out);
+    CHECK(out.empty());
+    CHECK(fills.entities.size() == before);          // untouched (off-parity)
+}

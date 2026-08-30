@@ -355,6 +355,12 @@ static t_config_enum_values s_keys_map_BrimFilamentSource {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(BrimFilamentSource)
 
+static t_config_enum_values s_keys_map_SupportInterfaceFilamentSource {
+    { "manual",          int(SupportInterfaceFilamentSource::sifsManual) },
+    { "nearest_surface", int(SupportInterfaceFilamentSource::sifsNearestSurface) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(SupportInterfaceFilamentSource)
+
 // using 0,1 to compatible with old files
 static const t_config_enum_values s_keys_map_TimelapseType = {
     {"0",       tlTraditional},
@@ -5457,6 +5463,19 @@ void PrintConfigDef::init_fff_params()
     // BBS
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionInt(0));
+
+    def = this->add("support_interface_filament_source", coEnum);
+    def->label = L("Support interface filament source");
+    def->category = L("Support");
+    def->tooltip = L("manual: use the configured support interface filament (default). nearest_surface: "
+                     "each interface region uses the filament of the model surface it touches.");
+    def->enum_keys_map = &ConfigOptionEnum<SupportInterfaceFilamentSource>::get_enum_values();
+    def->enum_values.emplace_back("manual");
+    def->enum_values.emplace_back("nearest_surface");
+    def->enum_labels.emplace_back(L("Manual"));
+    def->enum_labels.emplace_back(L("Nearest surface"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<SupportInterfaceFilamentSource>(sifsManual));
 
     auto support_interface_top_layers = def = this->add("support_interface_top_layers", coInt);
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;

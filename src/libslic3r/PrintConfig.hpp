@@ -249,6 +249,9 @@ enum BrimType {
 // Chameleon brim: which filament a brim extrusion is printed with.
 enum BrimFilamentSource { bfsObject = 0, bfsNearestWall };
 
+// Chameleon support interface: which filament a support-interface extrusion is printed with.
+enum SupportInterfaceFilamentSource { sifsManual = 0, sifsNearestSurface };
+
 enum TimelapseType : int {
     tlTraditional = 0,
     tlSmooth
@@ -481,6 +484,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLADisplayOrientation)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLAPillarConnectionMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimFilamentSource)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SupportInterfaceFilamentSource)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TimelapseType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BedType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SkirtType)
@@ -870,6 +874,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                support_interface_not_for_body))
     ((ConfigOptionBool,                support_interface_loop_pattern))
     ((ConfigOptionInt,                 support_interface_filament))
+    // Chameleon: which filament a support-interface extrusion is printed with.
+    ((ConfigOptionEnum<SupportInterfaceFilamentSource>, support_interface_filament_source))
     ((ConfigOptionInt,                 support_interface_top_layers))
     ((ConfigOptionInt,                 support_interface_bottom_layers))
     // Spacing between interface lines (the hatching distance). Set zero to get a solid interface.

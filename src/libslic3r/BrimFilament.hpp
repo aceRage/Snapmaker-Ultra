@@ -47,5 +47,17 @@ void partition_brim_by_wall(const ExtrusionEntityCollection& brim,
 // Requires gap_mm > max layer height, else the direct contact layer itself is dropped.
 std::vector<size_t> select_contact_layers(const std::vector<double>& print_zs,
                                           double support_top_z, double gap_mm = 2.0);
+
+// Partition the interface-role entities of `support_fills` by vote against `idx`.
+// - Entities whose every vote == fallback stay in support_fills untouched (fast path).
+// - Otherwise the entity is split; runs voted fallback are appended back into
+//   support_fills as new interface paths; other runs go to out[extruder].
+// - Non-interface entities are never touched. Matched originals are deleted.
+// Returns switch-boundary count added (for the per-object cap accounting).
+size_t partition_support_interfaces(ExtrusionEntityCollection& support_fills,
+                                    unsigned fallback_extruder,
+                                    const WallSampleIndex& idx,
+                                    const BrimVoteParams& params,
+                                    std::map<unsigned, ExtrusionEntityCollection>& out);
 } // namespace Slic3r
 #endif
