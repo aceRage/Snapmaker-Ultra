@@ -70,16 +70,20 @@ private:
     void draw_polylines(wxGraphicsContext* gc, const std::vector<Polyline>& polylines,
                          const wxColour& colour, double pen_width) const;
 
-    // Side-by-side mode: draws `polylines` (already world-space) clipped to
-    // the pane rect [pane_x0, pane_x0+pane_w) x [0, client height), shifted
-    // horizontally by x_shift screen px so the shared world->screen
-    // transform recenters this pane's content within its own half. Caption
-    // is drawn last, unclipped/untranslated, at the pane's top-left.
-    void draw_pane(wxGraphicsContext* gc, const std::vector<Polyline>& polylines,
+    // Side-by-side mode: draws one pane's classified paths (shared/jitter in
+    // neutral colors, this side's exclusive paths in its diff colour) clipped
+    // to the pane rect [pane_x0, pane_x0+pane_w) x [0, client height), shifted
+    // horizontally by x_shift screen px so the shared world->screen transform
+    // recenters this pane's content within its own half. Caption is drawn
+    // last, unclipped/untranslated, at the pane's top-left.
+    void draw_pane(wxGraphicsContext* gc, const std::vector<Polyline>& shared,
+                   const std::vector<Polyline>& jitter,
+                   const std::vector<Polyline>& only, const wxColour& only_colour,
                    double pane_x0, double pane_w, double x_shift, const wxString& caption) const;
 
-    // Splits the client rect into A-left/B-right panes and draws each one's
-    // own raw segments (m_a_all/m_b_all) plus a divider between them.
+    // Splits the client rect into A-left/B-right panes, each drawn with the
+    // overlay's diff classification split per side (A pane: both + a_only;
+    // B pane: both + b_only), plus a divider between them.
     void draw_side_by_side(wxGraphicsContext* gc) const;
 
     static std::vector<Polyline> merge_collinear(const std::vector<SliceCompare::Seg>& segs);
@@ -88,11 +92,6 @@ private:
     const SliceCompare::LayerRec* m_b = nullptr; // not owned
 
     std::vector<Polyline> m_both, m_jitter, m_a_only, m_b_only;
-
-    // Side-by-side mode only: each side's own raw segments, merged the same
-    // way as the overlay classes but with no diff classification -- feature-
-    // neutral, one color, since there's no "other side" in a single pane.
-    std::vector<Polyline> m_a_all, m_b_all;
 
     bool m_side_by_side    = false;
     bool m_view_initialized = false;

@@ -2,6 +2,7 @@
 #include "libslic3r/GCode.hpp"
 #include "GUI_App.hpp"
 #include "NotificationManager.hpp"
+#include "SliceCompare/SliceCompareFrame.hpp"
 #ifndef IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_DEFINE_MATH_OPERATORS
 #endif
@@ -156,6 +157,11 @@ bool IMSlider::init_texture()
         result &= IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/im_gcode_pause.svg", 14, 14, m_pause_icon_id);
         result &= IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/im_gcode_custom.svg", 14, 14, m_custom_icon_id);
         result &= IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/im_slider_delete.svg", 14, 14, m_delete_icon_id);
+        // Ultra: Slice Compare launcher icon (A<->B), same footprint as one_layer.
+        result &= IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/slice_compare.svg", 56, 56, m_compare_id);
+        result &= IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/slice_compare_hover.svg", 56, 56, m_compare_hover_id);
+        result &= IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/slice_compare_dark.svg", 56, 56, m_compare_dark_id);
+        result &= IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/slice_compare_hover_dark.svg", 56, 56, m_compare_hover_dark_id);
     }
 
     return result;
@@ -1144,6 +1150,22 @@ bool IMSlider::render(int canvas_width, int canvas_height)
             switch_one_layer_mode();
         }
         imgui.end();
+
+        // Ultra: Slice Compare launcher, stacked directly above the one-layer button.
+        if (m_compare_id != nullptr) {
+            const float stack_off = (ONE_LAYER_BUTTON_SIZE.y + ONE_LAYER_MARGIN.y) * m_scale;
+            imgui.set_next_window_pos(canvas_width, canvas_height - stack_off, ImGuiCond_Always, 1.0f, 1.0f);
+            ImGui::SetNextWindowSize((ONE_LAYER_BUTTON_SIZE + ONE_LAYER_MARGIN) * m_scale, 0);
+            imgui.begin(std::string("slice_compare_button"), windows_flag);
+            ImTextureID cmp_normal = m_is_dark ? m_compare_dark_id : m_compare_id;
+            ImTextureID cmp_hover  = m_is_dark ? m_compare_hover_dark_id : m_compare_hover_id;
+            if (ImGui::ImageButton3(cmp_normal, cmp_hover, ONE_LAYER_BUTTON_SIZE * m_scale)) {
+                open_slice_compare_frame(wxGetApp().GetTopWindow(), false);
+            }
+            if (ImGui::IsItemHovered())
+                show_tooltip(_u8L("Compare slices (A/B)"));
+            imgui.end();
+        }
     }
 
     ImGui::PopStyleVar(3);

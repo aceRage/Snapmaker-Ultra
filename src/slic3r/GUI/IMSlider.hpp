@@ -210,6 +210,11 @@ private:
     void *m_pause_icon_id;
     void *m_custom_icon_id;
     void *m_delete_icon_id;
+    // Ultra: Slice Compare launcher (A<->B) shown above the one-layer button.
+    void *m_compare_id            = nullptr;
+    void *m_compare_hover_id      = nullptr;
+    void *m_compare_dark_id       = nullptr;
+    void *m_compare_hover_dark_id = nullptr;
 
     DrawMode            m_draw_mode = dmRegular;
     Mode                m_mode          = SingleExtruder;

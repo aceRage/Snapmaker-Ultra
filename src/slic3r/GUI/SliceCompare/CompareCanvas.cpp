@@ -92,11 +92,8 @@ void CompareCanvas::rebuild_diff()
     m_jitter = merge_collinear(diff.jitter);
     m_a_only = merge_collinear(diff.a_only);
     m_b_only = merge_collinear(diff.b_only);
-
-    // Side-by-side mode draws each side's own raw segments independent of
-    // the overlay diff above (no red/blue classification in that mode).
-    m_a_all = m_a ? merge_collinear(m_a->segs) : std::vector<Polyline>();
-    m_b_all = m_b ? merge_collinear(m_b->segs) : std::vector<Polyline>();
+    // Side-by-side reuses these same classified sets, split per pane
+    // (A pane: both+jitter+a_only, B pane: both+jitter+b_only).
 }
 
 bool CompareCanvas::compute_content_bbox(float& bx0, float& by0, float& bx1, float& by1) const
@@ -239,13 +236,21 @@ void CompareCanvas::draw_polylines(wxGraphicsContext* gc, const std::vector<Poly
     }
 }
 
-void CompareCanvas::draw_pane(wxGraphicsContext* gc, const std::vector<Polyline>& polylines,
+void CompareCanvas::draw_pane(wxGraphicsContext* gc, const std::vector<Polyline>& shared,
+                               const std::vector<Polyline>& jitter,
+                               const std::vector<Polyline>& only, const wxColour& only_colour,
                                double pane_x0, double pane_w, double x_shift, const wxString& caption) const
 {
     gc->PushState();
     gc->Clip(pane_x0, 0.0, pane_w, double(GetClientSize().GetHeight()));
     gc->Translate(x_shift, 0.0);
-    draw_polylines(gc, polylines, SIDE_BY_SIDE_COLOUR, PEN_WIDTH_MATCH);
+    // Same classification as the overlay, but split per side: the shared paths stay
+    // neutral gray while this pane's exclusive paths get its diff colour, so the
+    // side-by-side view highlights what each slice does differently instead of
+    // rendering two indistinguishable gray copies.
+    draw_polylines(gc, shared, SIDE_BY_SIDE_COLOUR, PEN_WIDTH_MATCH);
+    draw_polylines(gc, jitter, JITTER_COLOUR, PEN_WIDTH_MATCH);
+    draw_polylines(gc, only, only_colour, PEN_WIDTH_DIFF);
     gc->PopState(); // restores both the clip and the translate
 
     gc->SetFont(gc->CreateFont(GetFont(), PANE_CAPTION_COLOUR));
@@ -265,8 +270,10 @@ void CompareCanvas::draw_side_by_side(wxGraphicsContext* gc) const
     // for the full canvas); each pane's x_shift just recenters that same
     // transform's output within its own half, so panning/zooming moves both
     // panes together and A/B stay directly comparable.
-    draw_pane(gc, m_a_all, paneA_x0, pane_w, paneA_x0 + pane_w * 0.5 - full_centre, _L("A"));
-    draw_pane(gc, m_b_all, paneB_x0, pane_w, paneB_x0 + pane_w * 0.5 - full_centre, _L("B"));
+    draw_pane(gc, m_both, m_jitter, m_a_only, A_ONLY_COLOUR,
+              paneA_x0, pane_w, paneA_x0 + pane_w * 0.5 - full_centre, _L("A"));
+    draw_pane(gc, m_both, m_jitter, m_b_only, B_ONLY_COLOUR,
+              paneB_x0, pane_w, paneB_x0 + pane_w * 0.5 - full_centre, _L("B"));
 
     gc->SetPen(gc->CreatePen(wxGraphicsPenInfo(PANE_DIVIDER_COLOUR, 1.0)));
     const double divider_x = paneA_x0 + pane_w + DIVIDER_WIDTH * 0.5;
