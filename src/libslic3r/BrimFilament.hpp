@@ -41,5 +41,10 @@ void partition_brim_by_wall(const ExtrusionEntityCollection& brim,
                             const BrimVoteParams& p,
                             ExtrusionEntityCollection& kept,
                             std::map<unsigned, ExtrusionEntityCollection>& out);
+
+// Indices of object layers whose z-range overlaps (support_top_z, support_top_z + gap_mm].
+// print_zs = ascending layer TOP z values; layer i spans (print_zs[i-1], print_zs[i]].
+std::vector<size_t> select_contact_layers(const std::vector<double>& print_zs,
+                                          double support_top_z, double gap_mm = 2.0);
 } // namespace Slic3r
 #endif

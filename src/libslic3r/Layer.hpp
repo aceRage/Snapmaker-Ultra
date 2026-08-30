@@ -7,6 +7,7 @@
 #include "SurfaceCollection.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include "BoundingBox.hpp"
+#include <map>
 namespace Slic3r {
 
 class ExPolygon;
@@ -280,6 +281,8 @@ public:
     ExPolygons                  support_islands;
     // Extrusion paths for the support base and for the support interface and contacts.
     ExtrusionEntityCollection   support_fills;
+    // chameleon: per-extruder matched interface partitions (empty = feature off)
+    std::map<unsigned, ExtrusionEntityCollection> interface_by_extruder;
     SupportInnerType            support_type = stInnerNormal;
 
     // for tree supports

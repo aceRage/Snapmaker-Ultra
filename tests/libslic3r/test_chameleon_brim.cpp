@@ -162,3 +162,17 @@ TEST_CASE("partition keeps own-extruder loop intact, splits contested loop", "[c
     REQUIRE(out2.count(1) == 1);                        // right portion -> extruder 1
     CHECK(!out2.at(1).entities.empty());
 }
+
+TEST_CASE("select_contact_layers picks the 1-2 layers above", "[chameleon]")
+{
+    std::vector<double> zs = {0.2, 0.4, 0.6, 0.8, 1.0};
+    auto v = select_contact_layers(zs, 0.4, 2.0);          // support top at z=0.4
+    REQUIRE(!v.empty());
+    CHECK(v.front() == 2);                                  // first layer above (0.4,0.6]
+    CHECK(v.back() <= 4);
+    auto top = select_contact_layers(zs, 1.0, 2.0);         // nothing above the top
+    CHECK(top.empty());
+    auto vlh = select_contact_layers({0.2, 0.5, 1.4}, 0.2, 0.35); // VLH: only (0.2,0.55]
+    REQUIRE(vlh.size() == 1);
+    CHECK(vlh[0] == 1);
+}

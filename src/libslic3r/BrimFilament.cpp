@@ -320,4 +320,26 @@ std::vector<BrimRun> split_polyline_by_vote(const Points &poly, bool is_loop,
     return runs;
 }
 
+std::vector<size_t> select_contact_layers(const std::vector<double> &print_zs,
+                                           double support_top_z, double gap_mm)
+{
+    // Linear scan over ascending print_zs (print_zs is sorted, so this could be
+    // a binary search, but the contact band is only ever a few layers deep).
+    // A layer is selected by comparing its own TOP z (print_zs[i], the z its
+    // extruded material actually reaches) against the target band's bounds:
+    // strictly above support_top_z (excludes the layer that IS the support
+    // top) and at/below support_top_z + gap_mm. This intentionally excludes a
+    // layer whose top overshoots the gap even when its bottom still dips into
+    // the band (variable layer height: a tall layer straddling the far edge
+    // of the gap is not "in" the contact zone).
+    std::vector<size_t> result;
+    const double upper = support_top_z + gap_mm;
+    for (size_t i = 0; i < print_zs.size(); ++i) {
+        const double layer_top = print_zs[i];
+        if (layer_top > support_top_z + EPSILON && layer_top <= upper + EPSILON)
+            result.push_back(i);
+    }
+    return result;
+}
+
 } // namespace Slic3r
