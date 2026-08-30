@@ -12,6 +12,7 @@
 #include <wx/choice.h>
 #include <wx/filedlg.h>
 #include <wx/msgdlg.h>
+#include <wx/dcbuffer.h>
 
 #include <cmath>
 #include <utility>
@@ -90,13 +91,20 @@ struct FeatureAmount
     bool grams = true;
 };
 
+// (filament_g / filament_mm) for one snapshot; 0 when there's no usable
+// filament data (e.g. filament_mm == 0), signalling "fall back to mm".
+double filament_ratio(const SliceCompare::Snapshot& snap)
+{
+    return snap.filament_mm > 0.0 ? snap.filament_g / snap.filament_mm : 0.0;
+}
+
 FeatureAmount feature_amount(const SliceCompare::FeatureRow& row,
                               const SliceCompare::Snapshot& a,
                               const SliceCompare::Snapshot& b)
 {
     FeatureAmount out;
-    const double ratio_a = a.filament_mm > 0.0 ? a.filament_g / a.filament_mm : 0.0;
-    const double ratio_b = b.filament_mm > 0.0 ? b.filament_g / b.filament_mm : 0.0;
+    const double ratio_a = filament_ratio(a);
+    const double ratio_b = filament_ratio(b);
     if (ratio_a > 0.0 && ratio_b > 0.0) {
         out.grams = true;
         out.a = row.mm_a * ratio_a;
@@ -108,6 +116,80 @@ FeatureAmount feature_amount(const SliceCompare::FeatureRow& row,
     }
     return out;
 }
+
+// Same grams-with-mm-fallback convention as feature_amount(), but for a
+// single delta between two raw filament-mm quantities (used for the layer
+// status line's "Delta e", where we only have each side's LayerRec::extrusion_mm).
+wxString format_delta_grams_or_mm(double mm_a, double mm_b,
+                                   const SliceCompare::Snapshot& a, const SliceCompare::Snapshot& b)
+{
+    const double ratio_a = filament_ratio(a);
+    const double ratio_b = filament_ratio(b);
+    if (ratio_a > 0.0 && ratio_b > 0.0)
+        return wxString::Format("%+.2fg", mm_b * ratio_b - mm_a * ratio_a);
+    return wxString::Format("%+.1fmm", mm_b - mm_a);
+}
+
+wxString format_signed_seconds(double delta_seconds)
+{
+    return wxString::Format("%+.1fs", delta_seconds);
+}
+
+// Thin custom-painted strip mounted beside the layer slider: a colored tick
+// per row that is either "changed" (matched, but different) or "unmatched"
+// (a_only/b_only -- no counterpart on the other side). Rows are laid out
+// top-to-bottom in the same z-descending order as the vertical wxSlider
+// (index 0 = lowest z = bottom).
+class LayerTickStrip : public wxPanel
+{
+public:
+    explicit LayerTickStrip(wxWindow* parent)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(12, -1))
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetBackgroundColour(wxColour(0x11, 0x11, 0x11));
+        SetMinSize(wxSize(12, -1));
+        Bind(wxEVT_PAINT, &LayerTickStrip::on_paint, this);
+    }
+
+    void set_rows(std::vector<SliceCompare::LayerMatch> rows)
+    {
+        m_rows = std::move(rows);
+        Refresh();
+    }
+
+private:
+    void on_paint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC dc(this);
+        dc.SetBackground(wxBrush(wxColour(0x11, 0x11, 0x11)));
+        dc.Clear();
+
+        const int n = static_cast<int>(m_rows.size());
+        if (n <= 0)
+            return;
+
+        const wxSize sz = GetClientSize();
+        for (int i = 0; i < n; ++i) {
+            const SliceCompare::LayerMatch& row = m_rows[i];
+
+            wxColour colour;
+            if (row.zkey_a >= 0 && row.zkey_b >= 0 && row.changed)
+                colour = wxColour(0xC6, 0x28, 0x28); // changed
+            else if (row.zkey_a < 0 || row.zkey_b < 0)
+                colour = wxColour(0x9E, 0x9E, 0x9E); // unmatched (a_only/b_only)
+            else
+                continue; // matched + unchanged: no tick
+
+            // index 0 (lowest z) at the bottom, matching the vertical slider.
+            const int y = n > 1 ? (sz.GetHeight() - 1) * (n - 1 - i) / (n - 1) : sz.GetHeight() / 2;
+            dc.SetPen(wxPen(colour, 2));
+            dc.DrawLine(0, y, sz.GetWidth(), y);
+        }
+    }
+
+    std::vector<SliceCompare::LayerMatch> m_rows;
+};
 
 } // anonymous namespace
 
@@ -204,12 +286,39 @@ void SliceCompareFrame::build_ui()
     m_notebook->AddPage(cfg_page, _L("Settings changes"));
     m_notebook->AddPage(feat_page, _L("By feature"));
 
-    // Placeholder for the Task 9 canvas view.
-    m_canvas_placeholder = new wxPanel(this);
-    m_canvas_placeholder->SetBackgroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_BTNSHADOW));
+    // Canvas view: overlay canvas | tick strip | vertical layer slider, with
+    // the "z=" label and jump button stacked above/below the slider, and the
+    // status line spanning the full width underneath.
+    wxBoxSizer* canvas_col = new wxBoxSizer(wxVERTICAL);
+
+    wxBoxSizer* canvas_row = new wxBoxSizer(wxHORIZONTAL);
+    m_canvas = new CompareCanvas(this);
+    canvas_row->Add(m_canvas, 1, wxEXPAND);
+
+    wxBoxSizer* slider_col = new wxBoxSizer(wxVERTICAL);
+    m_layer_z_label = new wxStaticText(this, wxID_ANY, _L("z=") + "--", wxDefaultPosition, wxDefaultSize, wxALIGN_CENTER_HORIZONTAL);
+    slider_col->Add(m_layer_z_label, 0, wxALIGN_CENTER_HORIZONTAL | wxBOTTOM, 4);
+
+    wxBoxSizer* slider_row = new wxBoxSizer(wxHORIZONTAL);
+    m_layer_tick_strip = new LayerTickStrip(this);
+    slider_row->Add(m_layer_tick_strip, 0, wxEXPAND | wxRIGHT, 2);
+    m_layer_slider = new wxSlider(this, wxID_ANY, 0, 0, 0, wxDefaultPosition, wxDefaultSize, wxSL_VERTICAL);
+    m_layer_slider->Enable(false);
+    slider_row->Add(m_layer_slider, 0, wxEXPAND);
+    slider_col->Add(slider_row, 1, wxEXPAND);
+
+    m_jump_btn = new wxButton(this, wxID_ANY, _L("Jump to biggest change"));
+    m_jump_btn->Enable(false);
+    slider_col->Add(m_jump_btn, 0, wxEXPAND | wxTOP, 6);
+
+    canvas_row->Add(slider_col, 0, wxEXPAND | wxLEFT, 8);
+    canvas_col->Add(canvas_row, 1, wxEXPAND);
+
+    m_status_line = new wxStaticText(this, wxID_ANY, wxEmptyString);
+    canvas_col->Add(m_status_line, 0, wxEXPAND | wxTOP, 6);
 
     content_row->Add(m_notebook, 0, wxEXPAND | wxRIGHT, 10);
-    content_row->Add(m_canvas_placeholder, 1, wxEXPAND);
+    content_row->Add(canvas_col, 1, wxEXPAND);
 
     main_sizer->Add(content_row, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
@@ -223,6 +332,8 @@ void SliceCompareFrame::build_ui()
         sync_choice_selection(m_pick_b, m_b, m_pick_b_prev_sel);
         recompute();
     });
+    m_layer_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) { select_layer_row(m_layer_slider->GetValue()); });
+    m_jump_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { jump_to_biggest_change(); });
 
     wxGetApp().UpdateDVCDarkUI(m_cfg_table);
     wxGetApp().UpdateDVCDarkUI(m_feat_table);
@@ -385,8 +496,16 @@ void SliceCompareFrame::recompute()
 
     m_cfg_table->DeleteAllItems();
     m_feat_table->DeleteAllItems();
+    m_layer_diff = SliceCompare::LayerDiff();
 
     if (!m_a || !m_b) {
+        m_layer_slider->SetRange(0, 0);
+        m_layer_slider->Enable(false);
+        m_jump_btn->Enable(false);
+        static_cast<LayerTickStrip*>(m_layer_tick_strip)->set_rows({});
+        m_canvas->set_layers(nullptr, nullptr);
+        m_layer_z_label->SetLabel(_L("z=") + "--");
+        m_status_line->SetLabel(wxEmptyString);
         Layout();
         return;
     }
@@ -410,7 +529,123 @@ void SliceCompareFrame::recompute()
         m_feat_table->AppendItem(data);
     }
 
+    // Layer axis: diff_layers() rows are already z-ascending and include
+    // unmatched (a_only/b_only) rows, so they map directly onto slider indices.
+    m_layer_diff = SliceCompare::diff_layers(*m_a, *m_b);
+    static_cast<LayerTickStrip*>(m_layer_tick_strip)->set_rows(m_layer_diff.rows);
+
+    const int row_count = static_cast<int>(m_layer_diff.rows.size());
+    m_layer_slider->Enable(row_count > 0);
+    m_jump_btn->Enable(m_layer_diff.biggest_zkey_a != -1);
+
+    if (row_count > 0) {
+        m_layer_slider->SetRange(0, row_count - 1);
+
+        // Land on the biggest change (if there is one) so the interesting
+        // layer is what the user sees first; otherwise the first row.
+        int initial = 0;
+        if (m_layer_diff.biggest_zkey_a != -1) {
+            for (int i = 0; i < row_count; ++i) {
+                if (m_layer_diff.rows[i].zkey_a == m_layer_diff.biggest_zkey_a) {
+                    initial = i;
+                    break;
+                }
+            }
+        }
+        m_layer_slider->SetValue(initial);
+        select_layer_row(initial);
+        m_canvas->fit_view(); // fresh content: center/zoom to it once, then leave pan/zoom to the user
+    } else {
+        m_layer_slider->SetRange(0, 0);
+        m_canvas->set_layers(nullptr, nullptr);
+        m_layer_z_label->SetLabel(_L("z=") + "--");
+        m_status_line->SetLabel(wxEmptyString);
+    }
+
     Layout();
+}
+
+void SliceCompareFrame::select_layer_row(int row_index)
+{
+    if (row_index < 0 || row_index >= static_cast<int>(m_layer_diff.rows.size())) {
+        m_canvas->set_layers(nullptr, nullptr);
+        m_layer_z_label->SetLabel(_L("z=") + "--");
+        m_status_line->SetLabel(wxEmptyString);
+        return;
+    }
+
+    const SliceCompare::LayerMatch& row = m_layer_diff.rows[row_index];
+
+    const SliceCompare::LayerRec* la = nullptr;
+    const SliceCompare::LayerRec* lb = nullptr;
+    if (m_a && row.zkey_a >= 0) {
+        auto it = m_a->layers.find(row.zkey_a);
+        if (it != m_a->layers.end())
+            la = &it->second;
+    }
+    if (m_b && row.zkey_b >= 0) {
+        auto it = m_b->layers.find(row.zkey_b);
+        if (it != m_b->layers.end())
+            lb = &it->second;
+    }
+
+    m_canvas->set_layers(la, lb);
+
+    const double z = la ? la->z : (lb ? lb->z : 0.0);
+    m_layer_z_label->SetLabel(_L("z=") + wxString::Format("%.2f", z));
+
+    update_status_line(row, la, lb);
+}
+
+void SliceCompareFrame::update_status_line(const SliceCompare::LayerMatch& row,
+                                            const SliceCompare::LayerRec* la, const SliceCompare::LayerRec* lb)
+{
+    if (m_layer_diff.matched == 0 && (m_layer_diff.a_only + m_layer_diff.b_only) > 0) {
+        m_status_line->SetLabel(_L("Layer heights differ — showing coincident layers only; see Settings/Feature tabs"));
+        return;
+    }
+
+    if (!la) {
+        m_status_line->SetLabel(_L("Layer only in B"));
+        return;
+    }
+    if (!lb) {
+        m_status_line->SetLabel(_L("Layer only in A"));
+        return;
+    }
+
+    wxString flags_part;
+    if (!row.flags.empty()) {
+        wxString joined;
+        for (size_t i = 0; i < row.flags.size(); ++i) {
+            if (i > 0)
+                joined += ", ";
+            joined += wxString::FromUTF8(row.flags[i]);
+        }
+        flags_part = "  [" + joined + "]";
+    }
+
+    const wxString delta_e = format_delta_grams_or_mm(la->extrusion_mm, lb->extrusion_mm, *m_a, *m_b);
+
+    m_status_line->SetLabel(_L("Δt=") + format_signed_seconds(row.d_seconds) + "  " +
+                             _L("Δe=") + delta_e + "  " +
+                             _L("overlap=") + wxString::Format("%.2f", row.overlap) +
+                             flags_part);
+}
+
+void SliceCompareFrame::jump_to_biggest_change()
+{
+    if (m_layer_diff.biggest_zkey_a == -1)
+        return;
+
+    for (int i = 0; i < static_cast<int>(m_layer_diff.rows.size()); ++i) {
+        if (m_layer_diff.rows[i].zkey_a == m_layer_diff.biggest_zkey_a) {
+            m_layer_slider->SetValue(i);
+            select_layer_row(i);
+            m_canvas->fit_view(); // recenter on the layer we just jumped to
+            break;
+        }
+    }
 }
 
 } // namespace GUI

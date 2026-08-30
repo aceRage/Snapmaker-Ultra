@@ -2,10 +2,13 @@
 #define slic3r_GUI_SliceCompareFrame_hpp_
 
 #include "libslic3r/SliceCompare/Snapshot.hpp"
+#include "libslic3r/SliceCompare/Diff.hpp"
+#include "CompareCanvas.hpp"
 
 #include <wx/wx.h>
 #include <wx/notebook.h>
 #include <wx/dataview.h>
+#include <wx/slider.h>
 
 #include <memory>
 
@@ -48,6 +51,21 @@ private:
     // selects it.
     void sync_choice_selection(wxChoice* choice, const std::shared_ptr<const SliceCompare::Snapshot>& snap, int& prev_selection);
 
+    // Selects m_layer_diff.rows[row_index] (clamped/no-op if out of range):
+    // resolves the row's zkey_a/zkey_b to LayerRec pointers (nullptr for -1
+    // keys), pushes them to the canvas, and refreshes the "z=" label and
+    // status line.
+    void select_layer_row(int row_index);
+
+    // Fills the status line for the currently selected row (or the
+    // layer-height-mismatch banner, when the whole diff has no matched
+    // layers at all).
+    void update_status_line(const SliceCompare::LayerMatch& row,
+                             const SliceCompare::LayerRec* la, const SliceCompare::LayerRec* lb);
+
+    // Moves the slider/canvas to the row whose zkey_a == m_layer_diff.biggest_zkey_a.
+    void jump_to_biggest_change();
+
     wxChoice* m_pick_a = nullptr;
     wxChoice* m_pick_b = nullptr;
     wxButton* m_swap_btn = nullptr;
@@ -60,7 +78,15 @@ private:
     wxNotebook*         m_notebook = nullptr;
     wxDataViewListCtrl* m_cfg_table = nullptr;
     wxDataViewListCtrl* m_feat_table = nullptr;
-    wxPanel*            m_canvas_placeholder = nullptr; // canvas view lands in Task 9
+
+    CompareCanvas* m_canvas = nullptr;
+    wxSlider*      m_layer_slider = nullptr;
+    wxPanel*       m_layer_tick_strip = nullptr; // custom-painted; see LayerTickStrip in the .cpp
+    wxStaticText*  m_layer_z_label = nullptr;
+    wxButton*      m_jump_btn = nullptr;
+    wxStaticText*  m_status_line = nullptr;
+
+    SliceCompare::LayerDiff m_layer_diff;
 
     int m_pick_a_prev_sel = wxNOT_FOUND;
     int m_pick_b_prev_sel = wxNOT_FOUND;
