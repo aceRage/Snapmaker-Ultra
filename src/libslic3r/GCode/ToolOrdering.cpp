@@ -719,6 +719,14 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             layer_tools.has_support = true;
             layer_tools.wiping_extrusions().is_support_overriddable_and_mark(role, object);
         }
+
+        // Chameleon P2: register per-layer matched interface extruders (map keys are
+        // 0-based; this collection phase is 1-based until reorder_extruders reindexes).
+        for (const auto& kv : support_layer->interface_by_extruder)
+            if (!kv.second.entities.empty())
+                layer_tools.extruders.push_back(kv.first + 1);
+        if (!support_layer->interface_by_extruder.empty())
+            layer_tools.has_support = true;
     }
 
     // Extruder overrides are ordered by print_z.

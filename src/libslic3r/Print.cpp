@@ -2392,6 +2392,153 @@ std::map<ObjectID, unsigned int> getObjectExtruderMap(const Print& print) {
     return objectExtruderMap;
 }
 
+// Chameleon P2: this object's default extruder (0-based) - the last-resort default
+// used for wall samples that carry no per-region filament override (mirrors
+// chameleon_collect_wall_samples' own_extruder_0based parameter above), and also the
+// fallback interface extruder when support_interface_filament is unset (0 = "current
+// filament"). Deliberately NOT read from PrintObject::object_first_layer_wall_extruders
+// (getObjectExtruderMap's memoized path above): that field is only populated once
+// ToolOrdering::collect_extruders runs (ToolOrdering.cpp ~851), which for this pass is
+// always still in the future - see chameleon_assign_support_interfaces' call site in
+// Print::process, sited before psWipeTower constructs ToolOrdering. Recomputing directly
+// here (mirroring getObjectExtruderMap's own fresh-compute branch) keeps the value
+// deterministic and independent of whatever a prior process() run may have left behind.
+static unsigned chameleon_object_default_extruder(const Print &print, const PrintObject &object)
+{
+    if (object.layers().empty())
+        return 0;
+    unsigned int best = (unsigned int) print.config().filament_diameter.size(); // sentinel: none found
+    for (const LayerRegion *lr : object.layers().front()->regions())
+        if (lr->has_extrusions())
+            best = std::min(best, lr->region().extruder(frExternalPerimeter));
+    return (best > 0 && best < (unsigned int) print.config().filament_diameter.size()) ? best - 1 : 0;
+}
+
+// Chameleon P2: interface partition pass. For every object opted into
+// support_interface_filament_source == sifsNearestSurface, split each support layer's
+// interface entities across the extruders of the model walls they touch (contact band:
+// select_contact_layers, T1), storing the result in SupportLayer::interface_by_extruder
+// (T1 storage) via the partition_support_interfaces engine (T2). Must run after
+// generate_support_material has completed for every object - fresh or copied from a
+// shared/cached object - and before ToolOrdering/psWipeTower construction, so the
+// per-support-layer registration block in ToolOrdering.cpp (~698-721) - which reads
+// interface_by_extruder at ctor time - sees the finished result (see the call site
+// below for exactly where this sits in the pipeline; unlike Part 1's brim pass, no
+// post-hoc union hack is needed because this pass always runs first).
+//
+// Off (manual mode / single extruder / ByObject sequence): this function returns
+// immediately without touching support_fills or interface_by_extruder on ANY object -
+// byte-identical gcode is a hard requirement (spec's off-mode purity).
+static void chameleon_assign_support_interfaces(Print &print)
+{
+    if (print.extruders().size() <= 1 || print.config().print_sequence == PrintSequence::ByObject)
+        return;
+
+    PrintObjectPtrs &objects  = print.objects_mutable();
+    const Point      no_shift(0, 0); // supports and walls share object coordinates (no instance shift)
+
+    for (size_t obj_idx = 0; obj_idx < objects.size(); ++obj_idx) {
+        PrintObject *object = objects[obj_idx];
+        if (object == nullptr)
+            continue;
+        if (object->config().support_interface_filament_source.value != sifsNearestSurface)
+            continue;
+        if (object->layers().empty() || object->support_layers().empty())
+            continue;
+
+        const unsigned object_default_extruder = chameleon_object_default_extruder(print, *object);
+        // Spec-mandated fallback: the object's resolved interface extruder, mirroring
+        // ToolOrdering's own scalar computation (ToolOrdering.cpp ~709) for the case
+        // where no per-layer match beats it.
+        const unsigned fallback_extruder = object->config().support_interface_filament.value > 0
+            ? unsigned(object->config().support_interface_filament.value - 1)
+            : object_default_extruder;
+
+        // Ascending object-layer TOP z values, for select_contact_layers (VLH-safe: keyed
+        // by z overlap, not index arithmetic).
+        std::vector<double> layer_print_zs;
+        layer_print_zs.reserve(object->layers().size());
+        for (const Layer *layer : object->layers())
+            layer_print_zs.push_back(layer->print_z);
+
+        const double first_layer_top_z = object->slicing_parameters().first_print_layer_height;
+
+        BrimVoteParams vote_params;
+        vote_params.fallback_extruder = fallback_extruder;
+        // object_area left empty: every wall sample below carries this object's own
+        // ordinal as object_key, so BrimVoteParams::object_area's cross-object tie-break
+        // (Part 1's multi-object plate scenario) never applies here.
+
+        size_t cumulative_switches = 0; // per-object escalation cap accounting (assigned layers only)
+        bool   escalated           = false;
+        size_t layers_partitioned  = 0;
+        size_t layers_reverted     = 0;
+        size_t layers_zero_sample  = 0;
+
+        for (SupportLayer *support_layer : object->support_layers()) {
+            if (support_layer == nullptr || support_layer->support_fills.entities.empty())
+                continue;
+            // Plate guard: the first support layer (touching the build plate) always
+            // keeps the fallback extruder - never split its plate adhesion.
+            if (support_layer->print_z <= first_layer_top_z + EPSILON)
+                continue;
+            if (escalated)
+                continue; // per-object cap already exceeded; remaining layers keep fallback
+
+            std::vector<size_t> contact_idx = select_contact_layers(layer_print_zs, support_layer->print_z, 2.0);
+            if (contact_idx.empty()) {
+                ++layers_zero_sample;
+                continue; // no object layers in the contact band -> keep fallback
+            }
+
+            WallSampleIndex wall_idx;
+            for (size_t li : contact_idx)
+                for (const LayerRegion *lr : object->layers()[li]->regions())
+                    chameleon_collect_wall_samples(&lr->perimeters, lr->region().config(),
+                        object_default_extruder, no_shift, obj_idx, wall_idx);
+
+            if (wall_idx.empty()) {
+                ++layers_zero_sample;
+                continue; // contact layers contributed no wall samples -> keep fallback
+            }
+
+            std::map<unsigned, ExtrusionEntityCollection> partitioned;
+            const size_t switches = partition_support_interfaces(support_layer->support_fills, fallback_extruder,
+                                                                   wall_idx, vote_params, partitioned);
+
+            if (switches > 3) {
+                // Per-layer cap exceeded: revert. partition_support_interfaces already
+                // mutated support_fills in place (matched originals deleted, fallback-voted
+                // runs re-inserted); merge the non-fallback runs back in too, so the layer
+                // ends up printing exactly as if the pass had left it alone (whole-layer
+                // fallback). append(ExtrusionEntitiesPtr&&) transfers ownership (moves the
+                // pointers, leaves the source empty), so this cannot double-free.
+                for (auto &kv : partitioned)
+                    support_layer->support_fills.append(std::move(kv.second.entities));
+                ++layers_reverted;
+                continue;
+            }
+
+            if (!partitioned.empty()) {
+                support_layer->interface_by_extruder = std::move(partitioned);
+                cumulative_switches += switches;
+                ++layers_partitioned;
+                if (cumulative_switches > 20)
+                    escalated = true; // remaining layers of this object skip partition
+            }
+            // else: fast path, every entity voted fallback uniformly - support_fills is
+            // already untouched and interface_by_extruder stays empty (nothing to do).
+        }
+
+        BOOST_LOG_TRIVIAL(info) << "Chameleon support-interface match: object ordinal " << obj_idx
+            << " layers_partitioned=" << layers_partitioned
+            << " layers_reverted_cap=" << layers_reverted
+            << " layers_zero_sample=" << layers_zero_sample
+            << " cumulative_switches=" << cumulative_switches
+            << (escalated ? " escalated_over_20" : "");
+    }
+}
+
 // Slicing process, running at a background thread.
 void Print::process(long long *time_cost_with_cache, bool use_cache)
 {
@@ -2608,6 +2755,13 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
             obj->copy_layers_overhang_from_shared_object();
         }
     }
+
+    // Chameleon P2: assign support-interface extruders by nearest wall BEFORE ToolOrdering
+    // is built below - every object's support material (generate_support_material, above,
+    // fresh or copied from a shared object) has finished, and the per-support-layer block
+    // in ToolOrdering.cpp reads SupportLayer::interface_by_extruder at ctor time, so it
+    // must already be populated by the time psWipeTower constructs the tool ordering.
+    chameleon_assign_support_interfaces(*this);
 
     if (this->set_started(psWipeTower)) {
         m_wipe_tower_data.clear();
