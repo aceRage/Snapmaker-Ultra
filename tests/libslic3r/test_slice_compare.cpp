@@ -210,3 +210,174 @@ TEST_CASE("load_snapshot_from_file reports missing file", "[slice_compare]")
     CHECK(!r.snapshot.has_value());
     CHECK(!r.error.empty());
 }
+
+// --- final-review fix-wave coverage (2026-08-29) -------------------------
+
+TEST_CASE("diff_layers flags SUPPORT-CHANGED only in the affected z band", "[slice_compare]")
+{
+    // Each layer has a wall (erExternalPerimeter) plus, optionally, support
+    // (erSupportMaterial). Snapshot B drops the support seconds/extrusion/
+    // segs/cells for exactly one z-band layer (key 40); the other two layers
+    // are untouched copies.
+    auto make_layer = [](double z, bool with_support) {
+        LayerRec l;
+        l.z = z;
+        l.feature_seconds[(uint8_t)erExternalPerimeter] = 1.0;
+        l.feature_extrusion_mm[(uint8_t)erExternalPerimeter] = 1.0;
+        l.extrusion_mm += 1.0;
+        l.segs.push_back({0, 0, 10, 0, (uint8_t)erExternalPerimeter});
+        l.segs.push_back({10, 0, 10, 10, (uint8_t)erExternalPerimeter});
+        l.cells.insert({0, 0});
+        l.cells.insert({1, 1});
+        l.bx0 = 0; l.by0 = 0; l.bx1 = 10; l.by1 = 10; l.has_bbox = true;
+        if (with_support) {
+            l.feature_seconds[(uint8_t)erSupportMaterial] = 1.0;
+            l.feature_extrusion_mm[(uint8_t)erSupportMaterial] = 1.0;
+            l.extrusion_mm += 1.0;
+            l.segs.push_back({20, 20, 25, 20, (uint8_t)erSupportMaterial});
+            l.cells.insert({2, 2});
+        }
+        return l;
+    };
+
+    Snapshot a, b;
+    for (int i = 0; i < 3; ++i) {
+        const double z = 0.2 * (i + 1);           // 0.2, 0.4, 0.6 -> keys 20, 40, 60
+        const int key = (int)std::lround(z * 100.0);
+        a.layers[key] = make_layer(z, true);
+        b.layers[key] = make_layer(z, /*with_support=*/i != 1);   // support removed only at key 40
+    }
+
+    LayerDiff d = diff_layers(a, b);
+    REQUIRE(d.matched == 3);
+    CHECK(d.changed == 1);
+    CHECK(d.identical == 2);
+
+    for (const auto& row : d.rows) {
+        const bool has_support_flag =
+            std::find(row.flags.begin(), row.flags.end(), "SUPPORT-CHANGED") != row.flags.end();
+        if (row.zkey_a == 40) {
+            CHECK(row.changed);
+            CHECK(has_support_flag);
+        } else {
+            CHECK_FALSE(has_support_flag);
+        }
+    }
+
+    // diff_segments on the affected layer puts the (removed) support segs in a_only.
+    SegDiff sd = diff_segments(a.layers.at(40), b.layers.at(40));
+    REQUIRE(sd.a_only.size() == 1);
+    CHECK(sd.a_only[0].role == (uint8_t)erSupportMaterial);
+    CHECK(sd.b_only.empty());
+}
+
+TEST_CASE("diff_layers flags GEOMETRY-CHANGED only past the 5mm bbox threshold", "[slice_compare]")
+{
+    Snapshot a, b;
+
+    LayerRec la1; la1.z = 0.2; la1.has_bbox = true;
+    la1.bx0 = 0; la1.bx1 = 10; la1.by0 = 0; la1.by1 = 10;
+    LayerRec lb1 = la1; lb1.bx1 = 16;   // width delta 6mm > 5mm
+
+    LayerRec la2; la2.z = 0.4; la2.has_bbox = true;
+    la2.bx0 = 0; la2.bx1 = 10; la2.by0 = 0; la2.by1 = 10;
+    LayerRec lb2 = la2; lb2.bx1 = 15;   // width delta 5mm, not > 5mm
+
+    a.layers[20] = la1; b.layers[20] = lb1;
+    a.layers[40] = la2; b.layers[40] = lb2;
+
+    LayerDiff d = diff_layers(a, b);
+    REQUIRE(d.matched == 2);
+    auto has_geom_flag = [](const LayerMatch& m) {
+        return std::find(m.flags.begin(), m.flags.end(), "GEOMETRY-CHANGED") != m.flags.end();
+    };
+    REQUIRE(d.rows[0].zkey_a == 20);
+    CHECK(has_geom_flag(d.rows[0]));            // >5mm -> flag present
+    REQUIRE(d.rows[1].zkey_a == 40);
+    CHECK_FALSE(has_geom_flag(d.rows[1]));      // <=5mm -> flag absent
+}
+
+TEST_CASE("diff_layers biggest_zkey_a picks the matched layer with max |d_seconds|", "[slice_compare]")
+{
+    Snapshot a, b;
+    // Three matched layers (same keys on both sides), each "changed" via
+    // |d_seconds| > MATCH_TOL, with strictly increasing magnitude so the
+    // winner is unambiguous.
+    struct { int key; double sec_a, sec_b; } specs[] = {
+        {10, 1.0, 2.0},   // |d_seconds| = 1.0
+        {20, 1.0, 3.5},   // |d_seconds| = 2.5
+        {30, 1.0, 5.0},   // |d_seconds| = 4.0 (max)
+    };
+    for (const auto& s : specs) {
+        LayerRec la; la.feature_seconds[(uint8_t)erExternalPerimeter] = s.sec_a;
+        LayerRec lb; lb.feature_seconds[(uint8_t)erExternalPerimeter] = s.sec_b;
+        a.layers[s.key] = la;
+        b.layers[s.key] = lb;
+    }
+
+    LayerDiff d = diff_layers(a, b);
+    REQUIRE(d.matched == 3);
+    CHECK(d.changed == 3);
+    CHECK(d.biggest_zkey_a == 30);
+
+    // All-identical snapshots (self-diff) -> no changed rows -> -1.
+    LayerDiff self = diff_layers(a, a);
+    CHECK(self.biggest_zkey_a == -1);
+}
+
+TEST_CASE("diff_features reports exact per-role extrusion mm, not length-proportional", "[slice_compare]")
+{
+    // Two roles share the same 10mm segment length but carry very different
+    // extrusion mm. If diff_features ever derived mm from a length-weighted
+    // split of the total instead of reading feature_extrusion_mm per role
+    // exactly, both roles would come out ~3.5mm here instead of 2.0/5.0.
+    LayerRec l;
+    l.z = 0.2;
+    l.segs.push_back({0, 0, 10, 0, (uint8_t)erExternalPerimeter});   // length 10mm
+    l.segs.push_back({0, 0, 10, 0, (uint8_t)erSupportMaterial});     // length 10mm, different mm
+    l.feature_extrusion_mm[(uint8_t)erExternalPerimeter] = 2.0;
+    l.feature_extrusion_mm[(uint8_t)erSupportMaterial]   = 5.0;
+    l.feature_seconds[(uint8_t)erExternalPerimeter] = 1.0;
+    l.feature_seconds[(uint8_t)erSupportMaterial]   = 1.0;
+
+    Snapshot a, b;
+    a.layers[20] = l;
+    b.layers[20] = l;
+
+    auto rows = diff_features(a, b);
+    REQUIRE(rows.size() == 2);
+
+    const FeatureRow* wall = nullptr;
+    const FeatureRow* supp = nullptr;
+    for (const auto& r : rows) {
+        if (r.role == (uint8_t)erExternalPerimeter) wall = &r;
+        if (r.role == (uint8_t)erSupportMaterial)   supp = &r;
+    }
+    REQUIRE(wall != nullptr);
+    REQUIRE(supp != nullptr);
+
+    CHECK(wall->mm_a == Approx(2.0));
+    CHECK(wall->mm_b == Approx(2.0));
+    CHECK(supp->mm_a == Approx(5.0));
+    CHECK(supp->mm_b == Approx(5.0));
+    // Both roles have identical path length, so the differing mm above cannot
+    // be an artifact of a length-proportional split.
+    CHECK(wall->len_a == Approx(10.0));
+    CHECK(supp->len_a == Approx(10.0));
+}
+
+TEST_CASE("build_snapshot captures max_speed and layer bbox", "[slice_compare]")
+{
+    GCodeProcessorResult result;
+    make_result(result);
+    Snapshot s = build_snapshot(result, {}, "A", "session");
+    // Travel move runs at feedrate 200; extrude moves run at 60 -> max_speed
+    // must reflect the travel move, proving it isn't extrude-only.
+    CHECK(s.max_speed == Approx(200.0));
+    const LayerRec& l = s.layers.at(20);
+    CHECK(l.has_bbox);
+    CHECK(l.bx0 == Approx(0.0));
+    CHECK(l.bx1 == Approx(10.0));
+    CHECK(l.by0 == Approx(0.0));
+    CHECK(l.by1 == Approx(10.0));
+}
