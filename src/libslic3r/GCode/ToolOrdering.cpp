@@ -4,6 +4,7 @@
 #include "Layer.hpp"
 #include "ClipperUtils.hpp"
 #include "ParameterUtils.hpp"
+#include "../BrimFilament.hpp"
 
 // #define SLIC3R_DEBUG
 
@@ -700,7 +701,15 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
         layer_tools.layer_height = support_layer->height;
         ExtrusionRole role = support_layer->support_fills.role();
         bool         has_support        = role == erMixed || role == erSupportMaterial || role == erSupportTransition;
-        bool         has_interface      = role == erMixed || role == erSupportMaterialInterface;
+        // v2.2 Task 3 (spec C6, third anchor): support_role_needs_interface_extruder
+        // (BrimFilament.hpp/.cpp) adds erIroning to this classification - a layer whose
+        // support_fills collapsed to PURE erIroning (every erSupportMaterial/
+        // erSupportMaterialInterface entity matched away by C6's third
+        // partition_support_entities call and/or C7's whole-collection moves, residual
+        // fallback ironing left behind) must still register the interface extruder here
+        // or that ironing's toolchange never gets scheduled - see the shared predicate's
+        // own header comment for the full investigation finding.
+        bool         has_interface      = support_role_needs_interface_extruder(role);
         unsigned int extruder_support   = resolve_mixed(object.config().support_filament.value,
                                                         layer_tools.layer_index,
                                                         float(support_layer->print_z),

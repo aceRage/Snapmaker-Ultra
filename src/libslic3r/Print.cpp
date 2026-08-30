@@ -2620,16 +2620,24 @@ static unsigned chameleon_object_default_extruder(const Print &print, const Prin
 // (the model surface directly above a sample wins) with a lateral-proximity fallback when
 // projection misses ("SURFACE ABOVE WINS", user-approved); base entities
 // (erSupportMaterial) are resolved by lateral proximity only (v2.1's "any support within
-// 1mm of a wall at its own layer matches that wall" anti-contamination rule). Both roles
-// are partitioned via two calls to the SAME partition_support_entities engine (T1) -
-// interfaces first (role_filter = erSupportMaterialInterface), then base (role_filter =
-// erSupportMaterial) - sharing ONE SupportLayer::interface_by_extruder map (T1 storage),
-// which v2.2 Task 1 then gates/trims as a whole via ONE apply_bucket_caps call per layer
-// (spec C1-C3: length-ranked distinct-extruder cap with hysteresis, NOT a switch-count
-// budget - see apply_bucket_caps' own doc comment in BrimFilament.hpp for the full
-// rationale; order between the two partition_support_entities calls only matters for
-// log/counter bookkeeping, not correctness: each call only ever touches entities whose
-// role() matches its own role_filter).
+// 1mm of a wall at its own layer matches that wall" anti-contamination rule). v2.2 Task 3
+// (spec C6) adds a THIRD role: ironing (erIroning) follows the INTERFACE resolver/
+// fallback verbatim - "ironing follows its interface" - since erIroning entities are the
+// ironed top surface of matched interface tops, not a role with its own independent
+// vertical/lateral rule. All three roles are partitioned via three calls to the SAME
+// partition_support_entities engine (T1/v2.2 Task 3) - interface first (role_filter =
+// erSupportMaterialInterface), then base (role_filter = erSupportMaterial), then ironing
+// (role_filter = erIroning, reusing interface_resolver/fallback_extruder/vote_params
+// verbatim) - sharing ONE SupportLayer::interface_by_extruder map (T1 storage), which
+// v2.2 Task 1 then gates/trims as a whole via ONE apply_bucket_caps call per layer (spec
+// C1-C3: length-ranked distinct-extruder cap with hysteresis, NOT a switch-count budget -
+// see apply_bucket_caps' own doc comment in BrimFilament.hpp for the full rationale;
+// order among the three partition_support_entities calls only matters for log/counter
+// bookkeeping, not correctness: each call only ever touches entities whose role() matches
+// its own role_filter). v2.2 Task 3 (spec C7) also makes each of these three calls vote
+// any role-eligible NESTED collection (collapsed role() == that call's role_filter) as
+// one whole unit instead of leaving it invisible to the matcher entirely (spec root cause
+// 6) - see partition_support_entities' own doc comment in BrimFilament.hpp.
 //
 // Must run after generate_support_material has completed for every object - fresh or
 // copied from a shared/cached object - and before ToolOrdering/psWipeTower construction,
@@ -2779,6 +2787,14 @@ static void chameleon_assign_support_interfaces(Print &print)
         // role, summed across every layer that reached the engine calls.
         size_t interface_runs_matched = 0;
         size_t base_runs_matched      = 0;
+        // v2.2 Task 3 (spec C6): third role's own raw matched-run count, same
+        // informational-only accounting as the two above. A whole nested collection
+        // moved by C7 doesn't contribute to this (partition_support_entities only
+        // counts split-run boundaries), so this undercounts relative to "how much
+        // ironing actually matched" whenever C7 moves a collection - documented, not a
+        // bug: nothing downstream keys caps off this number (v2.2 Task 1 already made
+        // that true for interface/base too).
+        size_t ironing_runs_matched   = 0;
 
         for (SupportLayer *support_layer : object->support_layers()) {
             if (support_layer == nullptr || support_layer->support_fills.entities.empty())
@@ -2902,12 +2918,13 @@ static void chameleon_assign_support_interfaces(Print &print)
                 return brim_vote(coplanar_wall_idx, p, base_lateral_params);
             };
 
-            // Two engine calls sharing ONE out map and ONE raw switch count (spec:
-            // interfaces first, then base). Each call only ever touches entities whose
-            // role() matches its own role_filter (Task 1's partition_support_entities), so
-            // running these sequentially over the same support_fills is safe: the
-            // interface call's entities.swap() rebuild leaves every erSupportMaterial
-            // entity exactly where it was for the base call to then walk.
+            // Three engine calls sharing ONE out map (spec: interface, then base, then
+            // v2.2 Task 3's ironing). Each call only ever touches entities whose role()
+            // matches its own role_filter (Task 1's partition_support_entities; v2.2
+            // Task 3's C7 extends this to a nested collection's COLLAPSED role() too), so
+            // running these sequentially over the same support_fills is safe: each call's
+            // entities.swap() rebuild leaves every entity of a DIFFERENT role exactly
+            // where it was for the next call to then walk.
             std::map<unsigned, ExtrusionEntityCollection> partitioned;
 
             const size_t interface_switches = partition_support_entities(support_layer->support_fills,
@@ -2916,8 +2933,26 @@ static void chameleon_assign_support_interfaces(Print &print)
             const size_t base_switches = partition_support_entities(support_layer->support_fills,
                 erSupportMaterial, base_fallback_extruder, base_resolver, vote_params, partitioned);
 
+            // v2.2 Task 3 (spec C6, root cause 5): "ironing follows its interface" -
+            // erIroning entities are the ironed top surface of a matched interface run,
+            // not a role with its own independent vertical/lateral rule, so this call
+            // reuses interface_resolver/fallback_extruder/vote_params VERBATIM (same
+            // three arguments the interface call above passes - "vote_params_interface"
+            // in the plan/spec's own wording is this same shared `vote_params`, not a
+            // separate object; the interface call's own projection+lateral resolver
+            // already IS what "the interface resolver" means here). Runs BEFORE
+            // apply_bucket_caps below, into the SAME `partitioned` map, so an ironing
+            // bucket is gated/trimmed as part of the same per-layer distinct-extruder cap
+            // as the interface/base buckets it shares an extruder with - not a separate
+            // budget (v22-task-1-report.md's own concern for Task 3, confirmed still
+            // correct: apply_bucket_caps' total_path_length_mm already recurses into any
+            // nested collection a bucket might hold, per C7).
+            const size_t ironing_switches = partition_support_entities(support_layer->support_fills,
+                erIroning, fallback_extruder, interface_resolver, vote_params, partitioned);
+
             interface_runs_matched += interface_switches;
             base_runs_matched      += base_switches;
+            ironing_runs_matched   += ironing_switches;
 
             // v2.2 Task 1 (spec C1-C3): replaces the old ">3 switch-boundaries -> whole-
             // layer revert" and ">20 cumulative -> per-object escalation" machinery
@@ -2947,8 +2982,8 @@ static void chameleon_assign_support_interfaces(Print &print)
                 support_layer->interface_by_extruder = std::move(partitioned);
                 ++layers_partitioned;
             }
-            // else: either the uniform-fallback fast path (every entity of both roles
-            // voted fallback uniformly - support_fills untouched, nothing to gate/trim)
+            // else: either the uniform-fallback fast path (every entity of all three
+            // roles voted fallback uniformly - support_fills untouched, nothing to gate/trim)
             // or every matched bucket was gated/trimmed away by apply_bucket_caps
             // (support_fills already holds that geometry back); interface_by_extruder
             // stays empty either way.
@@ -2967,7 +3002,8 @@ static void chameleon_assign_support_interfaces(Print &print)
             << " buckets_dropped_min_benefit=" << buckets_dropped_min_benefit
             << " buckets_trimmed_cap=" << buckets_trimmed_cap
             << " interface_runs_matched=" << interface_runs_matched
-            << " base_runs_matched=" << base_runs_matched;
+            << " base_runs_matched=" << base_runs_matched
+            << " ironing_runs_matched=" << ironing_runs_matched;
     }
 }
 

@@ -294,6 +294,54 @@ size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fal
     return runs.empty() ? 0 : runs.size() - 1;
 }
 
+// v2.2 Task 3 (spec C7, "nested collections voted as one unit"): vote a WHOLE
+// role-eligible nested collection - never split apart internally. `collection` is
+// flattened (ExtrusionEntityCollection::flatten(), full recursion regardless of any
+// nested no_sort - flatten() only preserves ordering when explicitly asked to via its
+// preserve_ordering argument, which we don't need here since we're only SAMPLING
+// points, not rebuilding geometry) so every leaf polyline anywhere inside is visited
+// once, no matter how deeply nested. Each leaf is resampled with the SAME
+// build_chain(..., p.sample_mm) core split_polyline_core uses for a single path (the
+// "0.8mm sampling helper" the header comment/plan refer to - same default cadence,
+// same helper, just invoked directly instead of through the run-building wrapper
+// since a whole-collection vote has no runs to build), and `resolve` is called once
+// per sample. Votes accumulate across the ENTIRE collection (not per-leaf), then the
+// majority wins; ties broken to the LOWEST extruder id - std::map<unsigned, size_t>
+// iterates in ascending key order, and a candidate only replaces the current best on
+// a STRICTLY greater count, so the first (lowest-id) extruder reached at the max
+// count is kept automatically, deterministically, with no separate tie-break branch
+// needed. An empty collection, or one whose leaves contribute zero samples (e.g. every
+// leaf's own polyline is empty), returns fallback_extruder - the caller's "leave it in
+// support_fills untouched" path fires naturally on that value, same as the leaf fast
+// path above.
+unsigned vote_collection_as_unit(const ExtrusionEntityCollection &collection, unsigned fallback_extruder,
+                                  const std::function<unsigned(const Point &)> &resolve,
+                                  const BrimVoteParams &p)
+{
+    const ExtrusionEntityCollection flat = collection.flatten();
+
+    std::map<unsigned, size_t> votes;
+    for (const ExtrusionEntity *leaf : flat.entities) {
+        if (leaf == nullptr || leaf->is_collection())
+            continue; // flatten() should never leave a nested collection behind; guard anyway
+        const Points chain = build_chain(leaf->as_polyline().points, p.sample_mm);
+        for (const Point &pt : chain)
+            ++votes[resolve(pt)];
+    }
+
+    if (votes.empty())
+        return fallback_extruder;
+
+    unsigned best_extruder = 0;
+    size_t   best_count    = 0;
+    for (const auto &kv : votes) // ascending extruder id order
+        if (kv.second > best_count) {
+            best_extruder = kv.first;
+            best_count    = kv.second;
+        }
+    return best_extruder;
+}
+
 } // namespace
 
 void partition_brim_by_wall(const ExtrusionEntityCollection &brim, unsigned own_extruder,
@@ -647,12 +695,39 @@ size_t partition_support_entities(ExtrusionEntityCollection &support_fills, Extr
     for (ExtrusionEntity *entity : support_fills.entities) {
         if (entity == nullptr)
             continue;
-        // Only role_filter leaf entities (path/multipath/loop) are ever
-        // partitioned. Every other role, and any nested collection (whose
-        // role() could coincidentally aggregate to role_filter but which
-        // as_polyline()/is_loop() cannot handle), are left exactly where
-        // they are.
-        if (entity->is_collection() || entity->role() != role_filter) {
+
+        if (entity->is_collection()) {
+            // v2.2 Task 3 (spec C7): a nested collection is never split apart
+            // internally (as_polyline()/is_loop() can't handle one anyway) - it is
+            // either role-INELIGIBLE (its own collapsed role() isn't role_filter -
+            // mixed-role or some other single role entirely) and left untouched
+            // exactly like before C7, or role-ELIGIBLE and voted as ONE unit below.
+            auto *collection = static_cast<ExtrusionEntityCollection *>(entity);
+            if (collection->role() != role_filter) {
+                kept.push_back(entity);
+                continue;
+            }
+
+            const unsigned voted = vote_collection_as_unit(*collection, fallback_extruder, resolver, p);
+            if (voted == fallback_extruder) {
+                // Fallback majority (or no samples at all): leave the ORIGINAL
+                // collection pointer exactly where it is - byte-identical geometry,
+                // no entity churn, and its own no_sort flag is untouched because the
+                // collection object itself is never touched, only re-examined.
+                kept.push_back(entity);
+            } else {
+                // Non-fallback majority: move the WHOLE collection pointer into
+                // out[voted] - true ownership transfer (not append(), which clones),
+                // same "pointer moves, no clone" contract the leaf fast path already
+                // gives its own untouched entities. The collection's no_sort flag
+                // travels with it unchanged (still the same object).
+                out[voted].entities.push_back(entity);
+            }
+            continue;
+        }
+
+        // Only role_filter leaf entities (path/multipath/loop) reach here.
+        if (entity->role() != role_filter) {
             kept.push_back(entity);
             continue;
         }
@@ -764,6 +839,15 @@ double gap_aware_lateral_cap_mm(double support_object_xy_distance_mm,
     // no branching, so a caller passing 0 for either width (a defensive fallback, not
     // an error) still gets a sane, non-throwing result.
     return support_object_xy_distance_mm + 0.5 * outer_wall_width_mm + 0.5 * support_line_width_mm + 0.35;
+}
+
+bool support_role_needs_interface_extruder(ExtrusionRole role)
+{
+    // See this function's own header comment in BrimFilament.hpp for the full
+    // investigation finding (matched-out layers can leave PURE-ironing support_fills)
+    // - erIroning is the v2.2 Task 3 addition; erMixed/erSupportMaterialInterface are
+    // unchanged from pre-v2.2.
+    return role == erMixed || role == erSupportMaterialInterface || role == erIroning;
 }
 
 } // namespace Slic3r

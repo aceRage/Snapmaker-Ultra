@@ -177,9 +177,30 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView>& la
 //   support_fills as new paths (role copied from first_path_of(entity)->role(),
 //   falling back to entity->role() - so a base-role split stays erSupportMaterial,
 //   never hardcoded to erSupportMaterialInterface); other runs go to out[extruder].
-// - Entities whose role() != role_filter (and any nested collection) are never
-//   touched. Matched originals are deleted.
-// Returns switch-boundary count added (for the per-object cap accounting).
+// - Entities whose collapsed role() != role_filter are never touched (this includes
+//   a nested collection whose own contents mix roles, or match some OTHER role
+//   entirely - "collapsed" per ExtrusionEntityCollection::role(), which is already
+//   fully recursive: erNone for empty, the single common role for a uniform
+//   collection at any nesting depth, erMixed otherwise).
+// - v2.2 Task 3 (spec C7, "nested collections"): a nested ExtrusionEntityCollection
+//   whose collapsed role() DOES equal role_filter (tree double-wall branch
+//   collections, layer-0 no_sort sheath collections, etc. - previously invisible to
+//   this pass entirely, spec root cause 6) is voted as ONE UNIT, never split apart:
+//   every leaf polyline reachable via collection.flatten() is sampled at the same
+//   0.8mm-default cadence split_polyline_core's build_chain uses (reused directly),
+//   `resolver` is called once per sample across the WHOLE collection, and the
+//   majority vote decides the outcome (ties broken to the LOWEST extruder id,
+//   deterministic - see vote_collection_as_unit's own comment in the .cpp). A
+//   non-fallback majority MOVES the original collection pointer whole into
+//   out[extruder] (no clone, no per-child split); a fallback majority (or an empty/
+//   sample-less collection) leaves it in support_fills untouched, exactly like the
+//   leaf fast path above - this is also what preserves a moved-or-left collection's
+//   own `no_sort` flag, since the collection object itself is never touched, only
+//   relocated as a whole. Matched originals (leaf OR whole collection) are deleted
+//   from support_fills's own top-level entities vector, never from inside a
+//   collection that stays behind.
+// Returns switch-boundary count added (for the per-object cap accounting) - a moved
+// whole collection does not contribute to this count (it isn't split into runs).
 size_t partition_support_entities(ExtrusionEntityCollection& support_fills,
                                   ExtrusionRole role_filter,
                                   unsigned fallback_extruder,
@@ -275,5 +296,26 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection>&
 double gap_aware_lateral_cap_mm(double support_object_xy_distance_mm,
                                 double outer_wall_width_mm,
                                 double support_line_width_mm);
+
+// v2.2 Task 3 (spec C6, third anchor): shared predicate behind the two independently
+// duplicated "has_interface" role classifications that decide whether a support
+// layer's residual (unmatched/fallback) support_fills still needs the interface
+// extruder registered/bucketed for it - ToolOrdering.cpp's per-support-layer
+// extruder-collection pass (~701-703) and GCode.cpp's own support-bucket mirror of
+// that same classification (~5339-5341, which picks the ObjectByExtruder key a
+// layer's fallback support_fills gets bucketed under). Both call sites collapse
+// support_fills.role() (single ExtrusionRole - erNone/uniform/erMixed) and, pre-v2.2,
+// treated only erMixed or erSupportMaterialInterface as "needs the interface
+// extruder". Investigation finding behind this addition: once C6's third
+// partition_support_entities call (role_filter = erIroning) and C7's whole-collection
+// moves can remove EVERY erSupportMaterial/erSupportMaterialInterface entity from a
+// layer's support_fills while leaving some erIroning behind on the fallback path,
+// support_fills.role() collapses to a PURE erIroning - which neither predicate above
+// recognized, so the interface extruder never got registered/bucketed for that layer
+// and the residual ironing silently never printed. Extracted here (rather than left
+// duplicated inline) so the two call sites cannot drift out of sync with each other,
+// and so this classification is unit-testable without a full Print/ToolOrdering
+// scaffold.
+bool support_role_needs_interface_extruder(ExtrusionRole role);
 } // namespace Slic3r
 #endif

@@ -18,6 +18,7 @@
 #include "MixedFilament.hpp"
 #include "Print.hpp"
 #include "Utils.hpp"
+#include "BrimFilament.hpp"
 #include "ClipperUtils.hpp"
 #include "libslic3r.h"
 #include "LocalesUtils.hpp"
@@ -5338,7 +5339,16 @@ LayerResult GCode::process_layer(const Print& print,
             if (!support_layer.support_fills.entities.empty()) {
                 ExtrusionRole role          = support_layer.support_fills.role();
                 bool          has_support   = role == erMixed || role == erSupportMaterial || role == erSupportTransition;
-                bool          has_interface = role == erMixed || role == erSupportMaterialInterface;
+                // v2.2 Task 3 (spec C6, third anchor): mirrors ToolOrdering.cpp's own
+                // has_interface classification (~701-703, shared predicate in
+                // BrimFilament.hpp/.cpp) - kept identical so the two duplicated role
+                // classifications can't drift. In THIS specific block the erIroning
+                // addition is inert for `single_extruder`/the bucket-key choice just
+                // below (both are driven by has_support, which erIroning was never part
+                // of, not by has_interface), but the mirror comment at this block's own
+                // site (spec, "GCode support-bucket mirror check") is the reason to keep
+                // it in lock-step with ToolOrdering.cpp's copy regardless.
+                bool          has_interface = support_role_needs_interface_extruder(role);
                 // Extruder ID of the support base. -1 if "don't care".
                 unsigned int support_extruder = object.config().support_filament.value - 1;
                 // Shall the support be printed with the active extruder, preferably with non-soluble, to avoid tool changes?
@@ -6459,6 +6469,28 @@ LayerResult GCode::process_layer(const Print& print,
                 // which is `path.role()` per ~7528). So per-path flow/speed/labeling is
                 // already correct with erMixed and no further change is needed here.
                 gcode += this->extrude_support(it->second, erMixed);
+
+                // v2.2 Task 3 (spec C6): make sure ironing is last, mirroring the
+                // direct/non-chameleon support path's own erMixed+erIroning pair
+                // (~6654-6657, "Make sure ironing is the last"). Verified by reading
+                // GCode::extrude_support (~7388-7441, comment above cites its old line
+                // numbers as ~7375/~7389-7393 - current numbers are ~7401/~7415-7419):
+                // its erMixed branch is `(role == support_extrusion_role) ||
+                // (support_extrusion_role == erMixed && role != erIroning)` - the
+                // `role != erIroning` term means erMixed NEVER matches an erIroning
+                // entity (leaf OR a whole nested collection, since role() is the same
+                // virtual call either way - v2.2 Task 3's C7 change), so the call just
+                // above unconditionally excludes this bucket's matched ironing (v2.2
+                // Task 3's third partition_support_entities call, role_filter =
+                // erIroning) no matter what else it->second holds. This second call with
+                // support_extrusion_role = erIroning is what actually emits it - only
+                // entities whose own role() == erIroning pass the first half of that
+                // same OR (`role == support_extrusion_role`). When this bucket carries
+                // no erIroning entity at all, `extrusions` (~7397-7404) ends up empty
+                // and the function returns "" immediately (~7405-7406) before touching
+                // m_last_pos/chain_and_reorder_extrusion_entities - a true no-op, not a
+                // crash or a duplicate emission of the erMixed call's own paths.
+                gcode += this->extrude_support(it->second, erIroning);
 
                 if (this->config().gcode_label_objects) {
                     gcode += std::string("; stop printing object ") + obj.model_object()->name +

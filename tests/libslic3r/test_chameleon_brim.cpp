@@ -1073,3 +1073,224 @@ TEST_CASE("chameleon_pick_projection_region: raw containment still wins outright
     CHECK(out_layer == 0);
     CHECK(out_region == 1);
 }
+
+// --- v2.2 Task 3: ironing follows its interface (spec C6) + nested collections (spec C7) ---
+
+TEST_CASE("partition_support_entities role_filter=erIroning splits ironing, preserves role, leaves other roles untouched (C6)", "[chameleon]")
+{
+    // v2.2 Task 3 (spec C6): partition_support_entities was already role-generic
+    // (role_filter has never been special-cased, since Task 1) - this documents that
+    // genericity extends correctly to erIroning specifically, which is what Print.cpp's
+    // new THIRD partition_support_entities call (chameleon_assign_support_interfaces)
+    // now actually exercises with role_filter=erIroning. The orchestration wiring
+    // itself (the third call site's placement before apply_bucket_caps, and the
+    // erIroning-last emission fix in GCode.cpp) is not unit-instantiable - same
+    // "layer-loop logic" reason Task 1's own report gives for not unit-testing
+    // chameleon_assign_support_interfaces directly.
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 14, 6), 1, 1);
+    idx.add_polyline(segment(16, 6, 30, 6), 2, 2);
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    auto fills = make_support_fills(5.0f); // 1 base path @ y=-5, 2 interface paths @ y=5/6
+    auto *ironing = new ExtrusionPath(erIroning, 1.0, 0.4f, 0.2f);
+    ironing->polyline = Polyline({Point(scale_(0), scale_(6.5)), Point(scale_(30), scale_(6.5))});
+    fills.entities.push_back(ironing);
+
+    const size_t base_before = std::count_if(fills.entities.begin(), fills.entities.end(),
+        [](const ExtrusionEntity *e) { return e->role() == erSupportMaterial; });
+    const size_t iface_before = std::count_if(fills.entities.begin(), fills.entities.end(),
+        [](const ExtrusionEntity *e) { return e->role() == erSupportMaterialInterface; });
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erIroning, 0, resolver, p, out);
+
+    REQUIRE(out.count(1) == 1);
+    REQUIRE(out.count(2) == 1);
+    for (auto &kv : out)
+        for (const ExtrusionEntity *e : kv.second.entities)
+            CHECK(e->role() == erIroning); // role copied from source, never hardcoded
+
+    size_t base_after = 0, iface_after = 0, ironing_after = 0;
+    for (const ExtrusionEntity *e : fills.entities) {
+        if (e->role() == erSupportMaterial)          ++base_after;
+        if (e->role() == erSupportMaterialInterface) ++iface_after;
+        if (e->role() == erIroning)                  ++ironing_after;
+    }
+    CHECK(base_after == base_before);   // base untouched by an erIroning-role_filter pass
+    CHECK(iface_after == iface_before); // interface untouched by an erIroning-role_filter pass
+    CHECK(ironing_after == 0);          // ironing fully matched away, none fell back
+}
+
+TEST_CASE("support_role_needs_interface_extruder: erIroning newly needs the interface extruder registered (C6)", "[chameleon]")
+{
+    // v2.2 Task 3 (spec C6, third anchor): the shared predicate behind ToolOrdering.cpp
+    // (~701-703) and GCode.cpp's own support-bucket mirror (~5339-5341) - both
+    // orchestration-level and not unit-instantiable directly, but the classification
+    // itself was extracted to BrimFilament.hpp/.cpp specifically so it IS testable.
+    // Investigation finding: a layer whose support_fills collapses to PURE erIroning
+    // (every erSupportMaterial/erSupportMaterialInterface entity matched away by the
+    // third partition_support_entities call and/or a C7 whole-collection move, residual
+    // fallback ironing left behind) must still count as needing the interface extruder,
+    // or that ironing's toolchange/bucket never gets registered and it silently never
+    // prints.
+    CHECK(support_role_needs_interface_extruder(erIroning));      // v2.2 Task 3 addition
+    CHECK(support_role_needs_interface_extruder(erMixed));        // unchanged pre-v2.2
+    CHECK(support_role_needs_interface_extruder(erSupportMaterialInterface)); // unchanged pre-v2.2
+    CHECK_FALSE(support_role_needs_interface_extruder(erSupportMaterial));
+    CHECK_FALSE(support_role_needs_interface_extruder(erSupportTransition));
+    CHECK_FALSE(support_role_needs_interface_extruder(erNone));
+}
+
+// Builds a nested (non-flat) ExtrusionEntityCollection of two erSupportMaterial leaf
+// paths at the given y, spanning the given x half. Mirrors the double-wall-branch /
+// no_sort-sheath collections spec root cause 6 calls out as "invisible to the matcher"
+// pre-C7.
+static ExtrusionEntityCollection *nested_base_collection(double y, bool no_sort)
+{
+    auto *inner = new ExtrusionEntityCollection();
+    inner->no_sort = no_sort;
+    auto *leaf_a = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf_a->polyline = Polyline({Point(scale_(0), scale_(y)), Point(scale_(10), scale_(y))});
+    auto *leaf_b = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf_b->polyline = Polyline({Point(scale_(20), scale_(y)), Point(scale_(30), scale_(y))});
+    inner->entities.push_back(leaf_a);
+    inner->entities.push_back(leaf_b);
+    return inner;
+}
+
+TEST_CASE("partition_support_entities (C7): a role-eligible nested collection is voted as ONE unit and moved whole, never split", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 30, 6), 1, 1); // one wall spanning the whole span -> extruder 1 everywhere
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    ExtrusionEntityCollection *inner = nested_base_collection(6.0, /*no_sort=*/true);
+    REQUIRE(inner->role() == erSupportMaterial); // collapsed role - both leaves uniform
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+    // A plain (non-collection) base path alongside it, to show the new collection
+    // branch doesn't interfere with ordinary leaf partitioning.
+    auto *plain = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    plain->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(30), scale_(6))});
+    fills.entities.push_back(plain);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    REQUIRE(out.count(1) == 1);
+    bool found_whole_collection = false;
+    for (const ExtrusionEntity *e : out.at(1).entities) {
+        if (e == inner) {
+            found_whole_collection = true;
+            REQUIRE(e->is_collection());
+            const auto *coll = static_cast<const ExtrusionEntityCollection *>(e);
+            CHECK(coll->entities.size() == 2);  // both leaves intact - never split apart
+            CHECK(coll->no_sort == true);       // C7: no_sort travels with the moved pointer, untouched
+        }
+    }
+    CHECK(found_whole_collection);
+
+    // Moved, not cloned: the original pointer is gone from support_fills' top level.
+    for (const ExtrusionEntity *e : fills.entities)
+        CHECK(e != inner);
+}
+
+TEST_CASE("partition_support_entities (C7): a role-eligible nested collection that votes fallback stays in place, untouched", "[chameleon]")
+{
+    WallSampleIndex idx; // empty index -> brim_vote always returns fallback_extruder
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    ExtrusionEntityCollection *inner = nested_base_collection(6.0, /*no_sort=*/false);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    CHECK(out.empty());
+    REQUIRE(fills.entities.size() == 1);
+    CHECK(fills.entities.front() == inner); // untouched pointer, still in place
+    CHECK(static_cast<ExtrusionEntityCollection *>(fills.entities.front())->entities.size() == 2);
+}
+
+TEST_CASE("partition_support_entities (C7): a mixed-role nested collection is left untouched, never voted or split", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 30, 6), 1, 1);
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    // erSupportMaterial + erSupportMaterialInterface leaves -> collapsed role() ==
+    // erMixed, which never equals either role_filter this pass calls with below.
+    auto *inner = new ExtrusionEntityCollection();
+    auto *leaf_base = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf_base->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(10), scale_(6))});
+    auto *leaf_iface = new ExtrusionPath(erSupportMaterialInterface, 1.0, 0.4f, 0.2f);
+    leaf_iface->polyline = Polyline({Point(scale_(20), scale_(6)), Point(scale_(30), scale_(6))});
+    inner->entities.push_back(leaf_base);
+    inner->entities.push_back(leaf_iface);
+    REQUIRE(inner->role() == erMixed);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out_base, out_iface;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out_base);
+    partition_support_entities(fills, erSupportMaterialInterface, 0, resolver, p, out_iface);
+
+    CHECK(out_base.empty());
+    CHECK(out_iface.empty());
+    REQUIRE(fills.entities.size() == 1);
+    CHECK(fills.entities.front() == inner); // untouched pointer, both passes
+    CHECK(static_cast<ExtrusionEntityCollection *>(fills.entities.front())->entities.size() == 2);
+}
+
+TEST_CASE("partition_support_entities (C7): whole-collection majority vote ties break to the LOWEST extruder id", "[chameleon]")
+{
+    // Two walls, each covering exactly one of the collection's two EQUAL-length leaves
+    // (10mm each) - build_chain's 0.8mm-cadence sampling of each congruent leaf
+    // produces the identical sample count on each side, so votes tie EXACTLY between
+    // extruder 1 and extruder 2. The lower id must win outright (no split, no crash).
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 10, 6), 1, 1);
+    idx.add_polyline(segment(20, 6, 30, 6), 2, 2);
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    ExtrusionEntityCollection *inner = nested_base_collection(6.0, /*no_sort=*/false);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    REQUIRE(out.count(1) == 1);
+    CHECK(out.count(2) == 0);  // tie broken to the lower id, never split between both buckets
+    CHECK(fills.entities.empty());
+}
+
+TEST_CASE("total_path_length_mm recurses into a nested collection a C7 whole-collection move can now leave in a bucket", "[chameleon]")
+{
+    // v2.2 Task 1's own report flagged this recursion as "not exercised by today's
+    // tests" until a nested-collection vote (C7) could land a whole
+    // ExtrusionEntityCollection* in a bucket - it now can (the test just above proves
+    // the move), so apply_bucket_caps' gate/trim measures such a bucket correctly.
+    ExtrusionEntityCollection bucket;
+    auto *inner = new ExtrusionEntityCollection();
+    auto *leaf1 = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf1->polyline = Polyline({Point(scale_(0), scale_(0)), Point(scale_(10), scale_(0))});
+    auto *leaf2 = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf2->polyline = Polyline({Point(scale_(0), scale_(0)), Point(scale_(15), scale_(0))});
+    inner->entities.push_back(leaf1);
+    inner->entities.push_back(leaf2);
+    bucket.entities.push_back(inner);
+
+    CHECK_THAT(total_path_length_mm(bucket), Catch::Matchers::WithinAbs(25.0, 1e-6));
+}
