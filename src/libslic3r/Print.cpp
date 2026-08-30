@@ -3288,6 +3288,16 @@ static void chameleon_assign_support_interfaces(Print &print)
 
         BOOST_LOG_TRIVIAL(info) << "Chameleon support match: object ordinal " << obj_idx
             << " mode=" << (nearest_wall_mode ? "nearest_wall" : "nearest_surface")
+            // v2.3 Task 4 (spec C9): free_set_size is the once-per-PASS
+            // layer_filament_table's entry count (z-coincidence rows, not extruders per
+            // row) - same value on every object's line since the table is built once
+            // before this loop (see chameleon_collect_layer_filaments above). 0 means
+            // either mixed-filament gradient was active (table skipped entirely, C1) or
+            // no object in the plate has any wall/solid/sparse layer - i.e. the free tier
+            // (3mm floor) can never fire this pass; a triage reader can rule the free
+            // tier in/out of a gate-count anomaly from this one field before digging into
+            // per-layer free_extruders.
+            << " free_set_size=" << layer_filament_table.size()
             << " layers_partitioned=" << layers_partitioned
             << " layers_zero_sample=" << layers_zero_sample
             << " buckets_dropped_min_benefit=" << buckets_dropped_min_benefit
