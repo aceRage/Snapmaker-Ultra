@@ -273,6 +273,24 @@ void slice_compare_notify_snapshots_changed()
 SliceCompareFrame::SliceCompareFrame(wxWindow* parent)
     : wxFrame(parent, wxID_ANY, _L("Compare Slices"), wxDefaultPosition, wxSize(1200, 800), wxDEFAULT_FRAME_STYLE)
 {
+    // Match the main UI: app font (children inherit), white base background that the
+    // dark-mode mapper converts (AMSMaterialsSetting precedent), and the app icon
+    // loaded from the exe module (main_frame_icon precedent in MainFrame.cpp).
+    SetFont(wxGetApp().normal_font());
+    SetBackgroundColour(*wxWHITE);
+#ifdef _WIN32
+    {
+        std::wstring exe_path(size_t(MAX_PATH), wchar_t(0));
+        int len = int(::GetModuleFileName(nullptr, exe_path.data(), MAX_PATH));
+        if (len > 0 && len < MAX_PATH) {
+            exe_path.erase(exe_path.begin() + len, exe_path.end());
+            wxIcon icon(exe_path, wxBITMAP_TYPE_ICO);
+            if (icon.IsOk())
+                SetIcon(icon);
+        }
+    }
+#endif
+
     build_ui();
     rebuild_pickers();
     recompute();
@@ -318,25 +336,20 @@ void SliceCompareFrame::build_ui()
     main_sizer->Add(m_session_hint, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
     // Header strip: est time / filament / layers / max speed, "A -> B (delta)".
-    wxFlexGridSizer* header_grid = new wxFlexGridSizer(4, 2, 4, 10);
-    header_grid->AddGrowableCol(1, 1);
-    auto add_header_row = [&](const wxString& label, wxStaticText*& target) {
-        header_grid->Add(new wxStaticText(this, wxID_ANY, label), 0, wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL);
-        target = new wxStaticText(this, wxID_ANY, wxEmptyString);
-        header_grid->Add(target, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
-    };
-    add_header_row(_L("Estimated time:"), m_header_time);
-    add_header_row(_L("Filament:"), m_header_filament);
-    add_header_row(_L("Layers:"), m_header_layers);
-    add_header_row(_L("Max speed:"), m_header_speed);
-
-    main_sizer->Add(header_grid, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+    // Headerless two-column stats table so the top strip matches the sidebar
+    // tables (alternating row shading, themed text) instead of bare labels.
+    m_header_table = new wxDataViewListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                            wxDV_ROW_LINES | wxDV_NO_HEADER);
+    m_header_table->AppendTextColumn(wxEmptyString, wxDATAVIEW_CELL_INERT, FromDIP(150));
+    m_header_table->AppendTextColumn(wxEmptyString, wxDATAVIEW_CELL_INERT, -1);
+    m_header_table->SetMinSize(wxSize(-1, FromDIP(132))); // five rows
+    main_sizer->Add(m_header_table, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
     // Notebook (settings / feature tables) on the left, canvas placeholder on the right.
     wxBoxSizer* content_row = new wxBoxSizer(wxHORIZONTAL);
 
     m_notebook = new wxNotebook(this, wxID_ANY);
-    m_notebook->SetMinSize(wxSize(380, -1));
+    m_notebook->SetMinSize(wxSize(FromDIP(470), -1)); // wide enough for the app font without a horizontal scrollbar
 
     wxPanel* cfg_page = new wxPanel(m_notebook);
     m_cfg_table = new wxDataViewListCtrl(cfg_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxDV_ROW_LINES);
@@ -390,14 +403,6 @@ void SliceCompareFrame::build_ui()
     slider_row->Add(m_layer_slider, 0, wxEXPAND);
     slider_col->Add(slider_row, 1, wxEXPAND);
 
-    m_jump_btn = new wxButton(this, wxID_ANY, _L("Jump to biggest change"));
-    m_jump_btn->Enable(false);
-    slider_col->Add(m_jump_btn, 0, wxEXPAND | wxTOP, 6);
-
-    m_side_by_side_btn = new wxToggleButton(this, wxID_ANY, _L("Side by side"));
-    m_side_by_side_btn->SetToolTip(_L("Show A and B in separate panes instead of overlaid"));
-    slider_col->Add(m_side_by_side_btn, 0, wxEXPAND | wxTOP, 6);
-
     canvas_row->Add(slider_col, 0, wxEXPAND | wxLEFT, 8);
     canvas_col->Add(canvas_row, 1, wxEXPAND);
 
@@ -408,6 +413,17 @@ void SliceCompareFrame::build_ui()
     content_row->Add(canvas_col, 1, wxEXPAND);
 
     main_sizer->Add(content_row, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+
+    // Bottom action bar: the two canvas actions side by side, full-width row.
+    wxBoxSizer* action_row = new wxBoxSizer(wxHORIZONTAL);
+    m_jump_btn = new wxButton(this, wxID_ANY, _L("Show Biggest Change"));
+    m_jump_btn->Enable(false);
+    action_row->AddStretchSpacer(1);
+    action_row->Add(m_jump_btn, 0, wxRIGHT, 8);
+    m_side_by_side_btn = new wxToggleButton(this, wxID_ANY, _L("Side By Side"));
+    m_side_by_side_btn->SetToolTip(_L("Show A and B in separate panes instead of overlaid"));
+    action_row->Add(m_side_by_side_btn, 0);
+    main_sizer->Add(action_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
     SetSizer(main_sizer);
 
@@ -605,28 +621,44 @@ void SliceCompareFrame::preselect_last_two()
 void SliceCompareFrame::update_header()
 {
     if (!m_a || !m_b) {
-        m_header_time->SetLabel(_L("Select two snapshots to compare."));
-        m_header_filament->SetLabel(wxEmptyString);
-        m_header_layers->SetLabel(wxEmptyString);
-        m_header_speed->SetLabel(wxEmptyString);
+        m_header_table->DeleteAllItems();
+        wxVector<wxVariant> hint;
+        hint.push_back(wxVariant(_L("Compare")));
+        hint.push_back(wxVariant(_L("Select two snapshots to compare.")));
+        m_header_table->AppendItem(hint);
         return;
     }
 
-    m_header_time->SetLabel(format_stat_row(
+    m_header_table->DeleteAllItems();
+    auto add_stat = [this](const wxString& metric, const wxString& value) {
+        wxVector<wxVariant> data;
+        data.push_back(wxVariant(metric));
+        data.push_back(wxVariant(value));
+        m_header_table->AppendItem(data);
+    };
+
+    add_stat(_L("Estimated Time"), format_stat_row(
         format_duration_hm(m_a->est_seconds), format_duration_hm(m_b->est_seconds),
         format_signed_duration(m_b->est_seconds - m_a->est_seconds)));
 
-    m_header_filament->SetLabel(format_stat_row(
+    add_stat(_L("Filament"), format_stat_row(
         wxString::Format("%.1fg", m_a->filament_g), wxString::Format("%.1fg", m_b->filament_g),
         wxString::Format("%+.1fg", m_b->filament_g - m_a->filament_g)));
 
-    m_header_layers->SetLabel(format_stat_row(
+    add_stat(_L("Layers"), format_stat_row(
         wxString::Format("%d", m_a->layer_count), wxString::Format("%d", m_b->layer_count),
         wxString::Format("%+d", m_b->layer_count - m_a->layer_count)));
 
-    m_header_speed->SetLabel(format_stat_row(
+    add_stat(_L("Max Speed"), format_stat_row(
         wxString::Format("%.0f mm/s", m_a->max_speed), wxString::Format("%.0f mm/s", m_b->max_speed),
         wxString::Format("%+.0f mm/s", m_b->max_speed - m_a->max_speed)));
+
+    // Average time per layer (estimate total / layer count); guarded for empty snapshots.
+    const double avg_a = m_a->layer_count > 0 ? m_a->est_seconds / m_a->layer_count : 0.0;
+    const double avg_b = m_b->layer_count > 0 ? m_b->est_seconds / m_b->layer_count : 0.0;
+    add_stat(_L("Average Layer Time"), format_stat_row(
+        wxString::Format("%.1fs", avg_a), wxString::Format("%.1fs", avg_b),
+        wxString::Format("%+.1fs", avg_b - avg_a)));
 }
 
 void SliceCompareFrame::recompute()

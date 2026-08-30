@@ -90,10 +90,8 @@ private:
     // snapshots to pick from (see rebuild_pickers()).
     wxStaticText* m_session_hint = nullptr;
 
-    wxStaticText* m_header_time = nullptr;
-    wxStaticText* m_header_filament = nullptr;
-    wxStaticText* m_header_layers = nullptr;
-    wxStaticText* m_header_speed = nullptr;
+    // Headerless stats table (Metric | A -> B (delta)) matching the sidebar tables.
+    wxDataViewListCtrl* m_header_table = nullptr;
 
     wxNotebook*         m_notebook = nullptr;
     wxDataViewListCtrl* m_cfg_table = nullptr;
