@@ -302,7 +302,11 @@ void SliceCompareFrame::build_ui()
     wxBoxSizer* slider_row = new wxBoxSizer(wxHORIZONTAL);
     m_layer_tick_strip = new LayerTickStrip(this);
     slider_row->Add(m_layer_tick_strip, 0, wxEXPAND | wxRIGHT, 2);
-    m_layer_slider = new wxSlider(this, wxID_ANY, 0, 0, 0, wxDefaultPosition, wxDefaultSize, wxSL_VERTICAL);
+    // wxSL_VERTICAL alone defaults to min-at-top/max-at-bottom; wxSL_INVERSE flips that so the
+    // slider's minimum (row 0 == lowest z) sits at the bottom, matching LayerTickStrip's layout
+    // (which paints index 0 at the bottom, "low z at bottom" like a printer bed) and the physical
+    // thumb position after a jump/select.
+    m_layer_slider = new wxSlider(this, wxID_ANY, 0, 0, 0, wxDefaultPosition, wxDefaultSize, wxSL_VERTICAL | wxSL_INVERSE);
     m_layer_slider->Enable(false);
     slider_row->Add(m_layer_slider, 0, wxEXPAND);
     slider_col->Add(slider_row, 1, wxEXPAND);
