@@ -267,8 +267,8 @@ TEST_CASE("partition_support_interfaces re-run on its own output undercounts swi
     REQUIRE(out1.count(1) == 1);
     CHECK(!out1.at(1).entities.empty());
 
-    // Mirror Print.cpp's cap-revert merge-back (Print.cpp:2516-2519): fold the
-    // out-of-fallback runs back into support_fills, leaving it holding all three
+    // Mirror Print.cpp's v2.2 apply_bucket_caps merge-back (BrimFilament.cpp): fold
+    // the out-of-fallback runs back into support_fills, leaving it holding all three
     // pre-split runs as separate entities - exactly what either trigger in C1
     // (aliased shared-object copy, or a stale posSupportMaterial re-run) hands the
     // pass on its second visit to this layer.
@@ -278,14 +278,19 @@ TEST_CASE("partition_support_interfaces re-run on its own output undercounts swi
     const size_t switches2 = partition_support_interfaces(fills, 0, idx, p, out2);
 
     // Pass 2 re-votes each already-split fragment independently and reports FEWER
-    // switches than pass 1 found for the identical geometry - the per-layer/
-    // per-object switch caps (Print.cpp's ">3" and ">20" guards) would see this
-    // second run as cheaper than it really is ("the reverted layer is partitioned
-    // after all, with the per-layer cap counting 0" - final-review.md C1).
+    // switch boundaries than pass 1 found for the identical geometry. This
+    // switch-boundary return value is no longer what caps anything (v2.2 Task 1,
+    // spec C1-C3: apply_bucket_caps ranks/gates by bucket TOTAL PATH LENGTH, not by
+    // this switch count - see BrimFilament.hpp's apply_bucket_caps doc comment), but
+    // the underlying non-idempotency this test documents is exactly why Print.cpp's
+    // chameleon_interface_visited guard (C1 fix, guard (b)) exists: a second
+    // apply_bucket_caps call over these same pre-split fragments would rank the
+    // middle zone's bucket by ITS OWN (now fragment-local) length rather than the
+    // true length pass 1 matched, silently skewing the length-based trim/gate.
     CHECK(switches2 < switches1);
     // The undercounting is not from the geometry becoming inert: the middle zone's
     // material is still (correctly) matched to the foreign extruder on pass 2 - the
-    // switch that causes is simply no longer reflected in the cap accounting.
+    // switch that causes is simply no longer reflected in the switch-boundary count.
     REQUIRE(out2.count(1) == 1);
     CHECK(!out2.at(1).entities.empty());
 }
@@ -658,7 +663,7 @@ TEST_CASE("chameleon_pick_projection_region skips a layer whose lslices hit but 
 
 // --- v2.1 Task 3: pass rewiring (two-call sequence, shared out map) -------
 
-TEST_CASE("v2.1 Task 3: interface-then-base calls share one out map; buckets can mix roles; revert-merge is role-agnostic", "[chameleon]")
+TEST_CASE("v2.1 Task 3: interface-then-base calls share one out map; buckets can mix roles; cap merge-back is role-agnostic", "[chameleon]")
 {
     // Mirrors chameleon_assign_support_interfaces' v2.1 shape: an interface-role call
     // and a base-role call both consult the same coplanar wall data and write into the
@@ -688,9 +693,11 @@ TEST_CASE("v2.1 Task 3: interface-then-base calls share one out map; buckets can
     const size_t base_switches = partition_support_entities(fills, erSupportMaterial,
         0, resolver, p, partitioned);
 
-    // Task 3: "ONE raw switch count vs the caps" - the pass sums these two calls'
-    // returns before comparing against the 3/layer and 20/object caps. Both calls
-    // contributed (neither degenerated to the uniform-fallback fast path).
+    // Task 3: "ONE shared out map" - both calls write into the same `partitioned`
+    // map (v2.2 Task 1: that map is what a single apply_bucket_caps call then
+    // gates/trims as a whole by bucket path length, not by these switch-boundary
+    // return values - see BrimFilament.hpp's apply_bucket_caps doc comment). Both
+    // calls contributed here (neither degenerated to the uniform-fallback fast path).
     CHECK(interface_switches > 0);
     CHECK(base_switches > 0);
 
@@ -721,11 +728,13 @@ TEST_CASE("v2.1 Task 3: interface-then-base calls share one out map; buckets can
     CHECK(saw_base_role);
     CHECK(found_mixed_bucket);
 
-    // Mirror Print.cpp's per-layer cap-exceeded revert (for (auto &kv : partitioned)
-    // support_layer->support_fills.append(std::move(kv.second.entities));) -
+    // Mirror apply_bucket_caps' merge-back (BrimFilament.cpp: merge_back_target.
+    // append(std::move(it->second.entities)) for every gated/trimmed bucket) -
     // append(ExtrusionEntitiesPtr&&) is role-agnostic, so merging a map built from TWO
     // different role_filter calls back into one collection must restore BOTH roles'
-    // geometry, not just whichever role happened to be appended first/last.
+    // geometry, not just whichever role happened to be appended first/last. This is
+    // the same mechanic the old whole-layer revert used (just applied per-bucket by
+    // apply_bucket_caps now, rather than unconditionally to every bucket per-layer).
     for (auto &kv : partitioned)
         fills.append(std::move(kv.second.entities));
 
@@ -736,4 +745,161 @@ TEST_CASE("v2.1 Task 3: interface-then-base calls share one out map; buckets can
     }
     CHECK(restored_iface > 0);
     CHECK(restored_base > 0);
+}
+
+// --- v2.2 Task 1: cap semantics rework (spec C1-C3) -------------------------
+
+// Builds one bucket's ExtrusionEntityCollection: a single straight path of exactly
+// `len_mm` length (x-axis, so total_path_length_mm's unscale<double>(length()) sum is
+// trivial to hand-verify), role/flow attributes arbitrary (mirrors make_support_fills'
+// fixture style above - only the geometry matters to these tests).
+static ExtrusionEntityCollection bucket_of_length(double len_mm)
+{
+    ExtrusionEntityCollection c;
+    auto *p = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    p->polyline = Polyline({Point(scale_(0), scale_(0)), Point(scale_(len_mm), scale_(0))});
+    c.entities.push_back(p);
+    return c;
+}
+
+TEST_CASE("total_path_length_mm sums a bucket's entities", "[chameleon]")
+{
+    ExtrusionEntityCollection c = bucket_of_length(12.5);
+    CHECK_THAT(total_path_length_mm(c), Catch::Matchers::WithinAbs(12.5, 1e-6));
+
+    // Two paths -> sum, not just the first.
+    auto *p2 = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    p2->polyline = Polyline({Point(scale_(0), scale_(0)), Point(scale_(0), scale_(17.5))});
+    c.entities.push_back(p2);
+    CHECK_THAT(total_path_length_mm(c), Catch::Matchers::WithinAbs(30.0, 1e-6));
+
+    // Empty collection -> 0, not a throw (ExtrusionEntityCollection::length() itself
+    // throws - this helper must never call it directly).
+    ExtrusionEntityCollection empty;
+    CHECK_THAT(total_path_length_mm(empty), Catch::Matchers::WithinAbs(0.0, 1e-6));
+}
+
+TEST_CASE("apply_bucket_caps: under-cap map is left untouched", "[chameleon]")
+{
+    // 2 buckets, max_extruders=2 -> nothing to trim, and both are well above the
+    // min-benefit floor -> nothing to gate either.
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(100.0);
+    map[2] = bucket_of_length(80.0);
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 40.0, merge_back);
+
+    REQUIRE(map.count(1) == 1);
+    REQUIRE(map.count(2) == 1);
+    CHECK(!map.at(1).entities.empty());
+    CHECK(!map.at(2).entities.empty());
+    CHECK(merge_back.entities.empty());
+    CHECK(result.kept == std::set<unsigned>{1, 2});
+    CHECK(result.buckets_dropped_min_benefit == 0);
+    CHECK(result.buckets_trimmed_cap == 0);
+}
+
+TEST_CASE("apply_bucket_caps: sub-40mm bucket is dropped by the min-benefit gate", "[chameleon]")
+{
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(100.0);
+    map[2] = bucket_of_length(39.9);   // just under the 40mm floor
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 40.0, merge_back);
+
+    CHECK(map.count(1) == 1);
+    CHECK(map.count(2) == 0);                 // gated out
+    CHECK(!merge_back.entities.empty());      // its geometry landed back in fallback
+    CHECK(result.kept == std::set<unsigned>{1});
+    CHECK(result.buckets_dropped_min_benefit == 1);
+    CHECK(result.buckets_trimmed_cap == 0);
+}
+
+TEST_CASE("apply_bucket_caps: 3-extruder partition trims to the 2 longest", "[chameleon]")
+{
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(50.0);
+    map[2] = bucket_of_length(100.0);
+    map[3] = bucket_of_length(75.0);
+    std::set<unsigned> prev_kept;             // no hysteresis pressure - pure length rank
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 40.0, merge_back);
+
+    // Longest two survive (2: 100mm, 3: 75mm); shortest (1: 50mm) is trimmed.
+    CHECK(map.count(1) == 0);
+    CHECK(map.count(2) == 1);
+    CHECK(map.count(3) == 1);
+    CHECK(!merge_back.entities.empty());
+    CHECK(result.kept == std::set<unsigned>{2, 3});
+    CHECK(result.buckets_dropped_min_benefit == 0);
+    CHECK(result.buckets_trimmed_cap == 1);
+}
+
+TEST_CASE("apply_bucket_caps: hysteresis preference flips which bucket the trim keeps", "[chameleon]")
+{
+    // Same 3 buckets both times: ext 1 is the SHORTEST (30mm - would lose on pure
+    // length to both 2 and 3), ext 2 is longest (100mm), ext 3 is middle (90mm).
+    auto make_map = [] {
+        std::map<unsigned, ExtrusionEntityCollection> m;
+        m[1] = bucket_of_length(30.0);
+        m[2] = bucket_of_length(100.0);
+        m[3] = bucket_of_length(90.0);
+        return m;
+    };
+
+    // Without hysteresis (empty prev_kept): pure length rank keeps the two longest,
+    // {2, 3} - ext 1 loses despite being above the 40mm... wait, ext1 is BELOW the
+    // min-benefit floor at 30mm in the default fixture; use a lower floor here so the
+    // gate doesn't remove it before the trim even runs - this test is about the TRIM's
+    // ranking, not the gate.
+    {
+        std::map<unsigned, ExtrusionEntityCollection> map = make_map();
+        std::set<unsigned> prev_kept;   // ext 1 has no seniority
+        ExtrusionEntityCollection merge_back;
+        BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 10.0, merge_back);
+        CHECK(result.kept == std::set<unsigned>{2, 3});   // pure length: 1 (30mm) loses
+    }
+
+    // With hysteresis (prev_kept = {1}): ext 1 outranks BOTH 2 and 3 outright despite
+    // being the shortest bucket by far - stability up the column beats raw length.
+    // Among the two non-prev-kept candidates (2, 3), the trim still falls back to
+    // length to pick the second survivor: 2 (100mm) over 3 (90mm). This is the flip:
+    // the committed set changes from {2,3} to {1,2} purely because of prev_kept.
+    {
+        std::map<unsigned, ExtrusionEntityCollection> map = make_map();
+        std::set<unsigned> prev_kept{1};
+        ExtrusionEntityCollection merge_back;
+        BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 10.0, merge_back);
+        CHECK(result.kept == std::set<unsigned>{1, 2});
+        CHECK(map.count(1) == 1);
+        CHECK(map.count(2) == 1);
+        CHECK(map.count(3) == 0);
+        CHECK(result.buckets_trimmed_cap == 1);
+    }
+}
+
+TEST_CASE("apply_bucket_caps: gate runs before the trim, so a gated sliver never occupies a cap slot", "[chameleon]")
+{
+    // 3 buckets, only 2 survive the 40mm gate; max_extruders=2 -> the trim then has
+    // nothing left to do (exactly at the cap, not over it).
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(100.0);
+    map[2] = bucket_of_length(80.0);
+    map[3] = bucket_of_length(5.0);     // sliver - gated
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 40.0, merge_back);
+
+    CHECK(map.count(1) == 1);
+    CHECK(map.count(2) == 1);
+    CHECK(map.count(3) == 0);
+    CHECK(result.kept == std::set<unsigned>{1, 2});
+    CHECK(result.buckets_dropped_min_benefit == 1);
+    CHECK(result.buckets_trimmed_cap == 0);    // never reached - only 2 buckets left post-gate
 }

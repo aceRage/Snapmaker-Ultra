@@ -579,4 +579,78 @@ size_t partition_support_interfaces(ExtrusionEntityCollection &support_fills, un
         [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); }, p, out);
 }
 
+double total_path_length_mm(const ExtrusionEntityCollection &collection)
+{
+    double len = 0.0;
+    for (const ExtrusionEntity *entity : collection.entities) {
+        if (entity == nullptr)
+            continue;
+        // ExtrusionEntityCollection::length() throws - recurse instead of calling it
+        // (see this function's own header comment: today's buckets are flat
+        // ExtrusionPath* only, but this stays correct if that ever changes).
+        if (entity->is_collection())
+            len += total_path_length_mm(*static_cast<const ExtrusionEntityCollection *>(entity));
+        else
+            len += unscale<double>(entity->length()); // length() is in SCALED units
+    }
+    return len;
+}
+
+BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> &map,
+                                   const std::set<unsigned> &prev_kept,
+                                   size_t max_extruders,
+                                   double min_len_mm,
+                                   ExtrusionEntityCollection &merge_back_target)
+{
+    BucketCapResult result;
+
+    // (a) C3 min-benefit gate: drop any bucket under min_len_mm BEFORE the trim below
+    // ever ranks it - a sliver must never survive by being one of the "top N longest"
+    // among other slivers.
+    for (auto it = map.begin(); it != map.end(); ) {
+        if (total_path_length_mm(it->second) < min_len_mm) {
+            merge_back_target.append(std::move(it->second.entities));
+            it = map.erase(it);
+            ++result.buckets_dropped_min_benefit;
+        } else {
+            ++it;
+        }
+    }
+
+    // (b) C1 distinct-extruder trim: rank the gate's survivors by (previously-kept
+    // DESC, total length DESC, extruder id ASC as the final deterministic tie-break)
+    // and keep only the top max_extruders. Hysteresis outranks length outright - see
+    // this function's header comment for why (stability up the column vs. the
+    // alternating-stripe artifact the old whole-layer revert caused).
+    if (map.size() > max_extruders) {
+        std::vector<std::pair<unsigned, double>> ranked;
+        ranked.reserve(map.size());
+        for (auto &kv : map)
+            ranked.emplace_back(kv.first, total_path_length_mm(kv.second));
+
+        std::sort(ranked.begin(), ranked.end(),
+            [&prev_kept](const std::pair<unsigned, double> &a, const std::pair<unsigned, double> &b) {
+                const bool a_prev = prev_kept.count(a.first) != 0;
+                const bool b_prev = prev_kept.count(b.first) != 0;
+                if (a_prev != b_prev)
+                    return a_prev; // previously-kept extruder ranks first, regardless of length
+                if (a.second != b.second)
+                    return a.second > b.second; // then longer total path first
+                return a.first < b.first; // deterministic final tie-break
+            });
+
+        for (size_t i = max_extruders; i < ranked.size(); ++i) {
+            auto it = map.find(ranked[i].first);
+            merge_back_target.append(std::move(it->second.entities));
+            map.erase(it);
+            ++result.buckets_trimmed_cap;
+        }
+    }
+
+    for (const auto &kv : map)
+        result.kept.insert(kv.first);
+
+    return result;
+}
+
 } // namespace Slic3r

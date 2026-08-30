@@ -7,6 +7,7 @@
 #include "BoundingBox.hpp"
 #include <functional>
 #include <map>
+#include <set>
 #include <vector>
 namespace Slic3r {
 
@@ -149,5 +150,67 @@ size_t partition_support_interfaces(ExtrusionEntityCollection& support_fills,
                                     const WallSampleIndex& idx,
                                     const BrimVoteParams& params,
                                     std::map<unsigned, ExtrusionEntityCollection>& out);
+
+// v2.2 Task 1 (spec C1-C3, "cap semantics rework"): total path length (mm) of
+// `collection`'s entities. ExtrusionEntityCollection::length() throws (see its own
+// comment) - a bucket built by partition_support_entities is a flat vector of
+// ExtrusionPath* today (partition_support_leaf_entity only ever emplaces
+// ExtrusionPath), but this recurses into any nested collection too (is_collection())
+// so it stays correct if a future nested-collection vote (spec C7) ever lands a whole
+// ExtrusionEntityCollection* in a bucket. Each leaf's own length() is in SCALED units
+// (see Line::length()/MultiPoint::length()) - unscale<double> converts to mm, the same
+// way GCode.cpp/ExtrusionEntity.cpp do at every other length() call site.
+double total_path_length_mm(const ExtrusionEntityCollection& collection);
+
+// v2.2 Task 1 (spec C1-C3): result of one apply_bucket_caps call.
+struct BucketCapResult {
+    // The extruders whose buckets survived both caps this layer - i.e. `map`'s
+    // remaining keys. Empty when nothing survived (including the trivial case where
+    // `map` was empty going in). Feed this straight into the NEXT support layer's
+    // `prev_kept` argument for hysteresis (spec: "prev_kept updates to the committed
+    // set each layer" - a layer that reaches apply_bucket_caps at all always updates
+    // it, even to empty; only a layer whose caller skips calling apply_bucket_caps
+    // entirely - no engine call ran - leaves the caller's prev_kept unchanged).
+    std::set<unsigned> kept;
+    // Buckets merged back by the C3 min-benefit gate (total length < min_len_mm).
+    size_t buckets_dropped_min_benefit = 0;
+    // Buckets merged back by the C1 distinct-extruder trim (survived the gate, but
+    // ranked below the top max_extruders by (prev_kept membership, then length)).
+    size_t buckets_trimmed_cap = 0;
+};
+
+// v2.2 Task 1 (spec C1-C3, replaces the old per-layer ">3 switch-boundaries" whole-
+// layer revert and the per-object ">20 cumulative switches" escalation - both deleted
+// entirely, C2). `map` holds one support layer's matched geometry, keyed by extruder,
+// straight out of one or more partition_support_entities calls sharing the same out
+// map. Applied in order:
+//   a. C3 min-benefit gate: any bucket whose total_path_length_mm() < min_len_mm is
+//      merged into `merge_back_target` and erased from `map` - a matched sliver isn't
+//      worth a toolchange/purge, and must never survive the trim below by being one of
+//      the "top N longest" among other slivers.
+//   b. C1 distinct-extruder trim: if more than `max_extruders` buckets survive the
+//      gate, rank them by (extruder present in `prev_kept` DESC, total path length
+//      DESC, extruder id ASC as the final deterministic tie-break) and merge every
+//      bucket past the top `max_extruders` into `merge_back_target`. This measures the
+//      TRUE per-layer cost - the number of DISTINCT matched extruders (support fills
+//      emit one path-group per extruder; run-boundary/switch counts are a red herring,
+//      support fills are one ExtrusionPath per LINE so boundary-crossing runs trip
+//      that counter constantly without costing an extra toolchange). Hysteresis:
+//      prev_kept membership outranks length outright (a short bucket this object kept
+//      last layer beats a longer bucket that's new this layer) - stability up the
+//      column is what stops the alternating-stripe artifact a whole-layer revert
+//      caused; length only breaks ties among buckets with the same prev_kept status.
+// The merge-back itself is the same ownership-transferring append(ExtrusionEntitiesPtr
+// &&) the old whole-layer revert used (role-preserving - every path already carries
+// its true source role from partition_support_entities' role-copy, never hardcoded),
+// just applied per-bucket instead of per-layer, so a partial-degradation layer keeps
+// its winning bucket(s) matched instead of falling back to fallback entirely. `map` is
+// left holding only the committed buckets - the caller moves it straight into
+// SupportLayer::interface_by_extruder.
+BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection>& map,
+                                  const std::set<unsigned>& prev_kept,
+                                  size_t max_extruders,
+                                  double min_len_mm,
+                                  ExtrusionEntityCollection& merge_back_target);
 } // namespace Slic3r
 #endif

@@ -2591,10 +2591,13 @@ static unsigned chameleon_object_default_extruder(const Print &print, const Prin
 // 1mm of a wall at its own layer matches that wall" anti-contamination rule). Both roles
 // are partitioned via two calls to the SAME partition_support_entities engine (T1) -
 // interfaces first (role_filter = erSupportMaterialInterface), then base (role_filter =
-// erSupportMaterial) - sharing ONE SupportLayer::interface_by_extruder map (T1 storage)
-// and ONE switch-count/cap budget per layer/object (order between the two calls only
-// matters for log/counter bookkeeping, not correctness: each call only ever touches
-// entities whose role() matches its own role_filter).
+// erSupportMaterial) - sharing ONE SupportLayer::interface_by_extruder map (T1 storage),
+// which v2.2 Task 1 then gates/trims as a whole via ONE apply_bucket_caps call per layer
+// (spec C1-C3: length-ranked distinct-extruder cap with hysteresis, NOT a switch-count
+// budget - see apply_bucket_caps' own doc comment in BrimFilament.hpp for the full
+// rationale; order between the two partition_support_entities calls only matters for
+// log/counter bookkeeping, not correctness: each call only ever touches entities whose
+// role() matches its own role_filter).
 //
 // Must run after generate_support_material has completed for every object - fresh or
 // copied from a shared/cached object - and before ToolOrdering/psWipeTower construction,
@@ -2669,16 +2672,26 @@ static void chameleon_assign_support_interfaces(Print &print)
         // ordinal as object_key, so BrimVoteParams::object_area's cross-object tie-break
         // (Part 1's multi-object plate scenario) never applies here.
 
-        size_t cumulative_switches = 0; // per-object escalation cap accounting (assigned layers only)
-        bool   escalated           = false;
+        // v2.2 Task 1 (spec C1-C3): this object's hysteresis state - the extruder set
+        // apply_bucket_caps committed on the PREVIOUS support layer that reached the
+        // engine calls. Empty at object start. Threaded through every iteration of the
+        // loop below; only the guards that `continue` BEFORE the engine calls (plate,
+        // already-visited, zero-sample) leave it unchanged - every layer that reaches
+        // apply_bucket_caps updates it unconditionally, even to empty.
+        std::set<unsigned> prev_kept;
         size_t layers_partitioned  = 0;
-        size_t layers_reverted     = 0;
         size_t layers_zero_sample  = 0;
-        // v2.1: switch-boundary tally contributed by the base (erSupportMaterial) call
-        // only, committed layers only (excludes reverted layers, same as
-        // cumulative_switches) - mirrors cumulative_switches' switch-boundary semantics
-        // (NOT a raw matched-run count). Summary log line addition per plan Task 3 item 3.
-        size_t base_runs_matched   = 0;
+        // v2.2 Task 1: replaces the old cumulative_switches/layers_reverted/escalated
+        // counters (deleted with the >3 whole-layer revert and >20 per-object
+        // escalation, C1-C2 - a switch-boundary tally never measured the real per-layer
+        // cost). These count actual apply_bucket_caps outcomes instead.
+        size_t buckets_dropped_min_benefit = 0; // C3 gate: bucket total length < 40mm
+        size_t buckets_trimmed_cap         = 0; // C1 trim: bucket ranked below the top 2
+        // Raw matched-run counts (NOT switch-boundary/cap accounting - purely
+        // informational, mirrors partition_support_entities' own return value) per
+        // role, summed across every layer that reached the engine calls.
+        size_t interface_runs_matched = 0;
+        size_t base_runs_matched      = 0;
 
         for (SupportLayer *support_layer : object->support_layers()) {
             if (support_layer == nullptr || support_layer->support_fills.entities.empty())
@@ -2695,23 +2708,15 @@ static void chameleon_assign_support_interfaces(Print &print)
             // support_fills still carries that run's mutations: matched originals deleted,
             // fallback-voted runs re-inserted/re-split at vote boundaries). Re-voting
             // those already-mutated runs is not idempotent: the re-split resamples from a
-            // different phase and can report switches <= 3 even though pass 1 reverted
-            // (defeating both caps), or come back non-empty and overwrite
-            // interface_by_extruder outright, silently dropping pass 1's matched geometry
-            // (it lives nowhere else - removed from support_fills by design). Skip
-            // unconditionally instead of re-running.
+            // different phase and can report shorter/fewer per-bucket runs than pass 1
+            // really found even though pass 1's apply_bucket_caps already merged the
+            // excess back (defeating its length ranking - see the "re-run undercounts"
+            // unit test's own comment for the mechanism), or come back non-empty and
+            // overwrite interface_by_extruder outright, silently dropping pass 1's
+            // matched geometry (it lives nowhere else - removed from support_fills by
+            // design). Skip unconditionally instead of re-running.
             if (support_layer->chameleon_interface_visited)
                 continue;
-            if (escalated) {
-                // Per-object cap already exceeded this run: remaining layers keep
-                // fallback, but still must be marked visited so a later run (or an
-                // aliased copy processed after this one) doesn't attempt to partition a
-                // layer this run deliberately left alone - that would make the result
-                // depend on which run/copy touches the layer first, the same
-                // determinism defect C1 flags for the mutated-support_fills case.
-                support_layer->chameleon_interface_visited = true;
-                continue;
-            }
 
             // (a) Projection band: same call as v2.0 (contact band, (support_top_z,
             // support_top_z + 2.0]) - now feeds chameleon_build_projection_views /
@@ -2753,7 +2758,9 @@ static void chameleon_assign_support_interfaces(Print &print)
                 // (no coplanar wall samples) -> both roles' resolvers would trivially
                 // return their own fallback for every sample; skip the (pointless) engine
                 // calls and keep the whole layer on fallback, same as v2.0's zero-sample
-                // skip.
+                // skip. v2.2: this `continue` is BEFORE the engine calls, so it's one of
+                // the "layers that skip partitioning" the hysteresis contract (above)
+                // leaves prev_kept unchanged for.
                 ++layers_zero_sample;
                 support_layer->chameleon_interface_visited = true;
                 continue;
@@ -2822,51 +2829,58 @@ static void chameleon_assign_support_interfaces(Print &print)
             const size_t base_switches = partition_support_entities(support_layer->support_fills,
                 erSupportMaterial, base_fallback_extruder, base_resolver, vote_params, partitioned);
 
-            const size_t switches = interface_switches + base_switches;
+            interface_runs_matched += interface_switches;
+            base_runs_matched      += base_switches;
 
-            if (switches > 3) {
-                // Per-layer cap exceeded: revert. Both calls above already mutated
-                // support_fills in place (matched originals deleted, fallback-voted runs
-                // re-inserted); merge every non-fallback run back in too, regardless of
-                // which call (interface or base) produced it. This is role-agnostic and
-                // correct even though `partitioned` may now hold a mix of both roles
-                // (possibly merged into the SAME out[extruder] bucket, e.g. an interface
-                // run and a base run both matching extruder 2): append(ExtrusionEntitiesPtr&&)
-                // just transfers ownership of whatever ExtrusionPath objects are in each
-                // bucket, and every one of those paths already carries its true source
-                // role via partition_support_entities' role-copy (Task 1: `source ?
-                // source->role() : entity.role()`), never a hardcoded role. So the layer
-                // ends up printing exactly as if the pass had left it alone (whole-layer
-                // fallback, both roles restored). Moves the pointers, leaves the source
-                // empty, so this cannot double-free.
-                for (auto &kv : partitioned)
-                    support_layer->support_fills.append(std::move(kv.second.entities));
-                support_layer->chameleon_interface_visited = true;
-                ++layers_reverted;
-                continue;
-            }
+            // v2.2 Task 1 (spec C1-C3): replaces the old ">3 switch-boundaries -> whole-
+            // layer revert" and ">20 cumulative -> per-object escalation" machinery
+            // (deleted entirely, C2). Support fills are one ExtrusionPath per LINE, so a
+            // switch-boundary count (interface_switches + base_switches above) trips on
+            // ordinary boundary-crossing runs and has nothing to do with the toolchange
+            // this layer actually pays for - the TRUE per-layer cost is the number of
+            // DISTINCT matched extruders. apply_bucket_caps measures that directly and
+            // degrades PARTIALLY instead of reverting the whole layer: it first gates
+            // any bucket whose total matched path length is under 40mm (C3 - a matched
+            // sliver isn't worth a toolchange/purge), then, only if more than 2
+            // extruders' worth of geometry survived the gate, trims to the 2 with the
+            // longest total length - preferring whichever extruder(s) this object's
+            // PREVIOUS support layer committed (`prev_kept`) outright over length (C1
+            // hysteresis: stability up the column, the fix for the alternating-stripe
+            // artifact a whole-layer revert caused). Every dropped/trimmed bucket's
+            // geometry is merged straight back into support_fills (fallback) via the
+            // same ownership-transferring append(ExtrusionEntitiesPtr&&) the old revert
+            // used, just applied per-bucket instead of per-layer - each path still
+            // carries its true source role, so nothing is lost or mis-painted.
+            BucketCapResult cap_result = apply_bucket_caps(partitioned, prev_kept,
+                /*max_extruders=*/2, /*min_len_mm=*/40.0, support_layer->support_fills);
+            buckets_dropped_min_benefit += cap_result.buckets_dropped_min_benefit;
+            buckets_trimmed_cap         += cap_result.buckets_trimmed_cap;
 
             if (!partitioned.empty()) {
                 support_layer->interface_by_extruder = std::move(partitioned);
-                cumulative_switches += switches;
-                base_runs_matched   += base_switches;
                 ++layers_partitioned;
-                if (cumulative_switches > 20)
-                    escalated = true; // remaining layers of this object skip partition
             }
-            // else: fast path, every entity of both roles voted fallback uniformly -
-            // support_fills is already untouched and interface_by_extruder stays empty
-            // (nothing to do).
+            // else: either the uniform-fallback fast path (every entity of both roles
+            // voted fallback uniformly - support_fills untouched, nothing to gate/trim)
+            // or every matched bucket was gated/trimmed away by apply_bucket_caps
+            // (support_fills already holds that geometry back); interface_by_extruder
+            // stays empty either way.
+
+            // Hysteresis (C1): this layer reached the engine calls, so its committed
+            // set - possibly empty - unconditionally becomes prev_kept for the next
+            // layer. Only the guards ABOVE this point (plate/visited/zero-sample, all of
+            // which `continue` before ever reaching here) leave prev_kept unchanged.
+            prev_kept = std::move(cap_result.kept);
             support_layer->chameleon_interface_visited = true;
         }
 
         BOOST_LOG_TRIVIAL(info) << "Chameleon support match: object ordinal " << obj_idx
             << " layers_partitioned=" << layers_partitioned
-            << " layers_reverted_cap=" << layers_reverted
             << " layers_zero_sample=" << layers_zero_sample
-            << " cumulative_switches=" << cumulative_switches
-            << " base_runs_matched=" << base_runs_matched
-            << (escalated ? " escalated_over_20" : "");
+            << " buckets_dropped_min_benefit=" << buckets_dropped_min_benefit
+            << " buckets_trimmed_cap=" << buckets_trimmed_cap
+            << " interface_runs_matched=" << interface_runs_matched
+            << " base_runs_matched=" << base_runs_matched;
     }
 }
 
