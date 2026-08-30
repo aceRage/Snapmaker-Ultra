@@ -447,15 +447,18 @@ std::vector<size_t> select_contact_layers(const std::vector<double> &print_zs,
 }
 
 std::vector<size_t> select_layers_overlapping_span(const std::vector<double> &print_zs,
-                                                     double lo_z, double hi_z)
+                                                     double lo_z, double hi_z,
+                                                     double first_bottom_z)
 {
     // Two half-open intervals (a, b] and (c, d] overlap iff a < d && c < b. Here layer
     // i's own interval is (bottom, print_zs[i]] with bottom carried forward from the
-    // previous iteration (0.0 for i == 0), and the band is (lo_z, hi_z] - so keep layer
-    // i when bottom < hi_z && lo_z < print_zs[i], EPSILON-padded the same way
+    // previous iteration (first_bottom_z for i == 0 - callers with a raft must pass the
+    // first layer's true bottom, else raft-level bands falsely overlap layer 0's span,
+    // re-review finding N2), and the band is (lo_z, hi_z] - so keep layer i when
+    // bottom < hi_z && lo_z < print_zs[i], EPSILON-padded the same way
     // select_layers_in_band pads its own top-z comparison.
     std::vector<size_t> result;
-    double bottom = 0.0;
+    double bottom = first_bottom_z;
     for (size_t i = 0; i < print_zs.size(); ++i) {
         const double top = print_zs[i];
         if (top > lo_z + EPSILON && bottom < hi_z - EPSILON)

@@ -2736,7 +2736,11 @@ static void chameleon_assign_support_interfaces(Print &print)
             // deliberately left as-is: its 2.0mm width is wider than any single layer,
             // so the top-z deviation the v2.0 review accepted for it still holds.
             std::vector<size_t> coplanar_idx = select_layers_overlapping_span(
-                layer_print_zs, support_layer->print_z - support_layer->height, support_layer->print_z);
+                layer_print_zs, support_layer->print_z - support_layer->height, support_layer->print_z,
+                // Raft-aware first-layer bottom (re-review N2): with a raft the object's
+                // first layer starts well above the plate, and raft-level support layers
+                // must not coplanar-match layer 0's walls.
+                object->layers().front()->print_z - object->layers().front()->height);
 
             WallSampleIndex coplanar_wall_idx;
             for (size_t li : coplanar_idx)

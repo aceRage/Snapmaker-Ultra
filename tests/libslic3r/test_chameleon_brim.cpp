@@ -318,22 +318,23 @@ TEST_CASE("brim_vote max_dist_mm default 0 is uncapped (Part 1 brim path unchang
 TEST_CASE("brim_vote max_dist_mm cap filters the WHOLE electorate, not just the nearest sample (I1)", "[chameleon]")
 {
     // v2.1 final-review I1: a denser cluster of samples just beyond the cap must not be
-    // able to outvote a single sample inside the cap. Nearest sample (extruder 1) sits
-    // 0.9mm away, inside the 1.0mm cap; two samples of extruder 2 sit 1.1mm away, just
-    // beyond it. Pre-fix, only knn_result.front() (the 0.9mm sample) was checked against
-    // the cap, then scoring ran over all k=3 samples: extruder 2's two 1/d^2 votes
-    // (2 / 1.1^2 ~= 1.65) outscored extruder 1's one vote (1 / 0.9^2 ~= 1.23), so the
-    // wall BEYOND the cap won - exactly the "beyond-cap wall wins" defect the review
-    // hand-executed. Post-fix, the two 1.1mm samples are erased from the electorate
-    // before scoring, so only the in-cap extruder 1 sample can vote.
+    // able to outvote a single sample inside the cap. The in-cap sample deliberately
+    // carries the HIGHER extruder id (2): with the beyond-cap cluster (extruder 1) in
+    // the electorate, the score gap (2/1.1^2 ~= 1.65 vs 1/0.9^2 ~= 1.23, within 30%)
+    // plus the 0.2mm nearest-distance gap (< 0.3mm) sends the pre-fix code down the tie
+    // path, whose empty-object_area fallback picks min(extruder id) = 1 - the beyond-cap
+    // wall. Post-fix, the two 1.1mm samples are erased from the electorate before any
+    // scoring or tie-breaking, so only in-cap extruder 2 can win. (With the ids the
+    // other way round the tie path would coincidentally return the right answer and the
+    // test could not fail pre-fix - re-review finding N1.)
     WallSampleIndex idx;
-    idx.add_polyline(segment(0, 0.9, 0, 0.9), 1, 1);     // extruder 1 @ 0.9mm - inside cap
-    idx.add_polyline(segment(1.1, 0, 1.1, 0), 2, 2);     // extruder 2 @ 1.1mm - outside cap
-    idx.add_polyline(segment(-1.1, 0, -1.1, 0), 2, 3);   // extruder 2 @ 1.1mm - outside cap (denser cluster)
+    idx.add_polyline(segment(0, 0.9, 0, 0.9), 2, 1);     // extruder 2 @ 0.9mm - inside cap
+    idx.add_polyline(segment(1.1, 0, 1.1, 0), 1, 2);     // extruder 1 @ 1.1mm - outside cap
+    idx.add_polyline(segment(-1.1, 0, -1.1, 0), 1, 3);   // extruder 1 @ 1.1mm - outside cap (denser cluster)
     BrimVoteParams p;
     p.fallback_extruder = 9;
     p.max_dist_mm = 1.0;
-    CHECK(brim_vote(idx, Point(0, 0), p) == 1);
+    CHECK(brim_vote(idx, Point(0, 0), p) == 2);
 }
 
 TEST_CASE("split_polyline_by_resolver produces runs matching a synthetic resolver", "[chameleon]")
@@ -499,6 +500,24 @@ TEST_CASE("select_layers_overlapping_span finds a straddling layer that select_l
     auto wide_old = select_layers_in_band(zs, 9.5, 10.6);
     auto wide_new = select_layers_overlapping_span(zs, 9.5, 10.6);
     CHECK(wide_old == wide_new);
+}
+
+TEST_CASE("select_layers_overlapping_span raft-aware first bottom (N2)", "[chameleon]")
+{
+    // Re-review N2: with a raft, the object's first layer starts well above the plate.
+    // First layer spans (0.9, 1.1] (raft below it); a raft-level band (0.1, 0.3] must
+    // NOT match it. The default first_bottom_z = 0.0 wrongly treats layer 0 as spanning
+    // (0.0, 1.1] and matches.
+    std::vector<double> zs = {1.1, 1.3};
+    auto wrong = select_layers_overlapping_span(zs, 0.1, 0.3);
+    REQUIRE(wrong.size() == 1);           // documents the default-parameter hazard
+    CHECK(wrong[0] == 0);
+    auto raft_aware = select_layers_overlapping_span(zs, 0.1, 0.3, 0.9);
+    CHECK(raft_aware.empty());
+    // A band genuinely overlapping the first layer still matches with the true bottom.
+    auto touching = select_layers_overlapping_span(zs, 0.85, 1.0, 0.9);
+    REQUIRE(touching.size() == 1);
+    CHECK(touching[0] == 0);
 }
 
 // --- v2.1 Task 2: projection resolver pure geometric core -------------------

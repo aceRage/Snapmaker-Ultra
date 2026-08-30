@@ -76,11 +76,13 @@ std::vector<size_t> select_contact_layers(const std::vector<double>& print_zs,
 // band at this z even though its own top lies above it (unsynced support/object layer
 // grids, variable layer height) - is missed. This selects by z-INTERVAL overlap
 // instead: layer i spans (bottom_i, print_zs[i]], where bottom_i is the previous
-// layer's top (0.0 for i == 0, since the object's first layer always starts at the
-// build plate) - already recoverable from `print_zs` alone, no extra parameter needed.
-// Layer i is selected when that interval overlaps (lo_z, hi_z].
+// layer's top; for i == 0 it is `first_bottom_z` (default 0.0 = plate). Raft prints
+// elevate the first layer, so raft-aware callers pass its true bottom
+// (first print_z - first height), else raft-level bands falsely overlap layer 0's span
+// (re-review N2). Layer i is selected when that interval overlaps (lo_z, hi_z].
 std::vector<size_t> select_layers_overlapping_span(const std::vector<double>& print_zs,
-                                                    double lo_z, double hi_z);
+                                                    double lo_z, double hi_z,
+                                                    double first_bottom_z = 0.0);
 
 // v2.1 Task 2 (projection resolver): pure geometric core of Print.cpp's
 // chameleon_projection_extruder_from_view (fed by chameleon_build_projection_views;
