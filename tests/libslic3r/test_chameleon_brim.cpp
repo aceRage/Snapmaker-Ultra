@@ -221,3 +221,70 @@ TEST_CASE("partition_support_interfaces uniform-fallback fast path keeps entitie
     CHECK(out.empty());
     CHECK(fills.entities.size() == before);          // untouched (off-parity)
 }
+
+// C1: chameleon_assign_support_interfaces (Print.cpp) is not idempotent when it
+// re-runs partition_support_interfaces over already-partitioned support_fills - the
+// scenario a shared-object copy (aliasing the same SupportLayer*) or a stale
+// posSupportMaterial re-run produces without the Print.cpp-side
+// chameleon_interface_visited guard. That guard is orchestration-level and not
+// reachable from this engine-only fixture (no Print/PrintObject/SupportLayer here -
+// see the fix-wave report for the hand-walked trace through Print.cpp). What IS
+// reachable via the public engine API is the underlying mechanism the review calls
+// out as deterministic: partition_support_interfaces mutates support_fills in place
+// (matched originals deleted, fallback-voted runs re-inserted pre-split at vote
+// boundaries with a boundary vertex borrowed from the adjacent run - see
+// split_polyline_by_vote's continuity fix). Re-running the SAME pass on that
+// already-split output re-samples each fragment from its own start: the one
+// borrowed boundary point is a single 0mm-long "run" that absorb_short_runs
+// (min_run_mm=2.0 default) always folds into its neighbour's majority vote before
+// switch_boundaries is computed - so every fragment re-splits to runs.size()==1 and
+// contributes 0 switches, even the ones that get sent to a foreign extruder's bucket.
+static ExtrusionEntityCollection three_zone_interface_fill()
+{
+    ExtrusionEntityCollection c;
+    auto* p = new ExtrusionPath(erSupportMaterialInterface, 1.0, 0.4f, 0.2f);
+    p->polyline = Polyline({Point(scale_(0), scale_(5)), Point(scale_(45), scale_(5))});
+    c.entities.push_back(p);
+    return c;
+}
+
+TEST_CASE("partition_support_interfaces re-run on its own output undercounts switches (C1)", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 10, 6), 0, 1);   // zone A: fallback extruder 0
+    idx.add_polyline(segment(15, 6, 30, 6), 1, 2);  // zone B: foreign extruder 1 (wide -> unambiguous interior)
+    idx.add_polyline(segment(35, 6, 45, 6), 0, 3);  // zone C: fallback extruder 0
+    BrimVoteParams p; p.fallback_extruder = 0;
+
+    auto fills = three_zone_interface_fill();
+    std::map<unsigned, ExtrusionEntityCollection> out1;
+    const size_t switches1 = partition_support_interfaces(fills, 0, idx, p, out1);
+
+    // Pass 1: three zones -> three runs (0,1,0) -> 2 switch boundaries, and the
+    // middle (foreign) run lands in out1[1]. This is the real, correct result.
+    CHECK(switches1 > 0);
+    REQUIRE(out1.count(1) == 1);
+    CHECK(!out1.at(1).entities.empty());
+
+    // Mirror Print.cpp's cap-revert merge-back (Print.cpp:2516-2519): fold the
+    // out-of-fallback runs back into support_fills, leaving it holding all three
+    // pre-split runs as separate entities - exactly what either trigger in C1
+    // (aliased shared-object copy, or a stale posSupportMaterial re-run) hands the
+    // pass on its second visit to this layer.
+    fills.append(std::move(out1.at(1).entities));
+
+    std::map<unsigned, ExtrusionEntityCollection> out2;
+    const size_t switches2 = partition_support_interfaces(fills, 0, idx, p, out2);
+
+    // Pass 2 re-votes each already-split fragment independently and reports FEWER
+    // switches than pass 1 found for the identical geometry - the per-layer/
+    // per-object switch caps (Print.cpp's ">3" and ">20" guards) would see this
+    // second run as cheaper than it really is ("the reverted layer is partitioned
+    // after all, with the per-layer cap counting 0" - final-review.md C1).
+    CHECK(switches2 < switches1);
+    // The undercounting is not from the geometry becoming inert: the middle zone's
+    // material is still (correctly) matched to the foreign extruder on pass 2 - the
+    // switch that causes is simply no longer reflected in the cap accounting.
+    REQUIRE(out2.count(1) == 1);
+    CHECK(!out2.at(1).entities.empty());
+}

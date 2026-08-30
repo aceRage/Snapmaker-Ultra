@@ -6391,11 +6391,60 @@ LayerResult GCode::process_layer(const Print& print,
             if (it == sl.interface_by_extruder.end() || it->second.entities.empty())
                 continue;
             const PrintObject& obj  = *ltp.original_object;
+            // I1 fix: apply this object's config before extruding its matched interface
+            // partitions, mirroring the normal per-instance path (~6487:
+            // m_config.apply(instance_to_print.print_object.config(), true) before support
+            // extrusion). Without this, support_interface_speed/accel etc. resolve from
+            // whatever object's config m_config last saw (a previous object on this layer,
+            // or a previous layer's object), not this partition's own object.
+            m_config.apply(obj.config(), true);
             m_layer                  = ltp.support_layer;
             m_object_layer_over_raft = false;
             for (const PrintInstance& instance : obj.instances()) {
                 this->set_origin(unscale(instance.shift));
+                // I2 fix: wrap this instance's partition extrusions in the same
+                // exclude-object (M624/M625, EXCLUDE_OBJECT_*, M486) label machinery the
+                // normal per-instance loop uses (~6493-6513 start / ~6648-6667 end), so
+                // firmware skip-object suppresses matched interface for an excluded
+                // instance instead of extruding it into the void left by its skipped
+                // supports. Part 1's brim block shares this gap but is layer-0-only
+                // (out of scope here); this block runs on every layer.
+                if (m_enable_exclude_object) {
+                    if (is_BBL_Printer()) {
+                        m_writer.set_object_start_str(std::string("; start printing object, unique label id: ") +
+                                                      std::to_string(instance.model_instance->get_labeled_id()) + "\n" + "M624 " +
+                                                      _encode_label_ids_to_base64({instance.model_instance->get_labeled_id()}) + "\n");
+                    } else {
+                        const auto gflavor = print.config().gcode_flavor.value;
+                        if (gflavor == gcfKlipper) {
+                            m_writer.set_object_start_str(std::string("EXCLUDE_OBJECT_START NAME=") +
+                                                          get_instance_name(&obj, instance) + "\n");
+                        } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
+                            m_writer.set_object_start_str(std::string("M486 S") + std::to_string(instance.unique_id) + "\n");
+                        }
+                    }
+                }
+
                 gcode += this->extrude_support(it->second, erSupportMaterialInterface);
+
+                // Don't set m_gcode_label_objects_end if the start string never got
+                // consumed (nothing was extruded for this instance's partition).
+                if (!m_writer.is_object_start_str_empty()) {
+                    m_writer.set_object_start_str("");
+                } else if (m_enable_exclude_object) {
+                    if (is_BBL_Printer()) {
+                        m_writer.set_object_end_str(std::string("; stop printing object, unique label id: ") +
+                                                    std::to_string(instance.model_instance->get_labeled_id()) + "\n" + "M625\n");
+                    } else {
+                        const auto gflavor = print.config().gcode_flavor.value;
+                        if (gflavor == gcfKlipper) {
+                            m_writer.set_object_end_str(std::string("EXCLUDE_OBJECT_END NAME=") +
+                                                        get_instance_name(&obj, instance) + "\n");
+                        } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
+                            m_writer.set_object_end_str(std::string("M486 S-1\n"));
+                        }
+                    }
+                }
             }
         }
 

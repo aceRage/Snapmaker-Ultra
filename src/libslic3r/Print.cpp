@@ -2445,6 +2445,17 @@ static void chameleon_assign_support_interfaces(Print &print)
             continue;
         if (object->layers().empty() || object->support_layers().empty())
             continue;
+        // C1 fix, guard (a): a shared-object copy's support_layers() aliases the SAME
+        // SupportLayer* vector as the object it was copied from (copy_layers_from_shared_object,
+        // Print.cpp: m_support_layers = m_shared_object->support_layers()). The shared
+        // source object is processed earlier in this same loop (need_slicing_objects are
+        // sliced/support-generated before any copy resolves its shared_object, and
+        // Print::process's copy_layers_from_shared_object loop runs before this pass), so
+        // its layers are already partitioned/marked by the time we would reach this copy.
+        // Skip it outright: cheap, and avoids re-walking every layer only to hit the
+        // per-layer chameleon_interface_visited guard below on each one.
+        if (object->get_shared_object() != nullptr)
+            continue;
 
         const unsigned object_default_extruder = chameleon_object_default_extruder(print, *object);
         // Spec-mandated fallback: the object's resolved interface extruder, mirroring
@@ -2482,12 +2493,36 @@ static void chameleon_assign_support_interfaces(Print &print)
             // keeps the fallback extruder - never split its plate adhesion.
             if (support_layer->print_z <= first_layer_top_z + EPSILON)
                 continue;
-            if (escalated)
-                continue; // per-object cap already exceeded; remaining layers keep fallback
+            // C1 fix, guard (b): this layer was already visited by an earlier pass over
+            // the SAME SupportLayer object - either the shared source this object's copy
+            // aliases (belt-and-suspenders backstop for guard (a) above, in case that
+            // ordering assumption is ever violated by a future refactor), or an earlier
+            // Print::process() run whose posSupportMaterial fast-pathed to done (so
+            // support_fills still carries that run's mutations: matched originals deleted,
+            // fallback-voted runs re-inserted/re-split at vote boundaries). Re-voting
+            // those already-mutated runs is not idempotent: the re-split resamples from a
+            // different phase and can report switches <= 3 even though pass 1 reverted
+            // (defeating both caps), or come back non-empty and overwrite
+            // interface_by_extruder outright, silently dropping pass 1's matched geometry
+            // (it lives nowhere else - removed from support_fills by design). Skip
+            // unconditionally instead of re-running.
+            if (support_layer->chameleon_interface_visited)
+                continue;
+            if (escalated) {
+                // Per-object cap already exceeded this run: remaining layers keep
+                // fallback, but still must be marked visited so a later run (or an
+                // aliased copy processed after this one) doesn't attempt to partition a
+                // layer this run deliberately left alone - that would make the result
+                // depend on which run/copy touches the layer first, the same
+                // determinism defect C1 flags for the mutated-support_fills case.
+                support_layer->chameleon_interface_visited = true;
+                continue;
+            }
 
             std::vector<size_t> contact_idx = select_contact_layers(layer_print_zs, support_layer->print_z, 2.0);
             if (contact_idx.empty()) {
                 ++layers_zero_sample;
+                support_layer->chameleon_interface_visited = true;
                 continue; // no object layers in the contact band -> keep fallback
             }
 
@@ -2499,6 +2534,7 @@ static void chameleon_assign_support_interfaces(Print &print)
 
             if (wall_idx.empty()) {
                 ++layers_zero_sample;
+                support_layer->chameleon_interface_visited = true;
                 continue; // contact layers contributed no wall samples -> keep fallback
             }
 
@@ -2515,6 +2551,7 @@ static void chameleon_assign_support_interfaces(Print &print)
                 // pointers, leaves the source empty), so this cannot double-free.
                 for (auto &kv : partitioned)
                     support_layer->support_fills.append(std::move(kv.second.entities));
+                support_layer->chameleon_interface_visited = true;
                 ++layers_reverted;
                 continue;
             }
@@ -2528,6 +2565,7 @@ static void chameleon_assign_support_interfaces(Print &print)
             }
             // else: fast path, every entity voted fallback uniformly - support_fills is
             // already untouched and interface_by_extruder stays empty (nothing to do).
+            support_layer->chameleon_interface_visited = true;
         }
 
         BOOST_LOG_TRIVIAL(info) << "Chameleon support-interface match: object ordinal " << obj_idx
