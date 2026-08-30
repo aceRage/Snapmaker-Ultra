@@ -147,7 +147,7 @@ public:
         : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(12, -1))
     {
         SetBackgroundStyle(wxBG_STYLE_PAINT);
-        SetBackgroundColour(wxColour(0x11, 0x11, 0x11));
+        SetBackgroundColour(wxColour(0x11, 0x11, 0x11)); // keep in sync with CompareCanvas.cpp colors
         SetMinSize(wxSize(12, -1));
         Bind(wxEVT_PAINT, &LayerTickStrip::on_paint, this);
     }
@@ -162,7 +162,7 @@ private:
     void on_paint(wxPaintEvent&)
     {
         wxAutoBufferedPaintDC dc(this);
-        dc.SetBackground(wxBrush(wxColour(0x11, 0x11, 0x11)));
+        dc.SetBackground(wxBrush(wxColour(0x11, 0x11, 0x11))); // keep in sync with CompareCanvas.cpp colors
         dc.Clear();
 
         const int n = static_cast<int>(m_rows.size());
@@ -175,9 +175,9 @@ private:
 
             wxColour colour;
             if (row.zkey_a >= 0 && row.zkey_b >= 0 && row.changed)
-                colour = wxColour(0xC6, 0x28, 0x28); // changed
+                colour = wxColour(0xC6, 0x28, 0x28); // changed -- keep in sync with CompareCanvas.cpp colors
             else if (row.zkey_a < 0 || row.zkey_b < 0)
-                colour = wxColour(0x9E, 0x9E, 0x9E); // unmatched (a_only/b_only)
+                colour = wxColour(0x9E, 0x9E, 0x9E); // unmatched (a_only/b_only) -- keep in sync with CompareCanvas.cpp colors
             else
                 continue; // matched + unchanged: no tick
 
@@ -201,6 +201,10 @@ void open_slice_compare_frame(wxWindow* parent, bool preselect_last_two)
     } else {
         g_instance->Raise();
         g_instance->SetFocus();
+        // Snapshots sliced while the frame was already open otherwise
+        // wouldn't show up in the pickers until it was closed and reopened;
+        // preserves the current A/B selection by identity (see rebuild_pickers()).
+        g_instance->rebuild_pickers();
     }
 
     if (preselect_last_two)
@@ -242,6 +246,13 @@ void SliceCompareFrame::build_ui()
     top_row->Add(m_pick_b, 1, wxALIGN_CENTER_VERTICAL);
 
     main_sizer->Add(top_row, 0, wxEXPAND | wxALL, 10);
+
+    // Guard: nudge the user toward slicing/browsing when there aren't
+    // enough session snapshots to pick two from yet. Visibility is toggled
+    // in rebuild_pickers(); hidden by default until that first runs.
+    m_session_hint = new wxStaticText(this, wxID_ANY, _L("Slice something (or Browse…) to compare"));
+    m_session_hint->SetForegroundColour(wxColour(128, 128, 128));
+    main_sizer->Add(m_session_hint, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
 
     // Header strip: est time / filament / layers / max speed, "A -> B (delta)".
     wxFlexGridSizer* header_grid = new wxFlexGridSizer(4, 2, 4, 10);
@@ -315,6 +326,10 @@ void SliceCompareFrame::build_ui()
     m_jump_btn->Enable(false);
     slider_col->Add(m_jump_btn, 0, wxEXPAND | wxTOP, 6);
 
+    m_side_by_side_btn = new wxToggleButton(this, wxID_ANY, _L("Side by side"));
+    m_side_by_side_btn->SetToolTip(_L("Show A and B in separate panes instead of overlaid"));
+    slider_col->Add(m_side_by_side_btn, 0, wxEXPAND | wxTOP, 6);
+
     canvas_row->Add(slider_col, 0, wxEXPAND | wxLEFT, 8);
     canvas_col->Add(canvas_row, 1, wxEXPAND);
 
@@ -338,6 +353,9 @@ void SliceCompareFrame::build_ui()
     });
     m_layer_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) { select_layer_row(m_layer_slider->GetValue()); });
     m_jump_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { jump_to_biggest_change(); });
+    m_side_by_side_btn->Bind(wxEVT_TOGGLEBUTTON, [this](wxCommandEvent&) {
+        m_canvas->set_side_by_side(m_side_by_side_btn->GetValue());
+    });
 
     wxGetApp().UpdateDVCDarkUI(m_cfg_table);
     wxGetApp().UpdateDVCDarkUI(m_feat_table);
@@ -360,6 +378,21 @@ void SliceCompareFrame::rebuild_pickers()
     fill(m_pick_b);
     m_pick_a_prev_sel = wxNOT_FOUND;
     m_pick_b_prev_sel = wxNOT_FOUND;
+
+    // Re-raising an already-open frame calls this again (see
+    // open_slice_compare_frame() below): keep whatever A/B was already
+    // selected, matched back onto the freshly-rebuilt lists by store id/
+    // pointer identity (sync_choice_selection re-inserts file-loaded
+    // snapshots that aren't store-backed). A no-op when m_a/m_b are null or
+    // the entry was evicted in the meantime.
+    sync_choice_selection(m_pick_a, m_a, m_pick_a_prev_sel);
+    sync_choice_selection(m_pick_b, m_b, m_pick_b_prev_sel);
+
+    // Guard: with fewer than two session snapshots, the pickers can't offer
+    // two to compare from the store alone -- nudge toward slicing/Browse.
+    const bool few_snapshots = SliceCompare::SnapshotStore::instance().list().size() < 2;
+    m_session_hint->Show(few_snapshots);
+    Layout();
 }
 
 void SliceCompareFrame::on_choice_changed(wxChoice* choice, std::shared_ptr<const SliceCompare::Snapshot>& target, int& prev_selection)
@@ -399,11 +432,24 @@ void SliceCompareFrame::on_choice_changed(wxChoice* choice, std::shared_ptr<cons
         choice->Insert(snapshot_label(*snap), insert_pos, new_data);
         choice->SetSelection(static_cast<int>(insert_pos));
         prev_selection = static_cast<int>(insert_pos);
+        // Defensive: drop the canvas's raw LayerRec* pointers before `target`
+        // (an m_a/m_b shared_ptr) is reassigned below -- if it held the last
+        // reference to the old Snapshot, that reassignment can free the
+        // layers it points into before recompute() gets a chance to hand
+        // the canvas fresh ones.
+        m_canvas->set_layers(nullptr, nullptr);
         target = snap;
         recompute();
         return;
     }
 
+    // Same defensive ordering as above: null out the canvas's pointers into
+    // the outgoing snapshot before `target` can evict it (e.g. picking a
+    // still-valid entry while the previously-selected one has since been
+    // evicted from the SnapshotStore -- get() already null-guards that case
+    // downstream in recompute(), but the canvas mustn't hold stale pointers
+    // in between).
+    m_canvas->set_layers(nullptr, nullptr);
     if (data->store_id == 0)
         target = data->file_snapshot;
     else

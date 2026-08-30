@@ -9,6 +9,7 @@
 #include <wx/notebook.h>
 #include <wx/dataview.h>
 #include <wx/slider.h>
+#include <wx/tglbtn.h>
 
 #include <memory>
 
@@ -36,9 +37,16 @@ public:
     // exist. No-op otherwise.
     void preselect_last_two();
 
+    // Rebuilds the SnapshotStore-backed picker entries ("Browse..." entry
+    // always trails) and re-syncs the current A/B selection back onto the
+    // freshly-built lists by identity where it still exists. Public so
+    // open_slice_compare_frame() can refresh an already-open frame's
+    // pickers when raising it (snapshots sliced while it was open otherwise
+    // wouldn't show up until it was closed and reopened).
+    void rebuild_pickers();
+
 private:
     void build_ui();
-    void rebuild_pickers();  // SnapshotStore list + "Browse..." entries
     void recompute();        // runs diff_configs/diff_features, fills header+tables
     void update_header();
 
@@ -70,6 +78,10 @@ private:
     wxChoice* m_pick_b = nullptr;
     wxButton* m_swap_btn = nullptr;
 
+    // Shown only while the SnapshotStore has fewer than two session
+    // snapshots to pick from (see rebuild_pickers()).
+    wxStaticText* m_session_hint = nullptr;
+
     wxStaticText* m_header_time = nullptr;
     wxStaticText* m_header_filament = nullptr;
     wxStaticText* m_header_layers = nullptr;
@@ -84,6 +96,7 @@ private:
     wxPanel*       m_layer_tick_strip = nullptr; // custom-painted; see LayerTickStrip in the .cpp
     wxStaticText*  m_layer_z_label = nullptr;
     wxButton*      m_jump_btn = nullptr;
+    wxToggleButton* m_side_by_side_btn = nullptr;
     wxStaticText*  m_status_line = nullptr;
 
     SliceCompare::LayerDiff m_layer_diff;

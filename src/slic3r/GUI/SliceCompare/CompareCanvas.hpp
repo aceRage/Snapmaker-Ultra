@@ -31,9 +31,10 @@ public:
     // Recomputes the SegDiff for the new pair and repaints.
     void set_layers(const SliceCompare::LayerRec* a, const SliceCompare::LayerRec* b);
 
-    // Task 10: side-by-side split view. The flag is stored now; rendering
-    // still overlays A/B in the same viewport regardless of its value until
-    // Task 10 implements the split.
+    // Toggles between the overlay view (A/B superimposed, diff-classified
+    // colors) and the side-by-side split view (A left / B right, sharing
+    // scale/pan, each pane drawing only its own layer's raw geometry).
+    // Re-fits the view on toggle so the new layout starts well-framed.
     void set_side_by_side(bool on);
 
     // Rescales/recenters the view so the current layer(s)' content fills the
@@ -69,6 +70,18 @@ private:
     void draw_polylines(wxGraphicsContext* gc, const std::vector<Polyline>& polylines,
                          const wxColour& colour, double pen_width) const;
 
+    // Side-by-side mode: draws `polylines` (already world-space) clipped to
+    // the pane rect [pane_x0, pane_x0+pane_w) x [0, client height), shifted
+    // horizontally by x_shift screen px so the shared world->screen
+    // transform recenters this pane's content within its own half. Caption
+    // is drawn last, unclipped/untranslated, at the pane's top-left.
+    void draw_pane(wxGraphicsContext* gc, const std::vector<Polyline>& polylines,
+                   double pane_x0, double pane_w, double x_shift, const wxString& caption) const;
+
+    // Splits the client rect into A-left/B-right panes and draws each one's
+    // own raw segments (m_a_all/m_b_all) plus a divider between them.
+    void draw_side_by_side(wxGraphicsContext* gc) const;
+
     static std::vector<Polyline> merge_collinear(const std::vector<SliceCompare::Seg>& segs);
 
     const SliceCompare::LayerRec* m_a = nullptr; // not owned
@@ -76,8 +89,17 @@ private:
 
     std::vector<Polyline> m_both, m_jitter, m_a_only, m_b_only;
 
+    // Side-by-side mode only: each side's own raw segments, merged the same
+    // way as the overlay classes but with no diff classification -- feature-
+    // neutral, one color, since there's no "other side" in a single pane.
+    std::vector<Polyline> m_a_all, m_b_all;
+
     bool m_side_by_side    = false;
     bool m_view_initialized = false;
+
+    // Set once a paint takes longer than the 100ms budget, so the slow-paint
+    // warning below is logged only the first time it happens (not every frame).
+    bool m_logged_slow_paint = false;
 
     double          m_scale = 4.0;      // px per mm
     wxPoint2DDouble m_pan{0.0, 0.0};    // screen-space offset of the world origin

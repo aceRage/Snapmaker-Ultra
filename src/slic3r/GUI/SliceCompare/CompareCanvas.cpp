@@ -2,10 +2,15 @@
 
 #include "libslic3r/SliceCompare/Diff.hpp"
 
+#include "slic3r/GUI/I18N.hpp"
+
 #include <wx/dcbuffer.h>
 #include <wx/graphics.h>
 
+#include <boost/log/trivial.hpp>
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <memory>
 
@@ -24,8 +29,20 @@ const wxColour JITTER_COLOUR(0x2E, 0x7D, 0x32);
 const wxColour A_ONLY_COLOUR(0x15, 0x65, 0xC0);
 const wxColour B_ONLY_COLOUR(0xC6, 0x28, 0x28);
 
+// Side-by-side mode: each pane draws its own layer's raw segments feature-
+// neutral -- same gray as BOTH_COLOUR, but full alpha since there's no
+// underlying "match" to fade for (each pane shows exactly one side).
+const wxColour SIDE_BY_SIDE_COLOUR(0x9E, 0x9E, 0x9E);
+const wxColour PANE_CAPTION_COLOUR(0xC8, 0xC8, 0xC8);
+const wxColour PANE_DIVIDER_COLOUR(0x40, 0x40, 0x40);
+
 constexpr double PEN_WIDTH_MATCH = 1.0;
 constexpr double PEN_WIDTH_DIFF  = 2.0;
+
+// Paint-time guard (Task 10): a layer whose paint exceeds this is logged
+// once (not every frame) at debug level so slow dense-layer renders show up
+// in logs without spamming them.
+constexpr double SLOW_PAINT_BUDGET_MS = 100.0;
 
 } // anonymous namespace
 
@@ -55,8 +72,10 @@ void CompareCanvas::set_layers(const SliceCompare::LayerRec* a, const SliceCompa
 
 void CompareCanvas::set_side_by_side(bool on)
 {
-    m_side_by_side = on; // Task 10 wires this up to an actual split render.
-    Refresh();
+    if (m_side_by_side == on)
+        return;
+    m_side_by_side = on;
+    fit_view(); // re-fit for the new layout (each pane only gets half the width)
 }
 
 void CompareCanvas::rebuild_diff()
@@ -73,6 +92,11 @@ void CompareCanvas::rebuild_diff()
     m_jitter = merge_collinear(diff.jitter);
     m_a_only = merge_collinear(diff.a_only);
     m_b_only = merge_collinear(diff.b_only);
+
+    // Side-by-side mode draws each side's own raw segments independent of
+    // the overlay diff above (no red/blue classification in that mode).
+    m_a_all = m_a ? merge_collinear(m_a->segs) : std::vector<Polyline>();
+    m_b_all = m_b ? merge_collinear(m_b->segs) : std::vector<Polyline>();
 }
 
 bool CompareCanvas::compute_content_bbox(float& bx0, float& by0, float& bx1, float& by1) const
@@ -126,7 +150,12 @@ void CompareCanvas::fit_view()
     if (height < 1.0) height = 1.0;
 
     constexpr double MARGIN = 0.9; // small breathing room around the content
-    double scale = std::min(sz.GetWidth() / width, sz.GetHeight() / height) * MARGIN;
+    // In side-by-side mode each pane only occupies about half the client
+    // width (see draw_side_by_side()), so fit against that instead of the
+    // full canvas width -- otherwise content sized for a full-width overlay
+    // view would spill past its pane's clip rect.
+    const double fit_width = m_side_by_side ? std::max(1.0, (sz.GetWidth() - 2.0) / 2.0) : double(sz.GetWidth());
+    double scale = std::min(fit_width / width, sz.GetHeight() / height) * MARGIN;
     if (!(scale > 0.0) || !std::isfinite(scale))
         scale = 4.0;
     m_scale = scale;
@@ -210,6 +239,40 @@ void CompareCanvas::draw_polylines(wxGraphicsContext* gc, const std::vector<Poly
     }
 }
 
+void CompareCanvas::draw_pane(wxGraphicsContext* gc, const std::vector<Polyline>& polylines,
+                               double pane_x0, double pane_w, double x_shift, const wxString& caption) const
+{
+    gc->PushState();
+    gc->Clip(pane_x0, 0.0, pane_w, double(GetClientSize().GetHeight()));
+    gc->Translate(x_shift, 0.0);
+    draw_polylines(gc, polylines, SIDE_BY_SIDE_COLOUR, PEN_WIDTH_MATCH);
+    gc->PopState(); // restores both the clip and the translate
+
+    gc->SetFont(gc->CreateFont(GetFont(), PANE_CAPTION_COLOUR));
+    gc->DrawText(caption, pane_x0 + 6.0, 4.0);
+}
+
+void CompareCanvas::draw_side_by_side(wxGraphicsContext* gc) const
+{
+    const wxSize sz = GetClientSize();
+    constexpr double DIVIDER_WIDTH = 2.0;
+    const double pane_w   = std::max(1.0, (sz.GetWidth() - DIVIDER_WIDTH) / 2.0);
+    const double paneA_x0 = 0.0;
+    const double paneB_x0 = pane_w + DIVIDER_WIDTH;
+    const double full_centre = sz.GetWidth() * 0.5;
+
+    // Both panes share m_scale/m_pan (the world->screen transform computed
+    // for the full canvas); each pane's x_shift just recenters that same
+    // transform's output within its own half, so panning/zooming moves both
+    // panes together and A/B stay directly comparable.
+    draw_pane(gc, m_a_all, paneA_x0, pane_w, paneA_x0 + pane_w * 0.5 - full_centre, _L("A"));
+    draw_pane(gc, m_b_all, paneB_x0, pane_w, paneB_x0 + pane_w * 0.5 - full_centre, _L("B"));
+
+    gc->SetPen(gc->CreatePen(wxGraphicsPenInfo(PANE_DIVIDER_COLOUR, 1.0)));
+    const double divider_x = paneA_x0 + pane_w + DIVIDER_WIDTH * 0.5;
+    gc->StrokeLine(divider_x, 0.0, divider_x, double(sz.GetHeight()));
+}
+
 void CompareCanvas::on_paint(wxPaintEvent& /*evt*/)
 {
     wxAutoBufferedPaintDC dc(this); // unbuffered DC would flicker on repeated Refresh()
@@ -225,12 +288,27 @@ void CompareCanvas::on_paint(wxPaintEvent& /*evt*/)
 
     gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
 
-    // Draw order: both -> jitter -> a_only -> b_only, so the diffs that
-    // matter most stay on top of the (mostly unchanged) shared geometry.
-    draw_polylines(gc.get(), m_both,   BOTH_COLOUR,   PEN_WIDTH_MATCH);
-    draw_polylines(gc.get(), m_jitter, JITTER_COLOUR, PEN_WIDTH_MATCH);
-    draw_polylines(gc.get(), m_a_only, A_ONLY_COLOUR, PEN_WIDTH_DIFF);
-    draw_polylines(gc.get(), m_b_only, B_ONLY_COLOUR, PEN_WIDTH_DIFF);
+    const auto paint_start = std::chrono::steady_clock::now();
+
+    if (m_side_by_side) {
+        draw_side_by_side(gc.get());
+    } else {
+        // Draw order: both -> jitter -> a_only -> b_only, so the diffs that
+        // matter most stay on top of the (mostly unchanged) shared geometry.
+        draw_polylines(gc.get(), m_both,   BOTH_COLOUR,   PEN_WIDTH_MATCH);
+        draw_polylines(gc.get(), m_jitter, JITTER_COLOUR, PEN_WIDTH_MATCH);
+        draw_polylines(gc.get(), m_a_only, A_ONLY_COLOUR, PEN_WIDTH_DIFF);
+        draw_polylines(gc.get(), m_b_only, B_ONLY_COLOUR, PEN_WIDTH_DIFF);
+    }
+
+    const double paint_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - paint_start).count();
+    if (paint_ms > SLOW_PAINT_BUDGET_MS && !m_logged_slow_paint) {
+        m_logged_slow_paint = true;
+        BOOST_LOG_TRIVIAL(debug) << "CompareCanvas: layer paint took " << paint_ms
+                                  << "ms, exceeding the " << SLOW_PAINT_BUDGET_MS << "ms budget"
+                                  << " (dense layer? logged once)";
+    }
 }
 
 void CompareCanvas::on_mouse_wheel(wxMouseEvent& evt)
