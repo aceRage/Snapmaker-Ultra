@@ -6370,6 +6370,35 @@ LayerResult GCode::process_layer(const Print& print,
             }
         }
 
+        // Chameleon P2: print this extruder's matched support-interface partitions.
+        // MUST run after the toolchange gcode above (same reasoning as the brim block
+        // just above: this extruder isn't actually active/primed until gcode_toolchange
+        // has been appended, so emitting before it would extrude under the wrong tool).
+        // The Print.cpp partition pass (Task 2/3) REMOVES matched entities from
+        // support_fills - interface_by_extruder is the only place they still live, so
+        // this block is not optional: skipping it silently loses that geometry.
+        // Dedicated block, not routed through the (object, extruder) ObjectByExtruder
+        // support buckets built below (~5416-5423 in the support-collection pass): those
+        // buckets carry one scalar support_extrusion_role per (object, extruder) and would
+        // collide with per-partition emission here (documented Part 1 bucket-collision
+        // risk). Iterate `layers` in its existing run-stable order - mirrors the brim
+        // block's use of print.objects() order rather than any allocation-order map key.
+        for (const LayerToPrint& ltp : layers) {
+            if (ltp.support_layer == nullptr)
+                continue;
+            const SupportLayer& sl = *ltp.support_layer;
+            auto                 it = sl.interface_by_extruder.find(extruder_id);
+            if (it == sl.interface_by_extruder.end() || it->second.entities.empty())
+                continue;
+            const PrintObject& obj  = *ltp.original_object;
+            m_layer                  = ltp.support_layer;
+            m_object_layer_over_raft = false;
+            for (const PrintInstance& instance : obj.instances()) {
+                this->set_origin(unscale(instance.shift));
+                gcode += this->extrude_support(it->second, erSupportMaterialInterface);
+            }
+        }
+
         auto objects_by_extruder_it = by_extruder.find(extruder_id);
         if (objects_by_extruder_it == by_extruder.end())
             continue;
