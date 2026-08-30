@@ -25,6 +25,14 @@ struct BrimVoteParams {
     // the nearest knn sample is farther than this, brim_vote returns
     // fallback_extruder before scoring (v2.1 lateral-proximity rule).
     double max_dist_mm     = 0.0;
+    // v2.3 Task 1 (spec C3): the extruder set the PREVIOUS support layer committed
+    // (same value threaded into apply_bucket_caps' own prev_kept argument - see
+    // Print.cpp's chameleon_assign_support_interfaces, which keeps both in sync each
+    // layer). Default EMPTY, which makes every new branch that reads this a strict
+    // no-op: brim_vote's tie path and vote_collection_as_unit's majority-tie path both
+    // only special-case a NON-empty membership hit, so Part 1's brim call sites (which
+    // never set this) and every pre-v2.3 support caller see byte-identical behavior.
+    std::set<unsigned> prev_kept;
 };
 
 // Vote for one point. Deterministic. Returns extruder id.
@@ -315,11 +323,108 @@ struct BucketCapResult {
 // its winning bucket(s) matched instead of falling back to fallback entirely. `map` is
 // left holding only the committed buckets - the caller moves it straight into
 // SupportLayer::interface_by_extruder.
+// v2.3 Task 1 (spec C1): the "free extruder" table this task adds - one entry per
+// DISTINCT object-layer z across every object on the plate (EPSILON-merged: several
+// objects/layers that land on the "same" z, within float slicing noise, contribute to
+// ONE entry, their filament sets unioned rather than kept as separate near-duplicate
+// entries), ascending z, each entry holding the union of every wall/solid/sparse-
+// infill filament id (0-based) any object actually prints AT that z. A support layer
+// whose OWN z coincides with an entry gets that entry's set as its "free" extruders -
+// extruders already paying for a toolchange at that height anyway, so a support bucket
+// switching to one of them costs nothing extra (spec root cause 1's free-extruder
+// refinement). See chameleon_layer_free_extruders below for the per-support-layer
+// query side, and Print.cpp's chameleon_collect_layer_filaments for the once-per-pass
+// object/layer walk that builds the raw (z, extruder) samples this table is built
+// from - kept separate from that walk so the merge logic itself is a pure function,
+// testable without a Print/PrintObject scaffold.
+using LayerFilamentTable = std::vector<std::pair<double, std::set<unsigned>>>;
+
+// Pure merge step behind LayerFilamentTable: `raw` is unsorted and may repeat the same
+// z many times (one sample per wall/solid/sparse region per object-layer in practice -
+// the caller does no de-duplication of its own). Groups samples by z - EPSILON-
+// tolerant, the same float-noise tolerance select_layers_in_band/
+// select_layers_overlapping_span already use for their own top-z comparisons, since
+// independently sliced objects can land on the "same" nominal z with tiny float
+// differences - into ascending, duplicate-z-free entries whose set is the union of
+// every raw sample's extruder recorded at that z. `raw` is consumed by value (moved
+// from) since the caller's own copy is never needed again once this returns.
+LayerFilamentTable build_layer_filament_table(std::vector<std::pair<double, unsigned>> raw);
+
+// Pure query side of LayerFilamentTable: the union of every entry's set whose z lies
+// within EPSILON of `query_z` (a support layer's own print_z) - COINCIDENCE, not
+// nearest-neighbor: a query z with no matching entry (no object anywhere on the plate
+// has a layer at that height) returns an empty set - "not free" - rather than falling
+// back to the closest entry, since a support layer between two object layers isn't
+// actually sharing a toolchange with either one. `table` must already be ascending by
+// z (build_layer_filament_table's own contract) - this does a binary search (multiple
+// adjacent entries can each fall within EPSILON of query_z at a merge boundary, so the
+// search widens outward from the found index in both directions rather than trusting a
+// single lower_bound hit).
+std::set<unsigned> chameleon_layer_free_extruders(const LayerFilamentTable& table, double query_z);
+
+// v2.3 Task 1 (spec C2): per-object hysteresis state threaded through
+// chameleon_assign_support_interfaces' per-support-layer loop (Print.cpp) - `prev_kept`
+// is the committed extruder set (same value fed into both apply_bucket_caps' own
+// prev_kept argument and BrimVoteParams::prev_kept each layer), `retained_last_layer`
+// tracks whether the ONE-layer retention grace (see chameleon_update_prev_kept below)
+// was already spent on the immediately preceding layer that reached the engine calls -
+// without this, an all-gated column could retain stale hysteresis indefinitely instead
+// of decaying after a single layer (spec: "counted decay - not indefinite").
+struct PrevKeptState {
+    std::set<unsigned> prev_kept;
+    bool                retained_last_layer = false;
+};
+
+// v2.3 Task 1 (spec C2): pure prev_kept update-rule decision, extracted out of
+// chameleon_assign_support_interfaces so it's directly unit-testable without a Print/
+// PrintObject scaffold. The caller only invokes this for a support layer that actually
+// reached apply_bucket_caps this pass - a layer that `continue`s BEFORE the engine
+// calls (plate guard, already-visited, zero-sample) must leave `state` completely
+// untouched by simply never calling this, exactly today's (pre-v2.3) behavior; that
+// case is not modeled here at all, it's the caller skipping the call entirely.
+// `committed` is this layer's apply_bucket_caps result (BucketCapResult::kept, possibly
+// empty). `had_buckets_pre_gate` is whether ANY bucket existed in the per-layer
+// partitioned map BEFORE apply_bucket_caps ran (the caller must capture this itself,
+// before the call, since apply_bucket_caps erases gated/trimmed buckets from that same
+// map in place). Three outcomes:
+//   a. `committed` non-empty -> that becomes the new prev_kept outright, and the
+//      retention grace resets (a real commit is not a "gated away" event, so a LATER
+//      unlucky layer gets its own fresh one-layer grace).
+//   b. `committed` empty, but buckets existed pre-gate (real matches were found, then
+//      every one of them was gated/trimmed away by apply_bucket_caps' caps), AND the
+//      grace hasn't already been spent on the immediately preceding layer: retain the
+//      OLD prev_kept for exactly one more layer (spend the grace now) - stops a single
+//      unlucky all-gated layer from erasing column memory outright (spec root cause 2),
+//      while still decaying rather than holding on indefinitely.
+//   c. Otherwise (grace already spent last layer on a second consecutive all-gated
+//      layer, OR no buckets existed pre-gate at all - the uniform-fallback fast path,
+//      every sample voted fallback with nothing to gate) - clear to empty, same as
+//      today's unconditional overwrite.
+PrevKeptState chameleon_update_prev_kept(const PrevKeptState& state,
+                                         const std::set<unsigned>& committed,
+                                         bool had_buckets_pre_gate);
+
+// v2.3 Task 1 (spec C1-C2): signature grows two trailing, DEFAULTED parameters -
+// `free_extruders`/`min_len_free_mm` - so every pre-v2.3 call site (this function's own
+// existing unit tests included) compiles and behaves byte-identically unchanged: an
+// empty `free_extruders` (the default) means no bucket is ever "free", so step (a)
+// below always falls through to `min_len_mm` for every bucket, exactly as before this
+// task. `min_len_mm` is now the NORMAL-tier floor (spec C1: 12mm at the call site,
+// replacing the old flat 40mm) and `min_len_free_mm` is the FREE-tier floor (3mm at the
+// call site) for a bucket whose extruder is in `free_extruders` - the once-per-pass z-
+// table lookup (chameleon_layer_free_extruders) the caller resolves per support layer
+// before calling this. Independently (spec C2), a bucket whose extruder is in
+// `prev_kept` (this function's EXISTING argument, unchanged) passes the gate at HALF
+// its tier's floor (0.5x eff_min, where eff_min is whichever of min_len_mm/
+// min_len_free_mm the free-set membership above selected) - hysteresis stacks with,
+// never replaces, the free-tier selection.
 BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection>& map,
                                   const std::set<unsigned>& prev_kept,
                                   size_t max_extruders,
                                   double min_len_mm,
-                                  ExtrusionEntityCollection& merge_back_target);
+                                  ExtrusionEntityCollection& merge_back_target,
+                                  const std::set<unsigned>& free_extruders = {},
+                                  double min_len_free_mm = 0.0);
 
 // v2.2 Task 2 (spec C4, root cause 1): gap-aware lateral cap arithmetic, pure so it's
 // unit-testable without a full PrintObject/Print scaffold (the three mm inputs need

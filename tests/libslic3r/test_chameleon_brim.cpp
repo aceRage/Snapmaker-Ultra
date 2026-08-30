@@ -1450,3 +1450,228 @@ TEST_CASE("brim_vote k=1 makes uncapped mode a literal nearest-wall pick, immune
         CHECK(brim_vote(idx, p, params) == 9); // correct: wall 9 is strictly nearest
     }
 }
+
+// --- v2.3 Task 1: gate tiers + hysteresis (spec C1/C2/C3/C6) ---------------
+
+TEST_CASE("apply_bucket_caps: free-tier gate admits a bucket the normal 12mm floor would drop", "[chameleon]")
+{
+    // 5mm bucket: under the normal-tier floor (12mm) but over the free-tier floor
+    // (3mm). Two otherwise-identical buckets, only one's extruder is in free_extruders.
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(5.0); // NOT free -> gated at 12mm
+    map[2] = bucket_of_length(5.0); // free -> survives at 3mm
+    std::set<unsigned> prev_kept;
+    std::set<unsigned> free_extruders{2};
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, /*min_len_mm=*/12.0, merge_back,
+                                                free_extruders, /*min_len_free_mm=*/3.0);
+
+    CHECK(map.count(1) == 0);
+    CHECK(map.count(2) == 1);
+    CHECK(result.kept == std::set<unsigned>{2});
+    CHECK(result.buckets_dropped_min_benefit == 1);
+}
+
+TEST_CASE("apply_bucket_caps: default call (no free_extruders passed) behaves exactly like the pre-v2.3 flat gate", "[chameleon]")
+{
+    // Same 5mm bucket as above, but via the trailing-defaulted call signature (no
+    // free_extruders/min_len_free_mm argument at all) - proves existing call sites
+    // (this function's own pre-v2.3 tests included) keep compiling AND keep the exact
+    // same behavior: nothing is ever "free" by default, so the normal 12mm floor gates
+    // a 5mm bucket regardless of extruder id.
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[2] = bucket_of_length(5.0);
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, /*min_len_mm=*/12.0, merge_back);
+
+    CHECK(map.count(2) == 0);
+    CHECK(result.kept.empty());
+    CHECK(result.buckets_dropped_min_benefit == 1);
+}
+
+TEST_CASE("apply_bucket_caps: prev_kept halves the effective gate threshold (C2)", "[chameleon]")
+{
+    // 8mm bucket: under the normal 12mm floor, but over half of it (6mm) - passes the
+    // gate ONLY when its extruder is in prev_kept (0.5x eff_min).
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(8.0); // no seniority -> gated
+    map[2] = bucket_of_length(8.0); // prev_kept -> half-gate (6mm) admits it
+    std::set<unsigned> prev_kept{2};
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, /*min_len_mm=*/12.0, merge_back);
+
+    CHECK(map.count(1) == 0);
+    CHECK(map.count(2) == 1);
+    CHECK(result.kept == std::set<unsigned>{2});
+    CHECK(result.buckets_dropped_min_benefit == 1);
+}
+
+TEST_CASE("apply_bucket_caps: free-tier and prev_kept stack (half of the FREE floor, not the normal one)", "[chameleon]")
+{
+    // 1.6mm bucket: under the free-tier floor (3mm) but over HALF of it (1.5mm). Only
+    // passes when its extruder is BOTH free AND prev_kept - proves the two preferences
+    // compose (halve whichever tier's floor free-set membership already selected)
+    // rather than either one alone deciding the outcome.
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(1.6); // free but no seniority -> gated at 3mm
+    map[2] = bucket_of_length(1.6); // free AND prev_kept -> half of 3mm = 1.5mm admits it
+    std::set<unsigned> prev_kept{2};
+    std::set<unsigned> free_extruders{1, 2};
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, /*min_len_mm=*/12.0, merge_back,
+                                                free_extruders, /*min_len_free_mm=*/3.0);
+
+    CHECK(map.count(1) == 0);
+    CHECK(map.count(2) == 1);
+    CHECK(result.kept == std::set<unsigned>{2});
+}
+
+TEST_CASE("chameleon_update_prev_kept: a real commit becomes prev_kept outright and resets the retention grace", "[chameleon]")
+{
+    PrevKeptState state{ std::set<unsigned>{7}, /*retained_last_layer=*/true };
+    PrevKeptState next = chameleon_update_prev_kept(state, std::set<unsigned>{1, 2}, /*had_buckets_pre_gate=*/true);
+    CHECK(next.prev_kept == std::set<unsigned>{1, 2});
+    CHECK(next.retained_last_layer == false);
+}
+
+TEST_CASE("chameleon_update_prev_kept: buckets existed pre-gate but all were gated away -> retains prev_kept for ONE layer (C2)", "[chameleon]")
+{
+    PrevKeptState state{ std::set<unsigned>{5}, /*retained_last_layer=*/false };
+    PrevKeptState next = chameleon_update_prev_kept(state, /*committed=*/{}, /*had_buckets_pre_gate=*/true);
+    CHECK(next.prev_kept == std::set<unsigned>{5}); // retained, not erased
+    CHECK(next.retained_last_layer == true);        // grace spent
+}
+
+TEST_CASE("chameleon_update_prev_kept: a SECOND consecutive all-gated layer decays to empty (grace already spent)", "[chameleon]")
+{
+    // Same as above, but the grace was already spent on the immediately preceding
+    // layer - this is the "counted decay, not indefinite" half of spec C2.
+    PrevKeptState state{ std::set<unsigned>{5}, /*retained_last_layer=*/true };
+    PrevKeptState next = chameleon_update_prev_kept(state, /*committed=*/{}, /*had_buckets_pre_gate=*/true);
+    CHECK(next.prev_kept.empty());
+    CHECK(next.retained_last_layer == false);
+}
+
+TEST_CASE("chameleon_update_prev_kept: no buckets existed pre-gate at all (uniform fallback) clears to empty even with an unspent grace", "[chameleon]")
+{
+    // Distinct from the "gated away" case: nothing was ever a candidate this layer (the
+    // uniform-fallback fast path), so there is nothing to retain memory OF - this must
+    // NOT consume/preserve the grace the way a genuine gate-away does.
+    PrevKeptState state{ std::set<unsigned>{5}, /*retained_last_layer=*/false };
+    PrevKeptState next = chameleon_update_prev_kept(state, /*committed=*/{}, /*had_buckets_pre_gate=*/false);
+    CHECK(next.prev_kept.empty());
+    CHECK(next.retained_last_layer == false);
+}
+
+TEST_CASE("build_layer_filament_table: EPSILON-merges nearby z samples, unions their extruder sets", "[chameleon]")
+{
+    std::vector<std::pair<double, unsigned>> raw = {
+        {1.0, 0}, {1.0 + EPSILON * 0.5, 2}, {5.0, 1},
+    };
+    LayerFilamentTable table = build_layer_filament_table(raw);
+    REQUIRE(table.size() == 2);
+    CHECK_THAT(table[0].first, Catch::Matchers::WithinAbs(1.0, 1e-9));
+    CHECK(table[0].second == std::set<unsigned>{0, 2});
+    CHECK_THAT(table[1].first, Catch::Matchers::WithinAbs(5.0, 1e-9));
+    CHECK(table[1].second == std::set<unsigned>{1});
+}
+
+TEST_CASE("build_layer_filament_table: z's farther than EPSILON apart stay separate entries", "[chameleon]")
+{
+    std::vector<std::pair<double, unsigned>> raw = { {1.0, 0}, {1.5, 1}, {2.0, 2} };
+    LayerFilamentTable table = build_layer_filament_table(raw);
+    REQUIRE(table.size() == 3);
+    CHECK(table[0].second == std::set<unsigned>{0});
+    CHECK(table[1].second == std::set<unsigned>{1});
+    CHECK(table[2].second == std::set<unsigned>{2});
+}
+
+TEST_CASE("build_layer_filament_table: empty input returns an empty table", "[chameleon]")
+{
+    CHECK(build_layer_filament_table({}).empty());
+}
+
+TEST_CASE("chameleon_layer_free_extruders: exact z hit returns that entry's set", "[chameleon]")
+{
+    LayerFilamentTable table = build_layer_filament_table({ {1.0, 0}, {3.0, 1} });
+    CHECK(chameleon_layer_free_extruders(table, 3.0) == std::set<unsigned>{1});
+}
+
+TEST_CASE("chameleon_layer_free_extruders: an EPSILON-neighbor z still coincidence-hits", "[chameleon]")
+{
+    LayerFilamentTable table = build_layer_filament_table({ {3.0, 1} });
+    CHECK(chameleon_layer_free_extruders(table, 3.0 + EPSILON * 0.5) == std::set<unsigned>{1});
+}
+
+TEST_CASE("chameleon_layer_free_extruders: a z with no coincident entry returns EMPTY, never the nearest entry", "[chameleon]")
+{
+    // 3.0 and 3.0+10*EPSILON are two DISTINCT table entries (well outside each other's
+    // EPSILON window); a query z sitting between them, still outside EPSILON of both,
+    // must return empty rather than snapping to whichever entry happens to be nearest.
+    LayerFilamentTable table = build_layer_filament_table({ {1.0, 0}, {50.0, 1} });
+    CHECK(chameleon_layer_free_extruders(table, 25.0).empty());
+}
+
+TEST_CASE("chameleon_layer_free_extruders: empty table returns empty regardless of query_z", "[chameleon]")
+{
+    CHECK(chameleon_layer_free_extruders({}, 42.0).empty());
+}
+
+TEST_CASE("brim_vote tie-prefers-prev_kept (C3): flips the min-id tie-break outcome", "[chameleon]")
+{
+    // Same exact-tie setup as "brim_vote tie-break: larger object area wins, then
+    // lower extruder" above (two single-point walls equidistant from the origin, no
+    // object_area data) - without prev_kept this falls all the way through to
+    // std::min(1, 2) == 1 (proven by that other test). This test's whole point is that
+    // C3's prev_kept check runs BEFORE that fallback: with prev_kept = {2}, the higher
+    // id wins instead. Must FAIL if the C3 branch in brim_vote is reverted (min-id would
+    // pick 1, the wrong answer for a column whose previous layer committed 2).
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 2, 0, 2), 1, 7);
+    idx.add_polyline(segment(0, -2, 0, -2), 2, 9);
+    BrimVoteParams p;
+    p.prev_kept = {2};
+    CHECK(brim_vote(idx, Point(0, 0), p) == 2);
+}
+
+TEST_CASE("brim_vote tie-prefers-prev_kept (C3): both-tied-candidates in prev_kept falls through unchanged", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 2, 0, 2), 1, 7);
+    idx.add_polyline(segment(0, -2, 0, -2), 2, 9);
+    BrimVoteParams p;
+    p.prev_kept = {1, 2}; // both tied candidates -> not "exactly one" -> falls through
+    CHECK(brim_vote(idx, Point(0, 0), p) == 1); // object_area/min-id fallback, unchanged
+}
+
+TEST_CASE("partition_support_entities (C7 whole-collection vote) tie-prefers-prev_kept (C3): flips the lowest-id majority tie", "[chameleon]")
+{
+    // Identical fixture to "partition_support_entities (C7): whole-collection majority
+    // vote ties break to the LOWEST extruder id" above (proven there to land on
+    // extruder 1 with prev_kept empty) - only p.prev_kept differs here. Must FAIL if
+    // the C3 branch in vote_collection_as_unit is reverted (the tie would still break
+    // to the lowest id, 1, ignoring that this column's previous layer committed 2).
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 10, 6), 1, 1);
+    idx.add_polyline(segment(20, 6, 30, 6), 2, 2);
+    BrimVoteParams p; p.fallback_extruder = 0;
+    p.prev_kept = {2};
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    ExtrusionEntityCollection *inner = nested_base_collection(6.0, /*no_sort=*/false);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    REQUIRE(out.count(2) == 1);
+    CHECK(out.count(1) == 0);
+    CHECK(fills.entities.empty());
+}

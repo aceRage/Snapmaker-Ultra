@@ -332,14 +332,40 @@ unsigned vote_collection_as_unit(const ExtrusionEntityCollection &collection, un
     if (votes.empty())
         return fallback_extruder;
 
-    unsigned best_extruder = 0;
-    size_t   best_count    = 0;
-    for (const auto &kv : votes) // ascending extruder id order
-        if (kv.second > best_count) {
-            best_extruder = kv.first;
-            best_count    = kv.second;
-        }
-    return best_extruder;
+    size_t best_count = 0;
+    for (const auto &kv : votes)
+        best_count = std::max(best_count, kv.second);
+
+    // v2.3 Task 1 (spec C3): every extruder tied at best_count, ascending id order
+    // (votes is a std::map, so this loop already visits keys ascending). Before this
+    // task there was no explicit tie branch here at all - the strict `>` scan above
+    // (now replaced) silently kept the lowest id among ties as a side effect of never
+    // replacing on an equal count. That lowest-id fallback is preserved below
+    // (`tied.front()`); the only new behavior is trying prev_kept FIRST when the tie
+    // has more than one candidate.
+    std::vector<unsigned> tied;
+    for (const auto &kv : votes)
+        if (kv.second == best_count)
+            tied.push_back(kv.first);
+
+    if (tied.size() > 1) {
+        // Same hysteresis preference as brim_vote's own tie path (spec C3): if exactly
+        // ONE tied candidate is in the previous support layer's committed set, it wins
+        // outright. p.prev_kept defaults empty, so this is a no-op whenever the caller
+        // hasn't wired hysteresis through (Part 1 brim path never calls this function
+        // at all; every pre-v2.3 support caller left prev_kept empty).
+        unsigned prev_kept_member = 0;
+        size_t   prev_kept_hits   = 0;
+        for (unsigned ext : tied)
+            if (p.prev_kept.count(ext) != 0) {
+                prev_kept_member = ext;
+                ++prev_kept_hits;
+            }
+        if (prev_kept_hits == 1)
+            return prev_kept_member;
+    }
+
+    return tied.front(); // lowest id among the tied (or the sole max when there's no tie)
 }
 
 } // namespace
@@ -438,6 +464,18 @@ unsigned brim_vote(const WallSampleIndex &idx, const Point &pt, const BrimVotePa
 
     if (!tie)
         return winner_ext;
+
+    // v2.3 Task 1 (spec C3): hysteresis preference, tried BEFORE object_area/min-id -
+    // if exactly ONE of {winner, runner} was in the PREVIOUS support layer's committed
+    // set, it wins outright (stability up the column beats the tie-break heuristics
+    // below). Both-or-neither falls through unchanged - this never widens the tie
+    // window itself, it only changes which of the two already-tied candidates wins.
+    // p.prev_kept defaults empty (Part 1 brim path, every pre-v2.3 caller), so both
+    // membership tests are false and this is a strict no-op there.
+    const bool winner_prev_kept = p.prev_kept.count(winner_ext) != 0;
+    const bool runner_prev_kept = p.prev_kept.count(runner_ext) != 0;
+    if (winner_prev_kept != runner_prev_kept)
+        return winner_prev_kept ? winner_ext : runner_ext;
 
     auto object_area_of = [&p](size_t object_key) -> double {
         auto it = p.object_area.find(object_key);
@@ -806,19 +844,87 @@ double total_path_length_mm(const ExtrusionEntityCollection &collection)
     return len;
 }
 
+LayerFilamentTable build_layer_filament_table(std::vector<std::pair<double, unsigned>> raw)
+{
+    // Sort by z first so every sample that belongs together (within EPSILON) is
+    // adjacent - turns the merge below into a single linear pass instead of an O(n^2)
+    // scan for each sample's z-neighborhood.
+    std::sort(raw.begin(), raw.end(),
+        [](const std::pair<double, unsigned> &a, const std::pair<double, unsigned> &b) { return a.first < b.first; });
+
+    LayerFilamentTable table;
+    for (const auto &sample : raw) {
+        // A run of samples can drift by more than EPSILON from its OWN run's first
+        // z if compared one-hop-at-a-time (many small sub-EPSILON steps accumulating) -
+        // compare against the table's last COMMITTED entry z (not the previous raw
+        // sample) so the merge window is anchored, matching select_layers_in_band's own
+        // single-anchor EPSILON comparisons elsewhere in this file.
+        if (!table.empty() && sample.first <= table.back().first + EPSILON)
+            table.back().second.insert(sample.second);
+        else
+            table.push_back({ sample.first, std::set<unsigned>{ sample.second } });
+    }
+    return table;
+}
+
+std::set<unsigned> chameleon_layer_free_extruders(const LayerFilamentTable &table, double query_z)
+{
+    // Binary search (table is ascending by z, build_layer_filament_table's own
+    // contract) for the first entry whose z is >= query_z - EPSILON - by definition of
+    // lower_bound, every entry before it has z < query_z - EPSILON and so is wholly out
+    // of range, meaning that first qualifying entry is also the LEFTMOST one that could
+    // possibly fall within EPSILON of query_z (no separate backward scan needed). Widen
+    // forward from there while entries remain <= query_z + EPSILON - more than one
+    // table entry can qualify when a merge boundary in the table leaves two adjacent
+    // entries each individually within EPSILON of a query z that sits between them,
+    // even though the two entries themselves are more than EPSILON apart from EACH
+    // OTHER (EPSILON-merging is anchored per-run, not a transitive equivalence).
+    std::set<unsigned> result;
+    auto it = std::lower_bound(table.begin(), table.end(), query_z - EPSILON,
+        [](const std::pair<double, std::set<unsigned>> &entry, double z) { return entry.first < z; });
+    for (; it != table.end() && it->first <= query_z + EPSILON; ++it)
+        result.insert(it->second.begin(), it->second.end());
+    return result;
+}
+
+PrevKeptState chameleon_update_prev_kept(const PrevKeptState &state,
+                                          const std::set<unsigned> &committed,
+                                          bool had_buckets_pre_gate)
+{
+    if (!committed.empty())
+        return { committed, false }; // (a) real commit: fresh grace for next time
+
+    if (had_buckets_pre_gate && !state.retained_last_layer)
+        return { state.prev_kept, true }; // (b) spend the one-layer retention grace
+
+    return { {}, false }; // (c) grace already spent, or nothing existed pre-gate at all
+}
+
 BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> &map,
                                    const std::set<unsigned> &prev_kept,
                                    size_t max_extruders,
                                    double min_len_mm,
-                                   ExtrusionEntityCollection &merge_back_target)
+                                   ExtrusionEntityCollection &merge_back_target,
+                                   const std::set<unsigned> &free_extruders,
+                                   double min_len_free_mm)
 {
     BucketCapResult result;
 
-    // (a) C3 min-benefit gate: drop any bucket under min_len_mm BEFORE the trim below
-    // ever ranks it - a sliver must never survive by being one of the "top N longest"
-    // among other slivers.
+    // (a) C3 min-benefit gate, v2.3 Task 1 (spec C1-C2) two-tier rework: each bucket's
+    // own eff_min starts at min_len_free_mm if its extruder is in `free_extruders`
+    // (already printing wall/solid/sparse geometry at this z elsewhere on the plate -
+    // its toolchange costs nothing extra) or min_len_mm otherwise, THEN is halved (spec
+    // C2) if its extruder is also in `prev_kept` (the previous support layer's
+    // committed set) - the two preferences stack rather than one overriding the other.
+    // Default call (free_extruders empty) makes every bucket take the min_len_mm/
+    // prev_kept-halved path only - byte-identical to the pre-v2.3 flat-threshold gate
+    // this replaces, just re-expressed per-bucket instead of once for the whole call.
     for (auto it = map.begin(); it != map.end(); ) {
-        if (total_path_length_mm(it->second) < min_len_mm) {
+        const bool is_free = free_extruders.count(it->first) != 0;
+        double     eff_min = is_free ? min_len_free_mm : min_len_mm;
+        if (prev_kept.count(it->first) != 0)
+            eff_min *= 0.5;
+        if (total_path_length_mm(it->second) < eff_min) {
             merge_back_target.append(std::move(it->second.entities));
             it = map.erase(it);
             ++result.buckets_dropped_min_benefit;

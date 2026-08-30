@@ -2614,6 +2614,82 @@ static unsigned chameleon_object_default_extruder(const Print &print, const Prin
     return (best > 0 && best < (unsigned int) print.config().filament_diameter.size()) ? best - 1 : 0;
 }
 
+// v2.3 Task 1 (spec C1): true when ANY enabled, non-deleted mixed-filament row on the
+// plate has its own gradient interpolation on (MixedFilament::gradient_enabled) - used
+// below to skip chameleon_collect_layer_filaments' object/layer walk entirely rather
+// than attempt it. A gradient (or, more generally, a comma-grouped manual-pattern
+// mixed row - see MixedFilamentManager::resolve_perimeter's per-wall-loop-index
+// resolution, LayerRegion.cpp:73-76) row means a single region's TRUE per-layer, and
+// even per-WALL-LOOP, filament can vary in ways LayerRegion::extruder(role) alone (a
+// single scalar per role) cannot represent - ToolOrdering's own collect_extruders only
+// gets this right by running resolve_mixed with full per-layer-index/mixed-manager
+// context, which doesn't exist yet at this point in the pipeline (this pass runs
+// before ToolOrdering is even constructed - see chameleon_object_default_extruder's
+// own comment above for the same "still in the future" constraint). Skipping here is
+// deliberately conservative: every support layer's free-extruder lookup then returns
+// empty, so every bucket falls back to the gate's NORMAL tier only - inert, not wrong.
+static bool chameleon_mixed_gradient_active(const Print &print)
+{
+    for (const MixedFilament &mf : print.mixed_filament_manager().mixed_filaments())
+        if (mf.enabled && !mf.deleted && mf.gradient_enabled)
+            return true;
+    return false;
+}
+
+// v2.3 Task 1 (spec C1): once-per-pass "free extruder" table build - the object/layer
+// walk feeding BrimFilament.hpp's pure LayerFilamentTable/build_layer_filament_table
+// (see that function's own doc comment for the merge semantics this only supplies raw
+// samples to). Skipped entirely (empty table) when chameleon_mixed_gradient_active
+// above is true. Otherwise: for every object NOT a shared-object copy (mirrors the
+// skip in chameleon_assign_support_interfaces' own per-object loop below - a copy's
+// layers() alias the same Layer* vector as the object it was copied from, so walking
+// it again would only re-record the same z/extruder samples, harmlessly but
+// pointlessly), every object layer, every region on that layer: LayerRegion::extruder
+// (role) is read directly (NOT PrintRegion::extruder - LayerRegion's own override
+// already folds in painted-region/effective-filament resolution, see LayerRegion.cpp:
+// 86-100) for frExternalPerimeter AND frPerimeter (a region's outer_wall_filament
+// override can differ from its own wall_filament, so both must be checked - missing
+// the inner-wall-only filament would under-report which extruders are genuinely
+// "already here") when the layer has any perimeters, and for frSolidInfill/frInfill
+// when it has any fills. A role read of 0 (PrintRegion::extruder's own "follow the
+// object default" convention, PrintRegion.cpp:18-35) contributes nothing - this table
+// only ever records an EXPLICIT non-zero per-region filament assignment, not a scalar
+// default that could still mean any extruder depending on context.
+static LayerFilamentTable chameleon_collect_layer_filaments(const Print &print)
+{
+    if (chameleon_mixed_gradient_active(print))
+        return {};
+
+    std::vector<std::pair<double, unsigned>> raw;
+    for (const PrintObject *object : print.objects()) {
+        if (object == nullptr || object->get_shared_object() != nullptr)
+            continue;
+        for (const Layer *layer : object->layers()) {
+            if (layer == nullptr)
+                continue;
+            for (const LayerRegion *lr : layer->regions()) {
+                if (lr == nullptr)
+                    continue;
+                if (!lr->perimeters.entities.empty()) {
+                    for (FlowRole role : { frExternalPerimeter, frPerimeter }) {
+                        const unsigned int ext = lr->extruder(role);
+                        if (ext > 0)
+                            raw.emplace_back(layer->print_z, ext - 1);
+                    }
+                }
+                if (!lr->fills.entities.empty()) {
+                    for (FlowRole role : { frSolidInfill, frInfill }) {
+                        const unsigned int ext = lr->extruder(role);
+                        if (ext > 0)
+                            raw.emplace_back(layer->print_z, ext - 1);
+                    }
+                }
+            }
+        }
+    }
+    return build_layer_filament_table(std::move(raw));
+}
+
 // Chameleon P2.1: support match pass (renamed from "interface partition pass" - v2.1
 // resolves BOTH support roles now, see docs/superpowers/specs/2026-08-30-support-match-
 // v2-design.md's "Decision rules" section, the binding contract). For every object opted
@@ -2659,6 +2735,11 @@ static void chameleon_assign_support_interfaces(Print &print)
 
     PrintObjectPtrs &objects  = print.objects_mutable();
     const Point      no_shift(0, 0); // supports and walls share object coordinates (no instance shift)
+
+    // v2.3 Task 1 (spec C1): once per PASS (not once per object) - every object's walls/
+    // solid/sparse infill contribute to the SAME free-extruder table, since the whole
+    // point is "is some extruder already printing at this z ANYWHERE on the plate".
+    const LayerFilamentTable layer_filament_table = chameleon_collect_layer_filaments(print);
 
     for (size_t obj_idx = 0; obj_idx < objects.size(); ++obj_idx) {
         PrintObject *object = objects[obj_idx];
@@ -2728,6 +2809,25 @@ static void chameleon_assign_support_interfaces(Print &print)
         // ordinal as object_key, so BrimVoteParams::object_area's cross-object tie-break
         // (Part 1's multi-object plate scenario) never applies here.
 
+        // v2.3 Task 1 (spec C6): support-pass-only overrides of two run-building
+        // tunables - Part 1's own BrimVoteParams (the brim pass' own object, built
+        // separately in Print::process's brim call site further down this file) never
+        // touches this `vote_params` instance, so its defaults (max_runs=4,
+        // min_run_mm=2.0) stay exactly what they were for brim. Support fills sample
+        // far more numerous, far shorter runs per layer than a single long brim loop
+        // ever does - many short ring/lattice segments crossing sector boundaries every
+        // layer, not one continuous perimeter - so brim's max_runs=4/min_run_mm=2.0
+        // guard, tuned for a handful of long brim loops, throttled support's own
+        // legitimate per-sector matched runs down to noise. max_runs=8/min_run_mm=1.6
+        // give support twice the run budget and a tighter absorb floor, sized to the
+        // smaller branch-scale buckets C1's gate rework above now admits (5-30mm ring
+        // arcs, 20-60mm small interfaces) instead of brim's long-loop scale.
+        // sample_mm stays 0.8 and max_extruders (an apply_bucket_caps call-site
+        // argument, not a BrimVoteParams field) stays 2 - spec C6 only touches these
+        // two fields.
+        vote_params.max_runs   = 8;
+        vote_params.min_run_mm = 1.6;
+
         // v2.2 Task 2 (spec C4, root cause 1): gap-aware lateral cap, replacing the
         // hardcoded 1.0mm max_dist_mm below (BrimVoteParams.max_dist_mm, Task 1). The
         // cap is CENTERLINE-to-centerline (both wall samples and support line paths are
@@ -2787,16 +2887,21 @@ static void chameleon_assign_support_interfaces(Print &print)
         // apply_bucket_caps committed on the PREVIOUS support layer that reached the
         // engine calls. Empty at object start. Threaded through every iteration of the
         // loop below; only the guards that `continue` BEFORE the engine calls (plate,
-        // already-visited, zero-sample) leave it unchanged - every layer that reaches
-        // apply_bucket_caps updates it unconditionally, even to empty.
+        // already-visited, zero-sample) leave it unchanged.
+        // v2.3 Task 1 (spec C2): a layer that DOES reach the engine calls no longer
+        // always overwrites `prev_kept` unconditionally - chameleon_update_prev_kept
+        // (BrimFilament.hpp/.cpp) decides per-layer whether to commit, retain-for-one-
+        // more-layer, or clear to empty; `prev_kept_retained_last_layer` is that pure
+        // function's own decay-counter state, carried alongside prev_kept itself.
         std::set<unsigned> prev_kept;
+        bool                prev_kept_retained_last_layer = false;
         size_t layers_partitioned  = 0;
         size_t layers_zero_sample  = 0;
         // v2.2 Task 1: replaces the old cumulative_switches/layers_reverted/escalated
         // counters (deleted with the >3 whole-layer revert and >20 per-object
         // escalation, C1-C2 - a switch-boundary tally never measured the real per-layer
         // cost). These count actual apply_bucket_caps outcomes instead.
-        size_t buckets_dropped_min_benefit = 0; // C3 gate: bucket total length < 40mm
+        size_t buckets_dropped_min_benefit = 0; // C3 gate: bucket total length < its tier floor (v2.3 Task 1: 12mm normal / 3mm free)
         size_t buckets_trimmed_cap         = 0; // C1 trim: bucket ranked below the top 2
         // Raw matched-run counts (NOT switch-boundary/cap accounting - purely
         // informational, mirrors partition_support_entities' own return value) per
@@ -2836,6 +2941,27 @@ static void chameleon_assign_support_interfaces(Print &print)
             // design). Skip unconditionally instead of re-running.
             if (support_layer->chameleon_interface_visited)
                 continue;
+
+            // v2.3 Task 1 (spec C3): sync vote_params.prev_kept to THIS layer's current
+            // hysteresis state BEFORE any of the mode-branch resolvers below copy
+            // vote_params by value (interface_wall_params/base_wall_params/
+            // interface_lateral_params/base_lateral_params, all `= vote_params`) - those
+            // copies are taken fresh every iteration of this loop, but `vote_params`
+            // itself is constructed ONCE per OBJECT, above this loop, so without this
+            // line every layer's resolvers would see whatever prev_kept happened to be
+            // set at object-start (empty) forever, never the value this loop updates at
+            // the bottom of each iteration. Also feeds the three
+            // partition_support_entities calls' own `p` argument further down (still
+            // `vote_params` itself, unchanged), which is what vote_collection_as_unit's
+            // own tie path reads for C7 whole-collection votes.
+            vote_params.prev_kept = prev_kept;
+
+            // v2.3 Task 1 (spec C1): this layer's free-extruder set - the once-per-pass
+            // z-table's coincidence lookup at this support layer's own print_z. Resolved
+            // once per layer (not per bucket) since it depends only on z, feeds the
+            // apply_bucket_caps call at the tail of this iteration.
+            const std::set<unsigned> free_extruders =
+                chameleon_layer_free_extruders(layer_filament_table, support_layer->print_z);
 
             // (a) Contact-band layers: v2.0-style band (support_top_z, support_top_z +
             // 2.0]). nearest_surface (below) feeds this by index list directly into
@@ -3064,19 +3190,34 @@ static void chameleon_assign_support_interfaces(Print &print)
             // this layer actually pays for - the TRUE per-layer cost is the number of
             // DISTINCT matched extruders. apply_bucket_caps measures that directly and
             // degrades PARTIALLY instead of reverting the whole layer: it first gates
-            // any bucket whose total matched path length is under 40mm (C3 - a matched
-            // sliver isn't worth a toolchange/purge), then, only if more than 2
-            // extruders' worth of geometry survived the gate, trims to the 2 with the
-            // longest total length - preferring whichever extruder(s) this object's
-            // PREVIOUS support layer committed (`prev_kept`) outright over length (C1
-            // hysteresis: stability up the column, the fix for the alternating-stripe
-            // artifact a whole-layer revert caused). Every dropped/trimmed bucket's
-            // geometry is merged straight back into support_fills (fallback) via the
-            // same ownership-transferring append(ExtrusionEntitiesPtr&&) the old revert
-            // used, just applied per-bucket instead of per-layer - each path still
-            // carries its true source role, so nothing is lost or mis-painted.
+            // any bucket whose total matched path length is under the tier floor (v2.3
+            // Task 1, spec C1: 12mm normal / 3mm for a FREE extruder - see
+            // free_extruders above - replacing the old flat 40mm; a matched sliver isn't
+            // worth a toolchange/purge, but a FREE one is already paying for that
+            // toolchange anyway), then, only if more than 2 extruders' worth of geometry
+            // survived the gate, trims to the 2 with the longest total length -
+            // preferring whichever extruder(s) this object's PREVIOUS support layer
+            // committed (`prev_kept`) outright over length (C1 hysteresis: stability up
+            // the column, the fix for the alternating-stripe artifact a whole-layer
+            // revert caused; v2.3 Task 1 spec C2 additionally halves the GATE's own
+            // floor for a prev_kept bucket - see apply_bucket_caps' own doc comment).
+            // Every dropped/trimmed bucket's geometry is merged straight back into
+            // support_fills (fallback) via the same ownership-transferring
+            // append(ExtrusionEntitiesPtr&&) the old revert used, just applied per-
+            // bucket instead of per-layer - each path still carries its true source
+            // role, so nothing is lost or mis-painted.
+            //
+            // v2.3 Task 1 (spec C2): captured BEFORE the call, since apply_bucket_caps
+            // erases gated/trimmed buckets from `partitioned` in place - this is what
+            // distinguishes "buckets existed pre-gate but were all gated away" (the
+            // one-layer retention case) from "nothing was ever a candidate this layer"
+            // (the uniform-fallback fast path, which must NOT retain) in
+            // chameleon_update_prev_kept below.
+            const bool had_buckets_pre_gate = !partitioned.empty();
+
             BucketCapResult cap_result = apply_bucket_caps(partitioned, prev_kept,
-                /*max_extruders=*/2, /*min_len_mm=*/40.0, support_layer->support_fills);
+                /*max_extruders=*/2, /*min_len_mm=*/12.0, support_layer->support_fills,
+                free_extruders, /*min_len_free_mm=*/3.0);
             buckets_dropped_min_benefit += cap_result.buckets_dropped_min_benefit;
             buckets_trimmed_cap         += cap_result.buckets_trimmed_cap;
 
@@ -3090,11 +3231,17 @@ static void chameleon_assign_support_interfaces(Print &print)
             // (support_fills already holds that geometry back); interface_by_extruder
             // stays empty either way.
 
-            // Hysteresis (C1): this layer reached the engine calls, so its committed
-            // set - possibly empty - unconditionally becomes prev_kept for the next
-            // layer. Only the guards ABOVE this point (plate/visited/zero-sample, all of
-            // which `continue` before ever reaching here) leave prev_kept unchanged.
-            prev_kept = std::move(cap_result.kept);
+            // Hysteresis (v2.3 Task 1, spec C2): this layer reached the engine calls, so
+            // chameleon_update_prev_kept (BrimFilament.hpp/.cpp - see its own doc
+            // comment for the three-way decision) now decides prev_kept/the retention
+            // grace instead of the old unconditional overwrite. Only the guards ABOVE
+            // this point (plate/visited/zero-sample, all of which `continue` before
+            // ever reaching here) leave prev_kept/prev_kept_retained_last_layer
+            // unchanged.
+            PrevKeptState next_prev_kept_state = chameleon_update_prev_kept(
+                { prev_kept, prev_kept_retained_last_layer }, cap_result.kept, had_buckets_pre_gate);
+            prev_kept                     = std::move(next_prev_kept_state.prev_kept);
+            prev_kept_retained_last_layer = next_prev_kept_state.retained_last_layer;
             support_layer->chameleon_interface_visited = true;
         }
 
