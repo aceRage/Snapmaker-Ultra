@@ -50,6 +50,10 @@ private:
     std::atomic<bool> m_started { false };
     std::atomic<int>  m_port { 0 };
     long              m_pid { 0 };
+    // Windows Job Object (HANDLE as void*) with KILL_ON_JOB_CLOSE: our go2rtc is
+    // assigned to it so it dies with THIS app instance even on crash/force-quit — and
+    // only ours (each instance has its own job; other instances' go2rtc are untouched).
+    void*             m_job { nullptr };
 };
 
 } // namespace GUI

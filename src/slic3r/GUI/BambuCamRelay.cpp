@@ -15,6 +15,16 @@
 #include <wx/utils.h>
 #include <wx/process.h>
 
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h> // Job Object: kill our go2rtc child with this app instance
+#endif
+
 #include "libslic3r/Utils.hpp"
 
 namespace Slic3r {
@@ -223,6 +233,30 @@ int Go2RtcLauncher::port()
     }
     m_pid  = pid;
     m_port = GO2RTC_API_PORT;
+
+#ifdef _WIN32
+    // Assign OUR go2rtc to a kill-on-close Job Object so it terminates when this app
+    // instance exits by ANY means (graceful, crash, or force-quit) — stop() below only
+    // runs on a clean shutdown. The job is per-instance, so it never touches a go2rtc
+    // spawned by another running copy of the app.
+    if (!m_job) {
+        HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
+        if (job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+            m_job = job;
+        }
+    }
+    if (m_job) {
+        HANDLE hProc = ::OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, (DWORD) pid);
+        if (hProc) {
+            ::AssignProcessToJobObject((HANDLE) m_job, hProc);
+            ::CloseHandle(hProc);
+        }
+    }
+#endif
+
     BOOST_LOG_TRIVIAL(info) << "Go2RtcLauncher: go2rtc pid " << pid << " on 127.0.0.1:" << GO2RTC_API_PORT;
     return m_port.load();
 }
