@@ -69,14 +69,28 @@ std::vector<size_t> select_layers_in_band(const std::vector<double>& print_zs,
 std::vector<size_t> select_contact_layers(const std::vector<double>& print_zs,
                                           double support_top_z, double gap_mm = 2.0);
 
+// v2.1 final-review I2 fix: select_layers_in_band's sibling for bands that are only
+// ONE layer tall (e.g. the coplanar lateral band, sized to a support layer's own
+// height). select_layers_in_band only tests a layer's TOP z, so a layer whose top
+// overshoots hi_z but whose BOTTOM still dips into (lo_z, hi_z] - its walls flank the
+// band at this z even though its own top lies above it (unsynced support/object layer
+// grids, variable layer height) - is missed. This selects by z-INTERVAL overlap
+// instead: layer i spans (bottom_i, print_zs[i]], where bottom_i is the previous
+// layer's top (0.0 for i == 0, since the object's first layer always starts at the
+// build plate) - already recoverable from `print_zs` alone, no extra parameter needed.
+// Layer i is selected when that interval overlaps (lo_z, hi_z].
+std::vector<size_t> select_layers_overlapping_span(const std::vector<double>& print_zs,
+                                                    double lo_z, double hi_z);
+
 // v2.1 Task 2 (projection resolver): pure geometric core of Print.cpp's
-// chameleon_projection_extruder. Layer/LayerRegion can't be built standalone outside a
-// full slice (private/protected ctors, PrintObject-owned storage), so the point-in-band-
-// layer / region-preference selection is factored out here as a plain-data view over
-// ExPolygon POINTERS (no ownership, no copying - a LayerRegion's true storage is
-// SurfaceCollection, not a bare ExPolygons, so the caller collects `&surface.expolygon`
-// pointers per call; this stays cheap even though the helper below is invoked once per
-// 0.8mm sample point).
+// chameleon_projection_extruder_from_view (fed by chameleon_build_projection_views;
+// v2.1 final-review M1 fix hoisted that construction to once per support layer instead
+// of once per sample point - see those two functions' own comments). Layer/LayerRegion
+// can't be built standalone outside a full slice (private/protected ctors, PrintObject-
+// owned storage), so the point-in-band-layer / region-preference selection is factored
+// out here as a plain-data view over ExPolygon POINTERS (no ownership, no copying - a
+// LayerRegion's true storage is SurfaceCollection, not a bare ExPolygons, so the caller
+// collects `&surface.expolygon` pointers per call).
 struct ProjectionLayerView {
     // This band layer's lslices (required - a null/empty pointer is a miss) and, in
     // parallel (index i matches lslices[i]), each island's precomputed bbox for a cheap

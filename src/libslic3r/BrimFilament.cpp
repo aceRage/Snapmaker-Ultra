@@ -319,13 +319,24 @@ unsigned brim_vote(const WallSampleIndex &idx, const Point &pt, const BrimVotePa
         return p.fallback_extruder;
 
     // max_dist_mm == 0 means uncapped (Part 1 brim path; behavior identical to
-    // pre-v2.1). Otherwise: knn() returns results sorted by squared distance
-    // ascending, so knn_result.front() is the nearest sample overall. If even
-    // that nearest sample is farther than the cap, fall back before scoring -
-    // this must happen BEFORE any score/tie logic below.
+    // pre-v2.1). Otherwise (v2.1 final-review I1 fix): the cap must bound the whole
+    // electorate, not just the nearest sample - filtering only knn_result.front() left
+    // every farther-but-still-in-k sample free to vote (and win, via the 1/d^2 weighted
+    // score, or via the tie path's min-extruder-id fallback), so a wall beyond the cap
+    // could still be chosen even though the spec's "nearest wall <= 1.0mm" rule requires
+    // it to lose to a closer, cap-compliant wall or to fallback_extruder. Erase every
+    // candidate farther than the cap BEFORE any scoring/tie logic runs; if none remain
+    // (including the case where even the nearest sample was beyond the cap), fall back.
+    // The tie path below then only ever chooses among <=-cap candidates.
     if (p.max_dist_mm > 0.0) {
         const double cap_scaled = scale_(p.max_dist_mm);
-        if (knn_result.front().second > cap_scaled * cap_scaled)
+        const double cap2       = cap_scaled * cap_scaled;
+        knn_result.erase(std::remove_if(knn_result.begin(), knn_result.end(),
+                              [cap2](const std::pair<const WallSample *, double> &cand) {
+                                  return cand.second > cap2;
+                              }),
+                          knn_result.end());
+        if (knn_result.empty())
             return p.fallback_extruder;
     }
 
@@ -433,6 +444,25 @@ std::vector<size_t> select_contact_layers(const std::vector<double> &print_zs,
                                            double support_top_z, double gap_mm)
 {
     return select_layers_in_band(print_zs, support_top_z, support_top_z + gap_mm);
+}
+
+std::vector<size_t> select_layers_overlapping_span(const std::vector<double> &print_zs,
+                                                     double lo_z, double hi_z)
+{
+    // Two half-open intervals (a, b] and (c, d] overlap iff a < d && c < b. Here layer
+    // i's own interval is (bottom, print_zs[i]] with bottom carried forward from the
+    // previous iteration (0.0 for i == 0), and the band is (lo_z, hi_z] - so keep layer
+    // i when bottom < hi_z && lo_z < print_zs[i], EPSILON-padded the same way
+    // select_layers_in_band pads its own top-z comparison.
+    std::vector<size_t> result;
+    double bottom = 0.0;
+    for (size_t i = 0; i < print_zs.size(); ++i) {
+        const double top = print_zs[i];
+        if (top > lo_z + EPSILON && bottom < hi_z - EPSILON)
+            result.push_back(i);
+        bottom = top;
+    }
+    return result;
 }
 
 bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &layers,

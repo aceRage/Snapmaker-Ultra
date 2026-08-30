@@ -2343,13 +2343,15 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
 // uses (1-based config values), converted to the 0-based scheme used
 // throughout the chameleon-brim code (see task-3 report for the analysis).
 
-// Chameleon P2/P2.1: shared per-region "color" extruder derivation (0-based), factored
-// out of chameleon_collect_wall_samples' inline add_path lambda so chameleon_projection_
-// extruder (below) can reuse the exact same wall_filament/outer_wall_filament/object-
-// default chain instead of duplicating it. `is_external` is the erExternalPerimeter check
-// for a wall PATH; a projected surface sample has no such concept (see
-// chameleon_projection_extruder's own comment), so it always calls this with
-// is_external = false.
+// Chameleon P2/P2.1: per-region "color" extruder derivation (0-based) for a WALL path -
+// wall_filament, then outer_wall_filament for the external perimeter, then
+// object_default_extruder as the last resort. `is_external` is the erExternalPerimeter
+// check for a wall PATH. Used by chameleon_collect_wall_samples' add_path lambda below
+// (both the Part 1 brim wall index and the v2.1 coplanar lateral wall index feed off
+// it). v2.1 final-review I3 fix: the projection (vertical-surface) path does NOT reuse
+// this chain any more - a projected surface sample has no erExternalPerimeter concept
+// and prints with the region's solid_infill_filament, not wall_filament - see
+// chameleon_projection_region_extruder's own comment below for that derivation.
 static unsigned chameleon_region_extruder(const PrintRegionConfig &region_config, bool is_external,
                                            unsigned own_extruder_0based)
 {
@@ -2397,61 +2399,59 @@ static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const 
     }
 }
 
-// Chameleon P2.1 (v2.1 spec: "vertical projection is primary" for interface entities;
-// see docs/superpowers/specs/2026-08-30-support-match-v2-design.md). For one 0.8mm
-// sample point p (object coordinates, no instance shift - same convention as
-// chameleon_collect_wall_samples above), resolve the extruder of the model surface
-// directly above it: the first (lowest) object layer in `band_layer_indices` - the
-// caller passes these LOWEST layer first, exactly the order
-// select_layers_in_band/select_contact_layers (BrimFilament.hpp) already return, e.g.
-// (support_top_z, support_top_z + 2.0] per spec - whose lslices cover p; within that
-// layer, the LayerRegion whose own `slices` contain p, preferring a region with an
-// stBottom/stBottomBridge `fill_surfaces` surface covering p when more than one region's
-// slices contain p (the surface facing the support below is the one whose color the
-// support should match). Returns false, leaving out_extruder unwritten, when no band
-// layer's lslices cover p - the caller (Task 3) then falls through to the lateral rule.
-//
-// The actual geometric selection (Layer/LayerRegion can't be built standalone - private/
-// protected ctors, PrintObject-owned storage - see the T2 report for why this couldn't
-// be unit-tested directly) is delegated to chameleon_pick_projection_region
-// (BrimFilament.hpp/.cpp), which is unit-tested with hand-built ExPolygons; this
-// function's own job is just the Layer/LayerRegion -> ProjectionLayerView glue below,
-// plus extruder resolution.
-//
-// Extruder resolution mirrors chameleon_collect_wall_samples' derivation via the shared
-// chameleon_region_extruder helper above: region wall_filament, then
-// object_default_extruder as the last resort. Unlike a wall PATH, a projected surface
-// sample has no erExternalPerimeter concept - "is this the region's external perimeter
-// path" doesn't apply to a bare fill surface - so outer_wall_filament is deliberately
-// never consulted here (chameleon_region_extruder is always called with
-// is_external = false); see the T2 report for this call.
-//
-// object_default_extruder is a plain parameter (not recomputed here via
-// chameleon_object_default_extruder, which needs Print::config() for its filament-count
-// sentinel) for the same reason chameleon_collect_wall_samples' own_extruder_0based is:
-// the caller computes it ONCE per object/support layer (chameleon_assign_support_
-// interfaces already does, at the object_default_extruder local above) rather than this
-// function recomputing it on every one of the many sample-point calls a single support
-// layer makes. This is a deliberate, minimal deviation from the plan's literal
-// (const PrintObject&, band, p, out_extruder) signature - see the T2 report.
-//
-// Perf: O(band layers x regions x islands) per call, and every container built below
-// (`view` and its per-region pointer vectors) holds ExPolygon POINTERS only, never
-// copies polygon geometry - see BrimFilament.hpp's ProjectionLayerView comment. Layer::
-// lslices_bboxes is precomputed once at slicing time (PrintObjectSlice.cpp), long before
-// this pass runs, so the AABB gate inside chameleon_pick_projection_region is free.
-static bool chameleon_projection_extruder(const PrintObject &object,
-                                                             const std::vector<size_t> &band_layer_indices,
-                                                             const Point &p,
-                                                             unsigned object_default_extruder,
-                                                             unsigned &out_extruder)
+// Chameleon P2.1 v2.1 final-review I3 fix: the projection branch resolves the PRINTED
+// filament of a projected surface sample, which is NOT the same question
+// chameleon_region_extruder answers for a wall path. The surface the support interface
+// touches is the model's bottom shell, and the pipeline prints that shell with the
+// region's solid_infill_filament (ToolOrdering.cpp's LayerTools::solid_infill_filament /
+// PrintRegion::extruder(frSolidInfill|frTopSolidInfill), PrintRegion.cpp:18-35), not
+// wall_filament - painted regions set wall/solid/sparse together so the two only diverge
+// under a manual filament mapping (wall_filament != solid_infill_filament), exactly the
+// mismatch this feature exists to remove. Mirror PrintRegion::extruder's own fallback:
+// solid_infill_filament (if set), else sparse_infill_filament (PrintRegion::extruder
+// routes frSolidInfill through sparse_infill_filament when sparse_infill_density == 100%
+// - internal_solid_infill_uses_sparse_filament, PrintRegion.cpp:10-13 - so it is a real,
+// engine-consulted fallback for this surface, not an arbitrary substitute); grepped
+// PrintRegionConfig (PrintConfig.hpp) - solid_infill_filament and sparse_infill_filament
+// are the only two options that ever govern a solid/bottom shell's filament, there is no
+// more specific "bottom shell filament" option. wall_filament/outer_wall_filament are
+// NEVER consulted here - those stay chameleon_region_extruder's job, unchanged, for the
+// LATERAL (wall-sample) path only.
+static unsigned chameleon_projection_region_extruder(const PrintRegionConfig &region_config,
+                                                       unsigned own_extruder_0based)
+{
+    if (region_config.solid_infill_filament.value > 0)
+        return unsigned(region_config.solid_infill_filament.value - 1);
+    if (region_config.sparse_infill_filament.value > 0)
+        return unsigned(region_config.sparse_infill_filament.value - 1);
+    return own_extruder_0based;
+}
+
+// Chameleon P2.1 v2.1 final-review M1 fix: build the ProjectionLayerView list for a
+// projection band ONCE per support layer instead of once per 0.8mm sample point. Layer/
+// LayerRegion can't be built standalone (private/protected ctors, PrintObject-owned
+// storage - see the T2 report), so the geometric selection itself stays delegated to
+// chameleon_pick_projection_region (BrimFilament.hpp/.cpp, unit-tested with hand-built
+// ExPolygons); this function is just the Layer/LayerRegion -> ProjectionLayerView glue,
+// now factored out of the per-sample resolver so the caller (chameleon_assign_support_
+// interfaces) can call it once per support layer and capture the result by reference in
+// its interface_resolver lambda. `band_layer_indices` must already be ordered lowest
+// layer first (the order select_layers_in_band/select_contact_layers return). Every
+// container this builds (`out_view` and its per-region pointer vectors) holds ExPolygon
+// POINTERS only, never copies polygon geometry - see BrimFilament.hpp's
+// ProjectionLayerView comment. `out_view_layers` is parallel to `out_view` (same index),
+// kept for extruder resolution after chameleon_pick_projection_region reports a hit.
+static void chameleon_build_projection_views(const PrintObject &object,
+                                              const std::vector<size_t> &band_layer_indices,
+                                              std::vector<ProjectionLayerView> &out_view,
+                                              std::vector<const Layer *> &out_view_layers)
 {
     const auto &layers = object.layers();
 
-    std::vector<ProjectionLayerView> view;
-    std::vector<const Layer *>       view_layers; // parallel to `view`, for extruder resolution after a hit
-    view.reserve(band_layer_indices.size());
-    view_layers.reserve(band_layer_indices.size());
+    out_view.clear();
+    out_view_layers.clear();
+    out_view.reserve(band_layer_indices.size());
+    out_view_layers.reserve(band_layer_indices.size());
 
     for (size_t li : band_layer_indices) {
         if (li >= layers.size())
@@ -2479,10 +2479,46 @@ static bool chameleon_projection_extruder(const PrintObject &object,
             lv.region_bottom_polys.push_back(std::move(bottom_polys));
         }
 
-        view.push_back(std::move(lv));
-        view_layers.push_back(layer);
+        out_view.push_back(std::move(lv));
+        out_view_layers.push_back(layer);
     }
+}
 
+// Chameleon P2.1 (v2.1 spec: "vertical projection is primary" for interface entities;
+// see docs/superpowers/specs/2026-08-30-support-match-v2-design.md). For one 0.8mm
+// sample point p (object coordinates, no instance shift - same convention as
+// chameleon_collect_wall_samples above), resolve the extruder of the model surface
+// directly above it, against an ALREADY-BUILT `view`/`view_layers` pair (v2.1
+// final-review M1 fix: chameleon_build_projection_views above builds these once per
+// support layer; this function no longer builds anything, so it's cheap to call once per
+// sample point as before). Returns false, leaving out_extruder unwritten, when no band
+// layer's lslices cover p - the caller (Task 3) then falls through to the lateral rule.
+//
+// Extruder resolution: v2.1 final-review I3 fix - chameleon_projection_region_extruder
+// above (solid_infill_filament -> sparse_infill_filament -> object default), NOT
+// chameleon_region_extruder (wall_filament-based; still used unchanged by the lateral/
+// wall-sample path). A projected surface sample has no erExternalPerimeter concept
+// either way - "is this the region's external perimeter path" doesn't apply to a bare
+// fill surface - so outer_wall_filament was never, and is still never, consulted here.
+//
+// object_default_extruder is a plain parameter (not recomputed here via
+// chameleon_object_default_extruder, which needs Print::config() for its filament-count
+// sentinel) for the same reason chameleon_collect_wall_samples' own_extruder_0based is:
+// the caller computes it ONCE per object/support layer (chameleon_assign_support_
+// interfaces already does, at the object_default_extruder local above) rather than this
+// function recomputing it on every one of the many sample-point calls a single support
+// layer makes.
+//
+// Perf: O(band layers x regions) per call now that the view is prebuilt (was O(band
+// layers x regions x islands) per call before M1). Layer::lslices_bboxes is precomputed
+// once at slicing time (PrintObjectSlice.cpp), long before this pass runs, so the AABB
+// gate inside chameleon_pick_projection_region is free.
+static bool chameleon_projection_extruder_from_view(const std::vector<ProjectionLayerView> &view,
+                                                      const std::vector<const Layer *> &view_layers,
+                                                      const Point &p,
+                                                      unsigned object_default_extruder,
+                                                      unsigned &out_extruder)
+{
     size_t hit_layer = 0, hit_region = 0;
     if (!chameleon_pick_projection_region(view, p, hit_layer, hit_region))
         return false; // no band layer's lslices cover p -> caller falls through to lateral
@@ -2494,7 +2530,7 @@ static bool chameleon_projection_extruder(const PrintObject &object,
         return false; // defensive: cannot happen (hit_region indexes the same regions() this view was built from)
 
     const LayerRegion &lr = *regions[hit_region];
-    out_extruder = chameleon_region_extruder(lr.region().config(), /*is_external=*/false, object_default_extruder);
+    out_extruder = chameleon_projection_region_extruder(lr.region().config(), object_default_extruder);
     return true;
 }
 
@@ -2678,18 +2714,28 @@ static void chameleon_assign_support_interfaces(Print &print)
             }
 
             // (a) Projection band: same call as v2.0 (contact band, (support_top_z,
-            // support_top_z + 2.0]) - now feeds chameleon_projection_extruder (Task 2)
-            // directly by index list, no WallSampleIndex needed for this part.
+            // support_top_z + 2.0]) - now feeds chameleon_build_projection_views /
+            // chameleon_projection_extruder_from_view (Task 2, M1-hoisted) directly by
+            // index list, no WallSampleIndex needed for this part.
             std::vector<size_t> contact_idx = select_contact_layers(layer_print_zs, support_layer->print_z, 2.0);
 
-            // (b) Coplanar lateral band: object layers whose TOP z falls within this
+            // (b) Coplanar lateral band: object layers whose z-INTERVAL OVERLAPS this
             // support layer's OWN span (print_z - height, print_z] - v2.1's "any support
             // within 1mm of a wall at its own layer matches that wall" rule (spec's
             // Decision rules, "Lateral rule - all roles"). This REPLACES the old
             // contact-band WallSampleIndex that v2.0 used for interface lateral voting -
             // projection (a) now owns the contact band, and the lateral rule uses this
             // separate, layer-local band instead.
-            std::vector<size_t> coplanar_idx = select_layers_in_band(
+            //
+            // v2.1 final-review I2 fix: select_layers_overlapping_span, not
+            // select_layers_in_band - this band is only ONE support-layer tall, so a
+            // pure top-z-in-band test can miss an object layer whose walls flank the
+            // band even though its own top overshoots hi_z (unsynced support/object
+            // layer grids, variable layer height). The projection band above
+            // (contact_idx, select_contact_layers -> select_layers_in_band) is
+            // deliberately left as-is: its 2.0mm width is wider than any single layer,
+            // so the top-z deviation the v2.0 review accepted for it still holds.
+            std::vector<size_t> coplanar_idx = select_layers_overlapping_span(
                 layer_print_zs, support_layer->print_z - support_layer->height, support_layer->print_z);
 
             WallSampleIndex coplanar_wall_idx;
@@ -2722,6 +2768,16 @@ static void chameleon_assign_support_interfaces(Print &print)
             base_lateral_params.max_dist_mm       = 1.0;
             base_lateral_params.fallback_extruder = base_fallback_extruder;
 
+            // v2.1 final-review M1 fix: build the projection band's ProjectionLayerView
+            // list ONCE per support layer, not once per 0.8mm sample point. Previously
+            // this was rebuilt (2 vector allocations per region per band layer) inside
+            // every interface_resolver call below - see chameleon_build_projection_views'
+            // own comment. interface_resolver captures these two by reference and reuses
+            // them across every sample point this support layer resolves.
+            std::vector<ProjectionLayerView> projection_view;
+            std::vector<const Layer *>       projection_view_layers;
+            chameleon_build_projection_views(*object, contact_idx, projection_view, projection_view_layers);
+
             // Interface resolver: projection (the model surface directly above a sample)
             // wins whenever it hits; lateral (coplanar walls, 1mm cap) is the fallback
             // when projection misses. "SURFACE ABOVE WINS" is the user-approved priority
@@ -2731,10 +2787,11 @@ static void chameleon_assign_support_interfaces(Print &print)
             // self-contained expressions below is tried first and which becomes the
             // "else" branch; no other code needs to move, since both are already
             // independent (p) -> unsigned expressions with no shared mutable state.
-            auto interface_resolver = [&object, &contact_idx, object_default_extruder,
+            auto interface_resolver = [&projection_view, &projection_view_layers, object_default_extruder,
                                         &coplanar_wall_idx, &interface_lateral_params](const Point &p) -> unsigned {
                 unsigned proj_extruder = 0;
-                if (chameleon_projection_extruder(*object, contact_idx, p, object_default_extruder, proj_extruder))
+                if (chameleon_projection_extruder_from_view(projection_view, projection_view_layers, p,
+                                                              object_default_extruder, proj_extruder))
                     return proj_extruder;
                 return brim_vote(coplanar_wall_idx, p, interface_lateral_params);
             };

@@ -315,6 +315,27 @@ TEST_CASE("brim_vote max_dist_mm default 0 is uncapped (Part 1 brim path unchang
     CHECK(brim_vote(idx, Point(scale_(5), scale_(50.0)), p) == 1);
 }
 
+TEST_CASE("brim_vote max_dist_mm cap filters the WHOLE electorate, not just the nearest sample (I1)", "[chameleon]")
+{
+    // v2.1 final-review I1: a denser cluster of samples just beyond the cap must not be
+    // able to outvote a single sample inside the cap. Nearest sample (extruder 1) sits
+    // 0.9mm away, inside the 1.0mm cap; two samples of extruder 2 sit 1.1mm away, just
+    // beyond it. Pre-fix, only knn_result.front() (the 0.9mm sample) was checked against
+    // the cap, then scoring ran over all k=3 samples: extruder 2's two 1/d^2 votes
+    // (2 / 1.1^2 ~= 1.65) outscored extruder 1's one vote (1 / 0.9^2 ~= 1.23), so the
+    // wall BEYOND the cap won - exactly the "beyond-cap wall wins" defect the review
+    // hand-executed. Post-fix, the two 1.1mm samples are erased from the electorate
+    // before scoring, so only the in-cap extruder 1 sample can vote.
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 0.9, 0, 0.9), 1, 1);     // extruder 1 @ 0.9mm - inside cap
+    idx.add_polyline(segment(1.1, 0, 1.1, 0), 2, 2);     // extruder 2 @ 1.1mm - outside cap
+    idx.add_polyline(segment(-1.1, 0, -1.1, 0), 2, 3);   // extruder 2 @ 1.1mm - outside cap (denser cluster)
+    BrimVoteParams p;
+    p.fallback_extruder = 9;
+    p.max_dist_mm = 1.0;
+    CHECK(brim_vote(idx, Point(0, 0), p) == 1);
+}
+
 TEST_CASE("split_polyline_by_resolver produces runs matching a synthetic resolver", "[chameleon]")
 {
     BrimVoteParams p;
@@ -444,6 +465,40 @@ TEST_CASE("select_layers_in_band selects the coplanar (lo, hi] band; select_cont
     auto narrow = select_layers_in_band({0.2, 0.5, 1.4}, 0.2, 0.55);
     REQUIRE(narrow.size() == 1);
     CHECK(narrow[0] == 1);
+}
+
+TEST_CASE("select_layers_overlapping_span finds a straddling layer that select_layers_in_band misses (I2)", "[chameleon]")
+{
+    // v2.1 final-review I2: a band only one support-layer tall (here (9.8, 10.0]) must
+    // still pick up an object layer whose TOP overshoots hi_z but whose BOTTOM still
+    // dips into the band - its walls flank the band at this z even though its own top
+    // lies above it (unsynced support/object layer grids, variable layer height).
+    // Object layer tops: 9.6, 9.9, 10.2, 10.5 -> intervals (0,9.6], (9.6,9.9],
+    // (9.9,10.2], (10.2,10.5].
+    std::vector<double> zs = {9.6, 9.9, 10.2, 10.5};
+
+    // Old top-z-only test: only the layer whose TOP lies in (9.8, 10.0] - index 1 (top
+    // 9.9). The straddling layer at index 2 (top 10.2, bottom 9.9 - its interval
+    // (9.9,10.2] overlaps (9.8,10.0] even though its own top overshoots hi_z) is missed
+    // - this is the defect I2 fixes.
+    auto old_band = select_layers_in_band(zs, 9.8, 10.0);
+    REQUIRE(old_band.size() == 1);
+    CHECK(old_band[0] == 1);
+
+    // select_layers_overlapping_span finds BOTH the in-band layer (index 1) and the
+    // straddling layer (index 2, found). The fully-disjoint layers are still excluded:
+    // index 0's interval (0,9.6] never reaches lo_z=9.8 (not found); index 3's interval
+    // (10.2,10.5] starts at/after hi_z=10.0 (not found).
+    auto overlap = select_layers_overlapping_span(zs, 9.8, 10.0);
+    REQUIRE(overlap.size() == 2);
+    CHECK(overlap[0] == 1);
+    CHECK(overlap[1] == 2);
+
+    // Sanity: on a band wide enough that top-z-in-band already finds every overlapping
+    // layer (no straddler at the far edge), the two selectors agree.
+    auto wide_old = select_layers_in_band(zs, 9.5, 10.6);
+    auto wide_new = select_layers_overlapping_span(zs, 9.5, 10.6);
+    CHECK(wide_old == wide_new);
 }
 
 // --- v2.1 Task 2: projection resolver pure geometric core -------------------

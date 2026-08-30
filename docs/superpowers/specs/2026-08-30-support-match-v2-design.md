@@ -27,6 +27,11 @@ site, guards, idempotency, invalidation) carries over unchanged.
   (outer_wall_filament → wall_filament → object default). Projection wins over lateral
   whenever it hits ("surface above wins" — user decision; a future config option for the
   opposite priority is FENCED, design the resolver so priority is one branch).
+  **v2.1 fix-wave correction (I3, 2026-08-30):** the projected surface is the model's
+  bottom shell, which the pipeline prints with `solid_infill_filament`, not
+  `wall_filament` — the projection branch resolves `solid_infill_filament` →
+  `sparse_infill_filament` → object default instead; the wall-filament chain above
+  stays exactly as written for the lateral (wall-sample) rule below.
 - **Lateral rule — all roles**: any sample point (interface points where projection
   misses, and ALL base/erSupportMaterial points) matches the nearest wall of the
   COPLANAR object layer(s) (z-interval overlap with the support layer's own span) iff
