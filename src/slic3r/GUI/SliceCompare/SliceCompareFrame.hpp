@@ -18,8 +18,9 @@ namespace GUI {
 
 // Opens the (singleton) Slice Compare frame, raising the existing instance
 // instead of creating a second one if it is already open.
-// preselect_last_two: when true, the two newest SnapshotStore entries are
-// selected as A/B (older -> A, newer -> B).
+// preselect_last_two: when true, the two newest SnapshotStore entries (of
+// the current plate, falling back to the whole session) are selected as
+// A/B (older -> A, newer -> B). See SliceCompareFrame::preselect_last_two().
 void open_slice_compare_frame(wxWindow* parent, bool preselect_last_two);
 
 class SliceCompareFrame : public wxFrame
@@ -33,8 +34,10 @@ public:
     void set_snapshots(std::shared_ptr<const SliceCompare::Snapshot> a,
                         std::shared_ptr<const SliceCompare::Snapshot> b);
 
-    // Selects the two newest SnapshotStore entries as A/B, if at least two
-    // exist. No-op otherwise.
+    // Selects the two newest SnapshotStore entries belonging to the current
+    // plate as A/B (older -> A, newer -> B), falling back to the two newest
+    // of the whole session when fewer than two of the current plate exist.
+    // No-op when fewer than two session snapshots exist at all.
     void preselect_last_two();
 
     // Rebuilds the SnapshotStore-backed picker entries ("Browse..." entry

@@ -5,6 +5,8 @@
 
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/Plater.hpp"
+#include "slic3r/GUI/PartPlate.hpp"
 
 #include <wx/sizer.h>
 #include <wx/stattext.h>
@@ -507,8 +509,29 @@ void SliceCompareFrame::preselect_last_two()
     const auto list = SliceCompare::SnapshotStore::instance().list(); // newest first
     if (list.size() < 2)
         return;
-    std::shared_ptr<const SliceCompare::Snapshot> newer = SliceCompare::SnapshotStore::instance().get(list[0].first);
-    std::shared_ptr<const SliceCompare::Snapshot> older = SliceCompare::SnapshotStore::instance().get(list[1].first);
+
+    // Prefer the last two snapshots OF THE CURRENT PLATE. Session snapshot
+    // labels are built in Plater.cpp as "P<plate+1> \xC2\xB7 <preset> \xC2\xB7 <time>"
+    // (UTF-8 middle dot); match that literal prefix as raw bytes against the
+    // stored label directly, since both are already UTF-8 std::string and a
+    // wxString round-trip would just be extra risk for no benefit here.
+    std::vector<std::pair<int, std::string>> plate_matches;
+    if (Plater* plater = wxGetApp().plater()) {
+        const int plate_idx = plater->get_partplate_list().get_curr_plate_index();
+        const std::string prefix = "P" + std::to_string(plate_idx + 1) + " \xC2\xB7";
+        for (const auto& kv : list)
+            if (kv.second.rfind(prefix, 0) == 0)
+                plate_matches.push_back(kv);
+    }
+
+    // Fall back to the last two of the whole session when fewer than two
+    // snapshots of the current plate exist (or the current plate couldn't
+    // be determined).
+    const std::vector<std::pair<int, std::string>>& source =
+        plate_matches.size() >= 2 ? plate_matches : list;
+
+    std::shared_ptr<const SliceCompare::Snapshot> newer = SliceCompare::SnapshotStore::instance().get(source[0].first);
+    std::shared_ptr<const SliceCompare::Snapshot> older = SliceCompare::SnapshotStore::instance().get(source[1].first);
     if (older && newer)
         set_snapshots(older, newer);
 }
