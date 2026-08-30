@@ -5709,8 +5709,17 @@ void GUI_App::stop_sync_user_preset()
 
 void GUI_App::start_http_server()
 {
-    if (!m_http_server.is_started())
+    if (!m_http_server.is_started()) {
+        // Ultra P4: use a DEDICATED OAuth-callback port (not 13618). Bambu Studio and
+        // OrcaSlicer also bind 13618, so whichever grabbed it first would win the OAuth
+        // handoff. We advertise this port via get_localhost_url (get_http_port()), and
+        // bambulab redirects the ticket to whatever localhost port we report.
+        m_http_server.setPort(13650);
         m_http_server.start();
+    }
+    // The OAuth callback listener is short-lived; the 5s health-check auto-restart can
+    // tear the socket down mid-login (observed the port not listening). Disable it.
+    m_http_server.stop_health_check();
 }
 void GUI_App::stop_http_server()
 {

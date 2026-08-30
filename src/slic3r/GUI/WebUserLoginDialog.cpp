@@ -78,14 +78,13 @@ ZUserLogin::ZUserLogin() : wxDialog((wxWindow *) (wxGetApp().mainframe), wxID_AN
     }
     else {
         std::string host_url = agent->get_bambulab_host();
+        // Ultra P4: load the NON-localed /sign-in. The fork appended the UI language
+        // (e.g. /en-US/sign-in), which made bambulab carry locale through the OAuth flow
+        // and redirect Google's result to the localed callback /en-us/sign-in/callback,
+        // which 404s. Stock Bambu Studio uses the bare /sign-in, whose /sign-in/callback
+        // resolves and posts the token back to our loopback server.
         TargetUrl = host_url + "/sign-in";
         m_networkOk = false;
-
-        wxString strlang = wxGetApp().current_language_code_safe();
-        if (strlang != "") {
-            strlang.Replace("_", "-");
-            TargetUrl = host_url + "/" + strlang + "/sign-in";
-        }
 
         BOOST_LOG_TRIVIAL(info) << "login url = " << TargetUrl.ToStdString();
 
@@ -205,8 +204,6 @@ void ZUserLogin::OnIdle(wxIdleEvent &WXUNUSED(evt))
  */
 void ZUserLogin::OnNavigationRequest(wxWebViewEvent &evt)
 {
-    //wxLogMessage("%s", "Navigation request to '" + evt.GetURL() + "'(target='" + evt.GetTarget() + "')");
-
     UpdateState();
 }
 
@@ -309,7 +306,11 @@ void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
             CallAfter([this, sequence_id] {
                 json ack_j;
                 ack_j["command"] = "get_localhost_url";
-                ack_j["response"]["base_url"] = std::string(LOCALHOST_URL) + std::to_string(wxGetApp().get_http_port());
+                // Ultra P4: advertise http://localhost:<port> (NOT 127.0.0.1). Real Bambu
+                // Studio uses "localhost"; bambulab's sign-in callback validates redirect_url
+                // and rejects the 127.0.0.1 form -> the callback page 404s. localhost still
+                // resolves to our loopback server on 127.0.0.1.
+                ack_j["response"]["base_url"] = std::string("http://localhost:") + std::to_string(wxGetApp().get_http_port());
                 ack_j["response"]["result"] = "success";
                 ack_j["sequence_id"] = sequence_id;
                 wxString str_js = wxString::Format("window.postMessage(%s)", ack_j.dump());
@@ -317,9 +318,8 @@ void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
             });
         }
         else if (strCmd == "thirdparty_login") {
-            BOOST_LOG_TRIVIAL(info) << "thirdparty_login: thirdparty_login";
-            if (j["data"].contains("url")) {
-                std::string jump_url = j["data"]["url"].get<std::string>();
+            std::string jump_url = j["data"].contains("url") ? j["data"]["url"].get<std::string>() : std::string();
+            if (!jump_url.empty()) {
                 CallAfter([this, jump_url] {
                     wxString url = wxString::FromUTF8(jump_url);
                     wxLaunchDefaultBrowser(url);
@@ -327,8 +327,8 @@ void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
             }
         }
         else if (strCmd == "new_webpage") {
-            if (j["data"].contains("url")) {
-                std::string jump_url = j["data"]["url"].get<std::string>();
+            std::string jump_url = j["data"].contains("url") ? j["data"]["url"].get<std::string>() : std::string();
+            if (!jump_url.empty()) {
                 CallAfter([this, jump_url] {
                     wxString url = wxString::FromUTF8(jump_url);
                     wxLaunchDefaultBrowser(url);

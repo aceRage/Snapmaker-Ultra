@@ -271,8 +271,14 @@ wxWebView* WebView::CreateWebView(wxWindow * parent, wxString const & url, wxStr
     if (webView) {
         webView->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
 #ifdef __WIN32__
+        // Ultra P4: bambulab.com/sign-in version-gates its login flavor on the BBL-Slicer
+        // UA version. Our SLIC3R_VERSION (01.10.x) is below the ticketLogin gate
+        // (02.03.00.01), so the site falls back to its retired legacy /sign-in/callback
+        // (404) instead of the live /sign-in/studio-callback. Report a version >= the gate
+        // for the Bambu login webview ONLY (do not touch SLIC3R_VERSION globally).
+        wxString ua_ver = (brand_tag == "BBL-Slicer") ? wxString("02.03.00.01") : wxString(SLIC3R_VERSION);
         webView->SetUserAgent(wxString::Format("%s/v%s (%s) Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.52", brand_tag, SLIC3R_VERSION,
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.52", brand_tag, ua_ver,
             Slic3r::GUI::wxGetApp().dark_mode() ? "dark" : "light"));
         webView->Create(parent, wxID_ANY, url2, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
         // We register the wxfs:// protocol for testing purposes

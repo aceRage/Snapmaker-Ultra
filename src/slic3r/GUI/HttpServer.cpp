@@ -649,14 +649,38 @@ std::shared_ptr<HttpServer::Response> HttpServer::bbl_auth_handle_request(const 
 {
     BOOST_LOG_TRIVIAL(info) << "thirdparty_login: get_response";
 
-    if (boost::contains(url, "access_token")) {
-        std::string   redirect_url           = url_get_param(url, "redirect_url");
-        std::string   access_token           = url_get_param(url, "access_token");
-        std::string   refresh_token          = url_get_param(url, "refresh_token");
-        std::string   expires_in_str         = url_get_param(url, "expires_in");
-        std::string   refresh_expires_in_str = url_get_param(url, "refresh_expires_in");
-        NetworkAgent* agent                  = wxGetApp().getAgent();
+    std::string   redirect_url           = url_get_param(url, "redirect_url");
+    std::string   access_token           = url_get_param(url, "access_token");
+    std::string   refresh_token          = url_get_param(url, "refresh_token");
+    std::string   expires_in_str         = url_get_param(url, "expires_in");
+    std::string   refresh_expires_in_str = url_get_param(url, "refresh_expires_in");
+    NetworkAgent* agent                  = wxGetApp().getAgent();
 
+    // Ultra P4: third-party (Google/OAuth) ticket flow. The loopback receives
+    // ?ticket=<t>&redirect_url=...; exchange the ticket for real tokens, then continue
+    // exactly like the legacy access_token flow below.
+    if (access_token.empty() && agent && boost::contains(url, "ticket")) {
+        std::string  ticket  = url_get_param(url, "ticket");
+        unsigned int tk_code = 0;
+        std::string  tk_body;
+        if (agent->get_my_token(ticket, &tk_code, &tk_body) == 0) {
+            try {
+                json tj = json::parse(tk_body);
+                if (tj.contains("accessToken"))  access_token  = tj["accessToken"].get<std::string>();
+                if (tj.contains("refreshToken")) refresh_token = tj["refreshToken"].get<std::string>();
+                if (tj.contains("expiresIn"))
+                    expires_in_str = tj["expiresIn"].is_string() ? tj["expiresIn"].get<std::string>()
+                                                                  : std::to_string(tj["expiresIn"].get<long long>());
+                if (tj.contains("refreshExpiresIn"))
+                    refresh_expires_in_str = tj["refreshExpiresIn"].is_string() ? tj["refreshExpiresIn"].get<std::string>()
+                                                                                : std::to_string(tj["refreshExpiresIn"].get<long long>());
+            } catch (const std::exception& e) {
+                BOOST_LOG_TRIVIAL(error) << "ticket token JSON parse failed: " << e.what();
+            }
+        }
+    }
+
+    if (!access_token.empty() && agent) {
         unsigned int http_code;
         std::string  http_body;
         int          result = agent->get_my_profile(access_token, &http_code, &http_body);
