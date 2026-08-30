@@ -638,11 +638,17 @@ TEST_CASE("chameleon_pick_projection_region is bbox-gated but still exact when b
     CHECK_FALSE(chameleon_pick_projection_region(layers, Point(scale_(50), scale_(50)), out_layer, out_region));
 }
 
-TEST_CASE("chameleon_pick_projection_region skips a layer whose lslices hit but no region slice does", "[chameleon]")
+TEST_CASE("chameleon_pick_projection_region falls back to the nearest region on the SAME layer when lslices hit but no region slice does (C5)", "[chameleon]")
 {
-    // Degenerate/inconsistent input: lslices covers p but the (only) region's own
-    // slice polygon doesn't -> must NOT report a false hit on that layer; continues
-    // scanning and finds the next band layer instead of crashing or mis-resolving.
+    // v2.2 Task 2 (spec C5) deliberately changes this from v2.1's behavior: lslices
+    // covers p but the (only) region's own slice polygon doesn't. v2.1 treated this as
+    // a miss for the whole layer and fell through to the next band layer (see this
+    // test's own pre-C5 history). C5's nearest-region fallback now applies uniformly
+    // whenever a layer is a hit but no region's raw slices contain p - including this
+    // pre-existing degenerate case, not just the new margin-ring case - so layer0 is
+    // resolved using ITS OWN (distant, non-containing) region instead of skipping to
+    // layer1's exact-containing one. "Surface above [i.e. the lower band layer] wins"
+    // outranks "prefer an exact containment on a higher layer".
     ExPolygons layer0_lslices = { square_expoly(0, 0, 10) };
     ExPolygons layer0_region_slice = { square_expoly(-20, 0, 2) }; // doesn't cover (0,0)
     ExPolygons layer1_lslices = { square_expoly(0, 0, 10) };
@@ -651,6 +657,30 @@ TEST_CASE("chameleon_pick_projection_region skips a layer whose lslices hit but 
     ProjectionLayerView layer0, layer1;
     layer0.lslices = &layer0_lslices;
     layer0.region_slice_polys = { { &layer0_region_slice[0] } };
+    layer1.lslices = &layer1_lslices;
+    layer1.region_slice_polys = { { &layer1_region_slice[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer0, layer1 };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region));
+    CHECK(out_layer == 0);   // v2.1 expected 1 here - C5 changes this, see comment above
+    CHECK(out_region == 0);  // layer0's only region, chosen by the nearest-region fallback
+}
+
+TEST_CASE("chameleon_pick_projection_region still falls through when a hit layer offers NO region with any raw geometry at all", "[chameleon]")
+{
+    // The genuinely-unresolvable case the C5 fallback does NOT paper over: layer0's
+    // lslices cover p, but EVERY region on layer0 contributes zero raw slice polys (not
+    // just non-containing ones - there is nothing at all to measure "nearest" against).
+    // nearest_region_to_point has no candidate, so this layer still yields no region,
+    // and the scan correctly continues to layer1.
+    ExPolygons layer0_lslices = { square_expoly(0, 0, 10) };
+    ExPolygons layer1_lslices = { square_expoly(0, 0, 10) };
+    ExPolygons layer1_region_slice = { square_expoly(0, 0, 10) };  // does cover (0,0)
+
+    ProjectionLayerView layer0, layer1;
+    layer0.lslices = &layer0_lslices;
+    layer0.region_slice_polys = { {} };  // one region, contributes nothing
     layer1.lslices = &layer1_lslices;
     layer1.region_slice_polys = { { &layer1_region_slice[0] } };
 
@@ -902,4 +932,144 @@ TEST_CASE("apply_bucket_caps: gate runs before the trim, so a gated sliver never
     CHECK(result.kept == std::set<unsigned>{1, 2});
     CHECK(result.buckets_dropped_min_benefit == 1);
     CHECK(result.buckets_trimmed_cap == 0);    // never reached - only 2 buckets left post-gate
+}
+
+// --- v2.2 Task 2: gap-aware lateral cap arithmetic (spec C4) ----------------
+
+TEST_CASE("gap_aware_lateral_cap_mm sums the gap, both half-widths, and the 0.35mm slack", "[chameleon]")
+{
+    // 0.2mm gap + 0.4mm outer wall (half 0.2) + 0.42mm support line (half 0.21) +
+    // 0.35mm slack = 0.96mm - well above the old flat 1.0mm cap was frequently able to
+    // satisfy at these same inputs (the whole point of C4: 1.0 alone left ~0.04mm of
+    // slack over JUST the physical minimum, none at all once real-world jitter is
+    // added - see the spec's root cause 1).
+    const double cap = gap_aware_lateral_cap_mm(0.2, 0.4, 0.42);
+    CHECK_THAT(cap, Catch::Matchers::WithinAbs(0.96, 1e-9));
+}
+
+TEST_CASE("gap_aware_lateral_cap_mm with zero widths still returns gap + slack", "[chameleon]")
+{
+    // Degenerate/defensive input (e.g. a region contributing no printing regions at
+    // all, so outer_wall_width_mm resolved to 0) - the formula must not divide, throw,
+    // or otherwise misbehave; it's a plain sum, so 0 half-widths just drop out.
+    const double cap = gap_aware_lateral_cap_mm(0.15, 0.0, 0.0);
+    CHECK_THAT(cap, Catch::Matchers::WithinAbs(0.50, 1e-9));
+}
+
+TEST_CASE("gap_aware_lateral_cap_mm is NOT symmetric in its two width args (documents call-site order doesn't matter for the SUM, but values do)", "[chameleon]")
+{
+    // Sanity check that both widths are actually halved independently rather than one
+    // being silently ignored or double-counted - swap outer/support widths and confirm
+    // the result tracks the (now-different) sum, not the same cached value.
+    const double cap_a = gap_aware_lateral_cap_mm(0.3, 0.6, 0.2);   // 0.3+0.3+0.1+0.35=1.05
+    const double cap_b = gap_aware_lateral_cap_mm(0.3, 0.2, 0.6);   // 0.3+0.1+0.3+0.35=1.05
+    // Same total in this particular pair (sum is order-insensitive by construction),
+    // but a THIRD case with an actually different total proves neither arg is dropped.
+    const double cap_c = gap_aware_lateral_cap_mm(0.3, 0.6, 0.6);   // 0.3+0.3+0.3+0.35=1.25
+    CHECK_THAT(cap_a, Catch::Matchers::WithinAbs(1.05, 1e-9));
+    CHECK_THAT(cap_b, Catch::Matchers::WithinAbs(1.05, 1e-9));
+    CHECK_THAT(cap_c, Catch::Matchers::WithinAbs(1.25, 1e-9));
+}
+
+// --- v2.2 Task 2: projection margin ring (spec C5) --------------------------
+
+TEST_CASE("chameleon_pick_projection_region: margin-ring point (raw miss, expanded hit) resolves to the nearest region", "[chameleon]")
+{
+    // p is outside every region's raw slices on this layer (so the pre-existing
+    // containment scan finds nothing) but inside the layer's expanded_lslices (the C5
+    // margin ring - hand-built here directly, standing in for what
+    // chameleon_build_projection_views would compute via offset_ex in production).
+    // Two candidate regions at different distances from p; the nearer one must win.
+    Point p(0, 0);
+
+    ExPolygons raw_lslices      = { square_expoly(20, 0, 5) };   // spans x in [15,25] - doesn't cover p
+    ExPolygons expanded_lslices = { square_expoly(10, 0, 15) };  // spans x in [-5,25] - covers p
+
+    ExPolygons region_far_slice  = { square_expoly(20, 0, 5) };  // nearest vertex (15,*) -> dist ~15.81mm
+    ExPolygons region_near_slice = { square_expoly(3, 0, 1) };   // nearest vertex (2,*)  -> dist ~2.24mm
+
+    ProjectionLayerView layer;
+    layer.lslices             = &raw_lslices;
+    layer.expanded_lslices    = expanded_lslices;
+    layer.region_slice_polys  = { { &region_far_slice[0] }, { &region_near_slice[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, p, out_layer, out_region));
+    CHECK(out_layer == 0);
+    CHECK(out_region == 1);   // region_near_slice, not region_far_slice (index 0)
+}
+
+TEST_CASE("chameleon_pick_projection_region: point beyond even the expanded margin still misses", "[chameleon]")
+{
+    // p is outside BOTH the raw lslices and the expanded (margin-ring) lslices on the
+    // only band layer available - the margin doesn't turn every sample into a hit, only
+    // ones actually within it.
+    Point p(0, 0);
+
+    ExPolygons raw_lslices      = { square_expoly(50, 50, 5) };   // far from the origin
+    ExPolygons expanded_lslices = { square_expoly(50, 50, 7) };   // still far - modest margin growth
+
+    ProjectionLayerView layer;
+    layer.lslices            = &raw_lslices;
+    layer.expanded_lslices   = expanded_lslices;
+    layer.region_slice_polys = { { &raw_lslices[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer };
+    size_t out_layer = 999, out_region = 999;
+    CHECK_FALSE(chameleon_pick_projection_region(layers, p, out_layer, out_region));
+    CHECK(out_layer == 999);
+    CHECK(out_region == 999);
+}
+
+TEST_CASE("chameleon_pick_projection_region: nearest-region fallback ties broken by ascending region index", "[chameleon]")
+{
+    // Two regions exactly equidistant from p (mirror images across the origin), neither
+    // containing p, both reachable only via the margin ring - the tie must resolve to
+    // the LOWER region index deterministically, not by iteration/insertion order tricks.
+    Point p(0, 0);
+
+    ExPolygons raw_lslices      = { square_expoly(50, 50, 5) };  // far from p - only expanded covers it
+    ExPolygons expanded_lslices = { square_expoly(0, 0, 10) };   // covers p
+
+    ExPolygons region0_slice = { square_expoly(-3, 0, 1) };  // nearest vertex (-2,+-1) -> dist sqrt(5) ~= 2.236mm
+    ExPolygons region1_slice = { square_expoly(3, 0, 1) };   // nearest vertex (2,+-1)  -> dist sqrt(5) ~= 2.236mm (exact tie)
+
+    ProjectionLayerView layer;
+    layer.lslices             = &raw_lslices;
+    layer.expanded_lslices    = expanded_lslices;
+    layer.region_slice_polys  = { { &region0_slice[0] }, { &region1_slice[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, p, out_layer, out_region));
+    CHECK(out_layer == 0);
+    CHECK(out_region == 0);   // ascending-index tie-break, not region1
+}
+
+TEST_CASE("chameleon_pick_projection_region: raw containment still wins outright over the margin-ring fallback", "[chameleon]")
+{
+    // Regression guard for "raw-containment behavior unchanged" (spec C5's own
+    // constraint): when p IS inside a region's raw slice polygon, that must be picked
+    // even though expanded_lslices is also populated and would otherwise trigger the
+    // nearest-region machinery - the raw containment scan runs FIRST and returns before
+    // the nearest-region fallback is ever consulted.
+    Point p(0, 0);
+
+    ExPolygons raw_lslices      = { square_expoly(0, 0, 10) };
+    ExPolygons expanded_lslices = { square_expoly(0, 0, 15) };
+
+    ExPolygons region0_slice = { square_expoly(20, 0, 2) };   // doesn't cover p (would win the nearest search if reached)
+    ExPolygons region1_slice = { square_expoly(0, 0, 10) };   // DOES cover p
+
+    ProjectionLayerView layer;
+    layer.lslices            = &raw_lslices;
+    layer.expanded_lslices   = expanded_lslices;
+    layer.region_slice_polys = { { &region0_slice[0] }, { &region1_slice[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, p, out_layer, out_region));
+    CHECK(out_layer == 0);
+    CHECK(out_region == 1);
 }

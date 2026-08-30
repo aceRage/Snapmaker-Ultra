@@ -103,6 +103,27 @@ struct ProjectionLayerView {
     // well before this pass runs, so the common case is a free (already-computed) gate.
     const ExPolygons*              lslices = nullptr;
     const std::vector<BoundingBox>* lslices_bboxes = nullptr;
+    // v2.2 Task 2 (spec C5, root cause 4): this band layer's lslices, offset OUTWARD by
+    // SUPPORT_MATERIAL_MARGIN + this object's support_expansion - the same margin the
+    // support generator itself grows interface contact polygons by beyond the overhang
+    // (root cause 4: contact polygons are grown by that margin, so samples over small
+    // features can land outside raw lslices even though the generator's own contact
+    // polygon covered them). See Print.cpp's chameleon_build_projection_views for the
+    // exact offset call and the margin constant's citation/mirror. Unlike lslices/
+    // region_slice_polys/region_bottom_polys above (which only ever alias a Layer's own
+    // storage), this is OWNED storage: offset_ex produces brand-new geometry that
+    // doesn't exist anywhere else to point into. Populated once per band layer at view
+    // build (same M1 hoisting rationale as the rest of this struct). Left empty (there
+    // is no pointer to leave null) for a layer that contributes nothing.
+    ExPolygons                      expanded_lslices;
+    // Per-island bbox of expanded_lslices (index i matches expanded_lslices[i]),
+    // computed FRESH from the offset result - not a naive "take lslices_bboxes and
+    // inflate by the margin", because offset_ex can merge or split islands (two lslices
+    // islands within ~2x the margin of each other coalesce into one), so a 1:1 mapping
+    // from lslices_bboxes to expanded_lslices doesn't generally exist. Same cheap-AABB-
+    // gate role as lslices_bboxes above; always index-parallel to expanded_lslices (no
+    // null/size-mismatch case here - the caller that builds one builds the other).
+    std::vector<BoundingBox>        expanded_lslices_bboxes;
     // Per LayerRegion on this layer (same indexing the caller will map back to an
     // extruder): region_slice_polys[r] = pointers into that region's `slices` surfaces
     // (any type - "this region's own shape"); region_bottom_polys[r] = pointers into
@@ -114,13 +135,36 @@ struct ProjectionLayerView {
 
 // `layers` must already be ordered lowest band layer first (the same order
 // select_layers_in_band/select_contact_layers return). Finds the first (lowest) layer
-// whose lslices cover `p` (bbox-gated when lslices_bboxes is usable); within it, the
-// region whose slice polys contain p, preferring one whose bottom polys ALSO contain p
-// when more than one region's slices contain p (first-contains-p wins otherwise, ties
-// broken by ascending region index). If a layer's lslices cover p but no region's own
-// slice polys do (degenerate/inconsistent data), that layer is skipped, not treated as
-// a hit - the scan continues to the next band layer. Returns false (out_layer/out_region
-// left unwritten) when no band layer's lslices cover p.
+// that covers `p` (bbox-gated when the relevant bboxes are usable) - EITHER its raw
+// lslices, OR (v2.2 Task 2, spec C5) its expanded_lslices, the margin ring around them.
+// A raw hit is unchanged from v2.1: within it, the region whose slice polys contain p,
+// preferring one whose bottom polys ALSO contain p when more than one region's slices
+// contain p (first-contains-p wins otherwise, ties broken by ascending region index).
+//
+// v2.2 Task 2 (spec C5): when no region's raw slice polys contain p - either because the
+// hit was only via expanded_lslices (a genuine margin-ring sample), or the pre-existing
+// degenerate case (a layer whose lslices cover p but whose per-region data doesn't,
+// previously treated as a miss for the whole layer) - the region whose raw slice polys
+// are NEAREST to p is picked instead, over ALL of this layer's regions (not just the
+// island that produced the hit). No separate distance threshold is enforced at this
+// step: the layer-level hit test above already established p is within the margin of
+// SOME geometry on this layer, so "nearest region" is simply "which region does that
+// nearby geometry belong to". Two-stage search, per region: (1) a cheap bbox-distance
+// lower bound (point-to-AABB, via get_extents on each of the region's raw polys) prunes
+// any region whose lower bound already can't beat the current best, without touching its
+// polygon; (2) only surviving regions get the exact-ish "distance to polygon" test
+// Slic3r already uses elsewhere (MultiPoint::distance_to - nearest-VERTEX distance over
+// contour + holes, not true nearest-edge distance; a documented, precedented
+// simplification, not a new one). This is a correct branch-and-bound nearest search (the
+// bbox distance is a real lower bound), not an approximation of "nearest" itself.
+// Determinism: regions are scanned in ascending index order and only a STRICTLY smaller
+// exact distance replaces the current best, so an exact tie is won by the lower region
+// index, deterministically, regardless of visitation-order edge cases. A region that
+// contributes no raw slice polys at all is never a candidate.
+//
+// Returns false (out_layer/out_region left unwritten) when no band layer's raw or
+// expanded lslices cover p, or when a covering layer offers no region with any raw slice
+// geometry at all.
 bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView>& layers,
                                       const Point& p,
                                       size_t& out_layer, size_t& out_region);
@@ -212,5 +256,24 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection>&
                                   size_t max_extruders,
                                   double min_len_mm,
                                   ExtrusionEntityCollection& merge_back_target);
+
+// v2.2 Task 2 (spec C4, root cause 1): gap-aware lateral cap arithmetic, pure so it's
+// unit-testable without a full PrintObject/Print scaffold (the three mm inputs need
+// PrintObject/PrintRegion/PrintConfig access to resolve - see Print.cpp's
+// chameleon_assign_support_interfaces for that glue, which mirrors the support
+// generator's own width resolution: Support/SupportParameters.hpp:70-76 for the outer
+// wall width, :165-168 for the support line width's 0=auto fallback - then calls this).
+// The cap is CENTERLINE-to-centerline (both wall samples and support line paths are
+// centerlines), so the physical minimum distance it must admit between a wall and an
+// adjacent support skin is the surface-to-surface gap the generator holds
+// (support_object_xy_distance_mm) plus half the outer wall's own width (its centerline
+// sits that far inside the wall's true outer surface) plus half the support line's own
+// width (same, on the support side), plus a fixed 0.35mm slack for centerline
+// sampling/voronoi-snap error (spec C4). Replaces the old flat 1.0mm max_dist_mm, which
+// was frequently LESS than gap_xy + half-widths alone at common profiles - "nearly
+// unsatisfiable" (spec root cause 1).
+double gap_aware_lateral_cap_mm(double support_object_xy_distance_mm,
+                                double outer_wall_width_mm,
+                                double support_line_width_mm);
 } // namespace Slic3r
 #endif

@@ -2427,6 +2427,21 @@ static unsigned chameleon_projection_region_extruder(const PrintRegionConfig &re
     return own_extruder_0based;
 }
 
+// v2.2 Task 2 (spec C5, root cause 4): mirrors Support/SupportMaterial.cpp:57's
+// `#define SUPPORT_MATERIAL_MARGIN 1.2` - the margin the support generator itself grows
+// interface CONTACT polygons by beyond the overhang (root cause 4: "interface contact
+// polygons are grown up to SUPPORT_MATERIAL_MARGIN (1.2mm) + support_expansion beyond
+// the overhang, so samples over small features [...] land outside lslices"). That
+// #define is file-local (never exported via a header), so this is a deliberate VALUE
+// mirror, not a shared symbol - and deliberately NOT named `SUPPORT_MATERIAL_MARGIN`
+// itself, because two other unrelated same-named macros already exist in this codebase
+// and neither is the one this margin story is about: PrintObject.cpp:4421 #defines the
+// same name to the same value (1.2) for a completely different purpose (bridge-edge
+// removal, remove_bridges_from_contacts); Support/SupportCommon.cpp:39's own same-named
+// macro is 1.5, a different margin for a different purpose (its own bridge-edge/loop-
+// line offsetting). Giving this one a distinct name avoids ever confusing it with either.
+static constexpr double CHAMELEON_PROJECTION_MARGIN_MM = 1.2;
+
 // Chameleon P2.1 v2.1 final-review M1 fix: build the ProjectionLayerView list for a
 // projection band ONCE per support layer instead of once per 0.8mm sample point. Layer/
 // LayerRegion can't be built standalone (private/protected ctors, PrintObject-owned
@@ -2441,12 +2456,21 @@ static unsigned chameleon_projection_region_extruder(const PrintRegionConfig &re
 // POINTERS only, never copies polygon geometry - see BrimFilament.hpp's
 // ProjectionLayerView comment. `out_view_layers` is parallel to `out_view` (same index),
 // kept for extruder resolution after chameleon_pick_projection_region reports a hit.
+//
+// v2.2 Task 2 (spec C5): also builds each layer's expanded_lslices/expanded_lslices_
+// bboxes here - ONCE per band layer, same hoisting rationale as the rest of this view.
+// Offset amount is CHAMELEON_PROJECTION_MARGIN_MM + this object's own support_expansion
+// (mirrors the support generator's own contact-polygon growth - see
+// Support/SupportMaterial.cpp:1395's xy_expansion, added to the same margin). Unlike
+// lslices/region_slice_polys above, expanded_lslices IS a copy (offset_ex produces new
+// geometry, not aliased storage), so this is the one part of the view that isn't free.
 static void chameleon_build_projection_views(const PrintObject &object,
                                               const std::vector<size_t> &band_layer_indices,
                                               std::vector<ProjectionLayerView> &out_view,
                                               std::vector<const Layer *> &out_view_layers)
 {
     const auto &layers = object.layers();
+    const float margin_scaled = float(scale_(CHAMELEON_PROJECTION_MARGIN_MM + object.config().support_expansion.value));
 
     out_view.clear();
     out_view_layers.clear();
@@ -2463,6 +2487,14 @@ static void chameleon_build_projection_views(const PrintObject &object,
         ProjectionLayerView lv;
         lv.lslices        = &layer->lslices;
         lv.lslices_bboxes = &layer->lslices_bboxes;
+
+        // v2.2 Task 2 (spec C5): margin-ring geometry for this band layer, computed
+        // once here rather than once per sample point (see the function comment).
+        lv.expanded_lslices = offset_ex(layer->lslices, margin_scaled);
+        lv.expanded_lslices_bboxes.reserve(lv.expanded_lslices.size());
+        for (const ExPolygon &expoly : lv.expanded_lslices)
+            lv.expanded_lslices_bboxes.push_back(get_extents(expoly));
+
         lv.region_slice_polys.reserve(layer->regions().size());
         lv.region_bottom_polys.reserve(layer->regions().size());
         for (const LayerRegion *lr : layer->regions()) {
@@ -2672,6 +2704,61 @@ static void chameleon_assign_support_interfaces(Print &print)
         // ordinal as object_key, so BrimVoteParams::object_area's cross-object tie-break
         // (Part 1's multi-object plate scenario) never applies here.
 
+        // v2.2 Task 2 (spec C4, root cause 1): gap-aware lateral cap, replacing the
+        // hardcoded 1.0mm max_dist_mm below (BrimVoteParams.max_dist_mm, Task 1). The
+        // cap is CENTERLINE-to-centerline (both wall samples and support line paths are
+        // centerlines), so the physical minimum distance it must admit between a wall
+        // and an adjacent support skin is the surface-to-surface gap the support
+        // generator itself holds (support_object_xy_distance) plus half the outer
+        // wall's own width (its centerline sits that far inside the wall's true outer
+        // surface) plus half the support line's own width (same, on the support side).
+        // 1.0mm was frequently LESS than gap_xy + half-widths alone at common profiles
+        // (e.g. 0.2mm gap + 0.4mm outer wall + 0.4mm support line = 0.6mm of that
+        // minimum already, before the arithmetic's own slack) - "nearly unsatisfiable"
+        // (spec root cause 1), so nearly every base/lateral vote silently fell back to
+        // khaki even when a wall genuinely faced the support skin (the khaki-along-
+        // teal-wall GUI bug). gap_aware_lateral_cap_mm (BrimFilament.hpp/.cpp) is the
+        // pure arithmetic (+0.35mm slack, spec C4), unit-tested there; this is just the
+        // width resolution glue, computed once per object like vote_params above.
+        //
+        // Widths resolved the SAME WAY the support generator resolves them for this
+        // exact purpose (mirrored, not shared - SupportParameters is built fresh inside
+        // generate_support_material, long before this post-pass runs, so there's no
+        // live SupportParameters instance available here to read from):
+        //  - outer wall width: max over every printing region of PrintRegion::flow(
+        //    *object, frExternalPerimeter, layer_height).width() - Support/
+        //    SupportParameters.hpp:70-76's own external_perimeter_width loop, verbatim.
+        //    PrintRegion::flow() (PrintRegion.cpp:59-60) already folds a 0mm ("auto")
+        //    outer_wall_line_width to object.config().line_width internally, so the
+        //    "support_line_width may be 0 = auto" handling below has no counterpart
+        //    needed here - flow() already resolved it.
+        //  - support line width: object_config.support_line_width.get_abs_value(...),
+        //    falling back to object_config.line_width.get_abs_value(...) when 0 (auto) -
+        //    Support/SupportParameters.hpp:165-168's support_extrusion_width resolution,
+        //    verbatim, including its support_interface_filament-1 nozzle index (filament
+        //    value 0 underflows to size_t(-1), which ConfigOptionVector::get_at treats
+        //    as "the 0th/current nozzle" by design, not UB - see Slicing.cpp:71-74's own
+        //    comment, and Support/SupportMaterial.cpp:2152's identical expression for
+        //    this same fallback). First-layer width variants are deliberately ignored
+        //    here, same as v2.1's flat 1.0mm cap was - this is a lateral/coplanar rule,
+        //    not a first-layer-specific one.
+        double outer_wall_width_mm = 0.0;
+        for (size_t region_id = 0; region_id < object->num_printing_regions(); ++region_id) {
+            const PrintRegion &region = object->printing_region(region_id);
+            outer_wall_width_mm = std::max(outer_wall_width_mm,
+                double(region.flow(*object, frExternalPerimeter, object->slicing_parameters().layer_height).width()));
+        }
+        const double support_nozzle_diameter_mm = print.config().nozzle_diameter.get_at(
+            object->config().support_interface_filament.value - 1);
+        const double support_line_width_default_mm =
+            object->config().line_width.get_abs_value(support_nozzle_diameter_mm);
+        double support_line_width_mm =
+            object->config().support_line_width.get_abs_value(support_nozzle_diameter_mm);
+        support_line_width_mm = support_line_width_mm > 0.0 ? support_line_width_mm : support_line_width_default_mm;
+
+        const double lateral_cap_mm = gap_aware_lateral_cap_mm(
+            object->config().support_object_xy_distance.value, outer_wall_width_mm, support_line_width_mm);
+
         // v2.2 Task 1 (spec C1-C3): this object's hysteresis state - the extruder set
         // apply_bucket_caps committed on the PREVIOUS support layer that reached the
         // engine calls. Empty at object start. Threaded through every iteration of the
@@ -2766,17 +2853,17 @@ static void chameleon_assign_support_interfaces(Print &print)
                 continue;
             }
 
-            // v2.1 lateral rule: 1mm cap (BrimVoteParams.max_dist_mm, Task 1) layered on
-            // top of this object's shared run-building tunables (sample_mm/min_run_mm/
-            // max_runs/k, from vote_params above). fallback_extruder differs per role, so
-            // each role gets its own copy; both otherwise vote against the SAME
-            // coplanar_wall_idx.
+            // v2.2 Task 2 (spec C4): gap-aware lateral_cap_mm (computed once per object
+            // above), replacing v2.1's flat 1.0mm cap, layered on top of this object's
+            // shared run-building tunables (sample_mm/min_run_mm/max_runs/k, from
+            // vote_params above). fallback_extruder differs per role, so each role gets
+            // its own copy; both otherwise vote against the SAME coplanar_wall_idx.
             BrimVoteParams interface_lateral_params    = vote_params;
-            interface_lateral_params.max_dist_mm       = 1.0;
+            interface_lateral_params.max_dist_mm       = lateral_cap_mm;
             interface_lateral_params.fallback_extruder = fallback_extruder;
 
             BrimVoteParams base_lateral_params    = vote_params;
-            base_lateral_params.max_dist_mm       = 1.0;
+            base_lateral_params.max_dist_mm       = lateral_cap_mm;
             base_lateral_params.fallback_extruder = base_fallback_extruder;
 
             // v2.1 final-review M1 fix: build the projection band's ProjectionLayerView

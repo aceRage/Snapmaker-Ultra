@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace Slic3r {
@@ -468,37 +469,129 @@ std::vector<size_t> select_layers_overlapping_span(const std::vector<double> &pr
     return result;
 }
 
+namespace {
+
+// v2.2 Task 2 (spec C5): bbox-gated "does any island in `polys` contain p" test,
+// shared by the raw-lslices and expanded_lslices (margin-ring) layer-hit checks in
+// chameleon_pick_projection_region below - they differ only in which ExPolygons/bboxes
+// pair they're testing. `bboxes` may be null or size-mismatched to skip the gate
+// (falls straight through to the exact test) - the same defensive contract the
+// original raw-lslices-only code documented before this was factored out.
+bool any_polygon_contains(const ExPolygons &polys, const std::vector<BoundingBox> *bboxes, const Point &p)
+{
+    if (polys.empty())
+        return false;
+    if (bboxes != nullptr && bboxes->size() == polys.size()) {
+        bool bbox_hit = false;
+        for (size_t k = 0; k < bboxes->size() && !bbox_hit; ++k)
+            if ((*bboxes)[k].contains(p))
+                bbox_hit = true;
+        if (!bbox_hit)
+            return false;
+    }
+    for (const ExPolygon &expoly : polys)
+        if (expoly.contains(p))
+            return true;
+    return false;
+}
+
+// v2.2 Task 2 (spec C5): point-to-AABB clamped distance - a cheap LOWER BOUND on the
+// true distance from p to anything inside bb (zero when p is inside bb). Standard
+// clamped-rectangle formula. Used only to prune candidate regions in
+// nearest_region_to_point below before the more expensive exact-ish polygon distance
+// test - never itself treated as the final answer.
+double bbox_point_distance(const BoundingBox &bb, const Point &p)
+{
+    const double dx = std::max({ double(bb.min.x() - p.x()), 0.0, double(p.x() - bb.max.x()) });
+    const double dy = std::max({ double(bb.min.y() - p.y()), 0.0, double(p.y() - bb.max.y()) });
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// v2.2 Task 2 (spec C5): "distance from p to this ExPolygon" - the same definition
+// Slic3r already uses elsewhere for polygon-to-point distance (MultiPoint::distance_to,
+// MultiPoint.hpp: "the minimum distance of all points to that point"), applied to the
+// contour and every hole, taking the overall minimum. This is nearest-VERTEX distance,
+// not true nearest-EDGE distance - a documented, precedented simplification (the same
+// one MultiPoint::distance_to itself already documents), cheap because it needs no
+// per-edge projection math.
+double expoly_point_distance(const ExPolygon &poly, const Point &p)
+{
+    double d = poly.contour.distance_to(p);
+    for (const Polygon &hole : poly.holes)
+        d = std::min(d, hole.distance_to(p));
+    return d;
+}
+
+// v2.2 Task 2 (spec C5): among `lv`'s regions, the one whose raw slice polys are
+// nearest to p - see chameleon_pick_projection_region's own header comment for the
+// two-stage branch-and-bound algorithm (cheap bbox lower bound prunes the expensive
+// exact test) and its determinism (ties broken by ascending region index: only a
+// STRICTLY smaller exact distance replaces the current best). Returns
+// lv.region_slice_polys.size() (the same "none found" sentinel the caller already
+// uses) when no region on this layer contributes any raw slice geometry at all.
+size_t nearest_region_to_point(const ProjectionLayerView &lv, const Point &p)
+{
+    size_t nearest_region = lv.region_slice_polys.size();
+    double nearest_dist    = std::numeric_limits<double>::max();
+
+    for (size_t r = 0; r < lv.region_slice_polys.size(); ++r) {
+        if (lv.region_slice_polys[r].empty())
+            continue;
+
+        // Stage A: cheap bbox lower bound across this region's raw polys. If even the
+        // lower bound can't beat the current best, the exact distance certainly can't
+        // either - skip it without ever computing expoly_point_distance for this region.
+        double region_bbox_dist = std::numeric_limits<double>::max();
+        for (const ExPolygon *poly : lv.region_slice_polys[r])
+            if (poly != nullptr)
+                region_bbox_dist = std::min(region_bbox_dist, bbox_point_distance(get_extents(*poly), p));
+        if (region_bbox_dist >= nearest_dist)
+            continue;
+
+        // Stage B: exact-ish polygon distance, only for a region whose cheap bound
+        // didn't already rule it out.
+        double region_dist = std::numeric_limits<double>::max();
+        for (const ExPolygon *poly : lv.region_slice_polys[r])
+            if (poly != nullptr)
+                region_dist = std::min(region_dist, expoly_point_distance(*poly, p));
+
+        if (region_dist < nearest_dist) { // strict: ties keep the earlier (lower-index) region
+            nearest_dist   = region_dist;
+            nearest_region = r;
+        }
+    }
+    return nearest_region;
+}
+
+} // namespace
+
 bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &layers,
                                        const Point &p,
                                        size_t &out_layer, size_t &out_region)
 {
     for (size_t li = 0; li < layers.size(); ++li) {
         const ProjectionLayerView &lv = layers[li];
-        if (lv.lslices == nullptr || lv.lslices->empty())
-            continue;
+        const bool has_raw = lv.lslices != nullptr && !lv.lslices->empty();
+        if (!has_raw && lv.expanded_lslices.empty())
+            continue; // nothing on this layer at all, raw or margin-ring
 
-        // Cheap AABB reject before the exact point-in-polygon test below. Only used
-        // when the bboxes are present and index-parallel to lslices (defensive: never
-        // crashes on mismatched/degenerate input, just skips straight to the exact test).
-        if (lv.lslices_bboxes != nullptr && lv.lslices_bboxes->size() == lv.lslices->size()) {
-            bool bbox_hit = false;
-            for (size_t k = 0; k < lv.lslices_bboxes->size() && !bbox_hit; ++k)
-                if ((*lv.lslices_bboxes)[k].contains(p))
-                    bbox_hit = true;
-            if (!bbox_hit)
-                continue;
-        }
+        bool layer_hit = has_raw && any_polygon_contains(*lv.lslices, lv.lslices_bboxes, p);
 
-        bool layer_hit = false;
-        for (const ExPolygon &expoly : *lv.lslices)
-            if (expoly.contains(p)) { layer_hit = true; break; }
+        // v2.2 Task 2 (spec C5): a point only inside the MARGIN RING - raw miss, but
+        // covered by this layer's expanded_lslices - now also counts as a layer hit.
+        // Only checked when the raw test above didn't already settle it (cheaper, and
+        // the raw AABB gate above is strictly more precise anyway).
+        if (!layer_hit && !lv.expanded_lslices.empty())
+            layer_hit = any_polygon_contains(lv.expanded_lslices, &lv.expanded_lslices_bboxes, p);
+
         if (!layer_hit)
-            continue; // this band layer's islands don't cover p; try the next one
+            continue; // neither raw nor margin-ring geometry on this band layer covers p
 
-        // Within the hit layer: the region whose own slices contain p, preferring one
-        // with a bottom/bottom-bridge fill surface covering p when more than one
+        // Within the hit layer: the region whose own RAW slices contain p, preferring
+        // one with a bottom/bottom-bridge fill surface covering p when more than one
         // region's slices contain p. First-contains-p wins the non-preferred case, so
         // the outcome is a deterministic function of region order, not point order.
+        // Unchanged from v2.1 - the margin-ring case above never influences this scan.
         size_t chosen = lv.region_slice_polys.size(); // sentinel: none yet
         for (size_t r = 0; r < lv.region_slice_polys.size(); ++r) {
             bool slice_hit = false;
@@ -517,8 +610,17 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &la
             if (bottom_hit) { chosen = r; break; } // preferred tie-break wins outright
         }
 
+        // v2.2 Task 2 (spec C5): no region's raw slices directly contain p - either a
+        // genuine margin-ring sample, or the pre-existing degenerate case (this layer's
+        // lslices/expanded_lslices cover p, but no per-region data agrees). Both now
+        // resolve to the nearest region ON THIS SAME LAYER instead of treating the
+        // layer as a miss and scanning further (a deliberate v2.1 behavior change - see
+        // this function's header comment).
         if (chosen == lv.region_slice_polys.size())
-            continue; // lslices covered p but no region's own slices did; try the next layer
+            chosen = nearest_region_to_point(lv, p);
+
+        if (chosen == lv.region_slice_polys.size())
+            continue; // this layer offers no region with any raw geometry at all; try the next one
 
         out_layer  = li;
         out_region = chosen;
@@ -651,6 +753,17 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
         result.kept.insert(kv.first);
 
     return result;
+}
+
+double gap_aware_lateral_cap_mm(double support_object_xy_distance_mm,
+                                double outer_wall_width_mm,
+                                double support_line_width_mm)
+{
+    // v2.2 Task 2 (spec C4): see this function's own header comment in BrimFilament.hpp
+    // for the physical reasoning - this body is deliberately just the sum it describes,
+    // no branching, so a caller passing 0 for either width (a defensive fallback, not
+    // an error) still gets a sane, non-throwing result.
+    return support_object_xy_distance_mm + 0.5 * outer_wall_width_mm + 0.5 * support_line_width_mm + 0.35;
 }
 
 } // namespace Slic3r
