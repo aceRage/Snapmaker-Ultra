@@ -1,6 +1,8 @@
 #include "Config.hpp"
 #include "Exception.hpp"
 #include "Print.hpp"
+#include <cstdlib>
+#include <cstdio>
 #include "BoundingBox.hpp"
 #include "Brim.hpp"
 #include "BrimFilament.hpp"
@@ -2323,6 +2325,7 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
 // per-path extruder follows the same override rules PrintRegion::extruder()
 // uses (1-based config values), converted to the 0-based scheme used
 // throughout the chameleon-brim code (see task-3 report for the analysis).
+
 static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const PrintRegionConfig& region_config,
                                             unsigned own_extruder_0based, const Point& shift,
                                             size_t object_key, WallSampleIndex& wall_idx)
@@ -2750,9 +2753,10 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
 
                     const size_t samples_before = wall_idx.size();
                     for (const PrintInstance& instance : object->instances())
-                        for (const LayerRegion* lr : layer0->regions())
+                        for (const LayerRegion* lr : layer0->regions()) {
                             chameleon_collect_wall_samples(&lr->perimeters, lr->region().config(),
                                 own_extruder_0based, instance.shift, object_key, wall_idx);
+                        }
                     if (wall_idx.size() == samples_before) {
                         zero_sample_objects[objIDPair.first] = true;
                         BOOST_LOG_TRIVIAL(warning) << "Chameleon brim: object id " << objIDPair.first.id
@@ -2786,7 +2790,16 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                     // themselves reassigned into `kept` - never both), so this clear() cannot
                     // double-free anything partition_brim_by_wall handed back to us.
                     brimEntry.second.clear();
-                    brimEntry.second = std::move(kept);
+                    // Root-cause fix (GUI validation): the per-object brim print site in
+                    // GCode::process_layer runs under whichever extruder prints that object
+                    // FIRST on layer 0 - not necessarily own_extruder - so leaving the kept
+                    // (own-voted) runs in m_brimMap printed them in an arbitrary filament.
+                    // Route the own partition through m_brimMapByExtruder as well: every run
+                    // then prints under exactly the extruder it was voted for, via the
+                    // toolchange-ordered emission block. m_brimMap stays EMPTY for partitioned
+                    // objects (the legacy per-object site prints nothing for them).
+                    if (!kept.entities.empty())
+                        m_brimMapByExtruder[brimEntry.first][own_extruder_0based] = std::move(kept);
                     for (auto& foreignEntry : foreign) {
                         if (foreignEntry.second.entities.empty())
                             continue;
