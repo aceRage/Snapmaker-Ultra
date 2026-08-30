@@ -5467,12 +5467,12 @@ void PrintConfigDef::init_fff_params()
     def = this->add("support_interface_filament_source", coEnum);
     def->label = L("Support interface filament source");
     def->category = L("Support");
-    def->tooltip = L("manual: use the configured support interface filament (default). nearest_surface: "
+    def->tooltip = L("Default: use the configured support interface filament. Nearest surface: "
                      "each interface region uses the filament of the model surface it touches.");
     def->enum_keys_map = &ConfigOptionEnum<SupportInterfaceFilamentSource>::get_enum_values();
     def->enum_values.emplace_back("manual");
     def->enum_values.emplace_back("nearest_surface");
-    def->enum_labels.emplace_back(L("Manual"));
+    def->enum_labels.emplace_back(L("Default"));
     def->enum_labels.emplace_back(L("Nearest surface"));
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<SupportInterfaceFilamentSource>(sifsManual));
