@@ -11,6 +11,19 @@
 #include <vector>
 namespace Slic3r {
 
+// v2.3 Task 3 (spec C5): per-object descend-hysteresis state - see
+// BrimVoteParams::descended_last_layer and partition_support_entities' collection
+// branch (the DESCEND decision) in the .cpp. Keyed by a QUANTIZED collection bbox
+// center (chameleon_quantize_point below, ~2mm grid - "the same physical column" across
+// consecutive support layers, approximately) rather than any stable topological id -
+// tree support branches have no such id available to this pass, and the spec explicitly
+// asked to "keep simple + documented" rather than track true branch topology. The bool
+// value is always true when present (a column is only ever recorded here the layer it
+// actually descended - see partition_support_entities, which never writes a `false`
+// entry); a column simply absent from the map is "did not descend last layer", the same
+// answer an explicit `false` would give, so callers only ever need to check membership.
+using DescendColumnMap = std::map<Point, bool>;
+
 struct BrimVoteParams {
     size_t k = 3;
     double tie_score_ratio = 0.30;      // top-two scores differ < 30% => tie path
@@ -33,7 +46,42 @@ struct BrimVoteParams {
     // only special-case a NON-empty membership hit, so Part 1's brim call sites (which
     // never set this) and every pre-v2.3 support caller see byte-identical behavior.
     std::set<unsigned> prev_kept;
+    // v2.3 Task 3 (spec C5): the set of columns (quantized bbox-center keys, see
+    // DescendColumnMap above) whose whole-collection vote DESCENDED (was split leaf-by-
+    // leaf rather than moved/left whole) on the PREVIOUS support layer that reached the
+    // engine calls - threaded through Print.cpp's per-object loop the same way prev_kept
+    // is (see chameleon_assign_support_interfaces). A column present here gets HALF the
+    // normal min_run_mm descend threshold this layer (partition_support_entities'
+    // collection branch) - a real minority arc that's been descending consistently
+    // doesn't need to re-clear the FULL bar every single layer, the same "stability up
+    // the column" rationale prev_kept/C2 already established for the gate/trim caps,
+    // just with a simpler one-shot rule here (no multi-layer grace counter like C2's -
+    // see Print.cpp's own comment on why). Default EMPTY, a strict no-op for any caller
+    // that never wires this up (every pre-v2.3 caller, and Part 1's brim path, which
+    // never calls vote_collection_as_unit's C5 descend path at all).
+    DescendColumnMap descended_last_layer;
 };
+
+// v2.3 Task 3 (spec C5): quantizes a point to a coarse (~quantize_mm) grid cell,
+// identifying "the same physical column" across consecutive support layers for
+// BrimVoteParams::descended_last_layer above - floor-based bucketing (not rounding), so
+// a value sitting exactly on a cell boundary is deterministic and doesn't depend on
+// which side of .5 it lands. This is a DELIBERATE APPROXIMATION, not true column
+// tracking: a tapering branch whose XY center drifts by more than quantize_mm between
+// consecutive support layers, or a column that splits/merges, will not reliably map to
+// the same key every layer - true topology tracking would need to follow the tree
+// support generator's own branch graph, well outside this pass's scope (spec: "keep
+// simple + documented"). quantize_mm defaults to 2.0mm (spec: "quantize ~2mm").
+Point chameleon_quantize_point(const Point &p, double quantize_mm = 2.0);
+
+// v2.3 Task 3 (spec C5): the bbox CENTER (not a true area centroid) of every point
+// across every leaf reachable inside `collection` (collection.flatten(), the same full
+// recursion vote_collection_as_unit's own histogram walk uses) - the "where is this
+// collection" input to chameleon_quantize_point above. Returns Point(0, 0) for an
+// empty/all-empty-leaf collection (no geometry to center on); partition_support_entities
+// only ever calls this after vote_collection_as_unit has already found at least two
+// distinct votes, so that degenerate case does not arise in practice.
+Point chameleon_collection_bbox_center(const ExtrusionEntityCollection &collection);
 
 // Vote for one point. Deterministic. Returns extruder id.
 unsigned brim_vote(const WallSampleIndex& idx, const Point& pt, const BrimVoteParams& p);
@@ -266,14 +314,61 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView>& la
 //   relocated as a whole. Matched originals (leaf OR whole collection) are deleted
 //   from support_fills's own top-level entities vector, never from inside a
 //   collection that stays behind.
+// - v2.3 Task 3 (spec C5, root cause 5, "tree selective descent"): the whole-collection
+//   vote above (vote_collection_as_unit) now ALSO reports the raw per-extruder sample
+//   histogram and the longest contiguous run (mm) of samples that voted some extruder
+//   OTHER than the winner ("the minority's contiguous run"). A collection whose vote is
+//   UNIFORM (histogram has only one distinct extruder) or whose minority run is SHORTER
+//   than the descend threshold behaves EXACTLY as the C7 paragraph above describes -
+//   whole-move or stay, pointer-stable, no change. A collection whose minority run
+//   reaches the threshold DESCENDS instead: every LEAF entity reachable inside it
+//   (recursing into any further-nested sub-collection the same way) is individually
+//   partitioned via the SAME per-leaf logic the top-level leaf case above already uses -
+//   a leaf whose own vote is uniformly fallback is left in place untouched; a leaf whose
+//   own vote is uniformly one non-fallback extruder moves whole into out[extruder]
+//   (rebuilt as a new ExtrusionPath, per-leaf flow attrs from first_path_of(leaf) -
+//   ExtrusionLoop/MultiPath-ness is not preserved, same pre-existing tradeoff the
+//   top-level leaf case already has); a leaf with a genuinely mixed vote is split into
+//   runs, with non-fallback runs going to out[extruder] and fallback runs SPLICED BACK
+//   IN PLACE at that leaf's own index inside its IMMEDIATE parent collection (never
+//   appended to the end - `no_sort` order is preserved exactly, unlike the top-level
+//   leaf case's own new_fallback_paths, which DOES append to the end of support_fills
+//   since ordering there doesn't carry the same meaning). Every rebuilt ExtrusionPath
+//   (in either case above) inherits the SOURCE LEAF's own can_reverse() - see
+//   ExtrusionEntity::can_reverse()/ExtrusionPath::set_reverse() (ExtrusionEntity.hpp) -
+//   a branch-wall leaf built with reversal disabled (Support/SupportCommon.cpp:660-663/
+//   765-767, "always start with the anchor") must keep that property on its split
+//   pieces, or GCode's chain_and_reorder is free to flip a piece's direction and break
+//   the seam anchor (spec: "seam-anchor blob hazard"). A (possibly nested) sub-
+//   collection left fully empty by this recursion is itself removed from its parent and
+//   deleted - never left behind as a dangling empty shell - the SAME rule the top-level
+//   collection pointer follows: it stays in support_fills, still the same object,
+//   unless the descend emptied it entirely, in which case it is deleted exactly once.
+//   The descend threshold is `p.min_run_mm` (support-pass override, spec C6: 1.6mm),
+//   HALVED for a column found in `p.descended_last_layer` (see DescendColumnMap's own
+//   comment above) - if `descended_out` is non-null, every collection this call decides
+//   to DESCEND records its quantized column key into it as true (never a `false` entry -
+//   see DescendColumnMap's own comment for why absence already means false), so the
+//   caller can carry that forward as next layer's `descended_last_layer`. Passing
+//   `descended_out = nullptr` (the default) makes the halving lookup still work off
+//   `p.descended_last_layer` but skips recording - every pre-v2.3 call site (this
+//   function's own existing unit tests included) compiles and behaves unchanged, since
+//   `p.descended_last_layer` also defaults empty (C5 is then a strict no-op: the
+//   threshold is always the full `p.min_run_mm`, same as before this task whenever a
+//   collection's minority run happens to reach it - which, pre-C5, cannot happen at all,
+//   since vote_collection_as_unit had no minority-run concept until this task).
 // Returns switch-boundary count added (for the per-object cap accounting) - a moved
-// whole collection does not contribute to this count (it isn't split into runs).
+// whole collection does not contribute to this count (it isn't split into runs); a
+// DESCENDED collection contributes the sum of its own per-leaf switch-boundary counts
+// (mirrors the top-level leaf case's own accounting, just summed across every leaf the
+// descend touched).
 size_t partition_support_entities(ExtrusionEntityCollection& support_fills,
                                   ExtrusionRole role_filter,
                                   unsigned fallback_extruder,
                                   const std::function<unsigned(const Point&)>& resolver,
                                   const BrimVoteParams& p,
-                                  std::map<unsigned, ExtrusionEntityCollection>& out);
+                                  std::map<unsigned, ExtrusionEntityCollection>& out,
+                                  DescendColumnMap* descended_out = nullptr);
 
 // Thin wrapper: partition_support_entities with role_filter = erSupportMaterialInterface
 // and a knn-vote resolver over `idx`. Kept for existing call sites / unit tests.

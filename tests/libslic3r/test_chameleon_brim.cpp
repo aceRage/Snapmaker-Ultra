@@ -1402,6 +1402,18 @@ TEST_CASE("partition_support_entities (C7): whole-collection majority vote ties 
     idx.add_polyline(segment(0, 6, 10, 6), 1, 1);
     idx.add_polyline(segment(20, 6, 30, 6), 2, 2);
     BrimVoteParams p; p.fallback_extruder = 0;
+    // v2.3 Task 3 (spec C5): this fixture's "losing" side of the tie is ALSO, by
+    // construction, a genuine ~11.2mm contiguous minority run - exactly root cause 5's
+    // motivating shape ("Tree rings spanning sectors: whole-collection votes paint the
+    // minority arc the majority color"), which C5 now correctly DESCENDS and splits
+    // instead of painting both sectors the tie-winner's color (see the dedicated C5
+    // "mixed collection... DESCENDS" test above for that corrected behavior). This test
+    // predates C5 and exists to check vote_collection_as_unit's TIE-BREAK itself (the
+    // lowest-id winner selection feeding the (a) "uniform/dominant... whole-move" path C5
+    // still uses below its own threshold) - min_run_mm is set far above the fixture's
+    // ~11.2mm run so this fixture stays on that whole-move path and isolates the
+    // tie-break from C5's new descend decision.
+    p.min_run_mm = 100.0;
     auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
 
     ExtrusionEntityCollection *inner = nested_base_collection(6.0, /*no_sort=*/false);
@@ -1757,10 +1769,15 @@ TEST_CASE("partition_support_entities (C7 whole-collection vote) tie-prefers-pre
     // extruder 1 with prev_kept empty) - only p.prev_kept differs here. Must FAIL if
     // the C3 branch in vote_collection_as_unit is reverted (the tie would still break
     // to the lowest id, 1, ignoring that this column's previous layer committed 2).
+    // v2.3 Task 3 (spec C5): same min_run_mm widening as that test, same reason - this
+    // fixture's ~11.2mm "losing" side is also a genuine contiguous minority run that
+    // would otherwise DESCEND under C5's default threshold, which is not what this test
+    // is isolating (the C3 prev_kept tie-preference feeding the (a) whole-move path).
     WallSampleIndex idx;
     idx.add_polyline(segment(0, 6, 10, 6), 1, 1);
     idx.add_polyline(segment(20, 6, 30, 6), 2, 2);
     BrimVoteParams p; p.fallback_extruder = 0;
+    p.min_run_mm = 100.0;
     p.prev_kept = {2};
     auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
 
@@ -1775,4 +1792,349 @@ TEST_CASE("partition_support_entities (C7 whole-collection vote) tie-prefers-pre
     REQUIRE(out.count(2) == 1);
     CHECK(out.count(1) == 0);
     CHECK(fills.entities.empty());
+}
+
+// v2.3 Task 3 (spec C5, "tree selective descent") tests below. Resolvers here are
+// direct point->extruder lambdas (same idiom as "split_polyline_by_resolver produces
+// runs matching a synthetic resolver" above), not WallSampleIndex/brim_vote, since the
+// per-x-coordinate zone rule is simpler and fully deterministic - no knn/1/d^2 scoring
+// to reason about when the thing under test is the collection-level descend decision.
+
+TEST_CASE("partition_support_entities (C5): a mixed collection whose minority run clears the threshold DESCENDS and splits per leaf", "[chameleon]")
+{
+    // Two leaves, each internally uniform: leaf A (20mm, x in [0,20)) votes fallback (0)
+    // throughout; leaf B (10mm, x in [25,35)) votes extruder 2 throughout. Whole-
+    // collection histogram: ~27 fallback samples vs. ~14 extruder-2 samples (0.8mm
+    // sampling over 20mm/10mm respectively) - a genuine, CONTIGUOUS minority run of
+    // ~14*0.8 = 11.2mm, comfortably clearing the p.min_run_mm = 5.0 threshold set below.
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
+    };
+    BrimVoteParams p;
+    p.fallback_extruder = 0;
+    p.min_run_mm = 5.0;
+
+    auto *leafA = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafA->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(20), scale_(6))});
+    auto *leafB = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafB->polyline = Polyline({Point(scale_(25), scale_(6)), Point(scale_(35), scale_(6))});
+
+    auto *inner = new ExtrusionEntityCollection();
+    inner->no_sort = true;
+    inner->entities.push_back(leafA);
+    inner->entities.push_back(leafB);
+    REQUIRE(inner->role() == erSupportMaterial);
+
+    // Snapshotted BEFORE the call (pure function of leaf points, read-only) - proves
+    // descended_out records the SAME column key partition_support_entities computed
+    // internally, not some coincidentally-matching value.
+    const Point expected_key = chameleon_quantize_point(chameleon_collection_bbox_center(*inner));
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    DescendColumnMap descended;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
+
+    // DESCENDED: the collection pointer stays (not emptied - leaf A's fallback vote
+    // left it in place), but its contents were rebuilt - leaf B is gone, moved to
+    // out[2] as a fresh split path, never as the whole collection pointer.
+    REQUIRE(fills.entities.size() == 1);
+    CHECK(fills.entities.front() == inner);
+    REQUIRE(inner->entities.size() == 1);
+    CHECK(inner->entities.front() == leafA); // untouched fast path: original pointer, in place
+
+    REQUIRE(out.count(2) == 1);
+    REQUIRE(out.at(2).entities.size() == 1);
+    CHECK(out.at(2).entities.front() != leafB); // rebuilt, not the whole original leaf
+    CHECK(out.at(2).entities.front()->role() == erSupportMaterial);
+
+    // The whole collection was never moved into any out[] bucket (that's the pre-C5
+    // whole-move path, not what happened here).
+    for (const auto &kv : out)
+        for (const ExtrusionEntity *e : kv.second.entities)
+            CHECK(e != inner);
+
+    REQUIRE(descended.count(expected_key) == 1);
+    CHECK(descended.at(expected_key) == true);
+}
+
+TEST_CASE("partition_support_entities (C5): a mixed collection whose minority run stays BELOW threshold does not descend", "[chameleon]")
+{
+    // Same shape as the DESCEND test above, but leaf B is short: 2mm (x in [25,27)) ->
+    // 2 + floor(2/0.8) = 4 samples -> a minority run of 4*0.8 = 3.2mm, under the SAME
+    // p.min_run_mm = 5.0 threshold this time. Must behave EXACTLY like the pre-v2.3/
+    // pre-C5 fallback-majority whole-collection case: untouched pointer, no split, no
+    // move - "current behavior (pointer-stable)" per spec C5's own wording.
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
+    };
+    BrimVoteParams p;
+    p.fallback_extruder = 0;
+    p.min_run_mm = 5.0;
+
+    auto *leafA = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafA->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(20), scale_(6))});
+    auto *leafB = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafB->polyline = Polyline({Point(scale_(25), scale_(6)), Point(scale_(27), scale_(6))});
+
+    auto *inner = new ExtrusionEntityCollection();
+    inner->entities.push_back(leafA);
+    inner->entities.push_back(leafB);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    DescendColumnMap descended;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
+
+    CHECK(out.empty()); // nothing split off, nothing moved
+    REQUIRE(fills.entities.size() == 1);
+    CHECK(fills.entities.front() == inner); // untouched pointer
+    REQUIRE(inner->entities.size() == 2);
+    CHECK(inner->entities[0] == leafA); // both original leaf pointers intact
+    CHECK(inner->entities[1] == leafB);
+    CHECK(descended.empty()); // never wrote a descend entry - it never descended
+}
+
+TEST_CASE("partition_support_entities (C5): a uniform mixed-extruder-free collection still whole-moves, pointer-stable", "[chameleon]")
+{
+    // v2.2 Task 3 (C7)'s own "moved whole" test already covers this scenario and keeps
+    // passing unmodified after C5 (regression proof the new histogram-size<=1 short
+    // circuit changes nothing for a genuinely uniform vote); this is a second, C5-named
+    // instance with THREE leaves (a slightly larger "ring") for a clear regression
+    // trip-wire tied to this changeset specifically.
+    auto resolver = [](const Point &) -> unsigned { return 3u; }; // every sample -> extruder 3
+    BrimVoteParams p;
+    p.fallback_extruder = 0;
+
+    auto *leafA = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafA->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(10), scale_(6))});
+    auto *leafB = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafB->polyline = Polyline({Point(scale_(20), scale_(6)), Point(scale_(30), scale_(6))});
+    auto *leafC = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafC->polyline = Polyline({Point(scale_(40), scale_(6)), Point(scale_(50), scale_(6))});
+
+    auto *inner = new ExtrusionEntityCollection();
+    inner->no_sort = true;
+    inner->entities.push_back(leafA);
+    inner->entities.push_back(leafB);
+    inner->entities.push_back(leafC);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    REQUIRE(out.count(3) == 1);
+    REQUIRE(out.at(3).entities.size() == 1);
+    CHECK(out.at(3).entities.front() == inner); // moved WHOLE - same pointer, never split
+    CHECK(static_cast<ExtrusionEntityCollection *>(out.at(3).entities.front())->entities.size() == 3);
+    CHECK(fills.entities.empty());
+}
+
+TEST_CASE("partition_support_entities (C5): descend splices a leaf's fallback-voted run back AT ITS OWN INDEX, preserving no_sort collection order", "[chameleon]")
+{
+    // Three leaves in one no_sort collection: leaf0 (fallback-only), leaf1 (SPANS the
+    // vote boundary - part fallback, part extruder 2), leaf2 (fallback-only). p.min_run_mm
+    // = 0.0 isolates the SPLICE POSITION mechanic from the length-threshold arithmetic
+    // already covered above (any minority, however short, descends).
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 15.0 ? 0u : 2u;
+    };
+    BrimVoteParams p;
+    p.fallback_extruder = 0;
+    p.min_run_mm = 0.0;
+
+    auto *leaf0 = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf0->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(5), scale_(6))});
+    auto *leaf1 = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf1->polyline = Polyline({Point(scale_(8), scale_(6)), Point(scale_(18), scale_(6))}); // crosses x=15
+    auto *leaf2 = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf2->polyline = Polyline({Point(scale_(2), scale_(8)), Point(scale_(7), scale_(8))});
+
+    auto *inner = new ExtrusionEntityCollection();
+    inner->no_sort = true;
+    inner->entities.push_back(leaf0);
+    inner->entities.push_back(leaf1);
+    inner->entities.push_back(leaf2);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    // DESCENDED (leaf1 alone supplies a mixed vote -> histogram.size() > 1). Original
+    // entity count (3) preserved: leaf1's ONE fallback run replaces it 1-for-1, leaf0/
+    // leaf2 stay untouched at their own indices.
+    REQUIRE(fills.entities.size() == 1);
+    CHECK(fills.entities.front() == inner);
+    REQUIRE(inner->entities.size() == 3);
+
+    CHECK(inner->entities[0] == leaf0);  // untouched, first position preserved
+    CHECK(inner->entities[1] != leaf0);  // a NEW path (leaf1's fallback half)...
+    CHECK(inner->entities[1] != leaf1);
+    CHECK(inner->entities[1] != leaf2);
+    CHECK(inner->entities[2] == leaf2);  // ...spliced BETWEEN leaf0 and leaf2, not after
+
+    const auto *spliced = static_cast<const ExtrusionPath *>(inner->entities[1]);
+    REQUIRE(!spliced->polyline.points.empty());
+    // Starts where leaf1 itself started (its own chain's first sample)...
+    CHECK(unscale<double>(spliced->polyline.points.front().x()) == 8.0);
+    // ...and never reaches the x=15 vote boundary (that part went to out[2] instead).
+    CHECK(unscale<double>(spliced->polyline.points.back().x()) < 15.0);
+
+    REQUIRE(out.count(2) == 1);
+    REQUIRE(out.at(2).entities.size() == 1);
+    const auto *matched = static_cast<const ExtrusionPath *>(out.at(2).entities.front());
+    REQUIRE(!matched->polyline.points.empty());
+    // split_polyline_core's own shared-boundary-vertex invariant (same as the
+    // "split_polyline_by_resolver produces runs matching a synthetic resolver" test
+    // above): run k's first point is run (k-1)'s last point, so `matched`'s FRONT point
+    // is legitimately `spliced`'s BACK point (x=14.4, < 15) - only the run's LAST point
+    // is guaranteed to have truly crossed into the matched (>=15) zone.
+    CHECK(matched->polyline.points.front() == spliced->polyline.points.back());
+    CHECK(unscale<double>(matched->polyline.points.back().x()) >= 15.0);
+}
+
+TEST_CASE("partition_support_entities (C5): can_reverse is carried onto split runs, inside a descended collection", "[chameleon]")
+{
+    // Single leaf, self-contained, whose OWN vote is mixed (spans x=15) so descend
+    // splits it into exactly two runs: one spliced back (fallback), one moved to
+    // out[2]. set_reverse() is called on the SOURCE leaf before the fixture is built -
+    // both resulting pieces must inherit can_reverse() == false, mirroring how
+    // Support/SupportCommon.cpp:660-663/765-767 builds a branch anchor path with
+    // reversal disabled.
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 15.0 ? 0u : 2u;
+    };
+    BrimVoteParams p;
+    p.fallback_extruder = 0;
+    p.min_run_mm = 0.0;
+
+    auto *leaf = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(20), scale_(6))});
+    REQUIRE(leaf->can_reverse()); // default true, before set_reverse()
+    leaf->set_reverse();
+    REQUIRE_FALSE(leaf->can_reverse());
+
+    auto *inner = new ExtrusionEntityCollection();
+    inner->entities.push_back(leaf);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    REQUIRE(inner->entities.size() == 1); // the spliced-back fallback half
+    CHECK_FALSE(inner->entities.front()->can_reverse());
+
+    REQUIRE(out.count(2) == 1);
+    REQUIRE(out.at(2).entities.size() == 1); // the matched half
+    CHECK_FALSE(out.at(2).entities.front()->can_reverse());
+
+    // Control: the SAME shape, but the source leaf's can_reverse defaults true (never
+    // called set_reverse()) - both rebuilt pieces must stay true. Proves the mechanism
+    // actually forwards the source's own state rather than always emitting false.
+    auto *leaf2 = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf2->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(20), scale_(6))});
+    auto *inner2 = new ExtrusionEntityCollection();
+    inner2->entities.push_back(leaf2);
+    ExtrusionEntityCollection fills2;
+    fills2.entities.push_back(inner2);
+    std::map<unsigned, ExtrusionEntityCollection> out2;
+    partition_support_entities(fills2, erSupportMaterial, 0, resolver, p, out2);
+
+    REQUIRE(inner2->entities.size() == 1);
+    CHECK(inner2->entities.front()->can_reverse());
+    REQUIRE(out2.count(2) == 1);
+    REQUIRE(out2.at(2).entities.size() == 1);
+    CHECK(out2.at(2).entities.front()->can_reverse());
+}
+
+TEST_CASE("partition_support_entities (C5): can_reverse is carried for a top-level (non-collection) leaf entity too", "[chameleon]")
+{
+    // Same mechanism, exercised directly at the shared partition_support_leaf_entity
+    // call site the top-level (non-nested) leaf branch already used pre-C5 - this is
+    // the actual code location the can_reverse fix landed in, so it is worth proving
+    // independently of the descend/collection machinery above.
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 15.0 ? 0u : 2u;
+    };
+    BrimVoteParams p; p.fallback_extruder = 0; p.min_run_mm = 0.0;
+
+    auto *leaf = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leaf->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(20), scale_(6))});
+    leaf->set_reverse();
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(leaf);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    REQUIRE(fills.entities.size() == 1); // leaf's own fallback-voted run, spliced at top level
+    CHECK_FALSE(fills.entities.front()->can_reverse());
+    REQUIRE(out.count(2) == 1);
+    REQUIRE(out.at(2).entities.size() == 1);
+    CHECK_FALSE(out.at(2).entities.front()->can_reverse());
+}
+
+TEST_CASE("partition_support_entities (C5): a collection emptied by descend is removed and deleted exactly once, never left as a dangling shell", "[chameleon]")
+{
+    // Two leaves, each uniformly voting a DIFFERENT non-fallback extruder (2 and 3) -
+    // every leaf moves out of the collection entirely (nothing stays fallback), so the
+    // rebuilt collection ends up with ZERO entities. partition_support_entities must
+    // then delete the (now-empty) collection shell rather than leaving it behind empty
+    // in support_fills or inside any out[] bucket. Deletion itself isn't observable
+    // through the public API without UB (can't dereference freed memory to prove
+    // non-existence) - this asserts the pointer appears NOWHERE reachable afterward,
+    // the strongest black-box proof available; the report's ownership hand-walk covers
+    // the rest (single delete, no leak, no double-free).
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 15.0 ? 2u : 3u;
+    };
+    BrimVoteParams p;
+    p.fallback_extruder = 0; // never actually voted by either leaf below
+    p.min_run_mm = 0.0;
+
+    auto *leafA = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafA->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(10), scale_(6))});   // all < 15 -> extruder 2
+    auto *leafB = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafB->polyline = Polyline({Point(scale_(20), scale_(6)), Point(scale_(25), scale_(6))});  // all >= 15 -> extruder 3
+
+    auto *inner = new ExtrusionEntityCollection();
+    inner->entities.push_back(leafA);
+    inner->entities.push_back(leafB);
+    const Point expected_key = chameleon_quantize_point(chameleon_collection_bbox_center(*inner));
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    DescendColumnMap descended;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
+
+    CHECK(fills.entities.empty()); // the (emptied, deleted) collection is gone, nothing left behind
+
+    REQUIRE(out.count(2) == 1);
+    REQUIRE(out.at(2).entities.size() == 1);
+    CHECK(out.at(2).entities.front() != leafA); // rebuilt, not the original leaf
+    REQUIRE(out.count(3) == 1);
+    REQUIRE(out.at(3).entities.size() == 1);
+    CHECK(out.at(3).entities.front() != leafB);
+
+    // The deleted collection pointer itself is not reachable anywhere: not in
+    // support_fills (checked above, empty), and not smuggled into either bucket either.
+    for (const auto &kv : out)
+        for (const ExtrusionEntity *e : kv.second.entities)
+            CHECK(e != inner);
+
+    REQUIRE(descended.count(expected_key) == 1);
+    CHECK(descended.at(expected_key) == true);
 }

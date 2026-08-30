@@ -283,6 +283,20 @@ void partition_leaf_entity(const ExtrusionEntity &entity, unsigned own_extruder,
 // falling back to entity.role()) rather than hardcoding one - so a base-role
 // entity's split paths stay erSupportMaterial. Returns the number of switch
 // boundaries this entity contributed.
+// v2.3 Task 3 (spec C5): every emitted split path also inherits `entity`'s OWN
+// can_reverse() (ExtrusionEntity.hpp ~111/294/347/389/461 - each concrete entity type
+// expresses "reversal disabled" its own way: ExtrusionPath via the settable
+// m_can_reverse/set_reverse(), ExtrusionPathOriented/ExtrusionLoop by hard-overriding
+// can_reverse() to always return false). A branch-wall leaf built with reversal
+// disabled (Support/SupportCommon.cpp:660-663/765-767 -
+// extrusion_entities_append_paths(..., /*can_reverse=*/false), "always start with the
+// anchor, always print CCW") must keep that property on every rebuilt piece: every
+// new_path this function creates is a plain ExtrusionPath (never an
+// ExtrusionPathOriented), so the only way to carry a false can_reverse() forward is
+// set_reverse() - a no-op call for the (common) case where entity.can_reverse() is
+// already true, since ExtrusionPath defaults m_can_reverse to true. Losing this would
+// let GCode's chain_and_reorder flip a rebuilt piece's direction freely, breaking the
+// seam anchor into a visible blob (spec: "seam-anchor blob hazard").
 size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fallback_extruder,
                                       const std::function<unsigned(const Point &)> &resolver,
                                       const BrimVoteParams &p,
@@ -316,12 +330,15 @@ size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fal
     const float         width      = source ? source->width      : 0.f;
     const float         height     = source ? source->height     : 0.f;
     const ExtrusionRole  role      = source ? source->role() : entity.role();
+    const bool           source_can_reverse = entity.can_reverse(); // v2.3 Task 3 (spec C5)
 
     for (const BrimRun &run : runs) {
         if (run.pts.empty())
             continue;
         auto *new_path      = new ExtrusionPath(role, mm3_per_mm, width, height);
         new_path->polyline  = Polyline(run.pts);
+        if (!source_can_reverse)
+            new_path->set_reverse(); // v2.3 Task 3 (spec C5): carry reversal-disable forward
         if (run.extruder == fallback_extruder)
             new_fallback_paths.push_back(new_path);
         else
@@ -331,10 +348,37 @@ size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fal
     return runs.empty() ? 0 : runs.size() - 1;
 }
 
+// v2.3 Task 3 (spec C5): result of voting a whole nested collection as one unit -
+// extends the pre-v2.3 single winner-extruder answer (`.winner`, unchanged tie-break
+// semantics - see vote_collection_as_unit's own comment below) with the raw
+// per-extruder sample histogram and the longest contiguous run (mm) of samples that
+// voted some extruder OTHER than `.winner`, in COLLECTION ORDER (the same leaf-then-
+// sample walk the histogram itself uses - see below). This is what
+// partition_support_entities' collection branch uses to decide "uniform/dominant" (stay
+// whole, exactly the pre-v2.3 behavior) vs. "genuinely mixed with a real arc" (descend,
+// spec C5). `minority_run_mm` is a SAMPLE-COUNT approximation
+// (samples_in_the_run * p.sample_mm), NOT exact point-to-point geometry - consistent
+// with the "sampled at sample_mm" contract this whole vote already runs under
+// (build_chain resamples at that cadence), and deliberately avoids measuring a "run"
+// across a LEAF BOUNDARY as if the two leaves' endpoints were geometrically adjacent -
+// they are only adjacent in SAMPLE-SEQUENCE order, not necessarily in space (e.g. an
+// inner-loop leaf immediately followed by an outer-loop leaf in a double-wall branch
+// collection - SupportCommon.cpp:647-773's `eec` - are two concentric rings, not two
+// ends of one continuous line). `histogram` is empty (and `minority_run_mm` is 0.0) for
+// the same "no samples anywhere" case that returns `.winner == fallback_extruder`
+// (empty/all-empty-leaf collection).
+struct CollectionVoteResult {
+    unsigned                   winner = 0;
+    std::map<unsigned, size_t> histogram;
+    double                     minority_run_mm = 0.0;
+};
+
 // v2.2 Task 3 (spec C7, "nested collections voted as one unit"): vote a WHOLE
-// role-eligible nested collection - never split apart internally. `collection` is
-// flattened (ExtrusionEntityCollection::flatten(), full recursion regardless of any
-// nested no_sort - flatten() only preserves ordering when explicitly asked to via its
+// role-eligible nested collection - never split apart internally BY THIS FUNCTION (v2.3
+// Task 3's DESCEND path, driven by this function's richer CollectionVoteResult, is what
+// may go on to split it - see partition_support_entities). `collection` is flattened
+// (ExtrusionEntityCollection::flatten(), full recursion regardless of any nested
+// no_sort - flatten() only preserves ordering when explicitly asked to via its
 // preserve_ordering argument, which we don't need here since we're only SAMPLING
 // points, not rebuilding geometry) so every leaf polyline anywhere inside is visited
 // once, no matter how deeply nested. Each leaf is resampled with the SAME
@@ -348,26 +392,34 @@ size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fal
 // a STRICTLY greater count, so the first (lowest-id) extruder reached at the max
 // count is kept automatically, deterministically, with no separate tie-break branch
 // needed. An empty collection, or one whose leaves contribute zero samples (e.g. every
-// leaf's own polyline is empty), returns fallback_extruder - the caller's "leave it in
-// support_fills untouched" path fires naturally on that value, same as the leaf fast
-// path above.
-unsigned vote_collection_as_unit(const ExtrusionEntityCollection &collection, unsigned fallback_extruder,
+// leaf's own polyline is empty), returns fallback_extruder as `.winner` (empty
+// histogram) - the caller's "leave it in support_fills untouched" path fires naturally
+// on that value, same as the leaf fast path above.
+CollectionVoteResult vote_collection_as_unit(const ExtrusionEntityCollection &collection, unsigned fallback_extruder,
                                   const std::function<unsigned(const Point &)> &resolve,
                                   const BrimVoteParams &p)
 {
     const ExtrusionEntityCollection flat = collection.flatten();
 
+    // v2.3 Task 3 (spec C5): the same per-sample votes the histogram below accumulates,
+    // ALSO kept in COLLECTION ORDER (leaf by leaf, sample by sample within each leaf -
+    // the same walk order, just not collapsed into counts) so the minority-run scan
+    // after the winner is decided can find contiguous same-extruder stretches.
+    std::vector<unsigned> ordered_votes;
     std::map<unsigned, size_t> votes;
     for (const ExtrusionEntity *leaf : flat.entities) {
         if (leaf == nullptr || leaf->is_collection())
             continue; // flatten() should never leave a nested collection behind; guard anyway
         const Points chain = build_chain(leaf->as_polyline().points, p.sample_mm);
-        for (const Point &pt : chain)
-            ++votes[resolve(pt)];
+        for (const Point &pt : chain) {
+            const unsigned v = resolve(pt);
+            ordered_votes.push_back(v);
+            ++votes[v];
+        }
     }
 
     if (votes.empty())
-        return fallback_extruder;
+        return { fallback_extruder, {}, 0.0 };
 
     size_t best_count = 0;
     for (const auto &kv : votes)
@@ -385,6 +437,7 @@ unsigned vote_collection_as_unit(const ExtrusionEntityCollection &collection, un
         if (kv.second == best_count)
             tied.push_back(kv.first);
 
+    unsigned winner = tied.front(); // lowest id among the tied (or the sole max when there's no tie)
     if (tied.size() > 1) {
         // Same hysteresis preference as brim_vote's own tie path (spec C3): if exactly
         // ONE tied candidate is in the previous support layer's committed set, it wins
@@ -399,13 +452,120 @@ unsigned vote_collection_as_unit(const ExtrusionEntityCollection &collection, un
                 ++prev_kept_hits;
             }
         if (prev_kept_hits == 1)
-            return prev_kept_member;
+            winner = prev_kept_member;
     }
 
-    return tied.front(); // lowest id among the tied (or the sole max when there's no tie)
+    // v2.3 Task 3 (spec C5): longest contiguous run of the SAME non-winner extruder, in
+    // collection order (ordered_votes, built above in the same leaf-then-sample walk the
+    // majority histogram itself uses) - see CollectionVoteResult's own comment for why
+    // this is a sample-count approximation of mm length, not exact point-to-point
+    // geometry.
+    double best_run_mm = 0.0;
+    {
+        size_t i = 0;
+        while (i < ordered_votes.size()) {
+            size_t j = i;
+            while (j + 1 < ordered_votes.size() && ordered_votes[j + 1] == ordered_votes[i])
+                ++j;
+            if (ordered_votes[i] != winner)
+                best_run_mm = std::max(best_run_mm, double(j - i + 1) * p.sample_mm);
+            i = j + 1;
+        }
+    }
+
+    return { winner, std::move(votes), best_run_mm };
+}
+
+// v2.3 Task 3 (spec C5): descend ONE role-eligible collection whose whole-unit vote came
+// back genuinely mixed (see partition_support_entities' collection branch below for the
+// threshold decision that leads here). Every LEAF entity reachable inside `collection`
+// is individually voted/split via the SAME per-leaf logic partition_support_leaf_entity
+// already uses for a top-level (non-nested) leaf entity - this recurses into any
+// FURTHER-nested sub-collection the same way (in practice, tree branch double-wall
+// collections - the only known nested-collection producer at this role,
+// SupportCommon.cpp:647-773 - are exactly one level deep, but this makes no assumption
+// of that):
+//   - a leaf whose entire vote is fallback_extruder is left in place, AT ITS OWN INDEX,
+//     inside its IMMEDIATE parent collection - untouched, no churn (mirrors
+//     partition_support_leaf_entity's own uniform-fallback fast path).
+//   - any other leaf (uniform non-fallback, or genuinely mixed) is split via
+//     partition_support_leaf_entity: fallback-voted runs become new ExtrusionPaths
+//     SPLICED IN at the original leaf's index inside its immediate parent - this is why
+//     the rebuild below appends to a fresh per-collection vector IN ITERATION ORDER
+//     rather than accumulating fallback runs globally the way the top-level leaf case's
+//     own new_fallback_paths does (no_sort order matters here, since these collections
+//     model the tree branch generator's own explicit anchor/sheath ordering); non-
+//     fallback runs go to out[extruder] (role/flow/can_reverse carried, same function).
+// A nested sub-collection left FULLY EMPTY by this recursion (every one of its own
+// direct entities matched/moved out, nothing fell back into it) is itself removed from
+// its parent and deleted - the SAME "emptied shell, single delete" rule the top-level
+// caller applies to `collection` itself, just recursive, so no empty shell is ever left
+// dangling at any nesting depth. Returns the summed switch-boundary count from every
+// leaf this touched (partition_support_leaf_entity's own per-leaf return value, summed).
+size_t descend_collection_in_place(ExtrusionEntityCollection &collection, unsigned fallback_extruder,
+                                    const std::function<unsigned(const Point &)> &resolver,
+                                    const BrimVoteParams &p,
+                                    std::map<unsigned, ExtrusionEntityCollection> &out)
+{
+    size_t switch_boundaries = 0;
+    ExtrusionEntitiesPtr rebuilt;
+    rebuilt.reserve(collection.entities.size());
+
+    for (ExtrusionEntity *child : collection.entities) {
+        if (child == nullptr)
+            continue;
+
+        if (child->is_collection()) {
+            auto *sub = static_cast<ExtrusionEntityCollection *>(child);
+            switch_boundaries += descend_collection_in_place(*sub, fallback_extruder, resolver, p, out);
+            if (sub->entities.empty())
+                delete sub; // emptied shell -> single delete, never left behind
+            else
+                rebuilt.push_back(sub); // stays at this same relative position (no_sort preserved)
+            continue;
+        }
+
+        std::vector<ExtrusionPath *> fallback_runs;
+        bool replaced = false;
+        switch_boundaries += partition_support_leaf_entity(*child, fallback_extruder, resolver, p,
+                                                             fallback_runs, out, replaced);
+        if (!replaced) {
+            rebuilt.push_back(child); // uniform-fallback fast path: original stays, at this index
+            continue;
+        }
+        // Splice fallback runs in AT THIS LEAF'S POSITION (no_sort order preserved),
+        // then drop the now-superseded original.
+        for (ExtrusionPath *fb : fallback_runs)
+            rebuilt.push_back(fb);
+        delete child;
+    }
+
+    collection.entities.swap(rebuilt);
+    return switch_boundaries;
 }
 
 } // namespace
+
+Point chameleon_quantize_point(const Point &p, double quantize_mm)
+{
+    const double cell = scale_(quantize_mm);
+    return Point(coord_t(std::floor(double(p.x()) / cell)), coord_t(std::floor(double(p.y()) / cell)));
+}
+
+Point chameleon_collection_bbox_center(const ExtrusionEntityCollection &collection)
+{
+    Points pts;
+    const ExtrusionEntityCollection flat = collection.flatten();
+    for (const ExtrusionEntity *leaf : flat.entities) {
+        if (leaf == nullptr || leaf->is_collection())
+            continue;
+        const Points leaf_pts = leaf->as_polyline().points;
+        pts.insert(pts.end(), leaf_pts.begin(), leaf_pts.end());
+    }
+    if (pts.empty())
+        return Point(0, 0);
+    return BoundingBox(pts).center();
+}
 
 void partition_brim_by_wall(const ExtrusionEntityCollection &brim, unsigned own_extruder,
                              const WallSampleIndex &idx, const BrimVoteParams &p,
@@ -804,7 +964,8 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &la
 
 size_t partition_support_entities(ExtrusionEntityCollection &support_fills, ExtrusionRole role_filter,
                                    unsigned fallback_extruder, const std::function<unsigned(const Point &)> &resolver,
-                                   const BrimVoteParams &p, std::map<unsigned, ExtrusionEntityCollection> &out)
+                                   const BrimVoteParams &p, std::map<unsigned, ExtrusionEntityCollection> &out,
+                                   DescendColumnMap *descended_out)
 {
     size_t switch_boundaries = 0;
     std::vector<ExtrusionPath *> new_fallback_paths;
@@ -833,21 +994,61 @@ size_t partition_support_entities(ExtrusionEntityCollection &support_fills, Extr
                 continue;
             }
 
-            const unsigned voted = vote_collection_as_unit(*collection, fallback_extruder, resolver, p);
-            if (voted == fallback_extruder) {
-                // Fallback majority (or no samples at all): leave the ORIGINAL
-                // collection pointer exactly where it is - byte-identical geometry,
-                // no entity churn, and its own no_sort flag is untouched because the
-                // collection object itself is never touched, only re-examined.
-                kept.push_back(entity);
-            } else {
-                // Non-fallback majority: move the WHOLE collection pointer into
-                // out[voted] - true ownership transfer (not append(), which clones),
-                // same "pointer moves, no clone" contract the leaf fast path already
-                // gives its own untouched entities. The collection's no_sort flag
-                // travels with it unchanged (still the same object).
-                out[voted].entities.push_back(entity);
+            const CollectionVoteResult vote = vote_collection_as_unit(*collection, fallback_extruder, resolver, p);
+
+            // v2.3 Task 3 (spec C5): a real minority only matters if it is CONTIGUOUS
+            // for at least the descend threshold - a handful of scattered stray votes
+            // (histogram.size() > 1 but no run ever gets long) is noise, not a genuine
+            // sector-straddling arc, so it stays on the pre-v2.3 whole-move/stay path
+            // exactly like a uniform collection does. The threshold is this object's own
+            // min_run_mm (support-pass override, spec C6: 1.6mm), HALVED for a column
+            // that already descended LAST layer (descend hysteresis) - see
+            // DescendColumnMap's own comment (BrimFilament.hpp) for the quantized-
+            // bbox-center key and why this is only computed once we know a minority
+            // exists at all (a uniform collection's minority_run_mm is always 0.0, and
+            // 0.0 can never clear a strictly positive threshold, so skipping the lookup
+            // entirely for that common case is both cheaper and harmless).
+            const bool has_minority = vote.histogram.size() > 1;
+            Point      column_key;
+            bool       genuinely_mixed = false;
+            if (has_minority) {
+                column_key = chameleon_quantize_point(chameleon_collection_bbox_center(*collection));
+                const auto it = p.descended_last_layer.find(column_key);
+                const bool descended_last = it != p.descended_last_layer.end() && it->second;
+                const double threshold = descended_last ? p.min_run_mm * 0.5 : p.min_run_mm;
+                genuinely_mixed = vote.minority_run_mm >= threshold;
             }
+
+            if (!genuinely_mixed) {
+                // (a) Uniform, or a real-but-too-short minority: EXACT pre-v2.3
+                // whole-move/stay behavior, pointer-stable.
+                if (vote.winner == fallback_extruder) {
+                    // Fallback majority (or no samples at all): leave the ORIGINAL
+                    // collection pointer exactly where it is - byte-identical geometry,
+                    // no entity churn, and its own no_sort flag is untouched because the
+                    // collection object itself is never touched, only re-examined.
+                    kept.push_back(entity);
+                } else {
+                    // Non-fallback majority: move the WHOLE collection pointer into
+                    // out[voted] - true ownership transfer (not append(), which clones),
+                    // same "pointer moves, no clone" contract the leaf fast path already
+                    // gives its own untouched entities. The collection's no_sort flag
+                    // travels with it unchanged (still the same object).
+                    out[vote.winner].entities.push_back(entity);
+                }
+                continue;
+            }
+
+            // (b) DESCEND: partition every leaf inside `collection` individually, in
+            // place - see descend_collection_in_place's own comment for the full
+            // per-leaf splice/delete contract.
+            switch_boundaries += descend_collection_in_place(*collection, fallback_extruder, resolver, p, out);
+            if (collection->entities.empty())
+                delete collection; // emptied shell -> single delete, never left in support_fills
+            else
+                kept.push_back(entity); // pointer stays - same object, rebuilt contents
+            if (descended_out != nullptr)
+                (*descended_out)[column_key] = true; // never records false - see DescendColumnMap's comment
             continue;
         }
 

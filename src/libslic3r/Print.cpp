@@ -2905,6 +2905,18 @@ static void chameleon_assign_support_interfaces(Print &print)
         // function's own decay-counter state, carried alongside prev_kept itself.
         std::set<unsigned> prev_kept;
         bool                prev_kept_retained_last_layer = false;
+        // v2.3 Task 3 (spec C5): this object's descend-hysteresis state - see
+        // BrimVoteParams::descended_last_layer's own comment (BrimFilament.hpp) and
+        // partition_support_entities' collection branch (BrimFilament.cpp) for the full
+        // mechanism. Threaded through this loop the SAME way prev_kept is (synced into
+        // vote_params before the engine calls each iteration that reaches them), but
+        // REPLACED wholesale - not merged - after those calls run each layer: a column
+        // is only ever written into descended_this_layer (below) the layer it actually
+        // descends, so a column that doesn't re-qualify simply has no entry going into
+        // the NEXT layer - immediate full-threshold reversion, no multi-layer grace like
+        // C2's prev_kept retention (the spec only asked for "halved if descended LAST
+        // layer", not a decaying grace).
+        DescendColumnMap descended_last_layer;
         size_t layers_partitioned  = 0;
         size_t layers_zero_sample  = 0;
         // v2.2 Task 1: replaces the old cumulative_switches/layers_reverted/escalated
@@ -2965,6 +2977,12 @@ static void chameleon_assign_support_interfaces(Print &print)
             // `vote_params` itself, unchanged), which is what vote_collection_as_unit's
             // own tie path reads for C7 whole-collection votes.
             vote_params.prev_kept = prev_kept;
+
+            // v2.3 Task 3 (spec C5): synced the same way, same reason - vote_params is
+            // constructed once per OBJECT, this loop updates descended_last_layer once
+            // per LAYER, so without this every layer's engine calls would see whatever
+            // descended_last_layer happened to be at object-start (empty) forever.
+            vote_params.descended_last_layer = descended_last_layer;
 
             // v2.3 Task 1 (spec C1): this layer's free-extruder set - the once-per-pass
             // z-table's coincidence lookup at this support layer's own print_z. Resolved
@@ -3164,12 +3182,20 @@ static void chameleon_assign_support_interfaces(Print &print)
             // entities.swap() rebuild leaves every entity of a DIFFERENT role exactly
             // where it was for the next call to then walk.
             std::map<unsigned, ExtrusionEntityCollection> partitioned;
+            // v2.3 Task 3 (spec C5): fresh accumulator for THIS layer's descends, shared
+            // across all three calls below the same way `partitioned` itself is -
+            // replaces `descended_last_layer` wholesale once this layer's processing
+            // finishes (see the assignment further down, mirroring prev_kept's own
+            // update site).
+            DescendColumnMap descended_this_layer;
 
             const size_t interface_switches = partition_support_entities(support_layer->support_fills,
-                erSupportMaterialInterface, fallback_extruder, interface_resolver, vote_params, partitioned);
+                erSupportMaterialInterface, fallback_extruder, interface_resolver, vote_params, partitioned,
+                &descended_this_layer);
 
             const size_t base_switches = partition_support_entities(support_layer->support_fills,
-                erSupportMaterial, base_fallback_extruder, base_resolver, vote_params, partitioned);
+                erSupportMaterial, base_fallback_extruder, base_resolver, vote_params, partitioned,
+                &descended_this_layer);
 
             // v2.2 Task 3 (spec C6, root cause 5): "ironing follows its interface" -
             // erIroning entities are the ironed top surface of a matched interface run,
@@ -3186,7 +3212,8 @@ static void chameleon_assign_support_interfaces(Print &print)
             // correct: apply_bucket_caps' total_path_length_mm already recurses into any
             // nested collection a bucket might hold, per C7).
             const size_t ironing_switches = partition_support_entities(support_layer->support_fills,
-                erIroning, fallback_extruder, interface_resolver, vote_params, partitioned);
+                erIroning, fallback_extruder, interface_resolver, vote_params, partitioned,
+                &descended_this_layer);
 
             interface_runs_matched += interface_switches;
             base_runs_matched      += base_switches;
@@ -3252,6 +3279,10 @@ static void chameleon_assign_support_interfaces(Print &print)
                 { prev_kept, prev_kept_retained_last_layer }, cap_result.kept, had_buckets_pre_gate);
             prev_kept                     = std::move(next_prev_kept_state.prev_kept);
             prev_kept_retained_last_layer = next_prev_kept_state.retained_last_layer;
+            // v2.3 Task 3 (spec C5): replace wholesale (not merge) - see
+            // descended_last_layer's own declaration comment above for why this layer's
+            // fresh accumulation is the whole next-layer state, not an addition to it.
+            descended_last_layer = std::move(descended_this_layer);
             support_layer->chameleon_interface_visited = true;
         }
 
