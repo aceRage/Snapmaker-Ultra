@@ -250,7 +250,10 @@ enum BrimType {
 enum BrimFilamentSource { bfsObject = 0, bfsNearestWall };
 
 // Chameleon support interface: which filament a support-interface extrusion is printed with.
-enum SupportInterfaceFilamentSource { sifsManual = 0, sifsNearestSurface };
+// v2.2 Task 4 (spec C8): sifsNearestWall appended (never inserted) - serialized configs
+// key this enum by its integer value (CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS), so an
+// existing "nearest_surface" (1) save must keep resolving to sifsNearestSurface.
+enum SupportInterfaceFilamentSource { sifsManual = 0, sifsNearestSurface, sifsNearestWall };
 
 enum TimelapseType : int {
     tlTraditional = 0,

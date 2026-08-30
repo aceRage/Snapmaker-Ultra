@@ -85,6 +85,19 @@ std::vector<size_t> select_layers_overlapping_span(const std::vector<double>& pr
                                                     double lo_z, double hi_z,
                                                     double first_bottom_z = 0.0);
 
+// v2.2 Task 4 (spec C8, "nearest_wall" comparison mode): dedupe-union of two layer-
+// index lists - nearest_wall builds its single WallSampleIndex over the UNION of the
+// contact-band layers (select_contact_layers) and the coplanar-span layers
+// (select_layers_overlapping_span), so a layer index selected by both bands only
+// contributes its walls once (WallSampleIndex::add_polyline called twice on the same
+// layer would double-weight it in brim_vote's 1/d^2 scoring). Pure/unit-testable
+// without a PrintObject scaffold, same free-function pattern as select_contact_layers/
+// select_layers_overlapping_span above. Neither input needs to already be sorted or
+// duplicate-free (each caller-side selector already returns ascending, duplicate-free
+// indices in practice, but this makes no assumption of its own); the result is always
+// ascending and duplicate-free.
+std::vector<size_t> union_layer_indices(const std::vector<size_t>& a, const std::vector<size_t>& b);
+
 // v2.1 Task 2 (projection resolver): pure geometric core of Print.cpp's
 // chameleon_projection_extruder_from_view (fed by chameleon_build_projection_views;
 // v2.1 final-review M1 fix hoisted that construction to once per support layer instead

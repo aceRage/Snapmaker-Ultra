@@ -517,6 +517,22 @@ std::vector<size_t> select_layers_overlapping_span(const std::vector<double> &pr
     return result;
 }
 
+std::vector<size_t> union_layer_indices(const std::vector<size_t> &a, const std::vector<size_t> &b)
+{
+    // v2.2 Task 4 (spec C8): see this function's own header comment in BrimFilament.hpp
+    // - no ordering/duplicate-free assumption on either input, sort+unique the
+    // concatenation. Layer index counts here are always small (a handful of band
+    // layers), so this is deliberately the simplest correct implementation, not a
+    // merge-of-two-sorted-ranges optimization.
+    std::vector<size_t> result;
+    result.reserve(a.size() + b.size());
+    result.insert(result.end(), a.begin(), a.end());
+    result.insert(result.end(), b.begin(), b.end());
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
 namespace {
 
 // v2.2 Task 2 (spec C5): bbox-gated "does any island in `polys` contain p" test,

@@ -11,6 +11,11 @@
 #      manual-mode support-region identity vs p2_baseline.gcode (tower off/on),
 #      nearest_surface-mode sanity (exit 0, bounded M620 growth, feature-tag
 #      presence; tower off/on), and a nearest_surface determinism repeat.
+#   4. (Part 2, v2.2 Task 4, spec C8) nearest_wall-mode sanity — same shape as
+#      3's nearest_surface checks (exit 0, bounded M620 growth, feature-tag
+#      presence; tower off/on) plus a determinism repeat. Checks are prefixed
+#      "p2-wall-" to avoid colliding with section 2's unrelated
+#      "nearestwall-*" (Part 1 brim_filament_source=nearest_wall) checks.
 #
 # Run from anywhere; the script cd's into its own directory (spike/) first so
 # all the relative harness paths below resolve the same way regardless of the
@@ -50,6 +55,10 @@ M620_MAX=10
 TSHAPE="tshape.stl"
 P2_MANUAL_OVERRIDES="spike_support_overrides.json"    # support_interface_filament_source = manual (default)
 P2_NEAREST_OVERRIDES="spike_p2_overrides.json"        # + support_interface_filament_source = nearest_surface
+# v2.2 Task 4 (spec C8): support_interface_filament_source = nearest_wall - the new
+# user-directed A/B comparison mode. Same fixture/shape as P2_NEAREST_OVERRIDES, just
+# the third enum value.
+P2_WALL_OVERRIDES="spike_p2_wall_overrides.json"
 P2_BASELINE="out/p2_baseline.gcode"                   # recorded pre-Task-4 (HEAD a157ac6cf8): manual mode, tower off, single PLA filament
 
 OUT_P2_MAN_OFF="out/p2_manual_off.gcode"
@@ -57,6 +66,9 @@ OUT_P2_MAN_ON="out/p2_manual_on.gcode"
 OUT_P2_NS_OFF_1="out/p2_nearest_off_1.gcode"
 OUT_P2_NS_OFF_2="out/p2_nearest_off_2.gcode"
 OUT_P2_NS_ON="out/p2_nearest_on.gcode"
+OUT_P2_WALL_OFF_1="out/p2_wall_off_1.gcode"
+OUT_P2_WALL_OFF_2="out/p2_wall_off_2.gcode"
+OUT_P2_WALL_ON="out/p2_wall_on.gcode"
 
 # ---------------------------------------------------------------------------
 # Preflight — fail fast with a clear message if the harness itself isn't set up,
@@ -64,7 +76,7 @@ OUT_P2_NS_ON="out/p2_nearest_on.gcode"
 # ---------------------------------------------------------------------------
 preflight_fail=0
 for f in "$EXE" "$MACHINE_PROFILE" "$FIL_PLA" "$FIL_PETG" "$OBJ_OVERRIDES" "$CHA_OVERRIDES" "$BASELINE" cube30.stl cube30b.stl \
-         "$TSHAPE" "$P2_MANUAL_OVERRIDES" "$P2_NEAREST_OVERRIDES" "$P2_BASELINE"; do
+         "$TSHAPE" "$P2_MANUAL_OVERRIDES" "$P2_NEAREST_OVERRIDES" "$P2_WALL_OVERRIDES" "$P2_BASELINE"; do
     if [ ! -f "$f" ]; then
         echo "PREFLIGHT FAIL: missing required file: $f" >&2
         preflight_fail=1
@@ -477,6 +489,93 @@ if [ $p2ns_off1_rc -eq 0 ] && [ $p2ns_off2_rc -eq 0 ]; then
     fi
 else
     record "p2-nearest-determinism" FAIL "skipped: one or both runs did not slice"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Support Interface Auto-Match (Part 2) — nearest_wall mode (v2.2 Task 4,
+#    spec C8). Same tshape.stl fixture and the same CLI LIMITATION/CAVEAT notes
+#    as section 3's nearest_surface checks above apply here verbatim (single
+#    used extruder on this CLI fixture, so this validates no-crash / well-formed
+#    output / feature-tag presence / determinism, not real cross-extruder
+#    matching — see section 3's own comment block for the full rationale).
+#    Checks are prefixed "p2-wall-" (NOT "nearestwall-", which section 2 above
+#    already uses for the unrelated Part 1 brim_filament_source=nearest_wall
+#    checks) so the two features' checks never collide in the results table.
+# ---------------------------------------------------------------------------
+
+# --- 4a. nearest_wall mode, tower OFF: no-crash + bounded M620 growth +
+#         feature-tag presence.
+run_slice_p2 "$P2_WALL_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_WALL_OFF_1" "out/p2_wall_off_1.log"
+p2wall_off1_rc=$?
+if [ $p2wall_off1_rc -eq 0 ]; then record "p2-wall-off-exit0" PASS "exit 0"
+else record "p2-wall-off-exit0" FAIL "exit $p2wall_off1_rc — see out/p2_wall_off_1.log"; fi
+
+if [ $p2wall_off1_rc -eq 0 ]; then
+    total_layers=$(total_layers_of "$OUT_P2_WALL_OFF_1")
+    [ -z "$total_layers" ] && total_layers=0
+    m620_max=$((2 + 2 * 3 * total_layers))
+    m620_count=$(m620_count_of "$OUT_P2_WALL_OFF_1")
+    if [ "$m620_count" -ge 2 ] && [ "$m620_count" -le "$m620_max" ]; then
+        record "p2-wall-off-m620-bounds" PASS "M620 count = $m620_count (bound [2,$m620_max], total_layers=$total_layers)"
+    else
+        record "p2-wall-off-m620-bounds" FAIL "M620 count = $m620_count, outside bound [2,$m620_max]"
+    fi
+
+    feature_count=$(grep -c "; FEATURE: Support interface" "$OUT_P2_WALL_OFF_1")
+    if [ "$feature_count" -ge 1 ]; then
+        record "p2-wall-off-feature-present" PASS "'; FEATURE: Support interface' occurs $feature_count time(s)"
+    else
+        record "p2-wall-off-feature-present" FAIL "'; FEATURE: Support interface' not found"
+    fi
+else
+    record "p2-wall-off-m620-bounds" FAIL "skipped: run did not slice"
+    record "p2-wall-off-feature-present" FAIL "skipped: run did not slice"
+fi
+
+# --- 4b. nearest_wall mode, tower ON: same sanity bar, tower override applied
+#         (collapses to tower-off here too, same as 3b/3d).
+run_slice_p2 "$P2_WALL_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_WALL_ON" "out/p2_wall_on.log" --enable-prime-tower=1
+p2wall_on_rc=$?
+if [ $p2wall_on_rc -eq 0 ]; then record "p2-wall-on-exit0" PASS "exit 0"
+else record "p2-wall-on-exit0" FAIL "exit $p2wall_on_rc — see out/p2_wall_on.log"; fi
+
+if [ $p2wall_on_rc -eq 0 ]; then
+    total_layers=$(total_layers_of "$OUT_P2_WALL_ON")
+    [ -z "$total_layers" ] && total_layers=0
+    m620_max=$((2 + 2 * 3 * total_layers))
+    m620_count=$(m620_count_of "$OUT_P2_WALL_ON")
+    if [ "$m620_count" -ge 2 ] && [ "$m620_count" -le "$m620_max" ]; then
+        record "p2-wall-on-m620-bounds" PASS "M620 count = $m620_count (bound [2,$m620_max], total_layers=$total_layers)"
+    else
+        record "p2-wall-on-m620-bounds" FAIL "M620 count = $m620_count, outside bound [2,$m620_max]"
+    fi
+
+    feature_count=$(grep -c "; FEATURE: Support interface" "$OUT_P2_WALL_ON")
+    if [ "$feature_count" -ge 1 ]; then
+        record "p2-wall-on-feature-present" PASS "'; FEATURE: Support interface' occurs $feature_count time(s)"
+    else
+        record "p2-wall-on-feature-present" FAIL "'; FEATURE: Support interface' not found"
+    fi
+else
+    record "p2-wall-on-m620-bounds" FAIL "skipped: run did not slice"
+    record "p2-wall-on-feature-present" FAIL "skipped: run did not slice"
+fi
+
+# --- 4c. Determinism repeat: nearest_wall, tower OFF, two consecutive slices,
+#         support-scoped compare (per section 3's CAVEAT).
+run_slice_p2 "$P2_WALL_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_WALL_OFF_2" "out/p2_wall_off_2.log"
+p2wall_off2_rc=$?
+if [ $p2wall_off2_rc -eq 0 ]; then record "p2-wall-determinism-run2-exit0" PASS "exit 0"
+else record "p2-wall-determinism-run2-exit0" FAIL "exit $p2wall_off2_rc — see out/p2_wall_off_2.log"; fi
+
+if [ $p2wall_off1_rc -eq 0 ] && [ $p2wall_off2_rc -eq 0 ]; then
+    if support_identical "$OUT_P2_WALL_OFF_1" "$OUT_P2_WALL_OFF_2"; then
+        record "p2-wall-determinism" PASS "run1 == run2, support-region + toolchange (normalized)"
+    else
+        record "p2-wall-determinism" FAIL "run1 != run2, support-region + toolchange (normalized)"
+    fi
+else
+    record "p2-wall-determinism" FAIL "skipped: one or both runs did not slice"
 fi
 
 # ---------------------------------------------------------------------------

@@ -1294,3 +1294,72 @@ TEST_CASE("total_path_length_mm recurses into a nested collection a C7 whole-col
 
     CHECK_THAT(total_path_length_mm(bucket), Catch::Matchers::WithinAbs(25.0, 1e-6));
 }
+
+// --- v2.2 Task 4 (spec C8): nearest_wall mode ------------------------------
+
+TEST_CASE("union_layer_indices dedupes the overlap between two ascending index lists", "[chameleon]")
+{
+    // The realistic shape: contact-band indices and coplanar-span indices are each
+    // individually ascending/duplicate-free (their own selectors guarantee that), but
+    // the two lists commonly share layers (a support layer's coplanar span usually
+    // sits inside or beside its 2mm-wide contact band) - the union must count each
+    // shared layer's walls exactly once.
+    std::vector<size_t> contact  = {2, 3, 4};
+    std::vector<size_t> coplanar = {1, 2};
+    auto result = union_layer_indices(contact, coplanar);
+    REQUIRE(result.size() == 4);
+    CHECK(result[0] == 1);
+    CHECK(result[1] == 2);
+    CHECK(result[2] == 3);
+    CHECK(result[3] == 4);
+}
+
+TEST_CASE("union_layer_indices: fully disjoint lists just merge, ascending", "[chameleon]")
+{
+    std::vector<size_t> a = {5, 7};
+    std::vector<size_t> b = {1, 3};
+    auto result = union_layer_indices(a, b);
+    REQUIRE(result.size() == 4);
+    CHECK(result[0] == 1);
+    CHECK(result[1] == 3);
+    CHECK(result[2] == 5);
+    CHECK(result[3] == 7);
+}
+
+TEST_CASE("union_layer_indices: identical lists collapse to one copy each", "[chameleon]")
+{
+    std::vector<size_t> a = {0, 1, 2};
+    auto result = union_layer_indices(a, a);
+    REQUIRE(result.size() == 3);
+    CHECK(result[0] == 0);
+    CHECK(result[1] == 1);
+    CHECK(result[2] == 2);
+}
+
+TEST_CASE("union_layer_indices: either side empty returns the other side, deduped", "[chameleon]")
+{
+    std::vector<size_t> empty;
+    std::vector<size_t> some = {4, 4, 2}; // caller-side duplicate, unsorted - documents no assumption
+    CHECK(union_layer_indices(empty, empty).empty());
+    auto r1 = union_layer_indices(empty, some);
+    REQUIRE(r1.size() == 2);
+    CHECK(r1[0] == 2);
+    CHECK(r1[1] == 4);
+    auto r2 = union_layer_indices(some, empty);
+    REQUIRE(r2.size() == 2);
+    CHECK(r2[0] == 2);
+    CHECK(r2[1] == 4);
+}
+
+TEST_CASE("brim_vote uncapped (max_dist_mm=0) picks the nearest wall regardless of distance (C8 nearest_wall mode)", "[chameleon]")
+{
+    // C8: nearest_wall's resolver is brim_vote with max_dist_mm left at 0 (uncapped) -
+    // unlike nearest_surface's gap-aware lateral cap (C4), a wall far beyond any
+    // physically-plausible gap must still win outright, never fall back.
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 500, 10, 500), 3, 1); // 500mm away - no real cap would admit this
+    BrimVoteParams p;
+    p.max_dist_mm = 0.0;
+    p.fallback_extruder = 9;
+    CHECK(brim_vote(idx, Point(scale_(5), scale_(0)), p) == 3);
+}

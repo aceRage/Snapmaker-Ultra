@@ -357,7 +357,8 @@ CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(BrimFilamentSource)
 
 static t_config_enum_values s_keys_map_SupportInterfaceFilamentSource {
     { "manual",          int(SupportInterfaceFilamentSource::sifsManual) },
-    { "nearest_surface", int(SupportInterfaceFilamentSource::sifsNearestSurface) }
+    { "nearest_surface", int(SupportInterfaceFilamentSource::sifsNearestSurface) },
+    { "nearest_wall",    int(SupportInterfaceFilamentSource::sifsNearestWall) }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(SupportInterfaceFilamentSource)
 
@@ -5468,12 +5469,16 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Support interface filament source");
     def->category = L("Support");
     def->tooltip = L("Default: use the configured support interface filament. Nearest surface: "
-                     "each interface region uses the filament of the model surface it touches.");
+                     "each interface region uses the filament of the model surface it touches. "
+                     "Nearest wall: every support extrusion matches the nearest model wall, no "
+                     "distance limit - comparison mode.");
     def->enum_keys_map = &ConfigOptionEnum<SupportInterfaceFilamentSource>::get_enum_values();
     def->enum_values.emplace_back("manual");
     def->enum_values.emplace_back("nearest_surface");
+    def->enum_values.emplace_back("nearest_wall");
     def->enum_labels.emplace_back(L("Default"));
     def->enum_labels.emplace_back(L("Nearest surface"));
+    def->enum_labels.emplace_back(L("Nearest wall"));
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<SupportInterfaceFilamentSource>(sifsManual));
 
