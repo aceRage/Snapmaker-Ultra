@@ -31,6 +31,21 @@ struct BrimVoteParams {
     double sample_mm       = 0.8;
     double min_run_mm      = 2.0;       // shorter runs absorbed
     size_t max_runs        = 4;         // guard cap per object brim
+    // v2.3 final-review M4 fix: gates split_polyline_core's ring-seam merge (spec C7,
+    // BrimFilament.cpp ~196) - default FALSE so every pre-v2.3-final-review caller (most
+    // notably Part 1's own brim BrimVoteParams, built independently in Print::process's
+    // brim call site, which never sets this) is unaffected: the plan's "Part 1 brim
+    // behavior stays byte-identical" contract was violated by C7 firing unconditionally
+    // for ANY loop, including feature-ON Part 1 brim loops sharing split_polyline_core
+    // via partition_leaf_entity -> split_polyline_by_vote (:250/:696) - see the v2.3
+    // final review, finding M4. The support pass (Print.cpp's
+    // chameleon_assign_support_interfaces) explicitly sets this true on its own
+    // vote_params before copying it into every per-role BrimVoteParams instance it
+    // builds, so support ring/loop splitting keeps the C7 merge (and its I1 wrap-closure
+    // fix) exactly as before; brim's own vote_params never touches this field, so it
+    // stays false and the merge block is unreachable for brim, restoring the byte-
+    // identical claim as actually true rather than aspirational.
+    bool merge_ring_seam   = false;
     // object_key -> layer-0 area (for tie-break 1); larger area wins
     std::map<size_t, double> object_area;
     unsigned fallback_extruder = 0;     // used when index empty / no candidates

@@ -2369,7 +2369,18 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
 // no longer has anything to feed.
 static unsigned chameleon_region_extruder(const PrintRegion &region, bool is_external)
 {
-    return unsigned(region.extruder(is_external ? frExternalPerimeter : frPerimeter) - 1);
+    // v2.3 final-review M5 fix: defensive clamp against a hand-edited/legacy profile that
+    // violates wall_filament's documented config min=1 and lets extruder() return 0 here -
+    // well-formed configs can never reach this (min=1 confirmed at PrintConfig.cpp:3498,
+    // painted regions always set it too, PrintApply.cpp:826-833), so this is pure defense-
+    // in-depth, not a live bug. Without it the raw `- 1` (unsigned arithmetic) underflows
+    // to 0xFFFFFFFF and that garbage value is used DIRECTLY as a bucket key/extruder id -
+    // unlike the engine's own `- 1` sites (e.g. LayerRegion.cpp:151's this->extruder(role)
+    // - 1), which feed ConfigOptionVector::get_at(), whose own underflow clamp silently
+    // falls back to the 0th element (get_at's documented behavior, cited in that same
+    // comment). std::max(1u, ...) buys back that same old own-extruder-fallback failure
+    // mode here, for free, since chameleon has no get_at() call in this path to clamp it.
+    return std::max(1u, region.extruder(is_external ? frExternalPerimeter : frPerimeter)) - 1;
 }
 
 static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const PrintRegion& region,
@@ -2437,7 +2448,12 @@ static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const 
 // PrintRegion::extruder() call instead of re-deriving its logic by hand.
 static unsigned chameleon_projection_region_extruder(const PrintRegion &region)
 {
-    return unsigned(region.extruder(frSolidInfill) - 1);
+    // v2.3 final-review M5 fix: same defensive underflow clamp as
+    // chameleon_region_extruder above, and for the same reason - solid_infill_filament/
+    // sparse_infill_filament both have config min=1 (well-formed configs never reach 0
+    // here), but chameleon reads the raw `- 1` directly as a bucket key/extruder id with
+    // no get_at()-style clamp downstream to catch a hand-edited/legacy profile's 0.
+    return std::max(1u, region.extruder(frSolidInfill)) - 1;
 }
 
 // v2.2 Task 2 (spec C5, root cause 4): mirrors Support/SupportMaterial.cpp:57's
@@ -2837,6 +2853,16 @@ static void chameleon_assign_support_interfaces(Print &print)
         // two fields.
         vote_params.max_runs   = 8;
         vote_params.min_run_mm = 1.6;
+        // v2.3 final-review M4 fix: support-pass-only opt-in to split_polyline_core's
+        // ring-seam merge (spec C7, BrimVoteParams::merge_ring_seam, default false) - set
+        // HERE, on the shared vote_params instance, before every per-role BrimVoteParams
+        // copy below (interface_wall_params/base_wall_params/interface_lateral_params/
+        // base_lateral_params) is made from it, so every support engine call keeps the
+        // seam merge exactly as before this fix. Part 1's own brim vote_params (built
+        // independently, further down this file) never touches this field, so it stays
+        // false there and the merge is unreachable for brim loops - restoring the "Part 1
+        // brim behavior stays byte-identical" contract the merge previously violated.
+        vote_params.merge_ring_seam = true;
 
         // v2.2 Task 2 (spec C4, root cause 1): gap-aware lateral cap, replacing the
         // hardcoded 1.0mm max_dist_mm below (BrimVoteParams.max_dist_mm, Task 1). The

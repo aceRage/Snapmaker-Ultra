@@ -193,11 +193,22 @@ std::vector<BrimRun> split_polyline_core(const Points &poly, bool is_loop,
     // the array's own adjacency invariant (no two array-adjacent runs ever share an
     // extruder) already differs from the just-removed original last run's extruder -
     // and the just-removed run's extruder is exactly what the merged run now carries.
-    if (is_loop && runs.size() >= 2 && runs.front().extruder == runs.back().extruder) {
+    // v2.3 final-review M4 fix: gated on p.merge_ring_seam (BrimVoteParams, defaults
+    // false) - this function is shared with Part 1's own split_polyline_by_vote
+    // (:696/partition_leaf_entity :250), and the merge used to fire unconditionally for
+    // ANY loop, violating the plan's "Part 1 brim behavior stays byte-identical" contract
+    // for a feature-ON brim loop whose seam happened to land inside one color's sector.
+    // Part 1's own brim BrimVoteParams never sets this field (stays false, block
+    // unreachable); the support pass (Print.cpp chameleon_assign_support_interfaces) sets
+    // it true on its own vote_params before copying it into every per-role BrimVoteParams
+    // it builds, so support ring/loop splitting keeps this merge exactly as before.
+    bool seam_merged = false;
+    if (p.merge_ring_seam && is_loop && runs.size() >= 2 && runs.front().extruder == runs.back().extruder) {
         BrimRun &first = runs.front();
         BrimRun &last  = runs.back();
         first.pts.insert(first.pts.begin(), last.pts.begin(), last.pts.end());
         runs.pop_back();
+        seam_merged = true;
     }
 
     absorb_short_runs(runs, p.min_run_mm);
@@ -213,6 +224,32 @@ std::vector<BrimRun> split_polyline_core(const Points &poly, bool is_loop,
     // continuous end to end.
     for (size_t k = 1; k < runs.size(); ++k)
         runs[k].pts.insert(runs[k].pts.begin(), runs[k - 1].pts.back());
+
+    // v2.3 final-review I1 fix: the seam merge above (when it fired) throws away the
+    // ring's own CIRCULAR wrap-boundary coverage. Before the merge, the array-last run's
+    // own last point was `chain`'s closing sample - the SAME coordinate as the array-
+    // first run's own first point (a loop's `working` has poly.front() appended as an
+    // explicit closing point, so build_chain's last output sample equals its first) - so
+    // the wrap segment was already covered with no extra fixup needed, exactly like every
+    // other run boundary. Folding the old last run into the front of the new first run
+    // (above) buries that shared closing vertex as an INTERIOR point of the merged run,
+    // not its boundary anymore: the run that is now runs.back() (the ORIGINAL second-to-
+    // last run - guard_max_runs/absorb_short_runs only ever combine ADJACENT runs, so it
+    // may have grown but its own tail end is unchanged) ends at a chain sample that is
+    // merely ADJACENT to runs.front()'s own first point (~sample_mm apart, not equal) -
+    // exactly the ordinary inter-run gap the loop just above closes for every OTHER pair,
+    // except this pair (back -> front, wrapping around) is never visited by that loop (k
+    // never wraps back to 0). Left alone, every ring whose seam merge fires prints with
+    // one ~sample_mm unextruded hole at the wrap boundary (spec/review finding I1).
+    // Prepend runs.back()'s own last point to runs.front(), the SAME shared-boundary-
+    // vertex fixup the loop above applies to every linear pair, closing the ring. Guarded
+    // on runs.size() >= 2 (post absorb/guard, matching the loop above's own domain) -
+    // seam_merged can only be true when the pre-merge run count was >= 2, and
+    // absorb_short_runs/guard_max_runs only ever REDUCE the count, so runs.size() == 1
+    // here means every run (including the merged seam run) collapsed into one - already
+    // fully self-contained, nothing left to close.
+    if (seam_merged && runs.size() >= 2)
+        runs.front().pts.insert(runs.front().pts.begin(), runs.back().pts.back());
 
     return runs;
 }
@@ -364,7 +401,14 @@ size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fal
 // they are only adjacent in SAMPLE-SEQUENCE order, not necessarily in space (e.g. an
 // inner-loop leaf immediately followed by an outer-loop leaf in a double-wall branch
 // collection - SupportCommon.cpp:647-773's `eec` - are two concentric rings, not two
-// ends of one continuous line). `histogram` is empty (and `minority_run_mm` is 0.0) for
+// ends of one continuous line). v2.3 final-review M1 fix: this paragraph describes the
+// INTENDED contract; the run-scan below now actually enforces it (a run resets at every
+// leaf boundary, tracked via `leaf_starts`/`is_leaf_start` built alongside `ordered_votes`
+// - see the scan's own comment) - pre-fix, `ordered_votes` carried no leaf-boundary
+// markers at all, so two sub-threshold same-extruder tails from UNRELATED leaves that
+// happened to land back-to-back in collection order could silently concatenate into one
+// run that clears the descend threshold, a spurious DESCEND this paragraph's own wording
+// already claimed could not happen. `histogram` is empty (and `minority_run_mm` is 0.0) for
 // the same "no samples anywhere" case that returns `.winner == fallback_extruder`
 // (empty/all-empty-leaf collection).
 struct CollectionVoteResult {
@@ -405,12 +449,19 @@ CollectionVoteResult vote_collection_as_unit(const ExtrusionEntityCollection &co
     // ALSO kept in COLLECTION ORDER (leaf by leaf, sample by sample within each leaf -
     // the same walk order, just not collapsed into counts) so the minority-run scan
     // after the winner is decided can find contiguous same-extruder stretches.
+    // v2.3 final-review M1 fix: `leaf_starts` records the ordered_votes index each leaf's
+    // OWN samples begin at, so the run scan below can refuse to extend a run across a
+    // leaf boundary - see the run-scan's own comment for why crossing one is wrong.
     std::vector<unsigned> ordered_votes;
+    std::vector<size_t>   leaf_starts;
     std::map<unsigned, size_t> votes;
     for (const ExtrusionEntity *leaf : flat.entities) {
         if (leaf == nullptr || leaf->is_collection())
             continue; // flatten() should never leave a nested collection behind; guard anyway
         const Points chain = build_chain(leaf->as_polyline().points, p.sample_mm);
+        if (chain.empty())
+            continue;
+        leaf_starts.push_back(ordered_votes.size());
         for (const Point &pt : chain) {
             const unsigned v = resolve(pt);
             ordered_votes.push_back(v);
@@ -459,13 +510,28 @@ CollectionVoteResult vote_collection_as_unit(const ExtrusionEntityCollection &co
     // collection order (ordered_votes, built above in the same leaf-then-sample walk the
     // majority histogram itself uses) - see CollectionVoteResult's own comment for why
     // this is a sample-count approximation of mm length, not exact point-to-point
-    // geometry.
+    // geometry. v2.3 final-review M1 fix: two samples adjacent in ordered_votes are only
+    // adjacent in SAMPLE-SEQUENCE order, not necessarily in space, whenever they straddle
+    // a LEAF boundary (e.g. an inner-loop leaf immediately followed by an outer-loop leaf
+    // in a double-wall branch collection - SupportCommon.cpp:647-773's `eec` - are two
+    // concentric rings, not two ends of one continuous line) - so a run must never extend
+    // past one. `is_leaf_start[k]` marks every index in ordered_votes where a leaf's own
+    // samples begin (leaf_starts above); the inner while loop's own extend condition below
+    // now also requires the NEXT sample not be one of those indices, resetting the run
+    // exactly at each leaf boundary instead of silently concatenating two leaves' matching
+    // tail/head runs into one that was never geometrically contiguous - the bug this
+    // function's own header comment already claimed was handled (CollectionVoteResult's
+    // comment above) but, pre-fix, was not.
+    std::vector<bool> is_leaf_start(ordered_votes.size(), false);
+    for (size_t start : leaf_starts)
+        is_leaf_start[start] = true;
+
     double best_run_mm = 0.0;
     {
         size_t i = 0;
         while (i < ordered_votes.size()) {
             size_t j = i;
-            while (j + 1 < ordered_votes.size() && ordered_votes[j + 1] == ordered_votes[i])
+            while (j + 1 < ordered_votes.size() && ordered_votes[j + 1] == ordered_votes[i] && !is_leaf_start[j + 1])
                 ++j;
             if (ordered_votes[i] != winner)
                 best_run_mm = std::max(best_run_mm, double(j - i + 1) * p.sample_mm);

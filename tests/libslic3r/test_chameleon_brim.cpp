@@ -412,6 +412,13 @@ TEST_CASE("split_polyline_by_resolver (LOOP): seam sector counted once when firs
     p.min_run_mm = 0.0;   // isolate the C7 merge from absorb_short_runs
     p.max_runs   = 8;     // isolate the C7 merge from guard_max_runs - must not let the
                            // pre-fix 5-run case get trimmed down to 4 by coincidence
+    // v2.3 final-review M4 fix: the merge itself is now gated on merge_ring_seam
+    // (BrimVoteParams, default false) so Part 1's own brim path - which shares this same
+    // split_polyline_core - stays unaffected by the C7 merge. This test exercises the
+    // merge MECHANISM directly (split_polyline_by_resolver, not a real brim/support call
+    // site), so it opts in explicitly, the same way the support pass's own vote_params
+    // does (Print.cpp chameleon_assign_support_interfaces).
+    p.merge_ring_seam = true;
 
     auto runs = split_polyline_by_resolver(ring, /*is_loop=*/true, resolver, p);
 
@@ -438,6 +445,56 @@ TEST_CASE("split_polyline_by_resolver (LOOP): seam sector counted once when firs
     const bool seam_vertex_present = std::find(runs[0].pts.begin(), runs[0].pts.end(),
                                                 Point(scale_(R), scale_(0))) != runs[0].pts.end();
     CHECK(seam_vertex_present);
+
+    // v2.3 final-review I1 fix: the CIRCULAR wrap boundary (runs.back() -> runs.front(),
+    // the pair the ordinary k=1.. loop above never visits since k never wraps to 0) must
+    // be closed exactly like every other pair - runs.front()'s own first point must equal
+    // runs.back()'s own last point. Must FAIL pre-fix: the seam merge buries the chain's
+    // shared closing vertex as an interior point of the merged run (see split_polyline_
+    // core's own I1 comment), so pre-fix runs.front().pts.front() is still the ORIGINAL
+    // last run's own first point - a different, unrelated sample - not runs.back().pts.
+    // back(), leaving the wrap segment between them unextruded.
+    REQUIRE(!runs.front().pts.empty());
+    REQUIRE(!runs.back().pts.empty());
+    CHECK(runs.front().pts.front() == runs.back().pts.back());
+}
+
+TEST_CASE("split_polyline_by_resolver (LOOP): default merge_ring_seam=false leaves the ring seam UNMERGED (M4: Part 1 brim path stays byte-identical)", "[chameleon]")
+{
+    // Same 4-sector ring/resolver as the C7 merge test above, but with a DEFAULT
+    // BrimVoteParams - merge_ring_seam left at its default false, exactly what Part 1's
+    // own brim BrimVoteParams does (Print.cpp's Part 1 brim call site never sets this
+    // field). Proves the merge is genuinely OPT-IN, not just opt-in in name: without
+    // setting merge_ring_seam, the seam-straddling color-0 sector stays split into its
+    // pre-v2.3-final-review two fragments (one at each end of the sample array) - the
+    // exact "Part 1 brim behavior stays byte-identical" contract M4 restores.
+    auto resolver = [](const Point &pt) -> unsigned {
+        const double x = unscale<double>(pt.x());
+        const double y = unscale<double>(pt.y());
+        double deg = std::atan2(y, x) * 180.0 / PI;
+        if (deg < 0.0)
+            deg += 360.0;
+        return unsigned(std::floor(std::fmod(deg + 45.0, 360.0) / 90.0));
+    };
+
+    const double R = 20.0;
+    Points ring = { Point(scale_(R), scale_(0)), Point(scale_(0), scale_(R)),
+                    Point(scale_(-R), scale_(0)), Point(scale_(0), scale_(-R)) };
+
+    BrimVoteParams p;
+    p.min_run_mm = 0.0;
+    p.max_runs   = 8;
+    // merge_ring_seam left at its default (false) - the point of this test.
+
+    auto runs = split_polyline_by_resolver(ring, /*is_loop=*/true, resolver, p);
+
+    // Unmerged: color 0 still counted twice (once at each array end) -> 5 runs.
+    REQUIRE(runs.size() == 5);
+    CHECK(runs[0].extruder == 0);
+    CHECK(runs[1].extruder == 1);
+    CHECK(runs[2].extruder == 2);
+    CHECK(runs[3].extruder == 3);
+    CHECK(runs[4].extruder == 0);
 }
 
 TEST_CASE("partition_support_entities role_filter=base splits base, preserves erSupportMaterial role, leaves interfaces untouched", "[chameleon]")
@@ -1897,6 +1954,160 @@ TEST_CASE("partition_support_entities (C5): a mixed collection whose minority ru
     CHECK(inner->entities[0] == leafA); // both original leaf pointers intact
     CHECK(inner->entities[1] == leafB);
     CHECK(descended.empty()); // never wrote a descend entry - it never descended
+}
+
+TEST_CASE("partition_support_entities (C5/M1): a minority split across TWO leaves, each individually sub-threshold, does NOT descend", "[chameleon]")
+{
+    // v2.3 final-review M1 fix: ordered_votes carries no leaf-boundary markers pre-fix,
+    // so a "contiguous" minority run scan could silently concatenate the tail of one leaf
+    // with the head of the NEXT leaf in collection order - two locations adjacent only in
+    // SAMPLE-SEQUENCE order, not in space. Three leaves here: leaf A (20mm, x in [0,20))
+    // votes fallback (0) throughout; leaf B (2mm, x in [25,27)) and leaf C (2mm, x in
+    // [30,32)) each vote extruder 2 throughout - same shape as the "stays BELOW threshold"
+    // test above (2mm -> 4 samples -> 3.2mm run each, under p.min_run_mm = 5.0), but split
+    // into TWO leaves placed back-to-back in the collection (B immediately before C), so
+    // their extruder-2 votes land adjacent in ordered_votes. Pre-fix, the scan concatenates
+    // them into one 8-sample/6.4mm run that CLEARS the 5.0mm threshold - a spurious
+    // DESCEND, even though B and C are two separate, non-adjacent support leaves (they
+    // don't even touch - x in [27,30) is a gap covered by neither). Post-fix, the run
+    // resets at the B/C boundary: each leaf's own run is 3.2mm, neither clears 5.0mm, so
+    // the collection stays whole - EXACTLY the pre-v2.3 pointer-stable behavior, same as
+    // the single-leaf "stays BELOW threshold" test above.
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
+    };
+    BrimVoteParams p;
+    p.fallback_extruder = 0;
+    p.min_run_mm = 5.0;
+
+    auto *leafA = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafA->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(20), scale_(6))});
+    auto *leafB = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafB->polyline = Polyline({Point(scale_(25), scale_(6)), Point(scale_(27), scale_(6))});
+    auto *leafC = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafC->polyline = Polyline({Point(scale_(30), scale_(6)), Point(scale_(32), scale_(6))});
+
+    auto *inner = new ExtrusionEntityCollection();
+    inner->entities.push_back(leafA);
+    inner->entities.push_back(leafB);
+    inner->entities.push_back(leafC);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    DescendColumnMap descended;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
+
+    // Must FAIL pre-fix: pre-fix, B+C's concatenated 6.4mm "run" clears the 5.0mm
+    // threshold, so the collection DESCENDS (out.count(2) == 1, inner shrinks to just
+    // leafA, descended records the column) instead of staying whole.
+    CHECK(out.empty()); // nothing split off, nothing moved
+    REQUIRE(fills.entities.size() == 1);
+    CHECK(fills.entities.front() == inner); // untouched pointer
+    REQUIRE(inner->entities.size() == 3);
+    CHECK(inner->entities[0] == leafA); // all three original leaf pointers intact
+    CHECK(inner->entities[1] == leafB);
+    CHECK(inner->entities[2] == leafC);
+    CHECK(descended.empty()); // never wrote a descend entry - it never descended
+}
+
+TEST_CASE("partition_support_entities (C5/M2): no prior descend on this column -> FULL threshold, minority stays below it, no descend", "[chameleon]")
+{
+    // v2.3 final-review M2 fix: the halved-threshold branch (p.min_run_mm * 0.5, gated on
+    // p.descended_last_layer membership - BrimFilament.cpp's collection-descend decision)
+    // had zero test coverage (grep for descended_last_layer in this file found nothing
+    // pre-fix). This test and its sibling below pin BOTH sides of that branch with the
+    // SAME fixture: leaf B is 2mm (x in [25,27)) -> 4 samples -> a 3.2mm minority run,
+    // deliberately chosen BETWEEN half (2.5mm) and full (5.0mm) of p.min_run_mm = 5.0 -
+    // the one honest seam that can only clear the descend threshold when the halving
+    // actually applies. Here, p.descended_last_layer is empty (this column never
+    // descended last layer), so the threshold stays the FULL 5.0mm - 3.2mm never clears
+    // it, and the collection stays whole (pre-v2.3 pointer-stable behavior).
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
+    };
+    BrimVoteParams p;
+    p.fallback_extruder = 0;
+    p.min_run_mm = 5.0;
+
+    auto *leafA = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafA->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(20), scale_(6))});
+    auto *leafB = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafB->polyline = Polyline({Point(scale_(25), scale_(6)), Point(scale_(27), scale_(6))});
+
+    auto *inner = new ExtrusionEntityCollection();
+    inner->entities.push_back(leafA);
+    inner->entities.push_back(leafB);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    DescendColumnMap descended; // empty: column never recorded as descended last layer
+
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
+
+    CHECK(out.empty());
+    REQUIRE(fills.entities.size() == 1);
+    CHECK(fills.entities.front() == inner);
+    REQUIRE(inner->entities.size() == 2);
+    CHECK(inner->entities[0] == leafA);
+    CHECK(inner->entities[1] == leafB);
+    CHECK(descended.empty());
+}
+
+TEST_CASE("partition_support_entities (C5/M2): column descended last layer -> HALVED threshold, same minority now clears it and DESCENDS", "[chameleon]")
+{
+    // Identical fixture to the sibling test above (leaf B's 3.2mm minority run, p.min_run_mm
+    // = 5.0), except p.descended_last_layer is pre-seeded with this exact collection's own
+    // quantized column key - the halved threshold (2.5mm) now applies, and 3.2mm clears
+    // it: the collection DESCENDS and splits per leaf, same shape as the full-threshold
+    // DESCEND test further above.
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
+    };
+    BrimVoteParams p;
+    p.fallback_extruder = 0;
+    p.min_run_mm = 5.0; // halved below to 2.5mm; 3.2mm run clears THAT
+
+    auto *leafA = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafA->polyline = Polyline({Point(scale_(0), scale_(6)), Point(scale_(20), scale_(6))});
+    auto *leafB = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    leafB->polyline = Polyline({Point(scale_(25), scale_(6)), Point(scale_(27), scale_(6))});
+
+    auto *inner = new ExtrusionEntityCollection();
+    inner->entities.push_back(leafA);
+    inner->entities.push_back(leafB);
+
+    // Snapshotted BEFORE the call (pure function of leaf points, read-only), same pattern
+    // the existing DESCEND tests use - proves the pre-seeded key is the SAME key
+    // partition_support_entities computes internally, not a coincidentally-matching value.
+    const Point expected_key = chameleon_quantize_point(chameleon_collection_bbox_center(*inner));
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(inner);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    DescendColumnMap descended;
+    p.descended_last_layer[expected_key] = true; // pre-seed: this column descended last layer
+
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
+
+    // DESCENDED: leaf A's fallback vote leaves the collection pointer in place (not
+    // emptied), but leaf B is gone, moved to out[2] as a fresh split path.
+    REQUIRE(out.count(2) == 1);
+    REQUIRE(out.at(2).entities.size() == 1);
+    CHECK(out.at(2).entities.front() != leafB); // rebuilt, not the whole original leaf
+    CHECK(out.at(2).entities.front()->role() == erSupportMaterial);
+
+    REQUIRE(fills.entities.size() == 1);
+    CHECK(fills.entities.front() == inner);
+    REQUIRE(inner->entities.size() == 1);
+    CHECK(inner->entities.front() == leafA); // untouched fast path: original pointer, in place
+
+    REQUIRE(descended.count(expected_key) == 1);
+    CHECK(descended.at(expected_key) == true);
 }
 
 TEST_CASE("partition_support_entities (C5): a uniform mixed-extruder-free collection still whole-moves, pointer-stable", "[chameleon]")
