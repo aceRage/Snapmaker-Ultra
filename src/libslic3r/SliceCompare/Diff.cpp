@@ -19,7 +19,10 @@ bool is_volatile_key(const std::string& key)
 {
     static const std::set<std::string> exact = {
         "filename", "preset_name", "preset_names", "printer_settings_id",
-        "print_settings_id", "filament_settings_id"
+        "print_settings_id", "filament_settings_id",
+        // Bookkeeping list of user-modified keys - redundant noise here: the diff
+        // table itself already enumerates every differing setting side by side.
+        "different_settings_to_system"
     };
     if (exact.count(key))
         return true;

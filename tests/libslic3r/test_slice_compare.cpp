@@ -74,8 +74,10 @@ TEST_CASE("SnapshotStore ring buffer evicts oldest", "[slice_compare]")
 TEST_CASE("diff_configs ignores volatile keys, reports changes", "[slice_compare]")
 {
     Snapshot a, b;
-    a.config = {{"layer_height","0.2"}, {"wall_loops","2"}, {"print_host","x"}};
-    b.config = {{"layer_height","0.16"},{"wall_loops","2"}, {"extra","1"}};
+    a.config = {{"layer_height","0.2"}, {"wall_loops","2"}, {"print_host","x"},
+                {"different_settings_to_system","wall_loops;layer_height"}};
+    b.config = {{"layer_height","0.16"},{"wall_loops","2"}, {"extra","1"},
+                {"different_settings_to_system","layer_height"}};
     auto rows = diff_configs(a, b);
     REQUIRE(rows.size() == 2);
     CHECK(rows[0].key == "extra");            // sorted by key; absent in a

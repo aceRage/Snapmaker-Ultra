@@ -94,6 +94,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/SliceCompare/Snapshot.hpp"
+#include "slic3r/GUI/SliceCompare/SliceCompareFrame.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -15350,6 +15351,8 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
                     % wxDateTime::Now().FormatTime().ToStdString()).str();
                 SliceCompare::SnapshotStore::instance().add(
                     SliceCompare::build_snapshot(*res, std::move(cfg), label, "session"));
+                // Live-refresh an open Compare Slices frame (UI thread; no-op otherwise).
+                Slic3r::GUI::slice_compare_notify_snapshots_changed();
             }
         } catch (...) { BOOST_LOG_TRIVIAL(warning) << "slice-compare snapshot capture failed"; }
     }

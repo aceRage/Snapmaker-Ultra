@@ -146,13 +146,29 @@ class LayerTickStrip : public wxPanel
 {
 public:
     explicit LayerTickStrip(wxWindow* parent)
-        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(12, -1))
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(22, -1))
     {
         SetBackgroundStyle(wxBG_STYLE_PAINT);
         SetBackgroundColour(wxColour(0x11, 0x11, 0x11)); // keep in sync with CompareCanvas.cpp colors
-        SetMinSize(wxSize(12, -1));
+        SetMinSize(wxSize(22, -1));
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        SetToolTip(_L("Click or drag to scrub layers; mouse wheel steps one layer"));
         Bind(wxEVT_PAINT, &LayerTickStrip::on_paint, this);
+        // Scrubber interaction: click/drag selects the nearest row, wheel steps one.
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) { CaptureMouse(); pick_at(e.GetY()); });
+        Bind(wxEVT_MOTION, [this](wxMouseEvent& e) { if (e.Dragging() && e.LeftIsDown()) pick_at(e.GetY()); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) { if (HasCapture()) ReleaseMouse(); });
+        Bind(wxEVT_MOUSE_CAPTURE_LOST, [this](wxMouseCaptureLostEvent&) {});
+        Bind(wxEVT_MOUSEWHEEL, [this](wxMouseEvent& e) {
+            if (m_rows.empty() || !on_pick) return;
+            const int step = e.GetWheelRotation() > 0 ? 1 : -1; // wheel up = higher z
+            const int next = std::max(0, std::min((int) m_rows.size() - 1, m_current + step));
+            if (next != m_current) on_pick(next);
+        });
     }
+
+    // Fired with the picked row index; the frame syncs slider/canvas/status.
+    std::function<void(int)> on_pick;
 
     void set_rows(std::vector<SliceCompare::LayerMatch> rows)
     {
@@ -160,7 +176,34 @@ public:
         Refresh();
     }
 
+    void set_current(int row)
+    {
+        m_current = row;
+        Refresh();
+    }
+
 private:
+    int row_to_y(int i, int n, int h) const
+    {
+        // index 0 (lowest z) at the bottom, matching the vertical slider.
+        return n > 1 ? (h - 1) * (n - 1 - i) / (n - 1) : h / 2;
+    }
+
+    void pick_at(int y)
+    {
+        const int n = static_cast<int>(m_rows.size());
+        if (n <= 0 || !on_pick)
+            return;
+        const int h = GetClientSize().GetHeight();
+        // Invert row_to_y: nearest row for this y.
+        int best = 0, best_d = INT_MAX;
+        for (int i = 0; i < n; ++i) {
+            const int d = std::abs(row_to_y(i, n, h) - y);
+            if (d < best_d) { best_d = d; best = i; }
+        }
+        if (best != m_current) on_pick(best);
+    }
+
     void on_paint(wxPaintEvent&)
     {
         wxAutoBufferedPaintDC dc(this);
@@ -183,14 +226,22 @@ private:
             else
                 continue; // matched + unchanged: no tick
 
-            // index 0 (lowest z) at the bottom, matching the vertical slider.
-            const int y = n > 1 ? (sz.GetHeight() - 1) * (n - 1 - i) / (n - 1) : sz.GetHeight() / 2;
+            const int y = row_to_y(i, n, sz.GetHeight());
             dc.SetPen(wxPen(colour, 2));
+            dc.DrawLine(2, y, sz.GetWidth() - 2, y);
+        }
+
+        // Current-layer indicator: full-width bright marker so the scrubber
+        // position is always visible even on unchanged (tickless) rows.
+        if (m_current >= 0 && m_current < n) {
+            const int y = row_to_y(m_current, n, sz.GetHeight());
+            dc.SetPen(wxPen(wxColour(0x2E, 0x7D, 0x32), 3)); // keep in sync with CompareCanvas.cpp colors (jitter green)
             dc.DrawLine(0, y, sz.GetWidth(), y);
         }
     }
 
     std::vector<SliceCompare::LayerMatch> m_rows;
+    int m_current = -1;
 };
 
 } // anonymous namespace
@@ -213,6 +264,12 @@ void open_slice_compare_frame(wxWindow* parent, bool preselect_last_two)
         g_instance->preselect_last_two();
 }
 
+void slice_compare_notify_snapshots_changed()
+{
+    if (g_instance != nullptr)
+        g_instance->rebuild_pickers();
+}
+
 SliceCompareFrame::SliceCompareFrame(wxWindow* parent)
     : wxFrame(parent, wxID_ANY, _L("Compare Slices"), wxDefaultPosition, wxSize(1200, 800), wxDEFAULT_FRAME_STYLE)
 {
@@ -221,6 +278,10 @@ SliceCompareFrame::SliceCompareFrame(wxWindow* parent)
     recompute();
 
     wxGetApp().UpdateFrameDarkUI(this);
+    // UpdateFrameDarkUI only themes the frame chrome; recurse the children so the
+    // frame body, notebook pages, tables and buttons match the app theme instead of
+    // the platform default light grey (precedent: AMSMaterialsSetting.cpp).
+    wxGetApp().UpdateDarkUIWin(this);
 }
 
 SliceCompareFrame::~SliceCompareFrame()
@@ -296,8 +357,8 @@ void SliceCompareFrame::build_ui()
     feat_sizer->Add(m_feat_table, 1, wxEXPAND);
     feat_page->SetSizer(feat_sizer);
 
-    m_notebook->AddPage(cfg_page, _L("Settings changes"));
-    m_notebook->AddPage(feat_page, _L("By feature"));
+    m_notebook->AddPage(cfg_page, _L("Settings Changes"));
+    m_notebook->AddPage(feat_page, _L("By Feature"));
 
     // Canvas view: overlay canvas | tick strip | vertical layer slider, with
     // the "z=" label and jump button stacked above/below the slider, and the
@@ -314,6 +375,11 @@ void SliceCompareFrame::build_ui()
 
     wxBoxSizer* slider_row = new wxBoxSizer(wxHORIZONTAL);
     m_layer_tick_strip = new LayerTickStrip(this);
+    // Strip doubles as the layer scrubber (click/drag/wheel); keep the slider in sync.
+    static_cast<LayerTickStrip*>(m_layer_tick_strip)->on_pick = [this](int row) {
+        m_layer_slider->SetValue(row);
+        select_layer_row(row);
+    };
     slider_row->Add(m_layer_tick_strip, 0, wxEXPAND | wxRIGHT, 2);
     // wxSL_VERTICAL alone defaults to min-at-top/max-at-bottom; wxSL_INVERSE flips that so the
     // slider's minimum (row 0 == lowest z) sits at the bottom, matching LayerTickStrip's layout
@@ -583,11 +649,17 @@ void SliceCompareFrame::recompute()
         return;
     }
 
+    // Long values (multi-line gcode blocks, list options) are elided for display —
+    // the table is a change *index*; the full text isn't inspectable in a cell anyway.
+    auto elide = [](const std::string& v) -> wxString {
+        if (v.size() <= 100) return wxString::FromUTF8(v);
+        return wxString::FromUTF8(v.substr(0, 100)) + wxString::FromUTF8("\xE2\x80\xA6");
+    };
     for (const auto& row : SliceCompare::diff_configs(*m_a, *m_b)) {
         wxVector<wxVariant> data;
         data.push_back(wxVariant(wxString::FromUTF8(row.key)));
-        data.push_back(wxVariant(row.a.empty() ? _L("(none)") : wxString::FromUTF8(row.a)));
-        data.push_back(wxVariant(row.b.empty() ? _L("(none)") : wxString::FromUTF8(row.b)));
+        data.push_back(wxVariant(row.a.empty() ? _L("(none)") : elide(row.a)));
+        data.push_back(wxVariant(row.b.empty() ? _L("(none)") : elide(row.b)));
         m_cfg_table->AppendItem(data);
     }
 
@@ -644,9 +716,11 @@ void SliceCompareFrame::select_layer_row(int row_index)
         m_canvas->set_layers(nullptr, nullptr);
         m_layer_z_label->SetLabel(_L("z=") + "--");
         m_status_line->SetLabel(wxEmptyString);
+        static_cast<LayerTickStrip*>(m_layer_tick_strip)->set_current(-1);
         return;
     }
 
+    static_cast<LayerTickStrip*>(m_layer_tick_strip)->set_current(row_index);
     const SliceCompare::LayerMatch& row = m_layer_diff.rows[row_index];
 
     const SliceCompare::LayerRec* la = nullptr;

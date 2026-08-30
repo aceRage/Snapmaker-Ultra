@@ -23,6 +23,11 @@ namespace GUI {
 // A/B (older -> A, newer -> B). See SliceCompareFrame::preselect_last_two().
 void open_slice_compare_frame(wxWindow* parent, bool preselect_last_two);
 
+// Refresh the open compare frame's snapshot pickers (no-op when no frame is open).
+// Called from the Plater slice-capture hook so snapshots created while the frame
+// is open appear without reopening it. UI thread only.
+void slice_compare_notify_snapshots_changed();
+
 class SliceCompareFrame : public wxFrame
 {
 public:
