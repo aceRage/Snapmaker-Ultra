@@ -797,6 +797,23 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             ) {
             steps.emplace_back(psWipeTower);
             steps.emplace_back(psSkirtBrim);
+            // Chameleon P2: chameleon_assign_support_interfaces (Print.cpp ~2434) gates
+            // the interface-partition pass off for ByObject sequence, but a prior ByLayer
+            // pass may have already partitioned support_fills / populated
+            // SupportLayer::interface_by_extruder. Toggling print_sequence alone doesn't
+            // undo that - the stale partitions survive on the still-valid SupportLayers
+            // and keep flowing into ToolOrdering + GCode emission even though the gate
+            // says the feature should be off. Force posSupportMaterial to re-run (in
+            // either direction) for any object opted into nearest_surface matching, so
+            // fresh layers are generated and the gate's decision actually takes effect.
+            // Only objects that opted in are checked; other objects on mixed plates are
+            // over-invalidated as a result (osteps applies to all objects below), which
+            // is accepted rather than threading a per-object condition through the loop.
+            if (opt_key == "print_sequence"
+                && std::any_of(m_objects.begin(), m_objects.end(), [](const PrintObject *object) {
+                       return object->config().support_interface_filament_source.value == sifsNearestSurface;
+                   }))
+                osteps.emplace_back(posSupportMaterial);
         } else if (opt_key == "filament_soluble"
                 || opt_key == "filament_is_support"
                 || opt_key == "independent_support_layer_height"

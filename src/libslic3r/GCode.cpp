@@ -6402,6 +6402,13 @@ LayerResult GCode::process_layer(const Print& print,
             m_object_layer_over_raft = false;
             for (const PrintInstance& instance : obj.instances()) {
                 this->set_origin(unscale(instance.shift));
+                // Mirror the normal per-instance loop's gcode_label_objects comment idiom
+                // (~6542-6545 start / ~6697-6700 end) so comment-parsing cancel-object
+                // tools (OctoPrint style) can attribute these partition extrusions too.
+                if (this->config().gcode_label_objects) {
+                    gcode += std::string("; printing object ") + obj.model_object()->name +
+                             " id:" + std::to_string(obj.get_id()) + " copy " + std::to_string(instance.id) + "\n";
+                }
                 // I2 fix: wrap this instance's partition extrusions in the same
                 // exclude-object (M624/M625, EXCLUDE_OBJECT_*, M486) label machinery the
                 // normal per-instance loop uses (~6493-6513 start / ~6648-6667 end), so
@@ -6427,6 +6434,10 @@ LayerResult GCode::process_layer(const Print& print,
 
                 gcode += this->extrude_support(it->second, erSupportMaterialInterface);
 
+                if (this->config().gcode_label_objects) {
+                    gcode += std::string("; stop printing object ") + obj.model_object()->name +
+                             " id:" + std::to_string(obj.get_id()) + " copy " + std::to_string(instance.id) + "\n";
+                }
                 // Don't set m_gcode_label_objects_end if the start string never got
                 // consumed (nothing was extruded for this instance's partition).
                 if (!m_writer.is_object_start_str_empty()) {
