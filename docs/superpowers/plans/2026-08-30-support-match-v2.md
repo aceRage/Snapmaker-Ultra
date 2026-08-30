@@ -76,6 +76,14 @@ Base: the branch tip after the "Default" label commit. All v2.0 conventions carr
 
 1. Extend verify script: a nearest_surface tshape slice must still exit 0; add a
    projection-determinism check (two runs, support-scoped diff empty).
+1b. Adopt the tolerant-diff recipe from the base-pipeline non-determinism investigation
+   (C:\Dev\SnapmakerOrcaSupports\solid_infill_nondeterminism.md — address-layout knife
+   edge on a degenerate solid-infill sliver, NOT a race, each variant byte-stable): in
+   `normalize()`, additionally strip (a) M73 lines, (b) extrusion blocks bounded by
+   travel/retract whose total XY extent is < 0.2 mm, (c) `; filament used` /
+   `; model printing time` header lines. This should eliminate the known 5–15% flake on
+   the Part 1 whole-file checks without masking real regressions. Do NOT touch
+   group_fills (the root fix is another session's lane).
 2. Re-slice guidance for the user's GUI fixture documented in the task report: the 9
    forensic flip-flop pairs (z 28.92/29.04, 30.96/31.08, 35.52/35.64, 38.76/38.88,
    44.28/44.4, 54.24/54.36, 58.32/58.44, 60.72/60.84, 64.8/64.92) must come out
