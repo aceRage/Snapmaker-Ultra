@@ -3,6 +3,7 @@
 #include "libslic3r/BrimFilament.hpp"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
+#include <algorithm>
 
 using namespace Slic3r;
 
@@ -287,4 +288,160 @@ TEST_CASE("partition_support_interfaces re-run on its own output undercounts swi
     // switch that causes is simply no longer reflected in the cap accounting.
     REQUIRE(out2.count(1) == 1);
     CHECK(!out2.at(1).entities.empty());
+}
+
+// --- v2.1 Task 1: engine generalization -----------------------------------
+
+TEST_CASE("brim_vote max_dist_mm cap returns fallback beyond the cap", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 5, 10, 5), 1, 1);   // wall at y=5
+    BrimVoteParams p;
+    p.fallback_extruder = 9;
+    p.max_dist_mm = 1.0;
+    // 0.5mm from the wall -> within the cap -> votes for the wall's extruder
+    CHECK(brim_vote(idx, Point(scale_(5), scale_(5.5)), p) == 1);
+    // 3mm from the wall -> beyond the cap -> fallback
+    CHECK(brim_vote(idx, Point(scale_(5), scale_(8.0)), p) == 9);
+}
+
+TEST_CASE("brim_vote max_dist_mm default 0 is uncapped (Part 1 brim path unchanged)", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 5, 10, 5), 1, 1);
+    BrimVoteParams p;
+    CHECK(p.max_dist_mm == 0.0);
+    // far away, but 0 means uncapped -> still votes the nearest wall, no fallback
+    CHECK(brim_vote(idx, Point(scale_(5), scale_(50.0)), p) == 1);
+}
+
+TEST_CASE("split_polyline_by_resolver produces runs matching a synthetic resolver", "[chameleon]")
+{
+    BrimVoteParams p;
+    // synthetic resolver: left half of the line -> extruder 5, right half -> extruder 6
+    auto resolver = [](const Point &pt) -> unsigned {
+        return unscale<double>(pt.x()) < 20.0 ? 5u : 6u;
+    };
+    Points line = segment(0, 5, 40, 5);
+    auto runs = split_polyline_by_resolver(line, false, resolver, p);
+    REQUIRE(runs.size() == 2);
+    CHECK(runs[0].extruder == 5);
+    CHECK(runs[1].extruder == 6);
+    // I1: shared boundary vertex, same as split_polyline_by_vote.
+    REQUIRE(!runs[1].pts.empty());
+    CHECK(runs[1].pts.front() == runs[0].pts.back());
+    // Coverage still holds end to end.
+    CHECK(runs.front().pts.front() == Point(scale_(0), scale_(5)));
+    CHECK(runs.back().pts.back()   == Point(scale_(40), scale_(5)));
+}
+
+TEST_CASE("split_polyline_by_resolver honors min_run_mm and max_runs like the vote variant", "[chameleon]")
+{
+    BrimVoteParams p; p.min_run_mm = 0.0; p.max_runs = 2;
+    // Four zones -> would be four runs, but max_runs=2 forces a coalesce.
+    auto resolver = [](const Point &pt) -> unsigned {
+        const double x = unscale<double>(pt.x());
+        if (x < 10.0) return 0u;
+        if (x < 20.0) return 1u;
+        if (x < 30.0) return 2u;
+        return 3u;
+    };
+    auto runs = split_polyline_by_resolver(segment(0, 5, 40, 5), false, resolver, p);
+    CHECK(runs.size() <= 2);
+    CHECK(runs.front().pts.front() == Point(scale_(0), scale_(5)));
+    CHECK(runs.back().pts.back()   == Point(scale_(40), scale_(5)));
+}
+
+TEST_CASE("partition_support_entities role_filter=base splits base, preserves erSupportMaterial role, leaves interfaces untouched", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 14, 6), 1, 1);    // left wall -> extruder 1
+    idx.add_polyline(segment(16, 6, 30, 6), 2, 2);   // right wall -> extruder 2
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    auto fills = make_support_fills(5.0f);            // 1 base path @ y=-5, 2 interface paths near y=5..6
+    const size_t iface_before = std::count_if(fills.entities.begin(), fills.entities.end(),
+        [](const ExtrusionEntity *e) { return e->role() == erSupportMaterialInterface; });
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    // Base path was split across both walls -> ends up entirely in out[1]/out[2].
+    REQUIRE(out.count(1) == 1);
+    REQUIRE(out.count(2) == 1);
+    CHECK(!out.at(1).entities.empty());
+    CHECK(!out.at(2).entities.empty());
+    for (auto &kv : out)
+        for (const ExtrusionEntity *e : kv.second.entities)
+            CHECK(e->role() == erSupportMaterial);      // role copied from source, not hardcoded
+
+    // Interface entities were never touched by a base-role_filter pass.
+    size_t iface_after = 0, base_after = 0;
+    for (const ExtrusionEntity *e : fills.entities) {
+        if (e->role() == erSupportMaterialInterface) ++iface_after;
+        if (e->role() == erSupportMaterial) ++base_after;
+    }
+    CHECK(iface_after == iface_before);
+    CHECK(base_after == 0);                              // base fully matched away, none fell back
+}
+
+TEST_CASE("partition_support_entities role_filter=interface never touches base entities", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 14, 6), 1, 1);
+    idx.add_polyline(segment(16, 6, 30, 6), 2, 2);
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    auto fills = make_support_fills(5.0f);
+    const size_t base_before = std::count_if(fills.entities.begin(), fills.entities.end(),
+        [](const ExtrusionEntity *e) { return e->role() == erSupportMaterial; });
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterialInterface, 0, resolver, p, out);
+
+    size_t base_after = 0;
+    for (const ExtrusionEntity *e : fills.entities)
+        if (e->role() == erSupportMaterial) ++base_after;
+    CHECK(base_after == base_before);                    // base untouched, same count
+
+    for (auto &kv : out)
+        for (const ExtrusionEntity *e : kv.second.entities)
+            CHECK(e->role() == erSupportMaterialInterface);
+}
+
+TEST_CASE("partition_support_interfaces still works as a thin wrapper over partition_support_entities", "[chameleon]")
+{
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 14, 6), 1, 1);
+    idx.add_polyline(segment(16, 6, 30, 6), 2, 2);
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto fills = make_support_fills(5.0f);
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_interfaces(fills, 0, idx, p, out);
+    REQUIRE(out.count(1) == 1);
+    REQUIRE(out.count(2) == 1);
+    for (auto &kv : out)
+        for (const ExtrusionEntity *e : kv.second.entities)
+            CHECK(e->role() == erSupportMaterialInterface);
+}
+
+TEST_CASE("select_layers_in_band selects the coplanar (lo, hi] band; select_contact_layers matches it", "[chameleon]")
+{
+    std::vector<double> zs = {0.2, 0.4, 0.6, 0.8, 1.0};
+    auto v = select_layers_in_band(zs, 0.4, 0.6);          // exactly one layer top in (0.4, 0.6]
+    REQUIRE(v.size() == 1);
+    CHECK(v[0] == 2);
+
+    // select_contact_layers is now a thin call onto select_layers_in_band with
+    // (support_top_z, support_top_z + gap_mm] -- results must be identical.
+    auto band    = select_layers_in_band(zs, 0.4, 0.4 + 2.0);
+    auto contact = select_contact_layers(zs, 0.4, 2.0);
+    CHECK(band == contact);
+
+    // VLH coplanar-style narrow band still resolves correctly.
+    auto narrow = select_layers_in_band({0.2, 0.5, 1.4}, 0.2, 0.55);
+    REQUIRE(narrow.size() == 1);
+    CHECK(narrow[0] == 1);
 }

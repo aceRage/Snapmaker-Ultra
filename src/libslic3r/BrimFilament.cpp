@@ -115,6 +115,70 @@ void guard_max_runs(std::vector<BrimRun> &runs, size_t max_runs)
     }
 }
 
+// Shared run-building core for split_polyline_by_vote / split_polyline_by_resolver:
+// sample `poly` (closed if is_loop) every sample_mm, call `resolve` per sample,
+// group runs, absorb runs shorter than min_run_mm into the previous run, then
+// coalesce smallest runs until <= max_runs, sharing the boundary vertex between
+// adjacent runs. Result covers the whole polyline in order.
+std::vector<BrimRun> split_polyline_core(const Points &poly, bool is_loop,
+                                          const std::function<unsigned(const Point &)> &resolve,
+                                          const BrimVoteParams &p)
+{
+    if (poly.size() < 2) {
+        BrimRun run;
+        run.extruder = resolve(poly.empty() ? Point(0, 0) : poly.front());
+        run.pts      = poly;
+        return { run };
+    }
+
+    Points working = poly;
+    if (is_loop)
+        working.push_back(poly.front());
+
+    if (path_length_mm(working) <= 0.0) {
+        BrimRun run;
+        run.extruder = resolve(poly.front());
+        run.pts      = poly;
+        return { run };
+    }
+
+    const Points chain = build_chain(working, p.sample_mm);
+
+    std::vector<unsigned> votes;
+    votes.reserve(chain.size());
+    for (const Point &pt : chain)
+        votes.push_back(resolve(pt));
+
+    std::vector<BrimRun> runs;
+    size_t i = 0;
+    while (i < chain.size()) {
+        size_t j = i;
+        while (j + 1 < chain.size() && votes[j + 1] == votes[i])
+            ++j;
+        BrimRun run;
+        run.extruder = votes[i];
+        run.pts.assign(chain.begin() + i, chain.begin() + j + 1);
+        runs.push_back(std::move(run));
+        i = j + 1;
+    }
+
+    absorb_short_runs(runs, p.min_run_mm);
+    guard_max_runs(runs, p.max_runs);
+
+    // Close the connecting gap between runs: as partitioned above (and after
+    // absorb/guard merges, which only ever combine adjacent partition segments and
+    // so preserve this invariant), run k-1's last point and run k's first point are
+    // two DIFFERENT, adjacent chain samples (~sample_mm apart) - the travel between
+    // them is not extruded, leaving a small unextruded gap at every boundary. Make
+    // each run after the first start at the previous run's last point instead, so
+    // consecutive runs share that boundary vertex and the extruded geometry is
+    // continuous end to end.
+    for (size_t k = 1; k < runs.size(); ++k)
+        runs[k].pts.insert(runs[k].pts.begin(), runs[k - 1].pts.back());
+
+    return runs;
+}
+
 // Return a representative source path to copy flow attributes (mm3_per_mm,
 // width, height) from, mirroring how ExtrusionLoop/ExtrusionMultiPath::role()
 // resolve to their first path. Returns nullptr for an empty loop/multipath.
@@ -171,15 +235,19 @@ void partition_leaf_entity(const ExtrusionEntity &entity, unsigned own_extruder,
     }
 }
 
-// Partition a single support-interface entity (path/multipath/loop). `entity`
+// Partition a single support entity (path/multipath/loop) of any role. `entity`
 // is still owned by support_fills at this point; the caller deletes it if
 // `replaced` comes back true. Fallback-voted runs are appended to
 // `new_fallback_paths` (the caller re-inserts them into support_fills once the
 // sweep over the original entities vector is finished, since it must not be
-// mutated mid-iteration); non-fallback runs land in `out[extruder]`. Returns
-// the number of switch boundaries this entity contributed.
+// mutated mid-iteration); non-fallback runs land in `out[extruder]`. Emitted
+// split paths copy the source entity's role (first_path_of(entity)->role(),
+// falling back to entity.role()) rather than hardcoding one - so a base-role
+// entity's split paths stay erSupportMaterial. Returns the number of switch
+// boundaries this entity contributed.
 size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fallback_extruder,
-                                      const WallSampleIndex &idx, const BrimVoteParams &p,
+                                      const std::function<unsigned(const Point &)> &resolver,
+                                      const BrimVoteParams &p,
                                       std::vector<ExtrusionPath *> &new_fallback_paths,
                                       std::map<unsigned, ExtrusionEntityCollection> &out,
                                       bool &replaced)
@@ -190,12 +258,12 @@ size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fal
     const Polyline as_pl   = entity.as_polyline();
     Points         chain   = as_pl.points;
     if (is_loop && chain.size() > 1 && chain.front() == chain.back())
-        chain.pop_back(); // split_polyline_by_vote closes loops itself
+        chain.pop_back(); // split_polyline_core closes loops itself
 
     if (chain.empty())
-        return 0; // guard: never call split_polyline_by_vote on an empty polyline; leave entity untouched
+        return 0; // guard: never call split_polyline_core on an empty polyline; leave entity untouched
 
-    std::vector<BrimRun> runs = split_polyline_by_vote(chain, is_loop, idx, p);
+    std::vector<BrimRun> runs = split_polyline_core(chain, is_loop, resolver, p);
 
     // Fast path: every sample voted for the fallback extruder -> leave the
     // ORIGINAL entity in support_fills untouched (byte-identical geometry, no
@@ -206,14 +274,15 @@ size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fal
     replaced = true;
 
     const ExtrusionPath *source = first_path_of(entity);
-    const double mm3_per_mm = source ? source->mm3_per_mm : 0.0;
-    const float  width      = source ? source->width      : 0.f;
-    const float  height     = source ? source->height     : 0.f;
+    const double        mm3_per_mm = source ? source->mm3_per_mm : 0.0;
+    const float         width      = source ? source->width      : 0.f;
+    const float         height     = source ? source->height     : 0.f;
+    const ExtrusionRole  role      = source ? source->role() : entity.role();
 
     for (const BrimRun &run : runs) {
         if (run.pts.empty())
             continue;
-        auto *new_path      = new ExtrusionPath(erSupportMaterialInterface, mm3_per_mm, width, height);
+        auto *new_path      = new ExtrusionPath(role, mm3_per_mm, width, height);
         new_path->polyline  = Polyline(run.pts);
         if (run.extruder == fallback_extruder)
             new_fallback_paths.push_back(new_path);
@@ -248,6 +317,17 @@ unsigned brim_vote(const WallSampleIndex &idx, const Point &pt, const BrimVotePa
     std::vector<std::pair<const WallSample *, double>> knn_result = idx.knn(pt, p.k);
     if (knn_result.empty())
         return p.fallback_extruder;
+
+    // max_dist_mm == 0 means uncapped (Part 1 brim path; behavior identical to
+    // pre-v2.1). Otherwise: knn() returns results sorted by squared distance
+    // ascending, so knn_result.front() is the nearest sample overall. If even
+    // that nearest sample is farther than the cap, fall back before scoring -
+    // this must happen BEFORE any score/tie logic below.
+    if (p.max_dist_mm > 0.0) {
+        const double cap_scaled = scale_(p.max_dist_mm);
+        if (knn_result.front().second > cap_scaled * cap_scaled)
+            return p.fallback_extruder;
+    }
 
     const double eps = double(scale_(0.01)) * double(scale_(0.01));
 
@@ -318,112 +398,73 @@ std::vector<BrimRun> split_polyline_by_vote(const Points &poly, bool is_loop,
                                              const WallSampleIndex &idx,
                                              const BrimVoteParams &p)
 {
-    if (poly.size() < 2) {
-        BrimRun run;
-        run.extruder = brim_vote(idx, poly.empty() ? Point(0, 0) : poly.front(), p);
-        run.pts      = poly;
-        return { run };
-    }
-
-    Points working = poly;
-    if (is_loop)
-        working.push_back(poly.front());
-
-    if (path_length_mm(working) <= 0.0) {
-        BrimRun run;
-        run.extruder = brim_vote(idx, poly.front(), p);
-        run.pts      = poly;
-        return { run };
-    }
-
-    const Points chain = build_chain(working, p.sample_mm);
-
-    std::vector<unsigned> votes;
-    votes.reserve(chain.size());
-    for (const Point &pt : chain)
-        votes.push_back(brim_vote(idx, pt, p));
-
-    std::vector<BrimRun> runs;
-    size_t i = 0;
-    while (i < chain.size()) {
-        size_t j = i;
-        while (j + 1 < chain.size() && votes[j + 1] == votes[i])
-            ++j;
-        BrimRun run;
-        run.extruder = votes[i];
-        run.pts.assign(chain.begin() + i, chain.begin() + j + 1);
-        runs.push_back(std::move(run));
-        i = j + 1;
-    }
-
-    absorb_short_runs(runs, p.min_run_mm);
-    guard_max_runs(runs, p.max_runs);
-
-    // Close the connecting gap between runs: as partitioned above (and after
-    // absorb/guard merges, which only ever combine adjacent partition segments and
-    // so preserve this invariant), run k-1's last point and run k's first point are
-    // two DIFFERENT, adjacent chain samples (~sample_mm apart) - the travel between
-    // them is not extruded, leaving a small unextruded gap at every boundary. Make
-    // each run after the first start at the previous run's last point instead, so
-    // consecutive runs share that boundary vertex and the extruded geometry is
-    // continuous end to end.
-    for (size_t k = 1; k < runs.size(); ++k)
-        runs[k].pts.insert(runs[k].pts.begin(), runs[k - 1].pts.back());
-
-    return runs;
+    return split_polyline_core(poly, is_loop,
+        [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); }, p);
 }
 
-std::vector<size_t> select_contact_layers(const std::vector<double> &print_zs,
-                                           double support_top_z, double gap_mm)
+std::vector<BrimRun> split_polyline_by_resolver(const Points &poly, bool is_loop,
+                                                 const std::function<unsigned(const Point &)> &resolver,
+                                                 const BrimVoteParams &p)
+{
+    return split_polyline_core(poly, is_loop, resolver, p);
+}
+
+std::vector<size_t> select_layers_in_band(const std::vector<double> &print_zs,
+                                           double lo_z, double hi_z)
 {
     // Linear scan over ascending print_zs (print_zs is sorted, so this could be
-    // a binary search, but the contact band is only ever a few layers deep).
-    // A layer is selected by comparing its own TOP z (print_zs[i], the z its
-    // extruded material actually reaches) against the target band's bounds:
-    // strictly above support_top_z (excludes the layer that IS the support
-    // top) and at/below support_top_z + gap_mm. This intentionally excludes a
-    // layer whose top overshoots the gap even when its bottom still dips into
-    // the band (variable layer height: a tall layer straddling the far edge
-    // of the gap is not "in" the contact zone).
+    // a binary search, but the band is only ever a few layers deep). A layer is
+    // selected by comparing its own TOP z (print_zs[i], the z its extruded
+    // material actually reaches) against the band's bounds: strictly above
+    // lo_z and at/below hi_z. This intentionally excludes a layer whose top
+    // overshoots hi_z even when its bottom still dips into the band (variable
+    // layer height: a tall layer straddling the far edge of the band is not
+    // "in" it).
     std::vector<size_t> result;
-    const double upper = support_top_z + gap_mm;
     for (size_t i = 0; i < print_zs.size(); ++i) {
         const double layer_top = print_zs[i];
-        if (layer_top > support_top_z + EPSILON && layer_top <= upper + EPSILON)
+        if (layer_top > lo_z + EPSILON && layer_top <= hi_z + EPSILON)
             result.push_back(i);
     }
     return result;
 }
 
-size_t partition_support_interfaces(ExtrusionEntityCollection &support_fills, unsigned fallback_extruder,
-                                     const WallSampleIndex &idx, const BrimVoteParams &p,
-                                     std::map<unsigned, ExtrusionEntityCollection> &out)
+std::vector<size_t> select_contact_layers(const std::vector<double> &print_zs,
+                                           double support_top_z, double gap_mm)
+{
+    return select_layers_in_band(print_zs, support_top_z, support_top_z + gap_mm);
+}
+
+size_t partition_support_entities(ExtrusionEntityCollection &support_fills, ExtrusionRole role_filter,
+                                   unsigned fallback_extruder, const std::function<unsigned(const Point &)> &resolver,
+                                   const BrimVoteParams &p, std::map<unsigned, ExtrusionEntityCollection> &out)
 {
     size_t switch_boundaries = 0;
     std::vector<ExtrusionPath *> new_fallback_paths;
 
-    // Rebuilt in place: base/unknown entities and untouched (fast-path)
-    // interface entities keep their original pointer and position; matched
-    // interface entities are deleted here and their fallback-voted runs are
-    // appended (as new entities) below, once the sweep is done.
+    // Rebuilt in place: entities whose role() != role_filter and untouched
+    // (fast-path) role_filter entities keep their original pointer and
+    // position; matched role_filter entities are deleted here and their
+    // fallback-voted runs are appended (as new entities, role copied from the
+    // source) below, once the sweep is done.
     ExtrusionEntitiesPtr kept;
     kept.reserve(support_fills.entities.size());
 
     for (ExtrusionEntity *entity : support_fills.entities) {
         if (entity == nullptr)
             continue;
-        // Only erSupportMaterialInterface leaf entities (path/multipath/loop)
-        // are ever partitioned. Base fills, other support roles, and any
-        // nested collection (whose role() could coincidentally aggregate to
-        // erSupportMaterialInterface but which as_polyline()/is_loop() cannot
-        // handle) are left exactly where they are.
-        if (entity->is_collection() || entity->role() != erSupportMaterialInterface) {
+        // Only role_filter leaf entities (path/multipath/loop) are ever
+        // partitioned. Every other role, and any nested collection (whose
+        // role() could coincidentally aggregate to role_filter but which
+        // as_polyline()/is_loop() cannot handle), are left exactly where
+        // they are.
+        if (entity->is_collection() || entity->role() != role_filter) {
             kept.push_back(entity);
             continue;
         }
 
         bool replaced = false;
-        switch_boundaries += partition_support_leaf_entity(*entity, fallback_extruder, idx, p,
+        switch_boundaries += partition_support_leaf_entity(*entity, fallback_extruder, resolver, p,
                                                              new_fallback_paths, out, replaced);
         if (replaced)
             delete entity; // matched original removed; its runs were recorded above
@@ -436,6 +477,14 @@ size_t partition_support_interfaces(ExtrusionEntityCollection &support_fills, un
 
     support_fills.entities.swap(kept);
     return switch_boundaries;
+}
+
+size_t partition_support_interfaces(ExtrusionEntityCollection &support_fills, unsigned fallback_extruder,
+                                     const WallSampleIndex &idx, const BrimVoteParams &p,
+                                     std::map<unsigned, ExtrusionEntityCollection> &out)
+{
+    return partition_support_entities(support_fills, erSupportMaterialInterface, fallback_extruder,
+        [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); }, p, out);
 }
 
 } // namespace Slic3r
