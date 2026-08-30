@@ -6370,10 +6370,14 @@ LayerResult GCode::process_layer(const Print& print,
             }
         }
 
-        // Chameleon P2: print this extruder's matched support-interface partitions.
-        // MUST run after the toolchange gcode above (same reasoning as the brim block
-        // just above: this extruder isn't actually active/primed until gcode_toolchange
-        // has been appended, so emitting before it would extrude under the wrong tool).
+        // Chameleon P2.1: print this extruder's matched support-interface AND matched
+        // base partitions - interface_by_extruder (T1 storage) now holds BOTH roles (v2.1
+        // Task 3: Print.cpp's chameleon_assign_support_interfaces calls
+        // partition_support_entities once per role, sharing this one map/extruder-key
+        // space). MUST run after the toolchange gcode above (same reasoning as the brim
+        // block just above: this extruder isn't actually active/primed until
+        // gcode_toolchange has been appended, so emitting before it would extrude under
+        // the wrong tool).
         // The Print.cpp partition pass (Task 2/3) REMOVES matched entities from
         // support_fills - interface_by_extruder is the only place they still live, so
         // this block is not optional: skipping it silently loses that geometry.
@@ -6432,7 +6436,29 @@ LayerResult GCode::process_layer(const Print& print,
                     }
                 }
 
-                gcode += this->extrude_support(it->second, erSupportMaterialInterface);
+                // v2.1 Task 3: pass erMixed, not erSupportMaterialInterface - it->second
+                // can now hold BOTH erSupportMaterial and erSupportMaterialInterface paths
+                // (base entities the lateral rule matched to this extruder share this same
+                // map bucket as matched interface entities). Passing
+                // erSupportMaterialInterface here would silently DROP every base path in
+                // it->second: extrude_support's own selection filter (~7375,
+                // `role == support_extrusion_role`) would reject each erSupportMaterial
+                // path and it would just never print. erMixed is this codebase's existing
+                // precedent for "let each path's own role drive everything" (~5419:
+                // `obj.support_extrusion_role = single_extruder ? erMixed :
+                // erSupportMaterial` for the ordinary interleaved-support case) - under
+                // erMixed, ~7375's filter becomes a pass-through
+                // (`support_extrusion_role == erMixed && role != erIroning`), and every
+                // downstream decision already keys off each PATH's own role(), not this
+                // argument: the gcode comment label (~7389-7393, switches on `ee->role()`),
+                // the speed resolution in _extrude (~7659-7662,
+                // `path.role() == erSupportMaterial ? support_speed :
+                // support_interface_speed`), the interface cooling-fan marker (~7962,
+                // `path.role() == erSupportMaterialInterface`), and the support-island
+                // retraction-skip check (~8554, keyed off the role travel_to receives,
+                // which is `path.role()` per ~7528). So per-path flow/speed/labeling is
+                // already correct with erMixed and no further change is needed here.
+                gcode += this->extrude_support(it->second, erMixed);
 
                 if (this->config().gcode_label_objects) {
                     gcode += std::string("; stop printing object ") + obj.model_object()->name +

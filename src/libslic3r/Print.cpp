@@ -2440,7 +2440,7 @@ static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const 
 // copies polygon geometry - see BrimFilament.hpp's ProjectionLayerView comment. Layer::
 // lslices_bboxes is precomputed once at slicing time (PrintObjectSlice.cpp), long before
 // this pass runs, so the AABB gate inside chameleon_pick_projection_region is free.
-[[maybe_unused]] static bool chameleon_projection_extruder(const PrintObject &object,
+static bool chameleon_projection_extruder(const PrintObject &object,
                                                              const std::vector<size_t> &band_layer_indices,
                                                              const Point &p,
                                                              unsigned object_default_extruder,
@@ -2544,17 +2544,29 @@ static unsigned chameleon_object_default_extruder(const Print &print, const Prin
     return (best > 0 && best < (unsigned int) print.config().filament_diameter.size()) ? best - 1 : 0;
 }
 
-// Chameleon P2: interface partition pass. For every object opted into
-// support_interface_filament_source == sifsNearestSurface, split each support layer's
-// interface entities across the extruders of the model walls they touch (contact band:
-// select_contact_layers, T1), storing the result in SupportLayer::interface_by_extruder
-// (T1 storage) via the partition_support_interfaces engine (T2). Must run after
-// generate_support_material has completed for every object - fresh or copied from a
-// shared/cached object - and before ToolOrdering/psWipeTower construction, so the
-// per-support-layer registration block in ToolOrdering.cpp (~698-721) - which reads
-// interface_by_extruder at ctor time - sees the finished result (see the call site
-// below for exactly where this sits in the pipeline; unlike Part 1's brim pass, no
-// post-hoc union hack is needed because this pass always runs first).
+// Chameleon P2.1: support match pass (renamed from "interface partition pass" - v2.1
+// resolves BOTH support roles now, see docs/superpowers/specs/2026-08-30-support-match-
+// v2-design.md's "Decision rules" section, the binding contract). For every object opted
+// into support_interface_filament_source == sifsNearestSurface, per support layer:
+// interface entities (erSupportMaterialInterface) are resolved by vertical projection
+// (the model surface directly above a sample wins) with a lateral-proximity fallback when
+// projection misses ("SURFACE ABOVE WINS", user-approved); base entities
+// (erSupportMaterial) are resolved by lateral proximity only (v2.1's "any support within
+// 1mm of a wall at its own layer matches that wall" anti-contamination rule). Both roles
+// are partitioned via two calls to the SAME partition_support_entities engine (T1) -
+// interfaces first (role_filter = erSupportMaterialInterface), then base (role_filter =
+// erSupportMaterial) - sharing ONE SupportLayer::interface_by_extruder map (T1 storage)
+// and ONE switch-count/cap budget per layer/object (order between the two calls only
+// matters for log/counter bookkeeping, not correctness: each call only ever touches
+// entities whose role() matches its own role_filter).
+//
+// Must run after generate_support_material has completed for every object - fresh or
+// copied from a shared/cached object - and before ToolOrdering/psWipeTower construction,
+// so the per-support-layer registration block in ToolOrdering.cpp (~698-721) - which reads
+// interface_by_extruder at ctor time, keyed by extruder regardless of which role(s) are
+// mixed within it - sees the finished result (see the call site below for exactly where
+// this sits in the pipeline; unlike Part 1's brim pass, no post-hoc union hack is needed
+// because this pass always runs first).
 //
 // Off (manual mode / single extruder / ByObject sequence): this function returns
 // immediately without touching support_fills or interface_by_extruder on ANY object -
@@ -2594,6 +2606,17 @@ static void chameleon_assign_support_interfaces(Print &print)
         const unsigned fallback_extruder = object->config().support_interface_filament.value > 0
             ? unsigned(object->config().support_interface_filament.value - 1)
             : object_default_extruder;
+        // v2.1 base fallback: mirrors ToolOrdering's own BASE scalar computation
+        // (ToolOrdering.cpp ~704: extruder_support = resolve_mixed(object.config().
+        // support_filament.value, ...)) the same APPROXIMATE way the interface fallback
+        // above mirrors ToolOrdering's interface scalar (~709) - a plain 1-based-to-
+        // 0-based scalar read of the config value, not resolve_mixed's per-layer gradient-
+        // mix resolution (that's the "mixed filament" gradient-printing feature, orthogonal
+        // to this pass's role-mixing). Good enough for a last-resort default when no
+        // per-point match beats it, same as the interface case.
+        const unsigned base_fallback_extruder = object->config().support_filament.value > 0
+            ? unsigned(object->config().support_filament.value - 1)
+            : object_default_extruder;
 
         // Ascending object-layer TOP z values, for select_contact_layers (VLH-safe: keyed
         // by z overlap, not index arithmetic).
@@ -2615,6 +2638,11 @@ static void chameleon_assign_support_interfaces(Print &print)
         size_t layers_partitioned  = 0;
         size_t layers_reverted     = 0;
         size_t layers_zero_sample  = 0;
+        // v2.1: switch-boundary tally contributed by the base (erSupportMaterial) call
+        // only, committed layers only (excludes reverted layers, same as
+        // cumulative_switches) - mirrors cumulative_switches' switch-boundary semantics
+        // (NOT a raw matched-run count). Summary log line addition per plan Task 3 item 3.
+        size_t base_runs_matched   = 0;
 
         for (SupportLayer *support_layer : object->support_layers()) {
             if (support_layer == nullptr || support_layer->support_fills.entities.empty())
@@ -2649,36 +2677,107 @@ static void chameleon_assign_support_interfaces(Print &print)
                 continue;
             }
 
+            // (a) Projection band: same call as v2.0 (contact band, (support_top_z,
+            // support_top_z + 2.0]) - now feeds chameleon_projection_extruder (Task 2)
+            // directly by index list, no WallSampleIndex needed for this part.
             std::vector<size_t> contact_idx = select_contact_layers(layer_print_zs, support_layer->print_z, 2.0);
-            if (contact_idx.empty()) {
-                ++layers_zero_sample;
-                support_layer->chameleon_interface_visited = true;
-                continue; // no object layers in the contact band -> keep fallback
-            }
 
-            WallSampleIndex wall_idx;
-            for (size_t li : contact_idx)
+            // (b) Coplanar lateral band: object layers whose TOP z falls within this
+            // support layer's OWN span (print_z - height, print_z] - v2.1's "any support
+            // within 1mm of a wall at its own layer matches that wall" rule (spec's
+            // Decision rules, "Lateral rule - all roles"). This REPLACES the old
+            // contact-band WallSampleIndex that v2.0 used for interface lateral voting -
+            // projection (a) now owns the contact band, and the lateral rule uses this
+            // separate, layer-local band instead.
+            std::vector<size_t> coplanar_idx = select_layers_in_band(
+                layer_print_zs, support_layer->print_z - support_layer->height, support_layer->print_z);
+
+            WallSampleIndex coplanar_wall_idx;
+            for (size_t li : coplanar_idx)
                 for (const LayerRegion *lr : object->layers()[li]->regions())
                     chameleon_collect_wall_samples(&lr->perimeters, lr->region().config(),
-                        object_default_extruder, no_shift, obj_idx, wall_idx);
+                        object_default_extruder, no_shift, obj_idx, coplanar_wall_idx);
 
-            if (wall_idx.empty()) {
+            if (contact_idx.empty() && coplanar_wall_idx.empty()) {
+                // Nothing to project onto (no band layers) AND nothing to vote laterally
+                // (no coplanar wall samples) -> both roles' resolvers would trivially
+                // return their own fallback for every sample; skip the (pointless) engine
+                // calls and keep the whole layer on fallback, same as v2.0's zero-sample
+                // skip.
                 ++layers_zero_sample;
                 support_layer->chameleon_interface_visited = true;
-                continue; // contact layers contributed no wall samples -> keep fallback
+                continue;
             }
 
+            // v2.1 lateral rule: 1mm cap (BrimVoteParams.max_dist_mm, Task 1) layered on
+            // top of this object's shared run-building tunables (sample_mm/min_run_mm/
+            // max_runs/k, from vote_params above). fallback_extruder differs per role, so
+            // each role gets its own copy; both otherwise vote against the SAME
+            // coplanar_wall_idx.
+            BrimVoteParams interface_lateral_params    = vote_params;
+            interface_lateral_params.max_dist_mm       = 1.0;
+            interface_lateral_params.fallback_extruder = fallback_extruder;
+
+            BrimVoteParams base_lateral_params    = vote_params;
+            base_lateral_params.max_dist_mm       = 1.0;
+            base_lateral_params.fallback_extruder = base_fallback_extruder;
+
+            // Interface resolver: projection (the model surface directly above a sample)
+            // wins whenever it hits; lateral (coplanar walls, 1mm cap) is the fallback
+            // when projection misses. "SURFACE ABOVE WINS" is the user-approved priority
+            // (spec's Decision rules). FENCED future option (NOT built - only this
+            // priority is approved): the opposite priority (lateral wins, projection only
+            // as its own fallback) is a one-branch change - swap which of the two
+            // self-contained expressions below is tried first and which becomes the
+            // "else" branch; no other code needs to move, since both are already
+            // independent (p) -> unsigned expressions with no shared mutable state.
+            auto interface_resolver = [&object, &contact_idx, object_default_extruder,
+                                        &coplanar_wall_idx, &interface_lateral_params](const Point &p) -> unsigned {
+                unsigned proj_extruder = 0;
+                if (chameleon_projection_extruder(*object, contact_idx, p, object_default_extruder, proj_extruder))
+                    return proj_extruder;
+                return brim_vote(coplanar_wall_idx, p, interface_lateral_params);
+            };
+
+            // Base resolver: lateral only. Spec: "ALL base/erSupportMaterial points" use
+            // the lateral rule - vertical projection is an interface-only concept (base
+            // support doesn't sit directly under a model surface the way an interface
+            // layer does), so there is no projection branch here at all.
+            auto base_resolver = [&coplanar_wall_idx, &base_lateral_params](const Point &p) -> unsigned {
+                return brim_vote(coplanar_wall_idx, p, base_lateral_params);
+            };
+
+            // Two engine calls sharing ONE out map and ONE raw switch count (spec:
+            // interfaces first, then base). Each call only ever touches entities whose
+            // role() matches its own role_filter (Task 1's partition_support_entities), so
+            // running these sequentially over the same support_fills is safe: the
+            // interface call's entities.swap() rebuild leaves every erSupportMaterial
+            // entity exactly where it was for the base call to then walk.
             std::map<unsigned, ExtrusionEntityCollection> partitioned;
-            const size_t switches = partition_support_interfaces(support_layer->support_fills, fallback_extruder,
-                                                                   wall_idx, vote_params, partitioned);
+
+            const size_t interface_switches = partition_support_entities(support_layer->support_fills,
+                erSupportMaterialInterface, fallback_extruder, interface_resolver, vote_params, partitioned);
+
+            const size_t base_switches = partition_support_entities(support_layer->support_fills,
+                erSupportMaterial, base_fallback_extruder, base_resolver, vote_params, partitioned);
+
+            const size_t switches = interface_switches + base_switches;
 
             if (switches > 3) {
-                // Per-layer cap exceeded: revert. partition_support_interfaces already
-                // mutated support_fills in place (matched originals deleted, fallback-voted
-                // runs re-inserted); merge the non-fallback runs back in too, so the layer
+                // Per-layer cap exceeded: revert. Both calls above already mutated
+                // support_fills in place (matched originals deleted, fallback-voted runs
+                // re-inserted); merge every non-fallback run back in too, regardless of
+                // which call (interface or base) produced it. This is role-agnostic and
+                // correct even though `partitioned` may now hold a mix of both roles
+                // (possibly merged into the SAME out[extruder] bucket, e.g. an interface
+                // run and a base run both matching extruder 2): append(ExtrusionEntitiesPtr&&)
+                // just transfers ownership of whatever ExtrusionPath objects are in each
+                // bucket, and every one of those paths already carries its true source
+                // role via partition_support_entities' role-copy (Task 1: `source ?
+                // source->role() : entity.role()`), never a hardcoded role. So the layer
                 // ends up printing exactly as if the pass had left it alone (whole-layer
-                // fallback). append(ExtrusionEntitiesPtr&&) transfers ownership (moves the
-                // pointers, leaves the source empty), so this cannot double-free.
+                // fallback, both roles restored). Moves the pointers, leaves the source
+                // empty, so this cannot double-free.
                 for (auto &kv : partitioned)
                     support_layer->support_fills.append(std::move(kv.second.entities));
                 support_layer->chameleon_interface_visited = true;
@@ -2689,20 +2788,23 @@ static void chameleon_assign_support_interfaces(Print &print)
             if (!partitioned.empty()) {
                 support_layer->interface_by_extruder = std::move(partitioned);
                 cumulative_switches += switches;
+                base_runs_matched   += base_switches;
                 ++layers_partitioned;
                 if (cumulative_switches > 20)
                     escalated = true; // remaining layers of this object skip partition
             }
-            // else: fast path, every entity voted fallback uniformly - support_fills is
-            // already untouched and interface_by_extruder stays empty (nothing to do).
+            // else: fast path, every entity of both roles voted fallback uniformly -
+            // support_fills is already untouched and interface_by_extruder stays empty
+            // (nothing to do).
             support_layer->chameleon_interface_visited = true;
         }
 
-        BOOST_LOG_TRIVIAL(info) << "Chameleon support-interface match: object ordinal " << obj_idx
+        BOOST_LOG_TRIVIAL(info) << "Chameleon support match: object ordinal " << obj_idx
             << " layers_partitioned=" << layers_partitioned
             << " layers_reverted_cap=" << layers_reverted
             << " layers_zero_sample=" << layers_zero_sample
             << " cumulative_switches=" << cumulative_switches
+            << " base_runs_matched=" << base_runs_matched
             << (escalated ? " escalated_over_20" : "");
     }
 }

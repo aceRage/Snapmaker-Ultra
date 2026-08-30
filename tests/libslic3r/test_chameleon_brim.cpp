@@ -581,3 +581,85 @@ TEST_CASE("chameleon_pick_projection_region skips a layer whose lslices hit but 
     CHECK(out_layer == 1);
     CHECK(out_region == 0);
 }
+
+// --- v2.1 Task 3: pass rewiring (two-call sequence, shared out map) -------
+
+TEST_CASE("v2.1 Task 3: interface-then-base calls share one out map; buckets can mix roles; revert-merge is role-agnostic", "[chameleon]")
+{
+    // Mirrors chameleon_assign_support_interfaces' v2.1 shape: an interface-role call
+    // and a base-role call both consult the same coplanar wall data and write into the
+    // SAME `out` map (Print.cpp's `partitioned`), differing only in role_filter/
+    // fallback_extruder (the pass's interface_resolver/base_resolver both ultimately
+    // call brim_vote against one shared coplanar WallSampleIndex; only projection - not
+    // exercised by this synthetic-resolver test - and fallback_extruder differ). This
+    // test is about what happens when BOTH calls write into the SAME out map, not
+    // about resolver composition (already covered by the projection-region tests
+    // above and the Print.cpp hand-walk in the task report).
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 14, 6), 1, 1);    // left wall -> extruder 1
+    idx.add_polyline(segment(16, 6, 30, 6), 2, 2);   // right wall -> extruder 2
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    // 1 base path @ y=-5 (x 0->30), 2 interface paths @ y=5/6 (x 0->30) - both roles'
+    // paths span both walls' x-ranges, so both calls are expected to split their own
+    // role's entities across extruder 1 and extruder 2 (established individually by
+    // the "role_filter=base"/"role_filter=interface" tests above).
+    auto fills = make_support_fills(5.0f);
+
+    std::map<unsigned, ExtrusionEntityCollection> partitioned;
+
+    const size_t interface_switches = partition_support_entities(fills, erSupportMaterialInterface,
+        0, resolver, p, partitioned);
+    const size_t base_switches = partition_support_entities(fills, erSupportMaterial,
+        0, resolver, p, partitioned);
+
+    // Task 3: "ONE raw switch count vs the caps" - the pass sums these two calls'
+    // returns before comparing against the 3/layer and 20/object caps. Both calls
+    // contributed (neither degenerated to the uniform-fallback fast path).
+    CHECK(interface_switches > 0);
+    CHECK(base_switches > 0);
+
+    REQUIRE(partitioned.count(1) == 1);
+    REQUIRE(partitioned.count(2) == 1);
+
+    // Every original entity (both roles) was fully matched away in this geometry -
+    // nothing fell back to support_fills (mirrors the individual base/interface tests
+    // above, now happening back-to-back into the shared map).
+    CHECK(fills.entities.empty());
+
+    // The crux of Task 3's shared-map design: at least one extruder bucket holds BOTH
+    // roles (an interface run and a base run both matched the same wall's extruder),
+    // and every path still carries its own true source role - never hardcoded by
+    // either call, never clobbered by the second call overwriting the first's work.
+    bool saw_interface_role = false, saw_base_role = false, found_mixed_bucket = false;
+    for (auto &kv : partitioned) {
+        bool has_iface = false, has_base = false;
+        for (const ExtrusionEntity *e : kv.second.entities) {
+            CHECK((e->role() == erSupportMaterialInterface || e->role() == erSupportMaterial));
+            if (e->role() == erSupportMaterialInterface) { has_iface = true; saw_interface_role = true; }
+            if (e->role() == erSupportMaterial)          { has_base  = true; saw_base_role      = true; }
+        }
+        if (has_iface && has_base)
+            found_mixed_bucket = true;
+    }
+    CHECK(saw_interface_role);
+    CHECK(saw_base_role);
+    CHECK(found_mixed_bucket);
+
+    // Mirror Print.cpp's per-layer cap-exceeded revert (for (auto &kv : partitioned)
+    // support_layer->support_fills.append(std::move(kv.second.entities));) -
+    // append(ExtrusionEntitiesPtr&&) is role-agnostic, so merging a map built from TWO
+    // different role_filter calls back into one collection must restore BOTH roles'
+    // geometry, not just whichever role happened to be appended first/last.
+    for (auto &kv : partitioned)
+        fills.append(std::move(kv.second.entities));
+
+    size_t restored_iface = 0, restored_base = 0;
+    for (const ExtrusionEntity *e : fills.entities) {
+        if (e->role() == erSupportMaterialInterface) ++restored_iface;
+        if (e->role() == erSupportMaterial)           ++restored_base;
+    }
+    CHECK(restored_iface > 0);
+    CHECK(restored_base > 0);
+}
