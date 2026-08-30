@@ -173,6 +173,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Gizmos/GLGizmoScale.hpp
     GUI/Gizmos/GLGizmosCommon.cpp
     GUI/Gizmos/GLGizmosCommon.hpp
+    GUI/Gizmos/FacetPicker.cpp
+    GUI/Gizmos/FacetPicker.hpp
     GUI/Gizmos/GLGizmoSeam.cpp
     GUI/Gizmos/GLGizmoSeam.hpp
     GUI/Gizmos/GLGizmoSimplify.cpp

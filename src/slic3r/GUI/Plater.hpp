@@ -169,6 +169,7 @@ public:
     void cleanup_unused_filaments_after_batch_match(const BatchMatchResult& match_result,
                                                     std::function<void(int /*current*/, int /*total*/)> on_progress = nullptr);
     void add_custom_filament(wxColour new_col);
+    void scroll_filament_area_to_bottom();
     void edit_filament();
 
     void on_filaments_delete(size_t filament_id);

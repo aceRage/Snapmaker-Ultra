@@ -5,6 +5,7 @@
 #include "slic3r/GUI/GLSelectionRectangle.hpp"
 #include "slic3r/GUI/GLModel.hpp"
 #include "slic3r/GUI/I18N.hpp"
+#include "FacetPicker.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/CutUtils.hpp"
@@ -54,6 +55,10 @@ class GLGizmoCut3D : public GLGizmoBase
 
     BoundingBoxf3 m_bounding_box;
     BoundingBoxf3 m_transformed_bounding_box;
+
+    // Pick-face mode: click a triangular facet of the model to set the cut plane flush
+    // with it (ported from BambuStudio #12048, re-targeted onto this Orca gizmo).
+    FacetPicker m_facet_picker;
 
     // values from RotationGizmo
     double m_radius{ 0.0 };
@@ -260,6 +265,8 @@ public:
     void put_connectors_on_cut_plane(const Vec3d& cp_normal, double cp_offset);
     void update_clipper();
     void invalidate_cut_plane();
+    // pick-face mode: apply the currently picked facet as the cut plane
+    bool apply_picked_facet();
 
     BoundingBoxf3   bounding_box() const;
     BoundingBoxf3   transformed_bounding_box(const Vec3d& plane_center, const Transform3d& rotation_m = Transform3d::Identity()) const;

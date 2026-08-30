@@ -389,7 +389,7 @@ SelectMachineDialog::SelectMachineDialog(Plater *plater)
     m_filament_panel_sizer = new wxBoxSizer(wxVERTICAL);
 
     m_sizer_ams_mapping = new wxGridSizer(0, 10, FromDIP(7), FromDIP(7));
-    m_filament_panel_sizer->Add(m_sizer_ams_mapping, 0, wxEXPAND|wxALL, FromDIP(10));
+    m_filament_panel_sizer->Add(m_sizer_ams_mapping, 0, wxEXPAND|wxALL, FromDIP(4));
     m_filament_panel->SetSizer(m_filament_panel_sizer);
     m_filament_panel->Layout();
     m_filament_panel->Fit();
@@ -407,14 +407,14 @@ SelectMachineDialog::SelectMachineDialog(Plater *plater)
 
     m_filament_panel_left_sizer = new wxBoxSizer(wxVERTICAL);
     m_sizer_ams_mapping_left = new wxGridSizer(0, 5, FromDIP(7), FromDIP(7));
-    m_filament_panel_left_sizer->Add(m_sizer_ams_mapping_left, 0, wxEXPAND | wxALL, FromDIP(10));
+    m_filament_panel_left_sizer->Add(m_sizer_ams_mapping_left, 0, wxEXPAND | wxALL, FromDIP(4));
     m_filament_left_panel->SetSizer(m_filament_panel_left_sizer);
     m_filament_left_panel->Layout();
     m_filament_left_panel->Fit();
 
     m_filament_panel_right_sizer = new wxBoxSizer(wxVERTICAL);
     m_sizer_ams_mapping_right = new wxGridSizer(0, 5, FromDIP(7), FromDIP(7));
-    m_filament_panel_right_sizer->Add(m_sizer_ams_mapping_right, 0, wxEXPAND | wxALL, FromDIP(10));
+    m_filament_panel_right_sizer->Add(m_sizer_ams_mapping_right, 0, wxEXPAND | wxALL, FromDIP(4));
     m_filament_right_panel->SetSizer(m_filament_panel_right_sizer);
     m_filament_right_panel->Layout();
     m_filament_right_panel->Fit();

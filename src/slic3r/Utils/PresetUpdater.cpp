@@ -1588,6 +1588,39 @@ bool PresetUpdater::priv::install_bundles_rsrc(const std::vector<std::string>& b
 }
 
 
+// Ultra: BBL/Orca vendor bundles use 4-component versions (e.g. "02.00.00.59") which the
+// 3-component semver parser rejects -> get_version_from_json returns 0.0.0 for every bundle,
+// so the resource->system refresh never fired on a profile-only version bump. Read + compare
+// the raw version strings component-wise instead.
+static std::string read_bundle_version_string(const std::string& json_path)
+{
+    try {
+        boost::nowide::ifstream ifs(json_path);
+        if (!ifs.good()) return {};
+        nlohmann::json j; ifs >> j;
+        if (j.is_object() && j.contains(BBL_JSON_KEY_VERSION))
+            return j.at(BBL_JSON_KEY_VERSION).get<std::string>();
+    } catch (...) {}
+    return {};
+}
+// compare dotted numeric versions of arbitrary component count: <0 if a<b, 0 if equal, >0 if a>b
+static int compare_dotted_version(const std::string& a, const std::string& b)
+{
+    auto next = [](const std::string& s, size_t& pos) -> long {
+        if (pos >= s.size()) return 0;
+        size_t dot = s.find('.', pos);
+        std::string tok = (dot == std::string::npos) ? s.substr(pos) : s.substr(pos, dot - pos);
+        pos = (dot == std::string::npos) ? s.size() : dot + 1;
+        return strtol(tok.c_str(), nullptr, 10);
+    };
+    size_t pa = 0, pb = 0;
+    while (pa < a.size() || pb < b.size()) {
+        long va = next(a, pa), vb = next(b, pb);
+        if (va != vb) return (va < vb) ? -1 : 1;
+    }
+    return 0;
+}
+
 // Orca: copy/update the vendor profiles from resource to system folder
 void PresetUpdater::priv::check_installed_vendor_profiles() const
 {
@@ -1614,13 +1647,17 @@ void PresetUpdater::priv::check_installed_vendor_profiles() const
             if (enabled_config_update) {
                 if ( fs::exists(path_in_vendor)) {
                     if (is_vendor_enabled) {
-                        Semver resource_ver = get_version_from_json(file_path);
-                        Semver vendor_ver = get_version_from_json(path_in_vendor.string());
+                        // Ultra: compare raw 4-component version strings (semver parse fails on the
+                        // 4th field -> everything read as 0.0.0). Refresh whenever the shipped resource
+                        // bundle version differs from the installed one, so system/ mirrors resources.
+                        std::string resource_ver = read_bundle_version_string(file_path);
+                        std::string vendor_ver   = read_bundle_version_string(path_in_vendor.string());
 
-                        bool version_match = ((resource_ver.maj() == vendor_ver.maj()) && (resource_ver.min() == vendor_ver.min()));
-
-                        if (!version_match || (vendor_ver < resource_ver)) {
-                            BOOST_LOG_TRIVIAL(info) << "[Orca Updater]:found vendor "<<vendor_name<<" newer version "<<resource_ver.to_string() <<" from resource, old version "<<vendor_ver.to_string();
+                        // Ultra: refresh only when the shipped resource bundle is strictly NEWER
+                        // than the installed one (never downgrade the user's system dir from a stale
+                        // resources copy). 4-component compare since semver parse fails on the 4th field.
+                        if (!resource_ver.empty() && compare_dotted_version(resource_ver, vendor_ver) > 0) {
+                            BOOST_LOG_TRIVIAL(info) << "[Orca Updater]:found vendor "<<vendor_name<<" newer version "<<resource_ver <<" from resource, installed "<<vendor_ver<<", refreshing";
                             bundles.insert(vendor_name);
                         }
                     }

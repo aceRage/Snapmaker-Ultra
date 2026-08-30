@@ -805,6 +805,60 @@ int ConfigBase::load_from_json(const std::string &file, ConfigSubstitutionContex
         ifs >> j;
         ifs.close();
 
+        // Ultra: resolve BambuStudio 2.x "include" externalized templates.
+        // Newer machine variant JSONs move start/end/layer-change/change-filament/
+        // timelapse gcode into separate template files pulled in via a top-level
+        // "include" array. The fork's loader had no native include support, so
+        // resolve+merge here before deserialization: load each included file (path
+        // relative to this file's dir) and copy any key the including file does not
+        // itself define. The including file always wins; earlier includes win over
+        // later ones. One level deep (sufficient for the gcode templates).
+        {
+            auto inc_it = j.find("include");
+            if (inc_it != j.end() && inc_it->is_array()) {
+                std::string base_dir;
+                size_t sep = file.find_last_of("/\\");
+                if (sep != std::string::npos)
+                    base_dir = file.substr(0, sep + 1);
+                auto is_meta_key = [](const std::string& k) {
+                    // preset meta keys the template files carry - never merge these
+                    static const char* mk[] = {"name","instantiation","from","inherits","type",
+                        "setting_id","filament_id","version","url","description","is_custom_defined"};
+                    for (const char* m : mk) if (boost::iequals(k, m)) return true;
+                    return false;
+                };
+                for (auto& inc : *inc_it) {
+                    if (!inc.is_string())
+                        continue;
+                    std::string inc_name = inc.get<std::string>();
+                    // BambuStudio include entries omit the .json extension
+                    if (inc_name.size() < 5 || !boost::iends_with(inc_name, ".json"))
+                        inc_name += ".json";
+                    std::string inc_path = base_dir + inc_name;
+                    try {
+                        boost::nowide::ifstream inc_ifs(inc_path);
+                        if (!inc_ifs.good()) {
+                            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": include not found: " << inc_path;
+                            continue;
+                        }
+                        json inc_j;
+                        inc_ifs >> inc_j;
+                        inc_ifs.close();
+                        for (auto iit = inc_j.begin(); iit != inc_j.end(); ++iit) {
+                            std::string k = iit.key();
+                            if (boost::iequals(k, std::string("include")) || is_meta_key(k))
+                                continue;
+                            if (j.find(k) == j.end())
+                                j[k] = iit.value();
+                        }
+                    } catch (std::exception& e) {
+                        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": failed to parse include " << inc_path << ": " << e.what();
+                    }
+                }
+                j.erase("include");
+            }
+        }
+
         const ConfigDef* config_def = this->def();
         if (config_def == nullptr) {
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": no config defs!";

@@ -2100,11 +2100,18 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 model_object->cut_id = cut_object_info->second.id;
                 int vol_cnt = int(model_object->volumes.size());
                 for (auto connector : cut_object_info->second.connectors) {
+                    // volume_id/type come from Metadata/cut_information.xml (untrusted file
+                    // content): range-check both before indexing volumes / casting the enum,
+                    // or a crafted/corrupted 3MF corrupts memory (BambuStudio #5829aa45f).
                     if (connector.volume_id < 0 || connector.volume_id >= vol_cnt) {
-                        add_error("Invalid connector is found");
+                        add_error("Invalid cut connector volume_id " + std::to_string(connector.volume_id));
                         continue;
                     }
-                    model_object->volumes[connector.volume_id]->cut_info = 
+                    if (connector.type < 0 || connector.type > int(CutConnectorType::Undef)) {
+                        add_error("Invalid cut connector type " + std::to_string(connector.type));
+                        continue;
+                    }
+                    model_object->volumes[connector.volume_id]->cut_info =
                         ModelVolume::CutInfo(CutConnectorType(connector.type), connector.r_tolerance, connector.h_tolerance, true);
                 }
             }

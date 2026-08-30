@@ -8209,6 +8209,26 @@ void Sidebar::add_filament() {
     if (!pb || pb->mixed_filaments.total_filaments(p->combos_filament.size()) >= MAXIMUM_FILAMENT_NUMBER) return;
     wxColour    new_col        = Plater::get_next_color_for_filament();
     add_custom_filament(new_col);
+    // Reveal the just-added filament: it is appended at the end of the (height-capped,
+    // scrollable) filament list, which may sit below the fold. (BambuStudio #a1e50264a,
+    // adapted to this fork's m_scrolled_filaments.)
+    scroll_filament_area_to_bottom();
+}
+
+void Sidebar::scroll_filament_area_to_bottom()
+{
+    auto* sw = p->m_scrolled_filaments;
+    if (!sw) return;
+    // Defer until after the pending layout pass so the virtual size reflects the new row.
+    sw->CallAfter([sw]() {
+        int ppu_x = 0, ppu_y = 0;
+        sw->GetScrollPixelsPerUnit(&ppu_x, &ppu_y);
+        if (ppu_y <= 0) return;
+        int virtual_h = sw->GetVirtualSize().GetHeight();
+        int client_h  = sw->GetClientSize().GetHeight();
+        int max_units = std::max(0, (virtual_h - client_h + ppu_y - 1) / ppu_y);
+        sw->Scroll(0, max_units);
+    });
 }
 
 void Sidebar::on_filaments_delete(size_t filament_id)

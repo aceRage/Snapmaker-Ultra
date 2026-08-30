@@ -273,6 +273,22 @@ bool GLGizmoCut3D::on_mouse(const wxMouseEvent &mouse_event)
     Vec2i32 mouse_coord(mouse_event.GetX(), mouse_event.GetY());
     Vec2d mouse_pos = mouse_coord.cast<double>();
 
+    // Pick-face mode (armed via the "Pick face" button). A click means "pick that facet"
+    // and is consumed so grabbers/pan don't also fire; hover just updates the highlight.
+    if (m_facet_picker.is_active() && !m_connectors_editing) {
+        if (mouse_event.Moving() || mouse_event.Dragging()) {
+            m_facet_picker.update(mouse_pos, m_c, m_parent.get_selection(), wxGetApp().plater()->get_camera());
+            m_parent.request_extra_frame();
+        } else if (mouse_event.LeftDown()) {
+            m_facet_picker.update(mouse_pos, m_c, m_parent.get_selection(), wxGetApp().plater()->get_camera());
+            if (apply_picked_facet())
+                m_facet_picker.set_active(false); // one-shot; press the button again to pick another
+            return true;
+        } else if (mouse_event.Leaving()) {
+            m_facet_picker.reset();
+        }
+    }
+
     if (mouse_event.ShiftDown() && mouse_event.LeftDown())
         return gizmo_event(SLAGizmoEventType::LeftDown, mouse_pos, mouse_event.ShiftDown(), mouse_event.AltDown(), mouse_event.CmdDown());
     if (mouse_event.CmdDown() && mouse_event.LeftDown())
@@ -1262,6 +1278,7 @@ void GLGizmoCut3D::apply_color_clip_plane_colors()
 
 void GLGizmoCut3D::on_set_state()
 {
+    m_facet_picker.set_active(false); // never leave pick-face armed across open/close
     if (m_state == On) {
         m_parent.set_use_color_clip_plane(true);
 
@@ -2154,6 +2171,9 @@ void GLGizmoCut3D::on_render()
 
     render_connectors();
 
+    if (m_facet_picker.is_active() && !m_connectors_editing)
+        m_facet_picker.render(wxGetApp().plater()->get_camera());
+
     if (!m_connectors_editing)
         m_part_selection.render(nullptr, m_sphere.model);
     else
@@ -2376,11 +2396,56 @@ void GLGizmoCut3D::set_connectors_editing(bool connectors_editing)
         return;
 
     m_connectors_editing = connectors_editing;
+    if (m_connectors_editing)
+        m_facet_picker.set_active(false); // pick-face is a planar-cut interaction only
     update_raycasters_for_picking();
 
     m_c->object_clipper()->set_behavior(m_connectors_editing, m_connectors_editing, double(m_contour_width));
 
     m_parent.request_extra_frame();
+}
+
+// Pick-face mode: place the cut plane flush with the currently-picked facet.
+// Mirrors flip_cut_plane()'s state-update idiom but sets an ABSOLUTE rotation + center
+// derived from the facet (plane normal = m_rotation_m * UnitZ).
+bool GLGizmoCut3D::apply_picked_facet()
+{
+    const FacetPicker::Hit &picked = m_facet_picker.hit();
+    if (!picked.valid() || picked.world_normal.isZero())
+        return false;
+
+    Eigen::Quaterniond q;
+    Transform3d        m = Transform3d::Identity();
+    m.matrix().block(0, 0, 3, 3) = q.setFromTwoVectors(Vec3d::UnitZ(), picked.world_normal).toRotationMatrix();
+
+    // Require the plane to actually straddle the model (bbox in the plane frame crosses
+    // z=0) so a grazing pick can't place a non-cutting plane.
+    const BoundingBoxf3 tbb = transformed_bounding_box(picked.world_pos, m);
+    const double        limit_val = 0.5;
+    if (!(tbb.max.z() > -limit_val && tbb.min.z() < limit_val))
+        return false;
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Cut plane from face"), UndoRedo::SnapshotType::GizmoAction);
+
+    m_rotation_m       = m;
+    m_start_dragging_m = m;
+    // Set the plane center directly rather than via set_center()/set_center_pos(): with a
+    // changed rotation, set_center_pos clamps the new center against the STALE
+    // m_transformed_bounding_box (old rotation) and, on failure, rejects the move so the
+    // plane snapped back to the model centre. Our straddle guard above already validated the
+    // pick against the NEW rotation, so assign directly and refresh the caches.
+    m_plane_center             = picked.world_pos;
+    m_center_offset            = m_plane_center - m_bb_center;
+    m_ar_plane_center          = m_plane_center;
+    m_transformed_bounding_box = transformed_bounding_box(m_plane_center, m_rotation_m);
+    check_and_update_connectors_state();
+    update_clipper();
+
+    if (CutMode(m_mode) == CutMode::cutTongueAndGroove)
+        reset_cut_by_contours();
+
+    m_parent.request_extra_frame();
+    return true;
 }
 
 void GLGizmoCut3D::flip_cut_plane()
@@ -2684,6 +2749,22 @@ void GLGizmoCut3D::render_cut_plane_input_window(CutConnectors &connectors, floa
                     reset_connectors();
                 }
             m_imgui->disabled_end();
+
+            // Pick-face: click a model facet to set the cut plane flush with it.
+            add_vertical_scaled_interval(0.75f);
+            const bool picking = m_facet_picker.is_active();
+            m_imgui->disabled_begin(has_connectors);
+                if (picking)
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(ImGuiCol_ButtonActive));
+                if (m_imgui->button(_L("Pick face"), _L("Click a model face to set the cut plane flush with it; use Cut position to offset")))
+                    m_facet_picker.set_active(!picking);
+                if (picking)
+                    ImGui::PopStyleColor();
+            m_imgui->disabled_end();
+            if (picking) {
+                ImGui::SameLine();
+                m_imgui->text(_L("Click a face of the model."));
+            }
         }
         else if (mode == CutMode::cutTongueAndGroove) {
             m_is_slider_editing_done = false;
@@ -3783,7 +3864,8 @@ CommonGizmosDataID GLGizmoCut3D::on_get_requirements() const {
     return CommonGizmosDataID(
                 int(CommonGizmosDataID::SelectionInfo)
               | int(CommonGizmosDataID::InstancesHider)
-              | int(CommonGizmosDataID::ObjectClipper));
+              | int(CommonGizmosDataID::ObjectClipper)
+              | int(CommonGizmosDataID::Raycaster)); // for pick-face (FacetPicker)
 }
 
 void GLGizmoCut3D::data_changed(bool is_serializing) 

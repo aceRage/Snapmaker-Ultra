@@ -31,7 +31,7 @@ wxDEFINE_EVENT(EVT_SET_FINISH_MAPPING, wxCommandEvent);
  {
     m_arraw_bitmap_gray =  ScalableBitmap(this, "drop_down", FromDIP(12));
     m_arraw_bitmap_white =  ScalableBitmap(this, "topbar_dropdown", FromDIP(12));
-    m_transparent_mitem = ScalableBitmap(this, "transparent_material_item", FromDIP(32));
+    m_transparent_mitem = ScalableBitmap(this, "transparent_material_item", FromDIP(48));
 
     m_material_coloul = mcolour;
     m_material_name = mname;
@@ -55,7 +55,7 @@ wxDEFINE_EVENT(EVT_SET_FINISH_MAPPING, wxCommandEvent);
 void MaterialItem::msw_rescale() {
     m_arraw_bitmap_gray  = ScalableBitmap(this, "drop_down", FromDIP(12));
     m_arraw_bitmap_white = ScalableBitmap(this, "topbar_dropdown", FromDIP(12));
-    m_transparent_mitem  = ScalableBitmap(this, "transparent_material_item", FromDIP(32));
+    m_transparent_mitem  = ScalableBitmap(this, "transparent_material_item", FromDIP(48));
 }
 
 void MaterialItem::set_ams_info(wxColour col, wxString txt, int ctype, std::vector<wxColour> cols)
@@ -160,7 +160,7 @@ void MaterialItem::render(wxDC &dc)
     }
 
     auto material_txt_size = dc.GetTextExtent(m_material_name);
-    dc.DrawText(m_material_name, wxPoint((MATERIAL_ITEM_SIZE.x - material_txt_size.x) / 2, (FromDIP(22) - material_txt_size.y) / 2));
+    dc.DrawText(m_material_name, wxPoint((MATERIAL_ITEM_SIZE.x - material_txt_size.x) / 2, (FromDIP(28) - material_txt_size.y) / 2));
 
     // mapping num
     dc.SetFont(::Label::Body_10);
@@ -177,7 +177,7 @@ void MaterialItem::render(wxDC &dc)
     }
 
     auto mapping_txt_size = dc.GetTextExtent(mapping_txt);
-    dc.DrawText(mapping_txt, wxPoint((MATERIAL_ITEM_SIZE.x - mapping_txt_size.x) / 2, FromDIP(20) + (FromDIP(14) - mapping_txt_size.y) / 2));
+    dc.DrawText(mapping_txt, wxPoint((MATERIAL_ITEM_SIZE.x - mapping_txt_size.x) / 2, FromDIP(30) + (FromDIP(16) - mapping_txt_size.y) / 2));
 }
 
 void MaterialItem::doRender(wxDC &dc) 
@@ -199,7 +199,7 @@ void MaterialItem::doRender(wxDC &dc)
     //top
     dc.SetPen(*wxTRANSPARENT_PEN);
     dc.SetBrush(wxBrush(mcolor));
-    dc.DrawRoundedRectangle(FromDIP(1), FromDIP(1), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(18), 5);
+    dc.DrawRoundedRectangle(FromDIP(1), FromDIP(1), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(27), 5);
     
     //bottom
     if (m_ams_cols.size() > 1) {
@@ -208,7 +208,7 @@ void MaterialItem::doRender(wxDC &dc)
         //gradient
         if (m_ams_ctype == 0) {
             for (int i = 0; i < m_ams_cols.size() - 1; i++) {
-                auto rect = wxRect(left, FromDIP(18), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(16));
+                auto rect = wxRect(left, FromDIP(28), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(19));
                 dc.GradientFillLinear(rect, m_ams_cols[i], m_ams_cols[i + 1], wxEAST);
                 left += gwidth;
             }
@@ -219,10 +219,10 @@ void MaterialItem::doRender(wxDC &dc)
                 dc.SetBrush(wxBrush(m_ams_cols[i]));
                 float x = left + ((float)MATERIAL_ITEM_REAL_SIZE.x) * i / cols_size;
                 if (i != cols_size - 1) {
-                    dc.DrawRoundedRectangle(x, FromDIP(18), ((float)MATERIAL_ITEM_REAL_SIZE.x) / cols_size + FromDIP(3), FromDIP(16), 3);
+                    dc.DrawRoundedRectangle(x, FromDIP(28), ((float)MATERIAL_ITEM_REAL_SIZE.x) / cols_size + FromDIP(3), FromDIP(19), 3);
                 }
                 else {
-                    dc.DrawRoundedRectangle(x, FromDIP(18), ((float)MATERIAL_ITEM_REAL_SIZE.x) / cols_size , FromDIP(16), 3);
+                    dc.DrawRoundedRectangle(x, FromDIP(28), ((float)MATERIAL_ITEM_REAL_SIZE.x) / cols_size , FromDIP(19), 3);
                 }
             }
  
@@ -232,16 +232,16 @@ void MaterialItem::doRender(wxDC &dc)
         
         dc.SetPen(*wxTRANSPARENT_PEN);
         dc.SetBrush(wxBrush(wxColour(acolor)));
-        dc.DrawRoundedRectangle(FromDIP(1), FromDIP(18), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(16), 5);
+        dc.DrawRoundedRectangle(FromDIP(1), FromDIP(28), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(19), 5);
         ////middle
 
         dc.SetPen(*wxTRANSPARENT_PEN);
         dc.SetBrush(wxBrush(acolor));
-        dc.DrawRectangle(FromDIP(1), FromDIP(18), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(8));
+        dc.DrawRectangle(FromDIP(1), FromDIP(28), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(8));
     }
     dc.SetPen(*wxTRANSPARENT_PEN);
     dc.SetBrush(wxBrush(mcolor));
-    dc.DrawRectangle(FromDIP(1), FromDIP(11), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(8));
+    dc.DrawRectangle(FromDIP(1), FromDIP(20), MATERIAL_ITEM_REAL_SIZE.x, FromDIP(8));
 
 
 
