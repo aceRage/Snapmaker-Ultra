@@ -1074,6 +1074,46 @@ TEST_CASE("chameleon_pick_projection_region: raw containment still wins outright
     CHECK(out_region == 1);
 }
 
+TEST_CASE("chameleon_pick_projection_region: a lower layer's margin-ring hit must NOT pre-empt a higher layer's genuine raw containment (C1)", "[chameleon]")
+{
+    // v2.2 final-review C1: the standard-configuration failure scenario. Band layer 0
+    // is the wall-only z-gap layer (its raw lslices only see the laterally-adjacent
+    // wall, not the overhang above it yet) - p sits inside layer 0's margin ring but
+    // NOT its raw lslices. Band layer 1 is one layer higher and its raw lslices DO
+    // genuinely contain p (the overhang body itself). "SURFACE ABOVE WINS" requires
+    // layer 1's raw containment to resolve this sample, regardless of layer 0's ring
+    // hit underneath it. The single-pass v2.1/pre-fix code returns from layer 0 (ring
+    // hit -> nearest_region_to_point) and never reaches layer 1 at all - this is the RED
+    // case the two-pass restructure (PASS 1 raw-only over ALL layers, PASS 2 ring-only)
+    // fixes.
+    Point p(0, 0);
+
+    // Layer 0 (lowest, wall-only z-gap layer): raw lslices are the wall, offset away
+    // from p; the margin ring (expanded_lslices) grows just far enough to cover p.
+    ExPolygons layer0_raw      = { square_expoly(20, 0, 5) };   // spans x in [15,25] - does NOT cover p
+    ExPolygons layer0_expanded = { square_expoly(0, 0, 15) };   // spans x in [-15,15] - covers p (ring)
+    ExPolygons layer0_region0  = { square_expoly(20, 0, 5) };   // the wall region's own raw slice - same as layer0_raw, doesn't cover p either
+
+    ProjectionLayerView layer0;
+    layer0.lslices            = &layer0_raw;
+    layer0.expanded_lslices   = layer0_expanded;
+    layer0.region_slice_polys = { { &layer0_region0[0] } };
+
+    // Layer 1 (one layer higher, the overhang body): raw lslices genuinely contain p.
+    ExPolygons layer1_raw     = { square_expoly(0, 0, 10) };    // covers p directly
+    ExPolygons layer1_region0 = { square_expoly(0, 0, 10) };    // the overhang region's own raw slice - also covers p
+
+    ProjectionLayerView layer1;
+    layer1.lslices            = &layer1_raw;
+    layer1.region_slice_polys = { { &layer1_region0[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer0, layer1 };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, p, out_layer, out_region));
+    CHECK(out_layer == 1);   // layer 1's raw containment, NOT layer 0's ring hit
+    CHECK(out_region == 0);
+}
+
 // --- v2.2 Task 3: ironing follows its interface (spec C6) + nested collections (spec C7) ---
 
 TEST_CASE("partition_support_entities role_filter=erIroning splits ironing, preserves role, leaves other roles untouched (C6)", "[chameleon]")
@@ -1362,4 +1402,51 @@ TEST_CASE("brim_vote uncapped (max_dist_mm=0) picks the nearest wall regardless 
     p.max_dist_mm = 0.0;
     p.fallback_extruder = 9;
     CHECK(brim_vote(idx, Point(scale_(5), scale_(0)), p) == 3);
+}
+
+TEST_CASE("brim_vote k=1 makes uncapped mode a literal nearest-wall pick, immune to the near-tie min-extruder-id pathology (I1 fix)", "[chameleon]")
+{
+    // v2.2 final-review I1: nearest_wall's decision rule is "nearest wall segment wins
+    // outright, no projection" (spec C8) - a single winner, not a vote. The electorate:
+    // one sample of extruder 9 strictly nearest to p (1.0mm), and two samples of
+    // extruder 3 both farther (1.2mm each) - deliberately given the LOWER extruder id
+    // despite being farther, since brim_vote's tie-break chain bottoms out at
+    // std::min(winner_ext, runner_ext) (BrimFilament.cpp, after the object_area
+    // tie-break - both empty here). At k=3 (vote_params' default, what
+    // interface_wall_params/base_wall_params left k at before this fix) all three
+    // samples enter the knn electorate: extruder 3's two farther samples score
+    // 2 * 1/1.2^2 ~= 1.389 vs extruder 9's one nearer sample at 1/1.0^2 = 1.0 - within
+    // brim_vote's tie_dist_mm(0.3mm) of each other (|1.2-1.0| = 0.2mm), so the near-tie
+    // path fires regardless of which raw score is higher, and - with no object_area data
+    // for either extruder - falls straight to the LOWEST extruder id, returning
+    // extruder 3, the FARTHER wall. This is exactly what the spec/I1 forensics describe:
+    // "two samples of a farther wall outvote one sample of the strictly nearest wall...
+    // near-ties resolve to the LOWEST extruder id." At k=1 (the fix) the electorate is
+    // exactly one sample - the nearest one - so brim_vote's score map has a single entry
+    // and returns extruder 9 directly, before the tie-break chain (or the id ordering
+    // that poisons it) ever runs.
+    WallSampleIndex idx;
+    idx.add_polyline(segment(1.2, 0, 1.2, 0), 3, 1);    // wall 3, sample 1, farther (1.2mm) - LOWER id despite being farther
+    idx.add_polyline(segment(-1.2, 0, -1.2, 0), 3, 1);  // wall 3, sample 2, farther (1.2mm)
+    idx.add_polyline(segment(1.0, 0, 1.0, 0), 9, 2);    // wall 9, single sample, strictly nearest (1.0mm) - HIGHER id
+
+    const Point p(scale_(0), scale_(0));
+
+    SECTION("k=3 (pre-fix default): the near-tie min-extruder-id pathology reproduces")
+    {
+        BrimVoteParams params;
+        params.k = 3;
+        params.max_dist_mm = 0.0;
+        params.fallback_extruder = 99;
+        CHECK(brim_vote(idx, p, params) == 3); // WRONG per "nearest wins outright" - the bug I1 fixes
+    }
+
+    SECTION("k=1 (I1 fix, the params nearest_wall mode now actually uses): the literal nearest wall always wins")
+    {
+        BrimVoteParams params;
+        params.k = 1;
+        params.max_dist_mm = 0.0;
+        params.fallback_extruder = 99;
+        CHECK(brim_vote(idx, p, params) == 9); // correct: wall 9 is strictly nearest
+    }
 }

@@ -147,37 +147,67 @@ struct ProjectionLayerView {
 };
 
 // `layers` must already be ordered lowest band layer first (the same order
-// select_layers_in_band/select_contact_layers return). Finds the first (lowest) layer
-// that covers `p` (bbox-gated when the relevant bboxes are usable) - EITHER its raw
-// lslices, OR (v2.2 Task 2, spec C5) its expanded_lslices, the margin ring around them.
-// A raw hit is unchanged from v2.1: within it, the region whose slice polys contain p,
-// preferring one whose bottom polys ALSO contain p when more than one region's slices
-// contain p (first-contains-p wins otherwise, ties broken by ascending region index).
+// select_layers_in_band/select_contact_layers return). "SURFACE ABOVE WINS" (the
+// user-approved priority - see Print.cpp's chameleon_assign_support_interfaces) means
+// the LOWEST band layer whose RAW geometry genuinely contains p must win, full stop,
+// no matter what any OTHER layer's margin ring also happens to cover. v2.2 Task 2 (spec
+// C5) added the margin ring (expanded_lslices) as a rescue for samples the grown contact
+// polygon pushed outside all raw geometry (see PASS 2 below) - it is a fallback for when
+// NOTHING raw covers p anywhere in the band, never a way to jump the queue ahead of a
+// higher layer's real containment. This matters in practice: with the standard one-layer
+// top gap, a band's FIRST (lowest) layer is typically wall-only - it spans the z-gap
+// between the support top and the overhang bottom, so its raw lslices contain only the
+// laterally-adjacent wall, and the overhang body itself only starts one layer higher.
+// A wall-edge sample commonly lands just inside that first layer's 1.2mm+ ring (support
+// lines run close to walls) while also sitting squarely inside the overhang's raw slices
+// one layer up - if the ring were allowed to resolve on the lower layer, every such
+// sample would mis-color to the wall's extruder instead of the overhang's, inverting
+// "surface above wins" along every wall (v2.2 final-review C1). To make that impossible,
+// this function runs as two SEPARATE passes over all of `layers`, never interleaved:
 //
-// v2.2 Task 2 (spec C5): when no region's raw slice polys contain p - either because the
-// hit was only via expanded_lslices (a genuine margin-ring sample), or the pre-existing
-// degenerate case (a layer whose lslices cover p but whose per-region data doesn't,
-// previously treated as a miss for the whole layer) - the region whose raw slice polys
-// are NEAREST to p is picked instead, over ALL of this layer's regions (not just the
-// island that produced the hit). No separate distance threshold is enforced at this
-// step: the layer-level hit test above already established p is within the margin of
-// SOME geometry on this layer, so "nearest region" is simply "which region does that
-// nearby geometry belong to". Two-stage search, per region: (1) a cheap bbox-distance
-// lower bound (point-to-AABB, via get_extents on each of the region's raw polys) prunes
-// any region whose lower bound already can't beat the current best, without touching its
-// polygon; (2) only surviving regions get the exact-ish "distance to polygon" test
-// Slic3r already uses elsewhere (MultiPoint::distance_to - nearest-VERTEX distance over
-// contour + holes, not true nearest-edge distance; a documented, precedented
-// simplification, not a new one). This is a correct branch-and-bound nearest search (the
-// bbox distance is a real lower bound), not an approximation of "nearest" itself.
-// Determinism: regions are scanned in ascending index order and only a STRICTLY smaller
-// exact distance replaces the current best, so an exact tie is won by the lower region
-// index, deterministically, regardless of visitation-order edge cases. A region that
-// contributes no raw slice polys at all is never a candidate.
+// PASS 1 (raw containment; wins over PASS 2 unconditionally): scan every layer, lowest
+// first; the first layer whose raw lslices contain p (bbox-gated when the relevant
+// bboxes are usable) is picked and returned from - a higher layer's raw containment is
+// never even reached once a lower layer's raw hit resolves. Within that layer: the
+// region whose slice polys contain p, preferring one whose bottom polys ALSO contain p
+// when more than one region's slices contain p (first-contains-p wins otherwise, ties
+// broken by ascending region index) - unchanged from v2.1. If no region's raw slice
+// polys agree with the layer-level raw hit (a pre-existing degenerate case - the layer's
+// lslices cover p but its per-region data doesn't), the region whose raw slice polys are
+// NEAREST to p on that SAME layer is picked instead (see below) - this layer already won
+// PASS 1 on raw containment, so resolution stays on this layer, it does not fall through
+// to a higher one.
+//
+// PASS 2 (margin ring; only reached when PASS 1 found NOTHING): scan every layer again,
+// lowest first, this time testing expanded_lslices (the margin ring) instead of raw
+// lslices. The first layer whose ring covers p is picked, resolved via the nearest-
+// region search (below) over ALL of that layer's regions. Reaching PASS 2 at all already
+// means no band layer anywhere raw-contains p, so there is no raw-containment region
+// scan to redo here - a region's own raw slice polys are always a subset of its layer's
+// raw lslices, which PASS 1 has already established as a global miss.
+//
+// Nearest-region search (used both for PASS 1's same-layer degenerate case and for every
+// PASS 2 resolution): among the layer's regions, the one whose raw slice polys are
+// NEAREST to p, over ALL of this layer's regions (not just the island that produced the
+// hit). No separate distance threshold is enforced at this step: the layer-level hit
+// test already established p is within the margin of SOME geometry on this layer, so
+// "nearest region" is simply "which region does that nearby geometry belong to".
+// Two-stage search, per region: (1) a cheap bbox-distance lower bound (point-to-AABB,
+// via get_extents on each of the region's raw polys) prunes any region whose lower bound
+// already can't beat the current best, without touching its polygon; (2) only surviving
+// regions get the exact-ish "distance to polygon" test Slic3r already uses elsewhere
+// (MultiPoint::distance_to - nearest-VERTEX distance over contour + holes, not true
+// nearest-edge distance; a documented, precedented simplification, not a new one). This
+// is a correct branch-and-bound nearest search (the bbox distance is a real lower
+// bound), not an approximation of "nearest" itself. Determinism: regions are scanned in
+// ascending index order and only a STRICTLY smaller exact distance replaces the current
+// best, so an exact tie is won by the lower region index, deterministically, regardless
+// of visitation-order edge cases. A region that contributes no raw slice polys at all is
+// never a candidate.
 //
 // Returns false (out_layer/out_region left unwritten) when no band layer's raw or
-// expanded lslices cover p, or when a covering layer offers no region with any raw slice
-// geometry at all.
+// expanded lslices cover p, or when every covering layer (raw in PASS 1, ring in PASS 2)
+// offers no region with any raw slice geometry at all.
 bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView>& layers,
                                       const Point& p,
                                       size_t& out_layer, size_t& out_region);

@@ -633,29 +633,23 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &la
                                        const Point &p,
                                        size_t &out_layer, size_t &out_region)
 {
+    // PASS 1 (v2.2 final-review C1 fix): raw containment ONLY, lowest band layer first.
+    // This must run to completion over every layer before the margin ring (PASS 2,
+    // below) is ever consulted - a ring hit on a lower layer must never pre-empt genuine
+    // raw containment on a higher layer. See this function's own header comment for why
+    // that ordering matters (the first contact-band layer is typically wall-only).
     for (size_t li = 0; li < layers.size(); ++li) {
         const ProjectionLayerView &lv = layers[li];
-        const bool has_raw = lv.lslices != nullptr && !lv.lslices->empty();
-        if (!has_raw && lv.expanded_lslices.empty())
-            continue; // nothing on this layer at all, raw or margin-ring
+        if (lv.lslices == nullptr || lv.lslices->empty())
+            continue; // no raw geometry on this layer at all
+        if (!any_polygon_contains(*lv.lslices, lv.lslices_bboxes, p))
+            continue; // raw miss on this layer; try the next one (still within PASS 1)
 
-        bool layer_hit = has_raw && any_polygon_contains(*lv.lslices, lv.lslices_bboxes, p);
-
-        // v2.2 Task 2 (spec C5): a point only inside the MARGIN RING - raw miss, but
-        // covered by this layer's expanded_lslices - now also counts as a layer hit.
-        // Only checked when the raw test above didn't already settle it (cheaper, and
-        // the raw AABB gate above is strictly more precise anyway).
-        if (!layer_hit && !lv.expanded_lslices.empty())
-            layer_hit = any_polygon_contains(lv.expanded_lslices, &lv.expanded_lslices_bboxes, p);
-
-        if (!layer_hit)
-            continue; // neither raw nor margin-ring geometry on this band layer covers p
-
-        // Within the hit layer: the region whose own RAW slices contain p, preferring
-        // one with a bottom/bottom-bridge fill surface covering p when more than one
-        // region's slices contain p. First-contains-p wins the non-preferred case, so
-        // the outcome is a deterministic function of region order, not point order.
-        // Unchanged from v2.1 - the margin-ring case above never influences this scan.
+        // Within the raw-hit layer: the region whose own RAW slices contain p,
+        // preferring one with a bottom/bottom-bridge fill surface covering p when more
+        // than one region's slices contain p. First-contains-p wins the non-preferred
+        // case, so the outcome is a deterministic function of region order, not point
+        // order. Unchanged from v2.1.
         size_t chosen = lv.region_slice_polys.size(); // sentinel: none yet
         for (size_t r = 0; r < lv.region_slice_polys.size(); ++r) {
             bool slice_hit = false;
@@ -674,22 +668,45 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &la
             if (bottom_hit) { chosen = r; break; } // preferred tie-break wins outright
         }
 
-        // v2.2 Task 2 (spec C5): no region's raw slices directly contain p - either a
-        // genuine margin-ring sample, or the pre-existing degenerate case (this layer's
-        // lslices/expanded_lslices cover p, but no per-region data agrees). Both now
-        // resolve to the nearest region ON THIS SAME LAYER instead of treating the
-        // layer as a miss and scanning further (a deliberate v2.1 behavior change - see
-        // this function's header comment).
+        // Pre-existing degenerate case: this layer's lslices cover p, but no per-region
+        // slice data agrees. Resolve to the nearest region ON THIS SAME LAYER rather
+        // than treating the layer as a miss and scanning further - this layer already
+        // won PASS 1 on raw containment, so it keeps resolution, it does not fall
+        // through to a higher layer (documented, tested v2.1 behavior, unchanged here).
         if (chosen == lv.region_slice_polys.size())
             chosen = nearest_region_to_point(lv, p);
 
         if (chosen == lv.region_slice_polys.size())
-            continue; // this layer offers no region with any raw geometry at all; try the next one
+            continue; // this raw-hit layer offers no region with any raw geometry at all; try the next one
 
         out_layer  = li;
         out_region = chosen;
         return true;
     }
+
+    // PASS 2 (spec C5 margin ring): reached only when NO band layer's raw lslices
+    // contain p anywhere. Scan again, lowest first, this time testing the margin ring
+    // (expanded_lslices) - a rescue for samples the grown contact polygon pushed outside
+    // all raw geometry, never a way to out-rank a higher layer's real containment (PASS
+    // 1 already ruled that out globally). No raw-containment region scan is repeated
+    // here: a region's own raw slice polys are always a subset of its layer's raw
+    // lslices, which PASS 1 has already established as a miss on every layer.
+    for (size_t li = 0; li < layers.size(); ++li) {
+        const ProjectionLayerView &lv = layers[li];
+        if (lv.expanded_lslices.empty())
+            continue; // no margin-ring geometry on this layer at all
+        if (!any_polygon_contains(lv.expanded_lslices, &lv.expanded_lslices_bboxes, p))
+            continue; // ring miss on this layer; try the next one
+
+        size_t chosen = nearest_region_to_point(lv, p);
+        if (chosen == lv.region_slice_polys.size())
+            continue; // ring covers p but this layer offers no region with any raw geometry; try the next one
+
+        out_layer  = li;
+        out_region = chosen;
+        return true;
+    }
+
     return false;
 }
 

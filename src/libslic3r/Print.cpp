@@ -2906,13 +2906,33 @@ static void chameleon_assign_support_interfaces(Print &print)
                     // wall_union_idx, UNCAPPED: max_dist_mm explicitly left at 0 (brim_
                     // vote's own "0 = uncapped" convention, BrimVoteParams' default) -
                     // the nearest wall wins outright, no distance limit, "comparison
-                    // mode" per spec C8. Only fallback_extruder differs between the two
-                    // role params below.
+                    // mode" per spec C8.
+                    //
+                    // v2.2 final-review I1 fix: k = 1, also set explicitly below (both
+                    // role params - only fallback_extruder actually differs between
+                    // them). The mode's decision rule is "nearest wall segment wins
+                    // outright, no projection" (spec C8), not a weighted vote. Leaving k
+                    // at vote_params' default of 3 resurrected the v2.0-era 1/d^2-
+                    // weighted knn vote even though max_dist_mm = 0 skips the v2.1-I1
+                    // electorate filter entirely: two samples of a farther wall could
+                    // outvote one sample of the strictly nearest wall, and near-ties fell
+                    // back to the LOWEST extruder id - exactly the mechanisms the v2.1
+                    // forensics blamed for most of its wrong pairs, now contaminating
+                    // this mode's sole purpose (A/B attribution of nearest_surface's
+                    // color decisions). With k = 1 the knn electorate is a single sample
+                    // - brim_vote's score map has exactly one entry, so it returns that
+                    // sample's extruder directly (score.size() == 1 path), before any
+                    // tie-break logic runs. WallSampleIndex::knn's own tie order (nearest
+                    // by squared distance, ties broken by ascending (extruder,
+                    // object_key)) then makes an exact single-sample tie deterministic on
+                    // its own, with no vote involved.
                     BrimVoteParams interface_wall_params    = vote_params;
+                    interface_wall_params.k                 = 1;
                     interface_wall_params.max_dist_mm       = 0.0;
                     interface_wall_params.fallback_extruder = fallback_extruder;
 
                     BrimVoteParams base_wall_params    = vote_params;
+                    base_wall_params.k                 = 1;
                     base_wall_params.max_dist_mm       = 0.0;
                     base_wall_params.fallback_extruder = base_fallback_extruder;
 
