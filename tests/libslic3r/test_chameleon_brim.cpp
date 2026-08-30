@@ -459,6 +459,33 @@ TEST_CASE("split_polyline_by_resolver (LOOP): seam sector counted once when firs
     CHECK(runs.front().pts.front() == runs.back().pts.back());
 }
 
+TEST_CASE("seam-merged ring collapsing to ONE run via absorb is still closed (N1)", "[chameleon]")
+{
+    // v2.3 fix-rereview N1: seam merge fires (first/last runs same extruder), then
+    // absorb_short_runs swallows the only minority run (< min_run_mm) so the whole ring
+    // collapses to a single run. The merge buried the chain's closing vertex as an
+    // interior point, so without the single-run closure the run's endpoints are two
+    // merely-adjacent samples - a ~sample_mm unextruded wrap hole. Common for small
+    // tree rings that barely cross a color boundary.
+    auto resolver = [](const Point &pt) -> unsigned {
+        // tiny minority zone: ~1.2mm of arc near (0, R) votes extruder 2, rest 1
+        return (std::abs(unscale<double>(pt.x())) < 0.6 && unscale<double>(pt.y()) > 0.0)
+                   ? 2u : 1u;
+    };
+    const double R = 6.0;
+    Points ring = { Point(scale_(R), scale_(0)), Point(scale_(0), scale_(R)),
+                    Point(scale_(-R), scale_(0)), Point(scale_(0), scale_(-R)) };
+    BrimVoteParams p;
+    p.min_run_mm      = 2.0;   // > minority arc -> absorb collapses to one run
+    p.merge_ring_seam = true;
+    auto runs = split_polyline_by_resolver(ring, /*is_loop=*/true, resolver, p);
+    REQUIRE(runs.size() == 1);
+    CHECK(runs.front().extruder == 1);
+    // Closed ring: endpoints coincide (would FAIL pre-fix - adjacent samples instead).
+    REQUIRE(runs.front().pts.size() >= 3);
+    CHECK(runs.front().pts.front() == runs.front().pts.back());
+}
+
 TEST_CASE("split_polyline_by_resolver (LOOP): default merge_ring_seam=false leaves the ring seam UNMERGED (M4: Part 1 brim path stays byte-identical)", "[chameleon]")
 {
     // Same 4-sector ring/resolver as the C7 merge test above, but with a DEFAULT

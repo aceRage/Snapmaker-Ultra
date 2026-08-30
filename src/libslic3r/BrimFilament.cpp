@@ -242,14 +242,19 @@ std::vector<BrimRun> split_polyline_core(const Points &poly, bool is_loop,
     // never wraps back to 0). Left alone, every ring whose seam merge fires prints with
     // one ~sample_mm unextruded hole at the wrap boundary (spec/review finding I1).
     // Prepend runs.back()'s own last point to runs.front(), the SAME shared-boundary-
-    // vertex fixup the loop above applies to every linear pair, closing the ring. Guarded
-    // on runs.size() >= 2 (post absorb/guard, matching the loop above's own domain) -
-    // seam_merged can only be true when the pre-merge run count was >= 2, and
-    // absorb_short_runs/guard_max_runs only ever REDUCE the count, so runs.size() == 1
-    // here means every run (including the merged seam run) collapsed into one - already
-    // fully self-contained, nothing left to close.
-    if (seam_merged && runs.size() >= 2)
-        runs.front().pts.insert(runs.front().pts.begin(), runs.back().pts.back());
+    // vertex fixup the loop above applies to every linear pair, closing the ring.
+    // Single-run case (re-review N1): when absorb/guard collapse EVERYTHING into one run
+    // after the seam merge fired, that run's endpoints are two merely-ADJACENT chain
+    // samples (the seam merge buried the ring's true closing vertex as an interior
+    // point), so the ring still has one ~sample_mm wrap hole - close it by appending the
+    // run's own first point, the circular analogue of the shared-boundary fixup.
+    if (seam_merged) {
+        if (runs.size() >= 2)
+            runs.front().pts.insert(runs.front().pts.begin(), runs.back().pts.back());
+        else if (runs.size() == 1 && runs.front().pts.size() >= 2 &&
+                 runs.front().pts.front() != runs.front().pts.back())
+            runs.front().pts.push_back(runs.front().pts.front());
+    }
 
     return runs;
 }
