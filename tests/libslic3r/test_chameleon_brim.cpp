@@ -445,3 +445,139 @@ TEST_CASE("select_layers_in_band selects the coplanar (lo, hi] band; select_cont
     REQUIRE(narrow.size() == 1);
     CHECK(narrow[0] == 1);
 }
+
+// --- v2.1 Task 2: projection resolver pure geometric core -------------------
+
+static ExPolygon square_expoly(double cx, double cy, double half)
+{
+    return ExPolygon(Points{
+        Point(scale_(cx - half), scale_(cy - half)),
+        Point(scale_(cx + half), scale_(cy - half)),
+        Point(scale_(cx + half), scale_(cy + half)),
+        Point(scale_(cx - half), scale_(cy + half)),
+    });
+}
+
+static BoundingBox bbox_of(const ExPolygon &expoly) { return BoundingBox(expoly.contour.points); }
+
+TEST_CASE("chameleon_pick_projection_region picks the lowest band layer that covers p", "[chameleon]")
+{
+    // Two band layers, caller-ordered lowest first (index 0 = lowest), both with a
+    // single region whose slices cover the same 10x10 square -> p in both must still
+    // resolve to the LOWER layer (index 0), "surface above wins" only ever escalates
+    // to the next layer when the lower one misses (see the next test).
+    ExPolygons lower_lslices = { square_expoly(0, 0, 5) };
+    ExPolygons upper_lslices = { square_expoly(0, 0, 5) };
+
+    ProjectionLayerView lower, upper;
+    lower.lslices = &lower_lslices;
+    lower.region_slice_polys = { { &lower_lslices[0] } };
+    upper.lslices = &upper_lslices;
+    upper.region_slice_polys = { { &upper_lslices[0] } };
+
+    std::vector<ProjectionLayerView> layers = { lower, upper };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region));
+    CHECK(out_layer == 0);
+    CHECK(out_region == 0);
+}
+
+TEST_CASE("chameleon_pick_projection_region falls through to the upper band layer when the lower one misses", "[chameleon]")
+{
+    ExPolygons lower_lslices = { square_expoly(-20, 0, 5) };  // does NOT cover (0,0)
+    ExPolygons upper_lslices = { square_expoly(0, 0, 5) };    // does
+
+    ProjectionLayerView lower, upper;
+    lower.lslices = &lower_lslices;
+    lower.region_slice_polys = { { &lower_lslices[0] } };
+    upper.lslices = &upper_lslices;
+    upper.region_slice_polys = { { &upper_lslices[0] } };
+
+    std::vector<ProjectionLayerView> layers = { lower, upper };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region));
+    CHECK(out_layer == 1);
+    CHECK(out_region == 0);
+}
+
+TEST_CASE("chameleon_pick_projection_region prefers the region with a bottom-surface hint at p", "[chameleon]")
+{
+    // One layer, two overlapping regions both containing p; only region 1 has a
+    // stBottom/stBottomBridge fill surface covering p -> region 1 must win even
+    // though region 0 is encountered first.
+    ExPolygons lslices = { square_expoly(0, 0, 10) };
+    ExPolygons region0_slice = { square_expoly(0, 0, 10) };
+    ExPolygons region1_slice = { square_expoly(0, 0, 10) };
+    ExPolygons region1_bottom = { square_expoly(0, 0, 10) };  // covers p
+
+    ProjectionLayerView layer;
+    layer.lslices = &lslices;
+    layer.region_slice_polys = { { &region0_slice[0] }, { &region1_slice[0] } };
+    layer.region_bottom_polys = { {}, { &region1_bottom[0] } };  // region 0: no bottom hint
+
+    std::vector<ProjectionLayerView> layers = { layer };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region));
+    CHECK(out_layer == 0);
+    CHECK(out_region == 1);
+}
+
+TEST_CASE("chameleon_pick_projection_region returns false when no band layer's lslices cover p", "[chameleon]")
+{
+    ExPolygons lslices = { square_expoly(50, 50, 5) };  // far from the origin
+    ProjectionLayerView layer;
+    layer.lslices = &lslices;
+    layer.region_slice_polys = { { &lslices[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer };
+    size_t out_layer = 999, out_region = 999;
+    CHECK_FALSE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region));
+    // out params must be left untouched on a miss.
+    CHECK(out_layer == 999);
+    CHECK(out_region == 999);
+}
+
+TEST_CASE("chameleon_pick_projection_region is bbox-gated but still exact when bboxes are absent", "[chameleon]")
+{
+    ExPolygons lslices = { square_expoly(0, 0, 5) };
+    std::vector<BoundingBox> bboxes = { bbox_of(lslices[0]) };
+
+    ProjectionLayerView layer;
+    layer.lslices = &lslices;
+    layer.lslices_bboxes = &bboxes;
+    layer.region_slice_polys = { { &lslices[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer };
+    size_t out_layer = 999, out_region = 999;
+    // Inside both the bbox and the polygon.
+    REQUIRE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region));
+    CHECK(out_layer == 0);
+
+    // Outside the bbox entirely -> gated out (same result as the exact test would give,
+    // just cheaper).
+    out_layer = 999;
+    CHECK_FALSE(chameleon_pick_projection_region(layers, Point(scale_(50), scale_(50)), out_layer, out_region));
+}
+
+TEST_CASE("chameleon_pick_projection_region skips a layer whose lslices hit but no region slice does", "[chameleon]")
+{
+    // Degenerate/inconsistent input: lslices covers p but the (only) region's own
+    // slice polygon doesn't -> must NOT report a false hit on that layer; continues
+    // scanning and finds the next band layer instead of crashing or mis-resolving.
+    ExPolygons layer0_lslices = { square_expoly(0, 0, 10) };
+    ExPolygons layer0_region_slice = { square_expoly(-20, 0, 2) }; // doesn't cover (0,0)
+    ExPolygons layer1_lslices = { square_expoly(0, 0, 10) };
+    ExPolygons layer1_region_slice = { square_expoly(0, 0, 10) };  // does cover (0,0)
+
+    ProjectionLayerView layer0, layer1;
+    layer0.lslices = &layer0_lslices;
+    layer0.region_slice_polys = { { &layer0_region_slice[0] } };
+    layer1.lslices = &layer1_lslices;
+    layer1.region_slice_polys = { { &layer1_region_slice[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer0, layer1 };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region));
+    CHECK(out_layer == 1);
+    CHECK(out_region == 0);
+}

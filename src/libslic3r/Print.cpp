@@ -2343,6 +2343,23 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
 // uses (1-based config values), converted to the 0-based scheme used
 // throughout the chameleon-brim code (see task-3 report for the analysis).
 
+// Chameleon P2/P2.1: shared per-region "color" extruder derivation (0-based), factored
+// out of chameleon_collect_wall_samples' inline add_path lambda so chameleon_projection_
+// extruder (below) can reuse the exact same wall_filament/outer_wall_filament/object-
+// default chain instead of duplicating it. `is_external` is the erExternalPerimeter check
+// for a wall PATH; a projected surface sample has no such concept (see
+// chameleon_projection_extruder's own comment), so it always calls this with
+// is_external = false.
+static unsigned chameleon_region_extruder(const PrintRegionConfig &region_config, bool is_external,
+                                           unsigned own_extruder_0based)
+{
+    if (is_external && region_config.outer_wall_filament.value > 0)
+        return unsigned(region_config.outer_wall_filament.value - 1);
+    if (region_config.wall_filament.value > 0)
+        return unsigned(region_config.wall_filament.value - 1);
+    return own_extruder_0based;
+}
+
 static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const PrintRegionConfig& region_config,
                                             unsigned own_extruder_0based, const Point& shift,
                                             size_t object_key, WallSampleIndex& wall_idx)
@@ -2359,13 +2376,8 @@ static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const 
     auto add_path = [&](const ExtrusionPath& path) {
         if (path.polyline.points.empty())
             return;
-        unsigned extruder;
-        if (path.role() == erExternalPerimeter && region_config.outer_wall_filament.value > 0)
-            extruder = unsigned(region_config.outer_wall_filament.value - 1);
-        else if (region_config.wall_filament.value > 0)
-            extruder = unsigned(region_config.wall_filament.value - 1);
-        else
-            extruder = own_extruder_0based;
+        const unsigned extruder = chameleon_region_extruder(region_config,
+            path.role() == erExternalPerimeter, own_extruder_0based);
 
         Points shifted;
         shifted.reserve(path.polyline.points.size());
@@ -2383,6 +2395,107 @@ static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const 
         for (const ExtrusionPath& path : loop->paths)
             add_path(path);
     }
+}
+
+// Chameleon P2.1 (v2.1 spec: "vertical projection is primary" for interface entities;
+// see docs/superpowers/specs/2026-08-30-support-match-v2-design.md). For one 0.8mm
+// sample point p (object coordinates, no instance shift - same convention as
+// chameleon_collect_wall_samples above), resolve the extruder of the model surface
+// directly above it: the first (lowest) object layer in `band_layer_indices` - the
+// caller passes these LOWEST layer first, exactly the order
+// select_layers_in_band/select_contact_layers (BrimFilament.hpp) already return, e.g.
+// (support_top_z, support_top_z + 2.0] per spec - whose lslices cover p; within that
+// layer, the LayerRegion whose own `slices` contain p, preferring a region with an
+// stBottom/stBottomBridge `fill_surfaces` surface covering p when more than one region's
+// slices contain p (the surface facing the support below is the one whose color the
+// support should match). Returns false, leaving out_extruder unwritten, when no band
+// layer's lslices cover p - the caller (Task 3) then falls through to the lateral rule.
+//
+// The actual geometric selection (Layer/LayerRegion can't be built standalone - private/
+// protected ctors, PrintObject-owned storage - see the T2 report for why this couldn't
+// be unit-tested directly) is delegated to chameleon_pick_projection_region
+// (BrimFilament.hpp/.cpp), which is unit-tested with hand-built ExPolygons; this
+// function's own job is just the Layer/LayerRegion -> ProjectionLayerView glue below,
+// plus extruder resolution.
+//
+// Extruder resolution mirrors chameleon_collect_wall_samples' derivation via the shared
+// chameleon_region_extruder helper above: region wall_filament, then
+// object_default_extruder as the last resort. Unlike a wall PATH, a projected surface
+// sample has no erExternalPerimeter concept - "is this the region's external perimeter
+// path" doesn't apply to a bare fill surface - so outer_wall_filament is deliberately
+// never consulted here (chameleon_region_extruder is always called with
+// is_external = false); see the T2 report for this call.
+//
+// object_default_extruder is a plain parameter (not recomputed here via
+// chameleon_object_default_extruder, which needs Print::config() for its filament-count
+// sentinel) for the same reason chameleon_collect_wall_samples' own_extruder_0based is:
+// the caller computes it ONCE per object/support layer (chameleon_assign_support_
+// interfaces already does, at the object_default_extruder local above) rather than this
+// function recomputing it on every one of the many sample-point calls a single support
+// layer makes. This is a deliberate, minimal deviation from the plan's literal
+// (const PrintObject&, band, p, out_extruder) signature - see the T2 report.
+//
+// Perf: O(band layers x regions x islands) per call, and every container built below
+// (`view` and its per-region pointer vectors) holds ExPolygon POINTERS only, never
+// copies polygon geometry - see BrimFilament.hpp's ProjectionLayerView comment. Layer::
+// lslices_bboxes is precomputed once at slicing time (PrintObjectSlice.cpp), long before
+// this pass runs, so the AABB gate inside chameleon_pick_projection_region is free.
+[[maybe_unused]] static bool chameleon_projection_extruder(const PrintObject &object,
+                                                             const std::vector<size_t> &band_layer_indices,
+                                                             const Point &p,
+                                                             unsigned object_default_extruder,
+                                                             unsigned &out_extruder)
+{
+    const auto &layers = object.layers();
+
+    std::vector<ProjectionLayerView> view;
+    std::vector<const Layer *>       view_layers; // parallel to `view`, for extruder resolution after a hit
+    view.reserve(band_layer_indices.size());
+    view_layers.reserve(band_layer_indices.size());
+
+    for (size_t li : band_layer_indices) {
+        if (li >= layers.size())
+            continue; // defensive: bail on out-of-range input rather than crash
+        const Layer *layer = layers[li];
+        if (layer == nullptr)
+            continue;
+
+        ProjectionLayerView lv;
+        lv.lslices        = &layer->lslices;
+        lv.lslices_bboxes = &layer->lslices_bboxes;
+        lv.region_slice_polys.reserve(layer->regions().size());
+        lv.region_bottom_polys.reserve(layer->regions().size());
+        for (const LayerRegion *lr : layer->regions()) {
+            std::vector<const ExPolygon *> slice_polys;
+            std::vector<const ExPolygon *> bottom_polys;
+            if (lr != nullptr) {
+                for (const Surface &s : lr->slices.surfaces)
+                    slice_polys.push_back(&s.expolygon);
+                for (const Surface &s : lr->fill_surfaces.surfaces)
+                    if (s.is_bottom())
+                        bottom_polys.push_back(&s.expolygon);
+            }
+            lv.region_slice_polys.push_back(std::move(slice_polys));
+            lv.region_bottom_polys.push_back(std::move(bottom_polys));
+        }
+
+        view.push_back(std::move(lv));
+        view_layers.push_back(layer);
+    }
+
+    size_t hit_layer = 0, hit_region = 0;
+    if (!chameleon_pick_projection_region(view, p, hit_layer, hit_region))
+        return false; // no band layer's lslices cover p -> caller falls through to lateral
+
+    if (hit_layer >= view_layers.size())
+        return false; // defensive: cannot happen (hit_layer indexes `view`, built 1:1 with view_layers)
+    const LayerRegionPtrs &regions = view_layers[hit_layer]->regions();
+    if (hit_region >= regions.size() || regions[hit_region] == nullptr)
+        return false; // defensive: cannot happen (hit_region indexes the same regions() this view was built from)
+
+    const LayerRegion &lr = *regions[hit_region];
+    out_extruder = chameleon_region_extruder(lr.region().config(), /*is_external=*/false, object_default_extruder);
+    return true;
 }
 
 // BBS: map print object with its first layer's first extruder

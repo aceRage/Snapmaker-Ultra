@@ -435,6 +435,65 @@ std::vector<size_t> select_contact_layers(const std::vector<double> &print_zs,
     return select_layers_in_band(print_zs, support_top_z, support_top_z + gap_mm);
 }
 
+bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &layers,
+                                       const Point &p,
+                                       size_t &out_layer, size_t &out_region)
+{
+    for (size_t li = 0; li < layers.size(); ++li) {
+        const ProjectionLayerView &lv = layers[li];
+        if (lv.lslices == nullptr || lv.lslices->empty())
+            continue;
+
+        // Cheap AABB reject before the exact point-in-polygon test below. Only used
+        // when the bboxes are present and index-parallel to lslices (defensive: never
+        // crashes on mismatched/degenerate input, just skips straight to the exact test).
+        if (lv.lslices_bboxes != nullptr && lv.lslices_bboxes->size() == lv.lslices->size()) {
+            bool bbox_hit = false;
+            for (size_t k = 0; k < lv.lslices_bboxes->size() && !bbox_hit; ++k)
+                if ((*lv.lslices_bboxes)[k].contains(p))
+                    bbox_hit = true;
+            if (!bbox_hit)
+                continue;
+        }
+
+        bool layer_hit = false;
+        for (const ExPolygon &expoly : *lv.lslices)
+            if (expoly.contains(p)) { layer_hit = true; break; }
+        if (!layer_hit)
+            continue; // this band layer's islands don't cover p; try the next one
+
+        // Within the hit layer: the region whose own slices contain p, preferring one
+        // with a bottom/bottom-bridge fill surface covering p when more than one
+        // region's slices contain p. First-contains-p wins the non-preferred case, so
+        // the outcome is a deterministic function of region order, not point order.
+        size_t chosen = lv.region_slice_polys.size(); // sentinel: none yet
+        for (size_t r = 0; r < lv.region_slice_polys.size(); ++r) {
+            bool slice_hit = false;
+            for (const ExPolygon *poly : lv.region_slice_polys[r])
+                if (poly != nullptr && poly->contains(p)) { slice_hit = true; break; }
+            if (!slice_hit)
+                continue;
+
+            if (chosen == lv.region_slice_polys.size())
+                chosen = r; // first region containing p; kept unless a bottom-hit region beats it
+
+            bool bottom_hit = false;
+            if (r < lv.region_bottom_polys.size())
+                for (const ExPolygon *poly : lv.region_bottom_polys[r])
+                    if (poly != nullptr && poly->contains(p)) { bottom_hit = true; break; }
+            if (bottom_hit) { chosen = r; break; } // preferred tie-break wins outright
+        }
+
+        if (chosen == lv.region_slice_polys.size())
+            continue; // lslices covered p but no region's own slices did; try the next layer
+
+        out_layer  = li;
+        out_region = chosen;
+        return true;
+    }
+    return false;
+}
+
 size_t partition_support_entities(ExtrusionEntityCollection &support_fills, ExtrusionRole role_filter,
                                    unsigned fallback_extruder, const std::function<unsigned(const Point &)> &resolver,
                                    const BrimVoteParams &p, std::map<unsigned, ExtrusionEntityCollection> &out)

@@ -3,8 +3,11 @@
 #include "WallSampleIndex.hpp"
 #include "ExtrusionEntity.hpp"
 #include "ExtrusionEntityCollection.hpp"
+#include "ExPolygon.hpp"
+#include "BoundingBox.hpp"
 #include <functional>
 #include <map>
+#include <vector>
 namespace Slic3r {
 
 struct BrimVoteParams {
@@ -65,6 +68,45 @@ std::vector<size_t> select_layers_in_band(const std::vector<double>& print_zs,
 // Requires gap_mm > max layer height, else the direct contact layer itself is dropped.
 std::vector<size_t> select_contact_layers(const std::vector<double>& print_zs,
                                           double support_top_z, double gap_mm = 2.0);
+
+// v2.1 Task 2 (projection resolver): pure geometric core of Print.cpp's
+// chameleon_projection_extruder. Layer/LayerRegion can't be built standalone outside a
+// full slice (private/protected ctors, PrintObject-owned storage), so the point-in-band-
+// layer / region-preference selection is factored out here as a plain-data view over
+// ExPolygon POINTERS (no ownership, no copying - a LayerRegion's true storage is
+// SurfaceCollection, not a bare ExPolygons, so the caller collects `&surface.expolygon`
+// pointers per call; this stays cheap even though the helper below is invoked once per
+// 0.8mm sample point).
+struct ProjectionLayerView {
+    // This band layer's lslices (required - a null/empty pointer is a miss) and, in
+    // parallel (index i matches lslices[i]), each island's precomputed bbox for a cheap
+    // AABB gate before the exact point-in-polygon test. lslices_bboxes may be left
+    // null or size-mismatched to skip the gate (falls straight through to the exact
+    // test) - Layer::lslices_bboxes is populated at slicing time (PrintObjectSlice.cpp),
+    // well before this pass runs, so the common case is a free (already-computed) gate.
+    const ExPolygons*              lslices = nullptr;
+    const std::vector<BoundingBox>* lslices_bboxes = nullptr;
+    // Per LayerRegion on this layer (same indexing the caller will map back to an
+    // extruder): region_slice_polys[r] = pointers into that region's `slices` surfaces
+    // (any type - "this region's own shape"); region_bottom_polys[r] = pointers into
+    // its `fill_surfaces` surfaces that are stBottom/stBottomBridge only (the tie-break
+    // hint). Both may be empty for a region that contributes nothing.
+    std::vector<std::vector<const ExPolygon*>> region_slice_polys;
+    std::vector<std::vector<const ExPolygon*>> region_bottom_polys;
+};
+
+// `layers` must already be ordered lowest band layer first (the same order
+// select_layers_in_band/select_contact_layers return). Finds the first (lowest) layer
+// whose lslices cover `p` (bbox-gated when lslices_bboxes is usable); within it, the
+// region whose slice polys contain p, preferring one whose bottom polys ALSO contain p
+// when more than one region's slices contain p (first-contains-p wins otherwise, ties
+// broken by ascending region index). If a layer's lslices cover p but no region's own
+// slice polys do (degenerate/inconsistent data), that layer is skipped, not treated as
+// a hit - the scan continues to the next band layer. Returns false (out_layer/out_region
+// left unwritten) when no band layer's lslices cover p.
+bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView>& layers,
+                                      const Point& p,
+                                      size_t& out_layer, size_t& out_region);
 
 // Partition the `role_filter`-role entities of `support_fills`: `resolver` is
 // called per sample point (in place of a fixed WallSampleIndex knn vote) via
