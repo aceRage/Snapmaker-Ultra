@@ -101,6 +101,7 @@
 #include "../Utils/UndoRedo.hpp"
 #include "slic3r/Config/Snapshot.hpp"
 #include "Preferences.hpp"
+#include "PresetMirror.hpp"
 #include "Tab.hpp"
 #include "SysInfoDialog.hpp"
 #include "UpdateDialogs.hpp"
@@ -2966,6 +2967,14 @@ bool GUI_App::on_init_inner()
         enable_user_preset_folder(true);
     } else {
         enable_user_preset_folder(false);
+    }
+
+    // Ultra: one-way mirror the logged-in Bambu Studio user's custom print/filament presets into
+    // user\default\ BEFORE load_presets, so they are usable/visible here too. BS stays authoritative;
+    // manifest-tracked (protects fork-native presets, respects user deletions). Gated by a toggle.
+    if (app_config->get_bool("sync_bambu_user_presets")) {
+        std::string bs_uid = (m_agent && m_agent->is_user_login()) ? m_agent->get_user_id() : std::string();
+        mirror_bambu_user_presets(bs_uid);
     }
 
     // BBS if load user preset failed

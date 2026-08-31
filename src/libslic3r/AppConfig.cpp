@@ -342,6 +342,11 @@ void AppConfig::set_defaults()
         set_bool("sync_user_preset", false);
     }
 
+    // Ultra: mirror the logged-in Bambu Studio user's custom print/filament presets into this fork.
+    if (get("sync_bambu_user_presets").empty()) {
+        set_bool("sync_bambu_user_presets", true);
+    }
+
     if (get("keyboard_supported").empty()) {
         set("keyboard_supported", std::string("none/alt/control/shift"));
     }
