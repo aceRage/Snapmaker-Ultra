@@ -2879,6 +2879,13 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
             this->placeholder_parser().set("close_additional_fan_first_x_layers",new ConfigOptionInts(std::vector<int>(nf, 0)));
             this->placeholder_parser().set("additional_fan_full_speed_layer",    new ConfigOptionInts(std::vector<int>(nf, 1)));
             this->placeholder_parser().set("first_x_layer_fan_speed",            new ConfigOptionFloats(std::vector<double>(nf, 0.)));
+            // Ultra: per-filament nozzle-change (_nc) vars + wipe-tower center coords used via the
+            // [opt_key] placeholder syntax in change_filament (single-mapped: no real nozzle change,
+            // so 0 is inert; wipe_tower_center_pos_valid=false gates the center coords).
+            this->placeholder_parser().set("filament_pre_cooling_temperature_nc", new ConfigOptionInts(std::vector<int>(nf, 0)));
+            this->placeholder_parser().set("filament_retract_length_nc",          new ConfigOptionFloats(std::vector<double>(nf, 0.)));
+            this->placeholder_parser().set("wipe_tower_center_pos_x",             new ConfigOptionFloat(0.));
+            this->placeholder_parser().set("wipe_tower_center_pos_y",             new ConfigOptionFloat(0.));
         }
     }
 
