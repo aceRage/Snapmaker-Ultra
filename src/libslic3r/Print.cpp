@@ -1,8 +1,11 @@
 #include "Config.hpp"
 #include "Exception.hpp"
 #include "Print.hpp"
+#include <cstdlib>
+#include <cstdio>
 #include "BoundingBox.hpp"
 #include "Brim.hpp"
+#include "BrimFilament.hpp"
 #include "ClipperUtils.hpp"
 #include "Extruder.hpp"
 #include "Flow.hpp"
@@ -26,10 +29,12 @@
 #include <limits>
 #include <unordered_set>
 #include <boost/filesystem/path.hpp>
+#include <boost/filesystem/operations.hpp>
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/regex.hpp>
 #include <boost/nowide/fstream.hpp>
+#include <boost/nowide/cstdio.hpp>
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -786,9 +791,33 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             || opt_key == "purge_in_prime_tower"
             || opt_key == "z_offset"
             || opt_key == "support_multi_bed_types"
+            // Chameleon brim: changes which extruder each brim run prints under
+            // (Print::process's psSkirtBrim partition pass) and, when it fires, which
+            // extruders psWipeTower's ToolOrdering must know about for layer 0 - both
+            // steps need to rerun together, same as the other options in this branch.
+            || opt_key == "brim_filament_source"
             ) {
             steps.emplace_back(psWipeTower);
             steps.emplace_back(psSkirtBrim);
+            // Chameleon P2: chameleon_assign_support_interfaces (Print.cpp ~2434) gates
+            // the interface-partition pass off for ByObject sequence, but a prior ByLayer
+            // pass may have already partitioned support_fills / populated
+            // SupportLayer::interface_by_extruder. Toggling print_sequence alone doesn't
+            // undo that - the stale partitions survive on the still-valid SupportLayers
+            // and keep flowing into ToolOrdering + GCode emission even though the gate
+            // says the feature should be off. Force posSupportMaterial to re-run (in
+            // either direction) for any object opted into cross-extruder matching
+            // (v2.6: support_filament_matching is a plain bool now - the gate below is
+            // `.value`, so this check mirrors it), so fresh layers are generated and the
+            // gate's decision actually takes effect. Only objects that opted in
+            // are checked; other objects on mixed plates are over-invalidated as a result
+            // (osteps applies to all objects below), which is accepted rather than
+            // threading a per-object condition through the loop.
+            if (opt_key == "print_sequence"
+                && std::any_of(m_objects.begin(), m_objects.end(), [](const PrintObject *object) {
+                       return object->config().support_filament_matching.value;
+                   }))
+                osteps.emplace_back(posSupportMaterial);
         } else if (opt_key == "filament_soluble"
                 || opt_key == "filament_is_support"
                 || opt_key == "independent_support_layer_height"
@@ -2311,6 +2340,481 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
     return bbox;
 }
 
+// ============================================================================
+// CHAMELEON_DEBUG diagnostic logging (v2.5c, support-match pass instrumentation)
+// ============================================================================
+// Purpose: discriminate why a color's bucket never forms at a given support layer -
+// see docs/superpowers/sdd/2026-08-29-support-interface-match/progress.md's v2.5a
+// section and the round-4 GUI refutation this instruments for (white claw supports
+// painting teal even though the max-2 trim never fires there - so either the k=1
+// nearest-wall vote never samples a white wall at that layer, or the min-benefit gate
+// kills the (tiny) claw bucket anyway).
+//
+// GUI slicing runs on a background thread whose BOOST_LOG_TRIVIAL output does not
+// reliably land in the GUI's own log sink (Part 1's own hard-won lesson - the file sink
+// wired up by set_log_path_and_level, utils.cpp, is not guaranteed to see every
+// background-thread message on a GUI slice the way a CLI run does), so this writes
+// directly to its own file via fopen-append instead of routing through
+// BOOST_LOG_TRIVIAL - boost::nowide::fopen, the same idiom GCode.cpp/GCodeReader.cpp/
+// GCodeProcessor.cpp already use elsewhere in this codebase for exactly this "open,
+// write, close" pattern (never held open across calls, so a crash mid-slice never loses
+// buffered-but-unflushed lines).
+//
+// Gate: chameleon_debug_enabled() reads getenv("CHAMELEON_DEBUG") exactly ONCE
+// (function-local static). chameleon_assign_support_interfaces reads this ONCE per
+// pass invocation into a local bool and threads that bool through every call site
+// below it - nothing past that one getenv call runs when the env var is unset (every
+// logging/formatting call below is behind `if (chameleon_debug_on)`; WallSampleIndex::
+// add_polyline's own sample_count_out and apply_bucket_caps' own debug_out stay
+// nullptr, so their own instrumentation is a no-op pointer compare too - see each
+// function's own header comment).
+//
+// Log destination: <data_dir()>/log/chamdbg_support.log (data_dir() resolves to
+// %APPDATA%\Snapmaker_Orca on Windows - see utils.cpp's set_log_path_and_level for the
+// same log/ subfolder convention this mirrors). Appended to, never truncated - a fresh
+// run's lines simply accumulate after any earlier run's; plain text, one record per
+// line, never rotated or size-capped (diagnostic tool, not a production log stream).
+//
+// Line format - every value is a single token with no embedded whitespace, so a line
+// splits cleanly into `key=value` fields on whitespace:
+//   obj=<ordinal> print_z=<mm> height=<mm> fallback=<extruder> base_fallback=<extruder>
+//   free_windowed=<id,id,...> free_strict=<id,id,...> base_cast_mm=<mm>
+//   contact_layers=<li,li,...> coplanar_layers=<li,li,...>
+//   band_samples=<li:e<id>=<count>,e<id>=<count>;li:...>
+//   coplanar_samples=<li:e<id>=<count>,e<id>=<count>;li:...>
+//   proj_hits=<n> proj_misses=<n> proj_hits_base=<n> proj_misses_base=<n>
+//   buckets=<e<id>:before=<mm>,after=<mm>,outcome=<kept|kept_exempt|gated|trimmed>,redirect=<id|none>;...>
+// v2.5d: band_samples/coplanar_samples replace the old single wall_samples= field -
+// band_samples is the union (contact-band + coplanar) index interface/ironing vote
+// against, unchanged in content/meaning from the old field; coplanar_samples is the
+// NEW coplanar-only index base votes against (root cause fix below) - see
+// chameleon_assign_support_interfaces' band_idx/coplanar_wall_idx declaration comment
+// for why base needed its own, narrower electorate.
+// v2.5e: proj_hits/proj_misses count every projection lookup this layer
+// (chameleon_assign_support_interfaces' projection_lookup local, threaded through
+// BrimFilament.hpp's chameleon_build_support_resolvers) - hit = the model surface
+// directly above the sample resolved it (projection-first won); miss = the sample fell
+// through to its role's own nearest-wall vote instead. Originally an interface/ironing-
+// only signal (base had no projection branch yet). v2.5e review M3 flagged that even
+// then, interface and ironing lookups landed in this ONE shared pair with no way to
+// tell which role contributed which count (both roles call the identical resolver, see
+// ChameleonSupportResolvers::ironing_resolver's own comment) - noted as cosmetic/
+// documentation-level, not fixed at the time.
+// v2.5f: base now ALSO tries projection first (chameleon_build_support_resolvers,
+// BrimFilament.hpp/.cpp - see that function's decision-rule comment), through the SAME
+// shared projection_lookup, so proj_hits/proj_misses now count ALL THREE roles combined
+// - widening, not just carrying forward, the v2.5e review M3 note above. Fixed the
+// base-vs-(interface+ironing) half of that conflation while extending the field (the
+// discriminator this task actually needs - "is base's new projection branch engaging"):
+// proj_hits_base/proj_misses_base (new fields, this line) isolate base's own share via
+// a before/after snapshot of the same shared counters taken around base's own
+// partition_support_entities call (chameleon_assign_support_interfaces' own per-layer
+// loop is a plain sequential `for`, not a tbb::parallel_for, so the snapshot cannot
+// race - see that loop's own comment at the snapshot site). proj_hits/proj_misses minus
+// proj_hits_base/proj_misses_base is therefore interface+ironing's own combined share -
+// the M3 conflation between THOSE two specifically is left as-is (still cosmetic: they
+// share one resolver by design, "ironing follows its interface", so a reader who wants
+// them apart would need chameleon_build_support_resolvers' projection_lookup seam to
+// learn about roles, which its own header comment explicitly says it has no reason to
+// do). Always 0/0/0/0 on a zero-sample layer (the engine calls, and therefore every
+// resolver, never run).
+// v2.5g: base_cast_mm is this support layer's own base projection depth limit
+// (chameleon_base_cast_mm, BrimFilament.hpp/.cpp - min(kBaseCastMaxMm, kBaseCastMaxLayers
+// * representative object layer height); see that function's own header comment for the
+// "which layer height" choice). Computed and logged unconditionally, even on a zero-
+// sample layer (it depends only on contact_idx's own leading layer heights, not on
+// band_idx/coplanar_wall_idx having any samples) - cheap (at most 4 double reads), and
+// aids exactly the next GUI round's diagnosis the same way every other per-layer field
+// here does: a VLH plate's base_cast_mm sequence directly shows whether the layer-count
+// or the 1.0mm ceiling is binding at each height.
+// (any list-valued field is empty-after-`=` when that set/vector/map is empty - e.g.
+// "free_strict=" means no extruder is strictly free at this layer). One line per
+// support layer of a mode-active object that reaches this pass' own per-layer body
+// (i.e. every layer NOT skipped by the plate guard or the chameleon_interface_visited
+// re-run guard - see chameleon_assign_support_interfaces' own per-layer loop for both -
+// including a zero-sample layer, whose line has an empty wall_samples/buckets tail:
+// "a contact/coplanar band was selected here but nothing in it sampled at all" IS the
+// signal that discriminates mechanism (a) from a normal gate/vote outcome). A per-
+// object "SUMMARY " line (field-for-field mirror of the existing BOOST_LOG_TRIVIAL info
+// line further down this file) is appended once per object, after its last per-layer
+// line - see that BOOST_LOG_TRIVIAL call site's own comment for why this duplicate
+// exists.
+static bool chameleon_debug_enabled()
+{
+    static const bool enabled = (std::getenv("CHAMELEON_DEBUG") != nullptr);
+    return enabled;
+}
+
+static void chameleon_debug_log(const std::string &line)
+{
+    boost::filesystem::path log_dir = boost::filesystem::path(data_dir()) / "log";
+    boost::system::error_code ec;
+    if (!boost::filesystem::exists(log_dir, ec))
+        boost::filesystem::create_directories(log_dir, ec); // best-effort - the fopen below just fails (and is skipped) if this didn't work
+    boost::filesystem::path log_path = log_dir / "chamdbg_support.log";
+    FILE *f = boost::nowide::fopen(log_path.string().c_str(), "a");
+    if (f == nullptr)
+        return;
+    fputs(line.c_str(), f);
+    fputc('\n', f);
+    fclose(f);
+}
+
+static std::string chameleon_debug_format_mm(double v)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f", v);
+    return std::string(buf);
+}
+
+static std::string chameleon_debug_format_ids(const std::set<unsigned> &ids)
+{
+    std::string out;
+    for (unsigned id : ids) {
+        if (!out.empty())
+            out += ',';
+        out += std::to_string(id);
+    }
+    return out;
+}
+
+static std::string chameleon_debug_format_indices(const std::vector<size_t> &indices)
+{
+    std::string out;
+    for (size_t i : indices) {
+        if (!out.empty())
+            out += ',';
+        out += std::to_string(i);
+    }
+    return out;
+}
+
+// per_layer: (band layer index -> per-extruder inserted-sample count), one entry per
+// li visited by chameleon_assign_support_interfaces' union_layer_indices loop - see
+// that call site's own comment for how this is built.
+static std::string chameleon_debug_format_wall_samples(
+    const std::vector<std::pair<size_t, std::map<unsigned, size_t>>> &per_layer)
+{
+    std::string out;
+    for (const auto &entry : per_layer) {
+        if (!out.empty())
+            out += ';';
+        out += "li" + std::to_string(entry.first) + ":";
+        bool first = true;
+        for (const auto &kv : entry.second) {
+            if (!first)
+                out += ',';
+            out += "e" + std::to_string(kv.first) + "=" + std::to_string(kv.second);
+            first = false;
+        }
+    }
+    return out;
+}
+
+static std::string chameleon_debug_format_buckets(const std::vector<ChameleonBucketDebugEntry> &entries)
+{
+    std::string out;
+    for (const ChameleonBucketDebugEntry &e : entries) {
+        if (!out.empty())
+            out += ';';
+        out += "e" + std::to_string(e.extruder)
+             + ":before=" + chameleon_debug_format_mm(e.length_before_mm)
+             + ",after=" + chameleon_debug_format_mm(e.length_after_mm)
+             + ",outcome=" + e.outcome
+             + ",redirect=" + (e.redirected_into >= 0 ? std::to_string(e.redirected_into) : std::string("none"));
+    }
+    return out;
+}
+
+// Chameleon brim: walk one LayerRegion's perimeters (recursing into nested
+// collections and unwrapping loops/multipaths to their leaf paths), adding
+// every wall sample - shifted into plate coordinates - to wall_idx. The
+// per-path extruder follows the same override rules PrintRegion::extruder()
+// uses (1-based config values), converted to the 0-based scheme used
+// throughout the chameleon-brim code (see task-3 report for the analysis).
+
+// Chameleon P2/P2.1: per-region "color" extruder derivation (0-based) for a WALL path -
+// wall_filament, then outer_wall_filament for the external perimeter. `is_external` is
+// the erExternalPerimeter check for a wall PATH. Used by chameleon_collect_wall_samples'
+// add_path lambda below (both the Part 1 brim wall index and the v2.1 coplanar lateral
+// wall index feed off it). v2.1 final-review I3 fix: the projection (vertical-surface)
+// path does NOT reuse this chain any more - a projected surface sample has no
+// erExternalPerimeter concept and prints with the region's solid_infill_filament, not
+// wall_filament - see chameleon_projection_region_extruder's own comment below for that
+// derivation.
+//
+// v2.3 Task 2 (spec C8, root cause 6): calls PrintRegion::extruder() (PrintRegion.cpp:
+// 18-29) directly instead of re-reading the raw wall_filament/outer_wall_filament config
+// values by hand - a PrintRegion is reachable at every call site below (LayerRegion::
+// region()), so this can never drift from the engine's own outer_wall_filament>0?outer:
+// wall selection. extruder() never returns 0 for frExternalPerimeter/frPerimeter:
+// wall_filament has config min=1 (PrintConfig.cpp) and painted regions always set it
+// explicitly too (PrintApply.cpp:826-833) - outer_wall_filament's own min=0 is a REAL
+// sentinel ("0 = follow walls"), already handled by extruder()'s internal ternary, not a
+// gap. So the old own_extruder_0based fallback (reached only if wall_filament.value was
+// <= 0, which config guarantees never happens) was unreachable dead code - removed here
+// and threaded out of chameleon_collect_wall_samples/its three call sites below, since it
+// no longer has anything to feed.
+static unsigned chameleon_region_extruder(const PrintRegion &region, bool is_external)
+{
+    // v2.3 final-review M5 fix: defensive clamp against a hand-edited/legacy profile that
+    // violates wall_filament's documented config min=1 and lets extruder() return 0 here -
+    // well-formed configs can never reach this (min=1 confirmed at PrintConfig.cpp:3498,
+    // painted regions always set it too, PrintApply.cpp:826-833), so this is pure defense-
+    // in-depth, not a live bug. Without it the raw `- 1` (unsigned arithmetic) underflows
+    // to 0xFFFFFFFF and that garbage value is used DIRECTLY as a bucket key/extruder id -
+    // unlike the engine's own `- 1` sites (e.g. LayerRegion.cpp:151's this->extruder(role)
+    // - 1), which feed ConfigOptionVector::get_at(), whose own underflow clamp silently
+    // falls back to the 0th element (get_at's documented behavior, cited in that same
+    // comment). std::max(1u, ...) buys back that same old own-extruder-fallback failure
+    // mode here, for free, since chameleon has no get_at() call in this path to clamp it.
+    return std::max(1u, region.extruder(is_external ? frExternalPerimeter : frPerimeter)) - 1;
+}
+
+// CHAMELEON_DEBUG (v2.5c diagnostic instrumentation): `sample_count_out`, when non-
+// null, is threaded straight through to every WallSampleIndex::add_polyline call below
+// (including the two recursive self-calls, so a nested collection's paths are counted
+// too) - see that function's own header comment (WallSampleIndex.hpp) for the per-
+// extruder accumulation this ultimately feeds. Default nullptr: every pre-v2.5c call
+// site is unaffected.
+static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const PrintRegion& region,
+                                            const Point& shift, size_t object_key, WallSampleIndex& wall_idx,
+                                            std::map<unsigned, size_t>* sample_count_out = nullptr)
+{
+    if (entity == nullptr)
+        return;
+    if (entity->is_collection()) {
+        const auto* coll = static_cast<const ExtrusionEntityCollection*>(entity);
+        for (const ExtrusionEntity* child : coll->entities)
+            chameleon_collect_wall_samples(child, region, shift, object_key, wall_idx, sample_count_out);
+        return;
+    }
+
+    auto add_path = [&](const ExtrusionPath& path) {
+        if (path.polyline.points.empty())
+            return;
+        const unsigned extruder = chameleon_region_extruder(region, path.role() == erExternalPerimeter);
+
+        Points shifted;
+        shifted.reserve(path.polyline.points.size());
+        for (const Point& pt : path.polyline.points)
+            shifted.push_back(pt + shift);
+        wall_idx.add_polyline(shifted, extruder, object_key, /*spacing_mm=*/0.8, sample_count_out);
+    };
+
+    if (const auto* path = dynamic_cast<const ExtrusionPath*>(entity)) {
+        add_path(*path);
+    } else if (const auto* multipath = dynamic_cast<const ExtrusionMultiPath*>(entity)) {
+        for (const ExtrusionPath& path : multipath->paths)
+            add_path(path);
+    } else if (const auto* loop = dynamic_cast<const ExtrusionLoop*>(entity)) {
+        for (const ExtrusionPath& path : loop->paths)
+            add_path(path);
+    }
+}
+
+// Chameleon P2.1 v2.1 final-review I3 fix: the projection branch resolves the PRINTED
+// filament of a projected surface sample, which is NOT the same question
+// chameleon_region_extruder answers for a wall path. The surface the support interface
+// touches is the model's bottom shell, and the pipeline prints that shell with the
+// region's solid_infill_filament (ToolOrdering.cpp's LayerTools::solid_infill_filament /
+// PrintRegion::extruder(frSolidInfill|frTopSolidInfill), PrintRegion.cpp:18-35), not
+// wall_filament - painted regions set wall/solid/sparse together so the two only diverge
+// under a manual filament mapping (wall_filament != solid_infill_filament), exactly the
+// mismatch this feature exists to remove. wall_filament/outer_wall_filament are NEVER
+// consulted here - those stay chameleon_region_extruder's job, unchanged, for the LATERAL
+// (wall-sample) path only.
+//
+// v2.3 Task 2 (spec C8, root cause 6): calls PrintRegion::extruder(frSolidInfill)
+// directly (PrintRegion.cpp:18-29) - a PrintRegion is reachable at the one call site
+// below (LayerRegion::region()) - instead of the old hand-rolled "solid_infill_filament
+// if set, else sparse_infill_filament" read. That raw read MISSED a real engine
+// behavior: PrintRegion::extruder(frSolidInfill) routes through sparse_infill_filament
+// whenever this region's sparse_infill_density == 100% (internal_solid_infill_uses_
+// sparse_filament, PrintRegion.cpp:10-13) - REGARDLESS of whether solid_infill_filament
+// is also set (it always is, see below), because the engine actually prints that
+// region's solid infill using sparse_infill_filament in that case. The old code's
+// "solid, else sparse" fallback chain only ever took the sparse branch when
+// solid_infill_filament read as 0, which - now that extruder() is called directly -
+// never happens anyway: both options have config min=1 (PrintConfig.cpp) and painted
+// regions always set both explicitly too (PrintApply.cpp:826-833), so the old
+// own_extruder_0based last-resort fallback (reached only if BOTH read <= 0) was also
+// unreachable dead code. Both issues are fixed by routing through the one canonical
+// PrintRegion::extruder() call instead of re-deriving its logic by hand.
+// v2.4 (spec A): this function and the two below it (chameleon_build_projection_views,
+// chameleon_projection_extruder_from_view) were nearest_surface's own vertical-
+// projection resolver glue; v2.4 deleted nearest_surface's only caller
+// (chameleon_assign_support_interfaces' else-arm) but deliberately did NOT delete
+// these - kept as v2.5 upward-cast scaffolding for IRONING + TOP INTERFACES (see
+// docs/superpowers/specs/2026-08-30-support-match-v24-design.md's "E. Non-changes"
+// section). v2.5e (this task): LIVE again - chameleon_assign_support_interfaces' own
+// projection_lookup lambda (see that function's per-layer loop) calls
+// chameleon_projection_extruder_from_view below, which calls this. ProjectionLayerView
+// (BrimFilament.hpp), chameleon_pick_projection_region (BrimFilament.hpp/.cpp), and
+// their existing unit tests needed no changes for this - only their CALLER was ever
+// missing.
+static unsigned chameleon_projection_region_extruder(const PrintRegion &region)
+{
+    // v2.3 final-review M5 fix: same defensive underflow clamp as
+    // chameleon_region_extruder above, and for the same reason - solid_infill_filament/
+    // sparse_infill_filament both have config min=1 (well-formed configs never reach 0
+    // here), but chameleon reads the raw `- 1` directly as a bucket key/extruder id with
+    // no get_at()-style clamp downstream to catch a hand-edited/legacy profile's 0.
+    return std::max(1u, region.extruder(frSolidInfill)) - 1;
+}
+
+// v2.2 Task 2 (spec C5, root cause 4): mirrors Support/SupportMaterial.cpp:57's
+// `#define SUPPORT_MATERIAL_MARGIN 1.2` - the margin the support generator itself grows
+// interface CONTACT polygons by beyond the overhang (root cause 4: "interface contact
+// polygons are grown up to SUPPORT_MATERIAL_MARGIN (1.2mm) + support_expansion beyond
+// the overhang, so samples over small features [...] land outside lslices"). That
+// #define is file-local (never exported via a header), so this is a deliberate VALUE
+// mirror, not a shared symbol - and deliberately NOT named `SUPPORT_MATERIAL_MARGIN`
+// itself, because two other unrelated same-named macros already exist in this codebase
+// and neither is the one this margin story is about: PrintObject.cpp:4421 #defines the
+// same name to the same value (1.2) for a completely different purpose (bridge-edge
+// removal, remove_bridges_from_contacts); Support/SupportCommon.cpp:39's own same-named
+// macro is 1.5, a different margin for a different purpose (its own bridge-edge/loop-
+// line offsetting). Giving this one a distinct name avoids ever confusing it with either.
+static constexpr double CHAMELEON_PROJECTION_MARGIN_MM = 1.2;
+
+// Chameleon P2.1 v2.1 final-review M1 fix: build the ProjectionLayerView list for a
+// projection band ONCE per support layer instead of once per 0.8mm sample point. Layer/
+// LayerRegion can't be built standalone (private/protected ctors, PrintObject-owned
+// storage - see the T2 report), so the geometric selection itself stays delegated to
+// chameleon_pick_projection_region (BrimFilament.hpp/.cpp, unit-tested with hand-built
+// ExPolygons); this function is just the Layer/LayerRegion -> ProjectionLayerView glue,
+// now factored out of the per-sample resolver so the caller (chameleon_assign_support_
+// interfaces) can call it once per support layer and capture the result by reference in
+// its interface_resolver lambda. `band_layer_indices` must already be ordered lowest
+// layer first (the order select_layers_in_band/select_contact_layers return). Every
+// container this builds (`out_view` and its per-region pointer vectors) holds ExPolygon
+// POINTERS only, never copies polygon geometry - see BrimFilament.hpp's
+// ProjectionLayerView comment. `out_view_layers` is parallel to `out_view` (same index),
+// kept for extruder resolution after chameleon_pick_projection_region reports a hit.
+//
+// v2.2 Task 2 (spec C5): also builds each layer's expanded_lslices/expanded_lslices_
+// bboxes here - ONCE per band layer, same hoisting rationale as the rest of this view.
+// Offset amount is CHAMELEON_PROJECTION_MARGIN_MM + this object's own support_expansion
+// (mirrors the support generator's own contact-polygon growth - see
+// Support/SupportMaterial.cpp:1395's xy_expansion, added to the same margin). Unlike
+// lslices/region_slice_polys above, expanded_lslices IS a copy (offset_ex produces new
+// geometry, not aliased storage), so this is the one part of the view that isn't free.
+// v2.5e: LIVE - called once per support layer from chameleon_assign_support_interfaces'
+// per-layer loop, over `contact_idx` (the contact-band layers only, mirroring
+// nearest_surface's pre-v2.4 own `band_layer_indices` argument here); see
+// chameleon_projection_region_extruder's own banner comment above.
+static void chameleon_build_projection_views(const PrintObject &object,
+                                              const std::vector<size_t> &band_layer_indices,
+                                              std::vector<ProjectionLayerView> &out_view,
+                                              std::vector<const Layer *> &out_view_layers)
+{
+    const auto &layers = object.layers();
+    const float margin_scaled = float(scale_(CHAMELEON_PROJECTION_MARGIN_MM + object.config().support_expansion.value));
+
+    out_view.clear();
+    out_view_layers.clear();
+    out_view.reserve(band_layer_indices.size());
+    out_view_layers.reserve(band_layer_indices.size());
+
+    for (size_t li : band_layer_indices) {
+        if (li >= layers.size())
+            continue; // defensive: bail on out-of-range input rather than crash
+        const Layer *layer = layers[li];
+        if (layer == nullptr)
+            continue;
+
+        ProjectionLayerView lv;
+        lv.lslices        = &layer->lslices;
+        lv.lslices_bboxes = &layer->lslices_bboxes;
+
+        // v2.2 Task 2 (spec C5): margin-ring geometry for this band layer, computed
+        // once here rather than once per sample point (see the function comment).
+        lv.expanded_lslices = offset_ex(layer->lslices, margin_scaled);
+        lv.expanded_lslices_bboxes.reserve(lv.expanded_lslices.size());
+        for (const ExPolygon &expoly : lv.expanded_lslices)
+            lv.expanded_lslices_bboxes.push_back(get_extents(expoly));
+
+        lv.region_slice_polys.reserve(layer->regions().size());
+        lv.region_bottom_polys.reserve(layer->regions().size());
+        for (const LayerRegion *lr : layer->regions()) {
+            std::vector<const ExPolygon *> slice_polys;
+            std::vector<const ExPolygon *> bottom_polys;
+            if (lr != nullptr) {
+                for (const Surface &s : lr->slices.surfaces)
+                    slice_polys.push_back(&s.expolygon);
+                for (const Surface &s : lr->fill_surfaces.surfaces)
+                    if (s.is_bottom())
+                        bottom_polys.push_back(&s.expolygon);
+            }
+            lv.region_slice_polys.push_back(std::move(slice_polys));
+            lv.region_bottom_polys.push_back(std::move(bottom_polys));
+        }
+
+        out_view.push_back(std::move(lv));
+        out_view_layers.push_back(layer);
+    }
+}
+
+// Chameleon P2.1 (v2.1 spec: "vertical projection is primary" for interface entities;
+// see docs/superpowers/specs/2026-08-30-support-match-v2-design.md). For one 0.8mm
+// sample point p (object coordinates, no instance shift - same convention as
+// chameleon_collect_wall_samples above), resolve the extruder of the model surface
+// directly above it, against an ALREADY-BUILT `view`/`view_layers` pair (v2.1
+// final-review M1 fix: chameleon_build_projection_views above builds these once per
+// support layer; this function no longer builds anything, so it's cheap to call once per
+// sample point as before). Returns false, leaving out_extruder unwritten, when no band
+// layer's lslices cover p - the caller (Task 3) then falls through to the lateral rule.
+//
+// Extruder resolution: v2.1 final-review I3 fix - chameleon_projection_region_extruder
+// above (routes through PrintRegion::extruder(frSolidInfill), v2.3 Task 2 spec C8), NOT
+// chameleon_region_extruder (wall_filament-based; still used unchanged by the lateral/
+// wall-sample path). A projected surface sample has no erExternalPerimeter concept
+// either way - "is this the region's external perimeter path" doesn't apply to a bare
+// fill surface - so outer_wall_filament was never, and is still never, consulted here.
+//
+// v2.3 Task 2 (spec C8): the object_default_extruder parameter this function used to take
+// is gone - it only ever fed chameleon_projection_region_extruder's own last-resort
+// fallback, which spec C8 established is unreachable dead code (PrintRegion::extruder()
+// never returns 0 for frSolidInfill; see that function's own comment above), so there is
+// nothing left here for a caller-supplied default to fall back to.
+//
+// Perf: O(band layers x regions) per call now that the view is prebuilt (was O(band
+// layers x regions x islands) per call before M1). Layer::lslices_bboxes is precomputed
+// once at slicing time (PrintObjectSlice.cpp), long before this pass runs, so the AABB
+// gate inside chameleon_pick_projection_region is free.
+// v2.5e: LIVE - wrapped in a small `bool(const Point&, unsigned&)` lambda
+// (chameleon_assign_support_interfaces' own projection_lookup local) and passed into
+// BrimFilament.hpp's chameleon_build_support_resolvers, whose interface_resolver tries
+// this before falling through to the nearest-wall vote; see
+// chameleon_projection_region_extruder's own banner comment above.
+static bool chameleon_projection_extruder_from_view(const std::vector<ProjectionLayerView> &view,
+                                                      const std::vector<const Layer *> &view_layers,
+                                                      const Point &p,
+                                                      unsigned &out_extruder,
+                                                      // v2.5g: forwarded verbatim to chameleon_pick_projection_region's
+                                                      // own `layer_limit` (BrimFilament.hpp/.cpp) - default unbounded, so
+                                                      // every pre-v2.5g call site (interface/ironing's projection_lookup
+                                                      // below) is byte-identical to before. base_projection_lookup
+                                                      // (chameleon_assign_support_interfaces, below) is the only caller
+                                                      // that ever passes a real limit - see that lambda's own comment.
+                                                      size_t layer_limit = std::numeric_limits<size_t>::max())
+{
+    size_t hit_layer = 0, hit_region = 0;
+    if (!chameleon_pick_projection_region(view, p, hit_layer, hit_region, layer_limit))
+        return false; // no band layer's lslices cover p -> caller falls through to lateral
+
+    if (hit_layer >= view_layers.size())
+        return false; // defensive: cannot happen (hit_layer indexes `view`, built 1:1 with view_layers)
+    const LayerRegionPtrs &regions = view_layers[hit_layer]->regions();
+    if (hit_region >= regions.size() || regions[hit_region] == nullptr)
+        return false; // defensive: cannot happen (hit_region indexes the same regions() this view was built from)
+
+    const LayerRegion &lr = *regions[hit_region];
+    out_extruder = chameleon_projection_region_extruder(lr.region());
+    return true;
+}
+
 // BBS: map print object with its first layer's first extruder
 std::map<ObjectID, unsigned int> getObjectExtruderMap(const Print& print) {
     std::map<ObjectID, unsigned int> objectExtruderMap;
@@ -2333,6 +2837,1110 @@ std::map<ObjectID, unsigned int> getObjectExtruderMap(const Print& print) {
         }
     }
     return objectExtruderMap;
+}
+
+// Chameleon P2: this object's default extruder (0-based) - the fallback interface
+// extruder when support_interface_filament is unset (0 = "current filament"). v2.3
+// Task 2 (spec C8) removed this value's other former use, chameleon_collect_wall_
+// samples' own_extruder_0based last-resort parameter - PrintRegion::extruder() never
+// actually needs a caller-supplied default (see chameleon_region_extruder's own
+// comment above), so that use was unreachable dead code. Deliberately NOT read from
+// PrintObject::object_first_layer_wall_extruders
+// (getObjectExtruderMap's memoized path above): that field is only populated once
+// ToolOrdering::collect_extruders runs (ToolOrdering.cpp ~851), which for this pass is
+// always still in the future - see chameleon_assign_support_interfaces' call site in
+// Print::process, sited before psWipeTower constructs ToolOrdering. Recomputing directly
+// here (mirroring getObjectExtruderMap's own fresh-compute branch) keeps the value
+// deterministic and independent of whatever a prior process() run may have left behind.
+static unsigned chameleon_object_default_extruder(const Print &print, const PrintObject &object)
+{
+    if (object.layers().empty())
+        return 0;
+    unsigned int best = (unsigned int) print.config().filament_diameter.size(); // sentinel: none found
+    for (const LayerRegion *lr : object.layers().front()->regions())
+        if (lr->has_extrusions())
+            best = std::min(best, lr->region().extruder(frExternalPerimeter));
+    return (best > 0 && best < (unsigned int) print.config().filament_diameter.size()) ? best - 1 : 0;
+}
+
+// v2.3 Task 1 (spec C1): true when ANY enabled, non-deleted mixed-filament row on the
+// plate has its own gradient interpolation on (MixedFilament::gradient_enabled) - used
+// below to skip chameleon_collect_layer_filaments' object/layer walk entirely rather
+// than attempt it. A gradient (or, more generally, a comma-grouped manual-pattern
+// mixed row - see MixedFilamentManager::resolve_perimeter's per-wall-loop-index
+// resolution, LayerRegion.cpp:73-76) row means a single region's TRUE per-layer, and
+// even per-WALL-LOOP, filament can vary in ways LayerRegion::extruder(role) alone (a
+// single scalar per role) cannot represent - ToolOrdering's own collect_extruders only
+// gets this right by running resolve_mixed with full per-layer-index/mixed-manager
+// context, which doesn't exist yet at this point in the pipeline (this pass runs
+// before ToolOrdering is even constructed - see chameleon_object_default_extruder's
+// own comment above for the same "still in the future" constraint). Skipping here is
+// deliberately conservative: every support layer's free-extruder lookup then returns
+// empty, so every bucket falls back to the gate's NORMAL tier only - inert, not wrong.
+static bool chameleon_mixed_gradient_active(const Print &print)
+{
+    for (const MixedFilament &mf : print.mixed_filament_manager().mixed_filaments())
+        if (mf.enabled && !mf.deleted && mf.gradient_enabled)
+            return true;
+    return false;
+}
+
+// v2.3 Task 1 (spec C1): once-per-pass "free extruder" table build - the object/layer
+// walk feeding BrimFilament.hpp's pure LayerFilamentTable/build_layer_filament_table
+// (see that function's own doc comment for the merge semantics this only supplies raw
+// samples to). Skipped entirely (empty table) when chameleon_mixed_gradient_active
+// above is true. Otherwise: for every object NOT a shared-object copy (mirrors the
+// skip in chameleon_assign_support_interfaces' own per-object loop below - a copy's
+// layers() alias the same Layer* vector as the object it was copied from, so walking
+// it again would only re-record the same z/extruder samples, harmlessly but
+// pointlessly), every object layer, every region on that layer: LayerRegion::extruder
+// (role) is read directly (NOT PrintRegion::extruder - LayerRegion's own override
+// already folds in painted-region/effective-filament resolution, see LayerRegion.cpp:
+// 86-100) for frExternalPerimeter AND frPerimeter (a region's outer_wall_filament
+// override can differ from its own wall_filament, so both must be checked - missing
+// the inner-wall-only filament would under-report which extruders are genuinely
+// "already here") when the layer has any perimeters, and for frSolidInfill/frInfill
+// when it has any fills. A role read of 0 (PrintRegion::extruder's own "follow the
+// object default" convention, PrintRegion.cpp:18-35) contributes nothing - this table
+// only ever records an EXPLICIT non-zero per-region filament assignment, not a scalar
+// default that could still mean any extruder depending on context.
+static LayerFilamentTable chameleon_collect_layer_filaments(const Print &print)
+{
+    if (chameleon_mixed_gradient_active(print))
+        return {};
+
+    std::vector<std::pair<double, unsigned>> raw;
+    for (const PrintObject *object : print.objects()) {
+        if (object == nullptr || object->get_shared_object() != nullptr)
+            continue;
+        for (const Layer *layer : object->layers()) {
+            if (layer == nullptr)
+                continue;
+            for (const LayerRegion *lr : layer->regions()) {
+                if (lr == nullptr)
+                    continue;
+                if (!lr->perimeters.entities.empty()) {
+                    for (FlowRole role : { frExternalPerimeter, frPerimeter }) {
+                        const unsigned int ext = lr->extruder(role);
+                        if (ext > 0)
+                            raw.emplace_back(layer->print_z, ext - 1);
+                    }
+                }
+                if (!lr->fills.entities.empty()) {
+                    for (FlowRole role : { frSolidInfill, frInfill }) {
+                        const unsigned int ext = lr->extruder(role);
+                        if (ext > 0)
+                            raw.emplace_back(layer->print_z, ext - 1);
+                    }
+                }
+            }
+        }
+    }
+    return build_layer_filament_table(std::move(raw));
+}
+
+// Chameleon P2.1: support match pass (renamed from "interface partition pass" - v2.1
+// resolves BOTH support roles now, see docs/superpowers/specs/2026-08-30-support-match-
+// v2-design.md's "Decision rules" section for the original binding contract; v2.4 (spec
+// A, docs/superpowers/specs/2026-08-30-support-match-v24-design.md) simplified the
+// per-layer resolution rule itself to a single mode - see below; v2.6 then replaced the
+// resulting two-valued enum with a plain checkbox, since a single mode is what it always
+// was). For every object opted into support_filament_matching (v2.4: nearest_surface's
+// OWN vertical-projection-primary/lateral-fallback MODE was REMOVED outright, GUI A/B
+// round 2 verdict: it still mixed layers even in large single-color areas even after
+// v2.2/v2.3's fixes, leaving nearest_wall as the sole non-manual mode this checkbox now
+// simply turns on or off), per
+// support layer: all three roles - interface (erSupportMaterialInterface), base
+// (erSupportMaterial), and ironing (erIroning, "ironing follows its interface": erIroning
+// entities are the ironed top surface of a matched interface run, not a role with its own
+// independent rule) - are resolved by nearest-wall voting: brim_vote, k=1, UNCAPPED
+// (max_dist_mm=0) - "the nearest wall segment wins outright, no distance limit, no
+// weighted vote" (spec C8).
+//
+// v2.5e (upward cast, GUI round 6/7 - user directive from the v2.4 nearest_surface-drop
+// decision: "the projection machinery is retained as scaffolding for exactly this")
+// covered interface/ironing; v2.5f (GUI round 7 continued - user's standing fidelity
+// ruling: "a support sample with model surface within the contact band directly above
+// takes that surface's color") extends the SAME rule to base:
+// DECISION RULE - a support sample with a model surface directly above it (within the
+// contact band) takes THAT surface's color - it will abut it, or supports toward it;
+// walls are the tiebreaker ONLY for samples with nothing overhead. Concretely: ALL
+// THREE ROLES now resolve PROJECTION FIRST - the model surface directly above a sample,
+// via chameleon_build_projection_views/chameleon_projection_extruder_from_view below
+// (the nearest_surface-era machinery this comment used to describe as "kept, currently
+// unused" before v2.5e revived it) - falling through to a nearest-wall vote only when
+// the projection misses (no band layer's lslices cover the sample), and further to that
+// vote's own empty-index fallback_extruder return when its index has no samples at all.
+// Interface and ironing (via interface_resolver/ironing_resolver, wired identically -
+// "ironing follows its interface") fall through to the v2.5d nearest-wall vote against
+// `band_idx` (the coplanar+contact-band union) - unchanged since v2.5e. Base (v2.5f,
+// this task) falls through to `coplanar_wall_idx` instead - same shape, narrower
+// electorate - because a base/wrap run with NOTHING above it still abuts a wall AT ITS
+// OWN Z (the wrap case), never the contact band above; that is "base votes same-layer
+// walls" in the ruling's own wording, and it is the reason base was left UNCHANGED
+// through v2.5e even though this task makes it no longer walls-ONLY. Root cause for
+// extending this to base at all: TREE support is ~99% base role (v2.5f forensics: 592mm
+// interface vs 191,556mm base on the reference plate) - v2.5e's fix alone covered only
+// the thin interface skin, leaving the visible bulk of a support column voting coplanar
+// under a painted overhang start. Taper note: at a tapering wall the margin-ring rescue
+// pass (chameleon_pick_projection_region PASS 2, BrimFilament.hpp/.cpp) can now resolve
+// a base wrap sample to the upper layer's color up to CHAMELEON_PROJECTION_MARGIN_MM
+// (1.2mm) early, the same way it already could for interface/ironing since v2.5e -
+// accepted per the same fidelity ruling (colors switch TOWARD the upcoming paint); the
+// v2.5d coplanar-only fix for base's WALL VOTE is unaffected (it is the fallthrough
+// tier, reached only on a genuine projection miss), so the old multi-layer bleed-upward
+// defect that fix targeted cannot return through this path. The actual resolver-
+// construction wiring for all three roles - the part this decision rule governs - lives
+// in BrimFilament.hpp/.cpp's chameleon_build_support_resolvers (v2.5d final-review I1
+// fix: pulled out specifically so a unit test can pin this wiring, not just the
+// underlying brim_vote/partition_support_entities primitives it composes) - see that
+// function's own header comment for the full three-tier fallback chain, the taper note
+// in full, and the reasoning behind its `projection_lookup` seam. This per-layer loop's
+// job is now just to build band_idx/coplanar_wall_idx/the projection view (unchanged
+// from before) and hand them to that function.
+//
+// All three roles are still partitioned via three calls to the SAME
+// partition_support_entities engine (T1/v2.2 Task 3) - interface first (role_filter =
+// erSupportMaterialInterface), then base (role_filter = erSupportMaterial), then ironing
+// (role_filter = erIroning, reusing ironing_resolver/fallback_extruder/vote_params -
+// ironing_resolver being the SAME callable as interface_resolver, per the rule above) -
+// sharing ONE SupportLayer::interface_by_extruder
+// map (T1 storage), which v2.2 Task 1 then gates/trims as a whole via ONE
+// apply_bucket_caps call per layer (spec C1-C3: length-ranked distinct-extruder cap with
+// hysteresis, NOT a switch-count budget - see apply_bucket_caps' own doc comment in
+// BrimFilament.hpp for the full rationale; order among the three partition_support_entities
+// calls only matters for log/counter bookkeeping, not correctness: each call only ever
+// touches entities whose role() matches its own role_filter). v2.2 Task 3 (spec C7) also
+// makes each of these three calls vote any role-eligible NESTED collection (collapsed
+// role() == that call's role_filter) as one whole unit instead of leaving it invisible to
+// the matcher entirely (spec root cause 6) - see partition_support_entities' own doc
+// comment in BrimFilament.hpp.
+//
+// Must run after generate_support_material has completed for every object - fresh or
+// copied from a shared/cached object - and before ToolOrdering/psWipeTower construction,
+// so the per-support-layer registration block in ToolOrdering.cpp (~698-721) - which reads
+// interface_by_extruder at ctor time, keyed by extruder regardless of which role(s) are
+// mixed within it - sees the finished result (see the call site below for exactly where
+// this sits in the pipeline; unlike Part 1's brim pass, no post-hoc union hack is needed
+// because this pass always runs first).
+//
+// Off (checkbox unchecked / single extruder / ByObject sequence): this function returns
+// immediately without touching support_fills or interface_by_extruder on ANY object -
+// byte-identical gcode is a hard requirement (spec's off-mode purity). The
+// `support_filament_matching.value` gate (below) is the WHOLE opt-in - v2.4 deleted the
+// second per-object mode branch that gate used to feed (the old `nearest_wall_mode`
+// local and its else-arm), and v2.6 replaced the manual/nearest_wall enum itself with
+// this plain bool, so every object that opts in takes the identical path below, no
+// per-object branching left.
+static void chameleon_assign_support_interfaces(Print &print)
+{
+    if (print.extruders().size() <= 1 || print.config().print_sequence == PrintSequence::ByObject)
+        return;
+
+    PrintObjectPtrs &objects  = print.objects_mutable();
+    const Point      no_shift(0, 0); // supports and walls share object coordinates (no instance shift)
+
+    // CHAMELEON_DEBUG (v2.5c diagnostic instrumentation): checked ONCE per pass
+    // invocation, here - not per object, not per layer, not per sample - so every
+    // downstream site below gates its own extra work behind this single bool instead
+    // of re-checking getenv itself. See the CHAMELEON_DEBUG header comment above
+    // chameleon_collect_wall_samples for the log destination/line format this feeds.
+    const bool chameleon_debug_on = chameleon_debug_enabled();
+
+    // v2.3 Task 1 (spec C1): once per PASS (not once per object) - every object's walls/
+    // solid/sparse infill contribute to the SAME free-extruder table, since the whole
+    // point is "is some extruder already printing at this z ANYWHERE on the plate".
+    const LayerFilamentTable layer_filament_table = chameleon_collect_layer_filaments(print);
+
+    for (size_t obj_idx = 0; obj_idx < objects.size(); ++obj_idx) {
+        PrintObject *object = objects[obj_idx];
+        if (object == nullptr)
+            continue;
+        // v2.6: support_filament_matching.value is the WHOLE opt-in - a plain checkbox
+        // now that (v2.4) nearest_surface was gone and nearest_wall was the only other
+        // enum value left, so there was no longer a second mode to pick between below.
+        // Every guard/step below this point (shared-object skip, plate guard, visited
+        // flag, apply_bucket_caps, storage, emission, logging) applies uniformly to
+        // every opted-in object.
+        if (!object->config().support_filament_matching.value)
+            continue;
+        if (object->layers().empty() || object->support_layers().empty())
+            continue;
+        // C1 fix, guard (a): a shared-object copy's support_layers() aliases the SAME
+        // SupportLayer* vector as the object it was copied from (copy_layers_from_shared_object,
+        // Print.cpp: m_support_layers = m_shared_object->support_layers()). The shared
+        // source object is processed earlier in this same loop (need_slicing_objects are
+        // sliced/support-generated before any copy resolves its shared_object, and
+        // Print::process's copy_layers_from_shared_object loop runs before this pass), so
+        // its layers are already partitioned/marked by the time we would reach this copy.
+        // Skip it outright: cheap, and avoids re-walking every layer only to hit the
+        // per-layer chameleon_interface_visited guard below on each one.
+        if (object->get_shared_object() != nullptr)
+            continue;
+
+        const unsigned object_default_extruder = chameleon_object_default_extruder(print, *object);
+        // Spec-mandated fallback: the object's resolved interface extruder, mirroring
+        // ToolOrdering's own scalar computation (ToolOrdering.cpp ~709) for the case
+        // where no per-layer match beats it.
+        const unsigned fallback_extruder = object->config().support_interface_filament.value > 0
+            ? unsigned(object->config().support_interface_filament.value - 1)
+            : object_default_extruder;
+        // v2.1 base fallback: mirrors ToolOrdering's own BASE scalar computation
+        // (ToolOrdering.cpp ~704: extruder_support = resolve_mixed(object.config().
+        // support_filament.value, ...)) the same APPROXIMATE way the interface fallback
+        // above mirrors ToolOrdering's interface scalar (~709) - a plain 1-based-to-
+        // 0-based scalar read of the config value, not resolve_mixed's per-layer gradient-
+        // mix resolution (that's the "mixed filament" gradient-printing feature, orthogonal
+        // to this pass's role-mixing). Good enough for a last-resort default when no
+        // per-point match beats it, same as the interface case.
+        const unsigned base_fallback_extruder = object->config().support_filament.value > 0
+            ? unsigned(object->config().support_filament.value - 1)
+            : object_default_extruder;
+
+        // Ascending object-layer TOP z values, for select_contact_layers (VLH-safe: keyed
+        // by z overlap, not index arithmetic).
+        std::vector<double> layer_print_zs;
+        layer_print_zs.reserve(object->layers().size());
+        for (const Layer *layer : object->layers())
+            layer_print_zs.push_back(layer->print_z);
+
+        const double first_layer_top_z = object->slicing_parameters().first_print_layer_height;
+
+        BrimVoteParams vote_params;
+        vote_params.fallback_extruder = fallback_extruder;
+        // object_area left empty: every wall sample below carries this object's own
+        // ordinal as object_key, so BrimVoteParams::object_area's cross-object tie-break
+        // (Part 1's multi-object plate scenario) never applies here.
+
+        // v2.3 Task 1 (spec C6): support-pass-only overrides of two run-building
+        // tunables - Part 1's own BrimVoteParams (the brim pass' own object, built
+        // separately in Print::process's brim call site further down this file) never
+        // touches this `vote_params` instance, so its defaults (max_runs=4,
+        // min_run_mm=2.0) stay exactly what they were for brim. Support fills sample
+        // far more numerous, far shorter runs per layer than a single long brim loop
+        // ever does - many short ring/lattice segments crossing sector boundaries every
+        // layer, not one continuous perimeter - so brim's max_runs=4/min_run_mm=2.0
+        // guard, tuned for a handful of long brim loops, throttled support's own
+        // legitimate per-sector matched runs down to noise. max_runs=8/min_run_mm=1.6
+        // give support twice the run budget and a tighter absorb floor, sized to the
+        // smaller branch-scale buckets C1's gate rework above now admits (5-30mm ring
+        // arcs, 20-60mm small interfaces) instead of brim's long-loop scale.
+        // sample_mm stays 0.8 and max_extruders (an apply_bucket_caps call-site
+        // argument, not a BrimVoteParams field) stays 2 - spec C6 only touches these
+        // two fields.
+        vote_params.max_runs   = 8;
+        vote_params.min_run_mm = 1.6;
+        // v2.3 final-review M4 fix: support-pass-only opt-in to split_polyline_core's
+        // ring-seam merge (spec C7, BrimVoteParams::merge_ring_seam, default false) - set
+        // HERE, on the shared vote_params instance, before every per-role BrimVoteParams
+        // copy (v2.5e: interface_wall_params/base_wall_params, built inside BrimFilament.
+        // hpp/.cpp's chameleon_build_support_resolvers now, not inline here) is made from
+        // it, so every support engine call keeps the seam merge exactly as before this
+        // fix. Part 1's own brim vote_params (built
+        // independently, further down this file) never touches this field, so it stays
+        // false there and the merge is unreachable for brim loops - restoring the "Part 1
+        // brim behavior stays byte-identical" contract the merge previously violated.
+        vote_params.merge_ring_seam = true;
+
+        // v2.4 (spec A): the gap-aware lateral cap (outer_wall_width_mm/
+        // support_nozzle_diameter_mm/support_line_width_mm/lateral_cap_mm, formerly
+        // computed here) was v2.2 Task 2's fix for nearest_surface's OWN lateral/base
+        // resolver, which capped how far a support skin could reach for a coplanar wall
+        // (BrimVoteParams.max_dist_mm). nearest_wall's resolver has never used a
+        // distance cap (max_dist_mm stays 0 = uncapped, spec C8) - "nearest wall wins
+        // outright, no distance limit" - so this glue has no caller left now that
+        // nearest_surface's else-arm is gone. gap_aware_lateral_cap_mm itself
+        // (BrimFilament.hpp/.cpp) is NOT deleted - pure function, unit-tested there,
+        // kept for the same v2.5 upward-cast reason as the projection machinery (see
+        // this function's own header comment above).
+        //
+        // v2.2 Task 1 (spec C1-C3): this object's hysteresis state - the extruder set
+        // apply_bucket_caps committed on the PREVIOUS support layer that reached the
+        // engine calls. Empty at object start. Threaded through every iteration of the
+        // loop below; only the guards that `continue` BEFORE the engine calls (plate,
+        // already-visited, zero-sample) leave it unchanged.
+        // v2.3 Task 1 (spec C2): a layer that DOES reach the engine calls no longer
+        // always overwrites `prev_kept` unconditionally - chameleon_update_prev_kept
+        // (BrimFilament.hpp/.cpp) decides per-layer whether to commit, retain-for-one-
+        // more-layer, or clear to empty; `prev_kept_retained_last_layer` is that pure
+        // function's own decay-counter state, carried alongside prev_kept itself.
+        std::set<unsigned> prev_kept;
+        bool                prev_kept_retained_last_layer = false;
+        // v2.3 Task 3 (spec C5): this object's descend-hysteresis state - see
+        // BrimVoteParams::descended_last_layer's own comment (BrimFilament.hpp) and
+        // partition_support_entities' collection branch (BrimFilament.cpp) for the full
+        // mechanism. Threaded through this loop the SAME way prev_kept is (synced into
+        // vote_params before the engine calls each iteration that reaches them), but
+        // REPLACED wholesale - not merged - after those calls run each layer: a column
+        // is only ever written into descended_this_layer (below) the layer it actually
+        // descends, so a column that doesn't re-qualify simply has no entry going into
+        // the NEXT layer - immediate full-threshold reversion, no multi-layer grace like
+        // C2's prev_kept retention (the spec only asked for "halved if descended LAST
+        // layer", not a decaying grace).
+        DescendColumnMap descended_last_layer;
+        size_t layers_partitioned  = 0;
+        size_t layers_zero_sample  = 0;
+        // v2.2 Task 1: replaces the old cumulative_switches/layers_reverted/escalated
+        // counters (deleted with the >3 whole-layer revert and >20 per-object
+        // escalation, C1-C2 - a switch-boundary tally never measured the real per-layer
+        // cost). These count actual apply_bucket_caps outcomes instead.
+        size_t buckets_dropped_min_benefit      = 0; // C3 gate: bucket total length < its tier floor (v2.3 Task 1: 12mm normal / 3mm free)
+        // v2.4 Task C (spec C): free-tier SUBSET of buckets_dropped_min_benefit above -
+        // cheap to split out (apply_bucket_caps' gate loop already computes `is_free`
+        // per bucket, BrimFilament.cpp) and answers a triage question the combined total
+        // can't: "did the claw fix's free-tier window still fail to rescue enough
+        // length, or is 12mm-normal-tier churn the dominant drop cause?" Normal-tier
+        // drops are buckets_dropped_min_benefit - buckets_dropped_min_benefit_free, not
+        // tracked as its own field since it's one subtraction away.
+        size_t buckets_dropped_min_benefit_free = 0;
+        size_t buckets_trimmed_cap              = 0; // C1 trim: bucket ranked below the top 2
+        // v2.5a Task 2 (spec item 2, residual-paint fix): SUBSET of the two counters
+        // above - how many of those gated/trimmed buckets landed inside a surviving
+        // MATCHED bucket (apply_bucket_caps' nearest-centroid redirect) rather than
+        // falling all the way back to residual support_fills. Always <=
+        // buckets_dropped_min_benefit + buckets_trimmed_cap; the gap between them is
+        // the legacy no-survivor fallback count (still residual, same as pre-v2.5a).
+        size_t buckets_redirected               = 0;
+        // v2.5b (spec: "free-extruder trim exemption"): how many buckets skipped the
+        // C1 trim entirely because their extruder was already paying for a toolchange
+        // at THIS layer's own z from model geometry (apply_bucket_caps'
+        // free_extruders_exempt argument, strict-coincidence set below) - triage
+        // signal for "is the trim exemption actually firing on this plate".
+        size_t buckets_exempt_kept              = 0;
+        // Raw matched-run counts (NOT switch-boundary/cap accounting - purely
+        // informational, mirrors partition_support_entities' own return value) per
+        // role, summed across every layer that reached the engine calls.
+        size_t interface_runs_matched = 0;
+        size_t base_runs_matched      = 0;
+        // v2.2 Task 3 (spec C6): third role's own raw matched-run count, same
+        // informational-only accounting as the two above. A whole nested collection
+        // moved by C7 doesn't contribute to this (partition_support_entities only
+        // counts split-run boundaries), so this undercounts relative to "how much
+        // ironing actually matched" whenever C7 moves a collection - documented, not a
+        // bug: nothing downstream keys caps off this number (v2.2 Task 1 already made
+        // that true for interface/base too).
+        size_t ironing_runs_matched   = 0;
+        // v2.5e: per-object totals of the per-layer proj_hits/proj_misses debug counts
+        // (see the CHAMELEON_DEBUG header comment above for the field's own meaning) -
+        // summed here the same way the raw matched-run counts above are, so the SUMMARY/
+        // BOOST_LOG_TRIVIAL lines carry an object-wide "how often did the upward cast
+        // actually resolve a sample" signal without a triage reader needing to sum every
+        // per-layer line themselves. Accumulated unconditionally (cheap integer adds),
+        // same as every other counter in this block - only the LOGGING of them is gated
+        // behind chameleon_debug_on/BOOST_LOG_TRIVIAL's own severity filter. v2.5f: this
+        // pair's own totals now include base's share too (see the CHAMELEON_DEBUG header
+        // comment's v2.5f paragraph) - `interface_proj_hits`/`interface_proj_misses`
+        // keeps its v2.5e name for grep-stability across log history, but as of this task
+        // it is an ALL-ROLES total, not an interface-only one; base_proj_hits/
+        // base_proj_misses just below is the isolated per-role breakdown this task adds.
+        size_t interface_proj_hits    = 0;
+        size_t interface_proj_misses  = 0;
+        // v2.5f (v2.5e review M3 fix, base half): base's own isolated share of the
+        // totals above, accumulated the same way - see the per-layer snapshot site
+        // (proj_hits_before_base, further down in this function) for how this is
+        // isolated out of the shared counters without teaching chameleon_build_support_
+        // resolvers' projection_lookup seam about roles.
+        size_t base_proj_hits         = 0;
+        size_t base_proj_misses       = 0;
+
+        for (SupportLayer *support_layer : object->support_layers()) {
+            if (support_layer == nullptr || support_layer->support_fills.entities.empty())
+                continue;
+            // Plate guard: the first support layer (touching the build plate) always
+            // keeps the fallback extruder - never split its plate adhesion.
+            if (support_layer->print_z <= first_layer_top_z + EPSILON)
+                continue;
+            // C1 fix, guard (b): this layer was already visited by an earlier pass over
+            // the SAME SupportLayer object - either the shared source this object's copy
+            // aliases (belt-and-suspenders backstop for guard (a) above, in case that
+            // ordering assumption is ever violated by a future refactor), or an earlier
+            // Print::process() run whose posSupportMaterial fast-pathed to done (so
+            // support_fills still carries that run's mutations: matched originals deleted,
+            // fallback-voted runs re-inserted/re-split at vote boundaries). Re-voting
+            // those already-mutated runs is not idempotent: the re-split resamples from a
+            // different phase and can report shorter/fewer per-bucket runs than pass 1
+            // really found even though pass 1's apply_bucket_caps already merged the
+            // excess back (defeating its length ranking - see the "re-run undercounts"
+            // unit test's own comment for the mechanism), or come back non-empty and
+            // overwrite interface_by_extruder outright, silently dropping pass 1's
+            // matched geometry (it lives nowhere else - removed from support_fills by
+            // design). Skip unconditionally instead of re-running.
+            if (support_layer->chameleon_interface_visited)
+                continue;
+
+            // v2.3 Task 1 (spec C3): sync vote_params.prev_kept to THIS layer's current
+            // hysteresis state BEFORE the resolvers below copy vote_params by value
+            // (interface_wall_params/base_wall_params, both `= vote_params`) - those
+            // copies are taken fresh every iteration of this loop, but `vote_params`
+            // itself is constructed ONCE per OBJECT, above this loop, so without this
+            // line every layer's resolvers would see whatever prev_kept happened to be
+            // set at object-start (empty) forever, never the value this loop updates at
+            // the bottom of each iteration. Also feeds the three
+            // partition_support_entities calls' own `p` argument further down (still
+            // `vote_params` itself, unchanged), which is what vote_collection_as_unit's
+            // own tie path reads for C7 whole-collection votes.
+            vote_params.prev_kept = prev_kept;
+
+            // v2.3 Task 3 (spec C5): synced the same way, same reason - vote_params is
+            // constructed once per OBJECT, this loop updates descended_last_layer once
+            // per LAYER, so without this every layer's engine calls would see whatever
+            // descended_last_layer happened to be at object-start (empty) forever.
+            vote_params.descended_last_layer = descended_last_layer;
+
+            // v2.3 Task 1 (spec C1): this layer's free-extruder set - the once-per-pass
+            // z-table's WINDOWED lookup at this support layer's own print_z. Resolved
+            // once per layer (not per bucket) since it depends only on z, feeds the
+            // apply_bucket_caps call at the tail of this iteration.
+            //
+            // v2.4 Task B (spec B, the claw fix): down_mm/up_mm replace the old exact-z
+            // query - a white claw wall that exists only in the contact band ABOVE its
+            // support column (z, z + kContactBandMm] was never "free" at the support
+            // layer's OWN z under strict coincidence, even though the vote above (a)/(b)
+            // samples that same band; every short white bucket then faced the 12mm
+            // normal-tier floor and merged back to fallback. down_mm = support_layer->
+            // height (interval-overlap correction, mirroring coplanar_idx's own
+            // rationale above, for unsynced support/object layer grids); up_mm =
+            // kContactBandMm - the SAME constant contact_idx's own select_contact_layers
+            // call uses (hoisted, BrimFilament.hpp) - so free-eligibility covers exactly
+            // the band the vote can actually match against, no more and no less.
+            const std::set<unsigned> free_extruders = chameleon_layer_free_extruders(
+                layer_filament_table, support_layer->print_z,
+                /*down_mm=*/support_layer->height, /*up_mm=*/kContactBandMm);
+
+            // v2.5b (spec: "free-extruder trim exemption"): a SECOND, STRICTER free-
+            // extruder query for apply_bucket_caps' new free_extruders_exempt argument
+            // below - deliberately NOT the same `free_extruders` set above. See
+            // apply_bucket_caps' own doc comment (BrimFilament.hpp) for the full
+            // rationale; short version: up_mm = 0.0 here (vs. kContactBandMm above)
+            // because the trim exemption's whole premise is "this bucket's toolchange
+            // is already free AT THIS LAYER", which is only true when the extruder is
+            // already going to land in THIS support layer's own LayerTools from model
+            // geometry (ToolOrdering.cpp's collect_extruders, ~734-736, deduped against
+            // model geometry by sort_remove_duplicates/remove_duplicates_preserve_order,
+            // ~870-874) - true only for an extruder that prints AT this exact z
+            // somewhere on the plate, never for one that only prints on a HIGHER object
+            // layer inside the contact band above (the up-window's own reach). down_mm
+            // stays support_layer->height, unchanged from free_extruders above - that
+            // term only corrects for THIS layer's own z-thickness / unsynced object-
+            // layer grids, it doesn't reach into the future the way up_mm does, so it
+            // stays part of the "strict, this-layer-only" query too.
+            const std::set<unsigned> free_extruders_exempt = chameleon_layer_free_extruders(
+                layer_filament_table, support_layer->print_z,
+                /*down_mm=*/support_layer->height, /*up_mm=*/0.0);
+
+            // (a) Contact-band layers: v2.0-style band (support_top_z, support_top_z +
+            // kContactBandMm]) - unioned below with the coplanar band (b) into ONE
+            // wall-sample index (v2.2 Task 4, spec C8; v2.4 spec A made this the only
+            // path, deleting nearest_surface's separate use of this list for a
+            // projection view - see this function's own header comment).
+            std::vector<size_t> contact_idx = select_contact_layers(layer_print_zs, support_layer->print_z, kContactBandMm);
+
+            // v2.5g (spec: "base projection depth limit" - GUI round 8): this support
+            // layer's own base_cast_mm, honestly derived from the ACTUAL heights of its
+            // leading contact_idx layers (contact_idx is already ascending/lowest-first -
+            // see chameleon_base_cast_mm's own header comment in BrimFilament.hpp for why
+            // MINIMUM-of-the-first-few rather than the first layer alone or an average),
+            // not a config scalar. Only the first kBaseCastMaxLayers entries are ever
+            // read - chameleon_base_cast_mm itself only ever looks at that many - so this
+            // reserves/collects at most 4 doubles per support layer regardless of how
+            // deep contact_idx runs. Empty contact_idx (support above the model's own top
+            // walls - the same case coplanar_wall_idx already tolerates) yields an empty
+            // `contact_layer_heights` and base_cast_mm = 0.0, which correctly zeroes out
+            // base_view_count below.
+            std::vector<double> contact_layer_heights;
+            contact_layer_heights.reserve(std::min(contact_idx.size(), kBaseCastMaxLayers));
+            for (size_t i = 0; i < contact_idx.size() && i < kBaseCastMaxLayers; ++i)
+                contact_layer_heights.push_back(object->layers()[contact_idx[i]]->height);
+            const double base_cast_mm = chameleon_base_cast_mm(contact_layer_heights);
+
+            // (b) Coplanar lateral band: object layers whose z-INTERVAL OVERLAPS this
+            // support layer's OWN span (print_z - height, print_z] - v2.1's "any support
+            // within 1mm of a wall at its own layer matches that wall" rule (spec's
+            // Decision rules, "Lateral rule - all roles").
+            //
+            // v2.1 final-review I2 fix: select_layers_overlapping_span, not
+            // select_layers_in_band - this band is only ONE support-layer tall, so a
+            // pure top-z-in-band test can miss an object layer whose walls flank the
+            // band even though its own top overshoots hi_z (unsynced support/object
+            // layer grids, variable layer height). The contact band above (contact_idx,
+            // select_contact_layers -> select_layers_in_band) is deliberately left
+            // as-is: its kContactBandMm width is wider than any single layer, so the
+            // top-z deviation the v2.0 review accepted for it still holds.
+            std::vector<size_t> coplanar_idx = select_layers_overlapping_span(
+                layer_print_zs, support_layer->print_z - support_layer->height, support_layer->print_z,
+                // Raft-aware first-layer bottom (re-review N2): with a raft the object's
+                // first layer starts well above the plate, and raft-level support layers
+                // must not coplanar-match layer 0's walls.
+                object->layers().front()->print_z - object->layers().front()->height);
+
+            // v2.4 (spec A): un-nested from the old per-object mode branch - nearest_wall
+            // is the only path left, so band_idx/coplanar_wall_idx/interface_resolver/
+            // base_resolver are populated unconditionally below instead of by one of two
+            // branches. interface_resolver/base_resolver/ironing_resolver (v2.5e) stay
+            // std::function (not `auto`) since the three-engine-call tail further down
+            // just calls them, agnostic to how they were built (chameleon_build_support_
+            // resolvers, BrimFilament.hpp/.cpp, as of v2.5e - see that function's own
+            // header comment for the wiring these three now come from). BrimVoteParams is
+            // captured BY VALUE (cheap, immutable after construction) so it never
+            // dangles; band_idx/coplanar_wall_idx/projection_view/projection_view_layers
+            // are captured BY REFERENCE and so are declared here, at the per-layer scope
+            // that outlives both the construction below and the engine calls that use
+            // the resolvers.
+            //
+            // v2.5d (root cause fix, debug-log-driven - GUI round 5, transition zone z
+            // 34.62-42.18): pre-v2.5d, interface AND base both voted against the SAME
+            // single WallSampleIndex - the union of the coplanar layer and the 16-layer
+            // contact band above it. That union is the RIGHT electorate for an interface
+            // (an interface touches the surface ABOVE it, so the contact band's walls
+            // are genuinely relevant), but WRONG for a base/wrap run, which abuts the
+            // wall AT ITS OWN Z: the claw tapers, so a higher (whiter) wall's samples
+            // land XY-inward - and, in the flattened 2D index, farther - while a teal
+            // wall genuinely coplanar with a LOWER support layer can still sit XY-nearer
+            // to a query point on a higher, white-zone layer. k=1 always picks the
+            // nearest sample regardless of which band contributed it, so the teal wrap
+            // bled upward past the diagonal paint transition even though every bucket
+            // otherwise formed correctly (engine healthy, nothing gated). Fix: split the
+            // single index into two - `band_idx` (unchanged: union of contact_idx and
+            // coplanar_idx, still feeds interface/ironing) and `coplanar_wall_idx`
+            // (coplanar_idx layers ONLY, feeds base) - so a base run only ever matches a
+            // wall that is genuinely at its own z.
+            WallSampleIndex                        band_idx;
+            WallSampleIndex                        coplanar_wall_idx;
+            bool                                    zero_sample = false;
+            std::function<unsigned(const Point &)> interface_resolver;
+            std::function<unsigned(const Point &)> base_resolver;
+            std::function<unsigned(const Point &)> ironing_resolver;
+
+            // v2.5e: the projection band's ProjectionLayerView list, built once per
+            // support layer (below, inside the `!zero_sample` block) by
+            // chameleon_build_projection_views over `contact_idx` ONLY (the contact-band
+            // layers - mirrors nearest_surface's pre-v2.4 own usage of this same
+            // function; NOT the coplanar+contact union band_idx votes against - a
+            // projection answers "what's directly above", which is a contact-band
+            // question, not a lateral one). Declared here (not inside the block below)
+            // for the same "outlives the resolvers that reference it" reason band_idx/
+            // coplanar_wall_idx are.
+            std::vector<ProjectionLayerView> projection_view;
+            std::vector<const Layer *>       projection_view_layers;
+
+            // CHAMELEON_DEBUG: per-band-layer, per-extruder wall sample counts feeding
+            // band_idx/coplanar_wall_idx below - the (a)-vs-(b) discriminator from the
+            // round-4 refutation (progress.md v2.5a section): if a claw's own extruder
+            // is ZERO here at its claw layers, the bucket dies at sampling/selection
+            // (mechanism a), not at the vote or the gate. v2.5d: tracked SEPARATELY per
+            // index now (debug_band_samples/debug_coplanar_samples) - see the loop below
+            // for how a coplanar_idx layer contributes to both. Populated only when
+            // chameleon_debug_on (see chameleon_collect_wall_samples' own trailing
+            // parameter and WallSampleIndex::add_polyline's own comment) - an empty
+            // vector plus one pointer check per li when off.
+            std::vector<std::pair<size_t, std::map<unsigned, size_t>>> debug_band_samples;
+            std::vector<std::pair<size_t, std::map<unsigned, size_t>>> debug_coplanar_samples;
+
+            // v2.5e: this layer's projection hit/miss counts - see the CHAMELEON_DEBUG
+            // header comment (proj_hits=/proj_misses=) for the full field meaning.
+            // Incremented unconditionally by projection_lookup below (cheap integer add
+            // per sample, same "always compute, only conditionally log" convention every
+            // other counter in this loop already follows - see interface_proj_hits'/
+            // interface_proj_misses' own per-object declaration comment above this
+            // loop). v2.5f: base_resolver now shares this SAME pair too (it consults the
+            // same projection_lookup, built once below and reused by all three role
+            // resolvers) - the per-role snapshot that isolates base's own share back out
+            // (proj_hits_before_base) sits at the base partition_support_entities call
+            // site further down, not here, since only the caller of that specific engine
+            // call knows "this is base's own turn".
+            size_t debug_projection_hits   = 0;
+            size_t debug_projection_misses = 0;
+
+            // v2.2 Task 4 (spec C8): band_idx over the UNION of the contact-band layers
+            // (a) and the coplanar layers (b) - dedupe via union_layer_indices
+            // (BrimFilament.hpp/.cpp) so a layer index selected by both bands doesn't
+            // double-weight its walls in brim_vote's 1/d^2 scoring. The projection view
+            // (projection_view/projection_view_layers, declared above) is built
+            // separately, below, over `contact_idx` alone - see this function's own
+            // header comment (v2.5e section) for why interface/ironing consult both.
+            //
+            // v2.5d: single pass over the union - a layer that is ALSO in coplanar_idx
+            // (membership tested via `coplanar_idx_set`, built once here since
+            // coplanar_idx is already ascending/duplicate-free per
+            // select_layers_overlapping_span's own contract) additionally samples into
+            // coplanar_wall_idx, so a contact-band-only layer (contributes to band_idx
+            // alone) is never charged the cost of a second, pointless lookup, and a
+            // coplanar layer is sampled into both indices exactly once each.
+            const std::set<size_t> coplanar_idx_set(coplanar_idx.begin(), coplanar_idx.end());
+            for (size_t li : union_layer_indices(contact_idx, coplanar_idx)) {
+                std::map<unsigned, size_t>  debug_band_li_counts;
+                std::map<unsigned, size_t> *debug_band_li_counts_ptr = chameleon_debug_on ? &debug_band_li_counts : nullptr;
+                for (const LayerRegion *lr : object->layers()[li]->regions())
+                    chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
+                        no_shift, obj_idx, band_idx, debug_band_li_counts_ptr);
+                if (chameleon_debug_on)
+                    debug_band_samples.emplace_back(li, std::move(debug_band_li_counts));
+
+                if (coplanar_idx_set.count(li)) {
+                    std::map<unsigned, size_t>  debug_coplanar_li_counts;
+                    std::map<unsigned, size_t> *debug_coplanar_li_counts_ptr = chameleon_debug_on ? &debug_coplanar_li_counts : nullptr;
+                    for (const LayerRegion *lr : object->layers()[li]->regions())
+                        chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
+                            no_shift, obj_idx, coplanar_wall_idx, debug_coplanar_li_counts_ptr);
+                    if (chameleon_debug_on)
+                        debug_coplanar_samples.emplace_back(li, std::move(debug_coplanar_li_counts));
+                }
+            }
+
+            // v2.5d: skip the whole layer (keep fallback, same as pre-v2.5d) only when
+            // BOTH indices are empty - band_idx is a strict superset of coplanar_wall_idx
+            // (every coplanar_idx layer is also a member of union_layer_indices(contact_
+            // idx, coplanar_idx), so it is sampled into band_idx too; coplanar_wall_idx
+            // non-empty therefore implies band_idx non-empty), so this condition can only
+            // ever reduce to band_idx.empty() in practice - checked as an explicit `&&`
+            // anyway (not relied on as a silent invariant) so a future change to either
+            // selector's relationship fails safe rather than silently skipping a layer
+            // that still had real interface/ironing geometry to match. A layer where
+            // band_idx is non-empty but coplanar_wall_idx is empty - support above the
+            // model's own top walls, nothing coplanar under it at all - is NOT skipped
+            // here: interface/ironing still resolve normally against band_idx, and
+            // base_resolver (built below) uniformly returns base_fallback_extruder for
+            // that empty index (brim_vote's own empty-knn_result fallback, verified in
+            // the "v2.5d: empty coplanar_idx..." unit test) - a real, deterministic
+            // bucket like any other (v2.5c: fallback buckets too), not a special case.
+            zero_sample = band_idx.empty() && coplanar_wall_idx.empty();
+
+            // CHAMELEON_DEBUG: common per-layer line prefix, built once here so both the
+            // zero-sample early-exit just below and the full engine-call path further
+            // down emit the same fields - only the trailing `buckets=` segment differs
+            // (a zero-sample layer never reaches apply_bucket_caps, so it logs an empty
+            // buckets field instead of no line at all - "a contact/coplanar band was
+            // selected here but nothing sampled anywhere in it" is itself part of the
+            // (a)-mechanism signal this instrumentation exists to surface).
+            std::string chameleon_debug_line;
+            if (chameleon_debug_on) {
+                chameleon_debug_line =
+                    "obj="            + std::to_string(obj_idx) +
+                    " print_z="       + chameleon_debug_format_mm(support_layer->print_z) +
+                    " height="        + chameleon_debug_format_mm(support_layer->height) +
+                    " fallback="      + std::to_string(fallback_extruder) +
+                    " base_fallback=" + std::to_string(base_fallback_extruder) +
+                    " free_windowed=" + chameleon_debug_format_ids(free_extruders) +
+                    " free_strict="   + chameleon_debug_format_ids(free_extruders_exempt) +
+                    // v2.5g: base's own projection depth limit for THIS layer - see this
+                    // function's own header comment (base_cast_mm= field) for why this is
+                    // logged unconditionally, ahead of the zero-sample early-exit below.
+                    " base_cast_mm="  + chameleon_debug_format_mm(base_cast_mm) +
+                    " contact_layers="  + chameleon_debug_format_indices(contact_idx) +
+                    " coplanar_layers=" + chameleon_debug_format_indices(coplanar_idx) +
+                    // v2.5d: split from the old single `wall_samples=` field -
+                    // band_samples is band_idx's per-layer counts (interface/ironing's
+                    // electorate, same shape/values the old field always had); coplanar_
+                    // samples is coplanar_wall_idx's own (base's electorate, v2.5d new) -
+                    // a claw layer whose coplanar_samples is empty for a color that IS
+                    // present in band_samples is exactly the "base correctly excludes
+                    // the contact-band-only wall" signal this split exists to surface.
+                    " band_samples="     + chameleon_debug_format_wall_samples(debug_band_samples) +
+                    " coplanar_samples=" + chameleon_debug_format_wall_samples(debug_coplanar_samples);
+            }
+
+            if (!zero_sample) {
+                // v2.5e: build the projection view for THIS support layer's contact
+                // band (contact_idx alone - see projection_view's own declaration
+                // comment above) ONCE here, the same M1 hoisting rationale as band_idx/
+                // coplanar_wall_idx's own per-layer sampling loop above - interface and
+                // ironing's resolver consults chameleon_projection_extruder_from_view
+                // once per 0.8mm sample point below (via projection_lookup), and
+                // rebuilding this view per sample (offset_ex + per-region polygon-
+                // pointer collection) would be wasteful.
+                chameleon_build_projection_views(*object, contact_idx, projection_view, projection_view_layers);
+
+                // v2.5g (spec: base projection depth limit): base_view_count is how many
+                // of contact_idx's LEADING (lowest-first) entries fall within the
+                // shallower base_cast_mm gap - i.e. top_z in (support_layer->print_z,
+                // support_layer->print_z + base_cast_mm]. contact_idx is walked directly
+                // (not re-selected via a second select_contact_layers call) since
+                // projection_view/projection_view_layers were just built 1:1 over
+                // contact_idx in that SAME order (chameleon_build_projection_views' own
+                // contract, modulo defensive skips - see the clamp below) - "slicing the
+                // vector prefix is the cheap honest form" (spec) only holds if contact_idx
+                // really is ascending by top_z here, so that assumption is asserted, not
+                // assumed: base_cast_mm <= kContactBandMm always (both are gaps measured
+                // from the same support_layer->print_z origin), and select_layers_in_band
+                // (which select_contact_layers calls) scans print_zs ascending and
+                // appends in that same order, so the set of entries satisfying the
+                // TIGHTER bound is necessarily contact_idx's own leading prefix - once one
+                // entry's top_z exceeds base_cast_mm's threshold, every later (higher-z,
+                // by the assert below) entry does too, so the loop can safely `break`
+                // rather than scan the rest.
+                size_t base_view_count = 0;
+                while (base_view_count < contact_idx.size()) {
+                    const double top_z = layer_print_zs[contact_idx[base_view_count]];
+                    assert(base_view_count == 0 ||
+                           top_z + EPSILON >= layer_print_zs[contact_idx[base_view_count - 1]]);
+                    if (top_z > support_layer->print_z + base_cast_mm + EPSILON)
+                        break;
+                    ++base_view_count;
+                }
+                // Clamp to projection_view's own size: chameleon_build_projection_views
+                // skips an out-of-range/null layer index defensively (never expected in
+                // practice - see that function's own comment), which would otherwise let
+                // a contact_idx-derived count outrun the parallel projection_view/
+                // projection_view_layers vectors chameleon_projection_extruder_from_view's
+                // `layer_limit` actually indexes into.
+                base_view_count = std::min(base_view_count, projection_view.size());
+
+                // v2.5e: projection_lookup wraps chameleon_projection_extruder_from_view
+                // as the narrow `bool(const Point&, unsigned&)` seam chameleon_build_
+                // support_resolvers (BrimFilament.hpp/.cpp) actually takes - see that
+                // function's own header comment for why this boundary (rather than the
+                // raw projection_view/projection_view_layers pair) is what got
+                // extracted. Captures projection_view/projection_view_layers BY
+                // REFERENCE (both outlive this lambda - same per-layer-scope lifetime
+                // band_idx/coplanar_wall_idx already rely on). CHAMELEON_DEBUG: also
+                // tallies debug_projection_hits/misses (see that pair's own declaration
+                // comment above) - counted HERE, not inside chameleon_build_support_
+                // resolvers, since a shared std::function/counter pair like this one
+                // needs no role knowledge at all to tally correctly (v2.5f: now shared
+                // by interface, ironing, AND base alike - see chameleon_build_support_
+                // resolvers' own generic projection_lookup parameter's header comment
+                // for why it deliberately has no reason to know which role is calling).
+                // Per-role attribution (base_proj_hits/base_proj_misses), when it's
+                // needed, is recovered further down by snapshotting these same shared
+                // counters around the specific engine call that's currently running -
+                // see proj_hits_before_base's own comment at that call site.
+                std::function<bool(const Point &, unsigned &)> projection_lookup =
+                    [&projection_view, &projection_view_layers, &debug_projection_hits,
+                     &debug_projection_misses](const Point &p, unsigned &out_extruder) -> bool {
+                        const bool hit = chameleon_projection_extruder_from_view(
+                            projection_view, projection_view_layers, p, out_extruder);
+                        if (hit)
+                            ++debug_projection_hits;
+                        else
+                            ++debug_projection_misses;
+                        return hit;
+                    };
+
+                // v2.5g (spec: base projection depth limit): base's OWN projection lookup
+                // - same seam shape as projection_lookup above, same shared projection_
+                // view/projection_view_layers (no second geometry build), but with
+                // `layer_limit=base_view_count` forwarded to chameleon_projection_extruder_
+                // from_view/chameleon_pick_projection_region (BrimFilament.hpp/.cpp) so
+                // base can only ever hit a band layer within its own shallower reach - a
+                // surface further away is invisible to this lookup even though the SAME
+                // point would still hit via the unlimited `projection_lookup` above (that
+                // is precisely interface/ironing's unchanged full-depth behavior). Tallies
+                // into the SAME shared debug_projection_hits/misses pair projection_lookup
+                // does (v2.5f precedent: these two counters have counted all three roles
+                // combined since base's own projection tier was introduced; base's
+                // isolated share is still recovered downstream via the existing before/
+                // after snapshot around base's own partition_support_entities call,
+                // unaffected by which of the two lookups actually produced the hit/miss).
+                std::function<bool(const Point &, unsigned &)> base_projection_lookup =
+                    [&projection_view, &projection_view_layers, base_view_count, &debug_projection_hits,
+                     &debug_projection_misses](const Point &p, unsigned &out_extruder) -> bool {
+                        const bool hit = chameleon_projection_extruder_from_view(
+                            projection_view, projection_view_layers, p, out_extruder, base_view_count);
+                        if (hit)
+                            ++debug_projection_hits;
+                        else
+                            ++debug_projection_misses;
+                        return hit;
+                    };
+
+                // v2.5e/v2.5f/v2.5g: the actual resolver-construction wiring - interface/
+                // ironing try PROJECTION FIRST via projection_lookup (full contact-band
+                // depth, unchanged), base via base_projection_lookup (v2.5g's shallower,
+                // depth-limited view of the SAME underlying geometry) - each falling
+                // through on a miss to its own nearest-wall vote (interface/ironing:
+                // band_idx; base: coplanar_wall_idx, never band_idx) - lives in
+                // BrimFilament.hpp/.cpp's chameleon_build_support_resolvers (v2.5d
+                // final-review I1 fix: pulled out specifically so a unit test can pin
+                // this wiring, not just the brim_vote/partition_support_entities
+                // primitives it composes). See that function's own header comment for
+                // the full decision rule, the v2.5f taper note, the v2.5g depth-limit
+                // paragraph, and the k=1/max_dist_mm=0 role-param construction this call
+                // replaces (formerly built inline, right here, pre-v2.5e).
+                const ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
+                    band_idx, coplanar_wall_idx, projection_lookup, base_projection_lookup, vote_params,
+                    fallback_extruder, base_fallback_extruder);
+                interface_resolver = resolvers.interface_resolver;
+                base_resolver      = resolvers.base_resolver;
+                ironing_resolver   = resolvers.ironing_resolver;
+            }
+
+            if (zero_sample) {
+                // Nothing to project onto / vote on for EITHER index (see the
+                // zero_sample assignment above for why band_idx.empty() is the only way
+                // both end up empty in practice) -> both roles' resolvers would
+                // trivially return their own fallback for every sample; skip the
+                // (pointless) engine calls and keep the whole layer on fallback, same as
+                // v2.0's zero-sample skip. v2.2: this `continue` is BEFORE the engine
+                // calls, so it's one of the "layers that skip partitioning" the
+                // hysteresis contract (above) leaves prev_kept unchanged for.
+                if (chameleon_debug_on)
+                    chameleon_debug_log(chameleon_debug_line +
+                        " proj_hits=0 proj_misses=0 proj_hits_base=0 proj_misses_base=0 buckets=");
+                ++layers_zero_sample;
+                support_layer->chameleon_interface_visited = true;
+                continue;
+            }
+
+            // Three engine calls sharing ONE out map (spec: interface, then base, then
+            // v2.2 Task 3's ironing). Each call only ever touches entities whose role()
+            // matches its own role_filter (Task 1's partition_support_entities; v2.2
+            // Task 3's C7 extends this to a nested collection's COLLAPSED role() too), so
+            // running these sequentially over the same support_fills is safe: each call's
+            // entities.swap() rebuild leaves every entity of a DIFFERENT role exactly
+            // where it was for the next call to then walk.
+            std::map<unsigned, ExtrusionEntityCollection> partitioned;
+            // v2.3 Task 3 (spec C5): fresh accumulator for THIS layer's descends, shared
+            // across all three calls below the same way `partitioned` itself is -
+            // replaces `descended_last_layer` wholesale once this layer's processing
+            // finishes (see the assignment further down, mirroring prev_kept's own
+            // update site).
+            DescendColumnMap descended_this_layer;
+
+            const size_t interface_switches = partition_support_entities(support_layer->support_fills,
+                erSupportMaterialInterface, fallback_extruder, interface_resolver, vote_params, partitioned,
+                &descended_this_layer);
+
+            // v2.5f (v2.5e review M3 fix, base half): debug_projection_hits/misses are
+            // shared by ALL THREE role resolvers now (base joined interface/ironing this
+            // task - see that pair's own per-layer declaration comment above), so a
+            // before/after snapshot taken around ONE specific engine call is how this
+            // loop recovers that one role's own isolated share, without teaching
+            // chameleon_build_support_resolvers' projection_lookup seam about roles
+            // (its own header comment explains why that seam stays deliberately
+            // generic). Safe with no extra synchronization: this per-layer loop, and the
+            // per-object loop it lives inside (chameleon_assign_support_interfaces),
+            // are both plain sequential `for` loops, not tbb::parallel_for - the three
+            // partition_support_entities calls below run strictly one after another on
+            // one thread, so nothing else can touch debug_projection_hits/misses between
+            // this snapshot and the one right after base's own call.
+            const size_t proj_hits_before_base   = debug_projection_hits;
+            const size_t proj_misses_before_base = debug_projection_misses;
+
+            const size_t base_switches = partition_support_entities(support_layer->support_fills,
+                erSupportMaterial, base_fallback_extruder, base_resolver, vote_params, partitioned,
+                &descended_this_layer);
+
+            // v2.5f: base's own isolated projection hit/miss count for THIS layer - see
+            // proj_hits_before_base's own comment just above for the snapshot mechanism.
+            // (debug_projection_hits/misses themselves are NOT reset here - they keep
+            // accumulating through the ironing call below too, exactly as before v2.5f,
+            // since the aggregate proj_hits=/proj_misses= log field is still meant to
+            // cover every role combined.)
+            const size_t base_proj_hits_this_layer   = debug_projection_hits   - proj_hits_before_base;
+            const size_t base_proj_misses_this_layer = debug_projection_misses - proj_misses_before_base;
+
+            // v2.2 Task 3 (spec C6, root cause 5): "ironing follows its interface" -
+            // erIroning entities are the ironed top surface of a matched interface run,
+            // not a role with its own independent vertical/lateral rule, so this call
+            // reuses ironing_resolver/fallback_extruder/vote_params VERBATIM (same three
+            // arguments the interface call above passes, modulo the resolver - "vote_
+            // params_interface" in the plan/spec's own wording is this same shared
+            // `vote_params`, not a separate object). v2.5e: ironing_resolver, not
+            // interface_resolver directly - the two are the SAME callable by construction
+            // (chameleon_build_support_resolvers, BrimFilament.hpp/.cpp - see
+            // ChameleonSupportResolvers::ironing_resolver's own comment), so this is a
+            // literal no-op change in behavior, but it is what actually exercises the
+            // struct field a unit test pins, rather than silently relying on interface_
+            // resolver and ironing_resolver happening to hold equal values. Runs BEFORE
+            // apply_bucket_caps below, into the SAME `partitioned` map, so an ironing
+            // bucket is gated/trimmed as part of the same per-layer distinct-extruder cap
+            // as the interface/base buckets it shares an extruder with - not a separate
+            // budget (v22-task-1-report.md's own concern for Task 3, confirmed still
+            // correct: apply_bucket_caps' total_path_length_mm already recurses into any
+            // nested collection a bucket might hold, per C7).
+            const size_t ironing_switches = partition_support_entities(support_layer->support_fills,
+                erIroning, fallback_extruder, ironing_resolver, vote_params, partitioned,
+                &descended_this_layer);
+
+            interface_runs_matched += interface_switches;
+            base_runs_matched      += base_switches;
+            ironing_runs_matched   += ironing_switches;
+            // v2.5e/v2.5f: accumulate this layer's projection hit/miss counts (already
+            // fully tallied by now - interface, base, AND ironing's
+            // partition_support_entities calls above have all finished sampling) into
+            // the object-wide totals; see interface_proj_hits'/interface_proj_misses'
+            // own declaration comment above this loop for why this pair is an ALL-ROLES
+            // total as of v2.5f, not an interface-only one.
+            interface_proj_hits   += debug_projection_hits;
+            interface_proj_misses += debug_projection_misses;
+            // v2.5f: base's own isolated share, accumulated the same way - see
+            // base_proj_hits'/base_proj_misses' own per-object declaration comment.
+            base_proj_hits   += base_proj_hits_this_layer;
+            base_proj_misses += base_proj_misses_this_layer;
+
+            // v2.2 Task 1 (spec C1-C3): replaces the old ">3 switch-boundaries -> whole-
+            // layer revert" and ">20 cumulative -> per-object escalation" machinery
+            // (deleted entirely, C2). Support fills are one ExtrusionPath per LINE, so a
+            // switch-boundary count (interface_switches + base_switches above) trips on
+            // ordinary boundary-crossing runs and has nothing to do with the toolchange
+            // this layer actually pays for - the TRUE per-layer cost is the number of
+            // DISTINCT matched extruders. apply_bucket_caps measures that directly and
+            // degrades PARTIALLY instead of reverting the whole layer: it first gates
+            // any bucket whose total matched path length is under the tier floor (v2.3
+            // Task 1, spec C1: 12mm normal / 3mm for a FREE extruder - see
+            // free_extruders above - replacing the old flat 40mm; a matched sliver isn't
+            // worth a toolchange/purge, but a FREE one is already paying for that
+            // toolchange anyway), then, only if more than 2 extruders' worth of geometry
+            // survived the gate, trims to the 2 with the longest total length -
+            // preferring whichever extruder(s) this object's PREVIOUS support layer
+            // committed (`prev_kept`) outright over length (C1 hysteresis: stability up
+            // the column, the fix for the alternating-stripe artifact a whole-layer
+            // revert caused; v2.3 Task 1 spec C2 additionally halves the GATE's own
+            // floor for a prev_kept bucket - see apply_bucket_caps' own doc comment).
+            // Every dropped/trimmed bucket's geometry is redirected to the nearest
+            // SURVIVING matched bucket (v2.5a: prints a real nearby matched color
+            // instead of the residual don't-care path); only when NO bucket survives
+            // does it merge back into support_fills (fallback) via the same ownership-
+            // transferring append(ExtrusionEntitiesPtr&&) the old revert used - each
+            // path still carries its true source role, so nothing is lost.
+            //
+            // v2.3 Task 1 (spec C2): captured BEFORE the call, since apply_bucket_caps
+            // erases gated/trimmed buckets from `partitioned` in place - this is what
+            // distinguishes "buckets existed pre-gate but were all gated away" (the
+            // one-layer retention case) from "nothing was ever a candidate this layer"
+            // (the uniform-fallback fast path, which must NOT retain) in
+            // chameleon_update_prev_kept below.
+            const bool had_buckets_pre_gate = !partitioned.empty();
+
+            // CHAMELEON_DEBUG: per-bucket before/after/outcome accounting - see
+            // ChameleonBucketDebugEntry's own doc comment (BrimFilament.hpp) and
+            // apply_bucket_caps' own trailing parameter for what populates this.
+            // nullptr when off, matching every other debug hook in this loop.
+            std::vector<ChameleonBucketDebugEntry> chameleon_debug_bucket_entries;
+
+            BucketCapResult cap_result = apply_bucket_caps(partitioned, prev_kept,
+                /*max_extruders=*/2, /*min_len_mm=*/12.0, support_layer->support_fills,
+                free_extruders, /*min_len_free_mm=*/3.0, free_extruders_exempt,
+                chameleon_debug_on ? &chameleon_debug_bucket_entries : nullptr);
+            buckets_dropped_min_benefit      += cap_result.buckets_dropped_min_benefit;
+            buckets_dropped_min_benefit_free += cap_result.buckets_dropped_min_benefit_free;
+            buckets_trimmed_cap              += cap_result.buckets_trimmed_cap;
+            buckets_redirected               += cap_result.buckets_redirected;
+            buckets_exempt_kept              += cap_result.buckets_exempt_kept;
+
+            if (chameleon_debug_on)
+                chameleon_debug_log(chameleon_debug_line +
+                    " proj_hits=" + std::to_string(debug_projection_hits) +
+                    " proj_misses=" + std::to_string(debug_projection_misses) +
+                    " proj_hits_base=" + std::to_string(base_proj_hits_this_layer) +
+                    " proj_misses_base=" + std::to_string(base_proj_misses_this_layer) +
+                    " buckets=" + chameleon_debug_format_buckets(chameleon_debug_bucket_entries));
+
+            if (!partitioned.empty()) {
+                support_layer->interface_by_extruder = std::move(partitioned);
+                ++layers_partitioned;
+            }
+            // else: partitioned can be empty only via (a) an all-degenerate layer (every
+            // entity Unchanged under the empty-chain guard) or (b) apply_bucket_caps gating/
+            // trimming everything with no-survivor merge-back (support_fills already holds
+            // that geometry back). interface_by_extruder stays empty either way.
+
+            // Hysteresis (v2.3 Task 1, spec C2): this layer reached the engine calls, so
+            // chameleon_update_prev_kept (BrimFilament.hpp/.cpp - see its own doc
+            // comment for the three-way decision) now decides prev_kept/the retention
+            // grace instead of the old unconditional overwrite. Only the guards ABOVE
+            // this point (plate/visited/zero-sample, all of which `continue` before
+            // ever reaching here) leave prev_kept/prev_kept_retained_last_layer
+            // unchanged.
+            PrevKeptState next_prev_kept_state = chameleon_update_prev_kept(
+                { prev_kept, prev_kept_retained_last_layer }, cap_result.kept, had_buckets_pre_gate);
+            prev_kept                     = std::move(next_prev_kept_state.prev_kept);
+            prev_kept_retained_last_layer = next_prev_kept_state.retained_last_layer;
+            // v2.3 Task 3 (spec C5): replace wholesale (not merge) - see
+            // descended_last_layer's own declaration comment above for why this layer's
+            // fresh accumulation is the whole next-layer state, not an addition to it.
+            descended_last_layer = std::move(descended_this_layer);
+            support_layer->chameleon_interface_visited = true;
+        }
+
+        // v2.4 (spec A): "mode=nearest_wall" is now a constant, not a per-object
+        // ternary - nearest_wall is the only resolution mode that ever reaches this line
+        // (objects with support_filament_matching off `continue`d out above the loop
+        // entirely, and nearest_surface no longer exists) - kept as a literal string, not removed,
+        // so the line stays a stable grep target and a triage/verify script can still
+        // assert "the pass ran for this object" (mode= present) vs. "the object was
+        // gated out as manual" (no line at all for that ordinal) - see the legacy-alias
+        // verify check (spike/verify_chameleon.sh) for exactly that assertion.
+        BOOST_LOG_TRIVIAL(info) << "Chameleon support match: object ordinal " << obj_idx
+            << " mode=nearest_wall"
+            // v2.3 Task 4 (spec C9): free_set_size is the once-per-PASS
+            // layer_filament_table's entry count (z-coincidence rows, not extruders per
+            // row) - same value on every object's line since the table is built once
+            // before this loop (see chameleon_collect_layer_filaments above). 0 means
+            // either mixed-filament gradient was active (table skipped entirely, C1) or
+            // no object in the plate has any wall/solid/sparse layer - i.e. the free tier
+            // (3mm floor) can never fire this pass; a triage reader can rule the free
+            // tier in/out of a gate-count anomaly from this one field before digging into
+            // per-layer free_extruders.
+            << " free_set_size=" << layer_filament_table.size()
+            // v2.4 Task C (spec C): resolved fallback ids, so a triage reader can tell
+            // "this object's whole layer degraded to fallback" apart from "the gate
+            // dropped a genuinely-matched bucket back to fallback" (same symptom, gcode-
+            // side - a run of the fallback color - but different root cause) without
+            // re-deriving these from object config by hand.
+            << " fallback=" << fallback_extruder
+            << " base_fallback=" << base_fallback_extruder
+            << " layers_partitioned=" << layers_partitioned
+            << " layers_zero_sample=" << layers_zero_sample
+            << " buckets_dropped_min_benefit=" << buckets_dropped_min_benefit
+            << " buckets_dropped_min_benefit_free=" << buckets_dropped_min_benefit_free
+            << " buckets_trimmed_cap=" << buckets_trimmed_cap
+            // v2.5a Task 2 (spec item 2): SUBSET of the two counters just above -
+            // see buckets_redirected's own declaration comment for the exact
+            // relationship.
+            << " buckets_redirected=" << buckets_redirected
+            << " buckets_exempt_kept=" << buckets_exempt_kept
+            << " interface_runs_matched=" << interface_runs_matched
+            << " base_runs_matched=" << base_runs_matched
+            << " ironing_runs_matched=" << ironing_runs_matched
+            // v2.5e/v2.5f: object-wide sums of the per-layer proj_hits/proj_misses debug
+            // counts (see the CHAMELEON_DEBUG header comment's proj_hits=/proj_misses=
+            // field for the full meaning, incl. the v2.5f note on why this pair is now
+            // an ALL-ROLES total) - unlike the other CHAMELEON_DEBUG-only per-layer
+            // fields, these are cheap to accumulate unconditionally (interface_proj_
+            // hits'/interface_proj_misses'/base_proj_hits'/base_proj_misses' own
+            // declaration comments above this loop), so they're meaningful on this
+            // BOOST_LOG_TRIVIAL line even when CHAMELEON_DEBUG itself is unset.
+            << " interface_proj_hits=" << interface_proj_hits
+            << " interface_proj_misses=" << interface_proj_misses
+            // v2.5f: base's own isolated share of the totals above (v2.5e review M3
+            // fix, base half) - the discriminator this task adds for "is base's new
+            // projection branch actually engaging".
+            << " base_proj_hits=" << base_proj_hits
+            << " base_proj_misses=" << base_proj_misses;
+
+        // CHAMELEON_DEBUG: field-for-field mirror of the BOOST_LOG_TRIVIAL summary line
+        // just above, also written to the dedicated debug file - BOOST_LOG_TRIVIAL(info)
+        // may be filtered by whatever log severity level is currently configured, and
+        // (Part 1's own hard-won lesson, see the CHAMELEON_DEBUG header comment above
+        // chameleon_collect_wall_samples) a GUI slicing background thread's
+        // BOOST_LOG_TRIVIAL output does not reliably reach the GUI's own log sink at
+        // all - so a triage session relying solely on the line above can come up empty
+        // even though the pass genuinely ran. "SUMMARY " prefix distinguishes this line
+        // from the per-layer lines above it in the same file.
+        if (chameleon_debug_on) {
+            chameleon_debug_log(
+                "SUMMARY obj=" + std::to_string(obj_idx) +
+                " mode=nearest_wall" +
+                " free_set_size=" + std::to_string(layer_filament_table.size()) +
+                " fallback=" + std::to_string(fallback_extruder) +
+                " base_fallback=" + std::to_string(base_fallback_extruder) +
+                " layers_partitioned=" + std::to_string(layers_partitioned) +
+                " layers_zero_sample=" + std::to_string(layers_zero_sample) +
+                " buckets_dropped_min_benefit=" + std::to_string(buckets_dropped_min_benefit) +
+                " buckets_dropped_min_benefit_free=" + std::to_string(buckets_dropped_min_benefit_free) +
+                " buckets_trimmed_cap=" + std::to_string(buckets_trimmed_cap) +
+                " buckets_redirected=" + std::to_string(buckets_redirected) +
+                " buckets_exempt_kept=" + std::to_string(buckets_exempt_kept) +
+                " interface_runs_matched=" + std::to_string(interface_runs_matched) +
+                " base_runs_matched=" + std::to_string(base_runs_matched) +
+                " ironing_runs_matched=" + std::to_string(ironing_runs_matched) +
+                " interface_proj_hits=" + std::to_string(interface_proj_hits) +
+                " interface_proj_misses=" + std::to_string(interface_proj_misses) +
+                " base_proj_hits=" + std::to_string(base_proj_hits) +
+                " base_proj_misses=" + std::to_string(base_proj_misses));
+        }
+    }
 }
 
 // Slicing process, running at a background thread.
@@ -2552,6 +4160,13 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         }
     }
 
+    // Chameleon P2: assign support-interface extruders by nearest wall BEFORE ToolOrdering
+    // is built below - every object's support material (generate_support_material, above,
+    // fresh or copied from a shared object) has finished, and the per-support-layer block
+    // in ToolOrdering.cpp reads SupportLayer::interface_by_extruder at ctor time, so it
+    // must already be populated by the time psWipeTower constructs the tool ordering.
+    chameleon_assign_support_interfaces(*this);
+
     if (this->set_started(psWipeTower)) {
         m_wipe_tower_data.clear();
         m_tool_ordering.clear();
@@ -2625,11 +4240,172 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         // BBS: m_brimMap and m_supportBrimMap are used instead of m_brim to generate brim of objs and supports seperately
         m_brimMap.clear();
         m_supportBrimMap.clear();
+        m_brimMapByExtruder.clear();
         m_first_layer_convex_hull.points.clear();
         if (this->has_brim()) {
             Polygons islands_area;
             make_brim(*this, this->make_try_cancel(), islands_area, m_brimMap,
                 m_supportBrimMap, objPrintVec, printExtruders);
+
+            // Chameleon brim: reassign brim extrusions to whichever extruder
+            // printed the nearest first-layer wall. Off by default (bfsObject),
+            // and skipped outright on single-extruder prints so the default
+            // path stays byte-identical to pre-chameleon behavior.
+            // Also restricted to by-layer printing: in PrintSequence::ByObject mode,
+            // GCode::process_layers() builds a separate per-object ToolOrdering for
+            // each object in turn (which never runs the whole-print union hook in
+            // ToolOrdering.cpp), so GCode::process_layer's foreign-brim emission block
+            // would see a populated m_brimMapByExtruder without the matching extruder
+            // having been registered for that object's layer - risking a double-emit
+            // (once via the normal per-object m_brimMap path, once foreign) or a
+            // missed/mis-sequenced foreign run. Keep m_brimMapByExtruder empty in
+            // sequential (by-object) mode so both the union hook and the emission
+            // block stay no-ops there and by-object prints keep the plain per-object
+            // brim behavior (each object's brim prints in its own filament).
+            if (m_config.brim_filament_source == bfsNearestWall && this->extruders().size() > 1
+                && m_config.print_sequence != PrintSequence::ByObject) {
+                // Run-stable object key: objIDPair.first.id (the raw ObjectID) is NOT stable
+                // across process runs - confirmed empirically (Task 5 verification): two
+                // back-to-back runs of the identical command produced wildly different id
+                // values (e.g. 0 vs 2317700280585562421), because ObjectID is an
+                // allocation-order/address-derived counter, not a content hash. WallSampleIndex's
+                // k-NN tie-break and BrimVoteParams::object_area are both keyed by this value
+                // specifically for determinism (see WallSampleIndex.hpp's own comment), so an
+                // unstable key silently flips tie votes between otherwise-identical runs,
+                // shifting brim-run partition boundaries. Build a small dense ordinal
+                // (0, 1, 2, ...) from objPrintVec's own iteration order instead:
+                // print_object_instances_ordering (which objPrintVec is derived from) is itself
+                // deterministic - model order or chained/arranged layout order, never an
+                // address/allocation id - so this ordinal is stable run-to-run even though the
+                // underlying ObjectID is not.
+                std::map<ObjectID, size_t> object_ordinal;
+                for (size_t i = 0; i < objPrintVec.size(); ++i)
+                    object_ordinal[objPrintVec[i].first] = i;
+
+                WallSampleIndex wall_idx;
+                std::map<size_t, double> object_area;
+                // Chameleon brim fallback (spec-mandated): an object that contributes zero
+                // layer-0 wall samples (e.g. its first layer is entirely support, no walls of
+                // its own) has no basis for a nearest-wall vote. Rather than let it fall through
+                // to whatever an empty-candidate vote produces, keep its brim on the object's own
+                // filament for its whole run - tracked here via a wall_idx size delta per object,
+                // acted on below by skipping the partition pass for these objects entirely.
+                std::map<ObjectID, bool> zero_sample_objects;
+
+                for (const auto& objIDPair : objPrintVec) {
+                    const PrintObject* object = this->get_object(objIDPair.first);
+                    if (object == nullptr || object->layers().empty())
+                        continue;
+                    const size_t object_key = object_ordinal.at(objIDPair.first);
+                    const Layer* layer0     = object->layers().front();
+
+                    double area_sum = 0.0;
+                    for (const ExPolygon& ex : layer0->lslices)
+                        area_sum += ex.area() * SCALING_FACTOR * SCALING_FACTOR;
+                    object_area[object_key] = area_sum;
+
+                    const size_t samples_before = wall_idx.size();
+                    for (const PrintInstance& instance : object->instances())
+                        for (const LayerRegion* lr : layer0->regions()) {
+                            chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
+                                instance.shift, object_key, wall_idx);
+                        }
+                    if (wall_idx.size() == samples_before) {
+                        zero_sample_objects[objIDPair.first] = true;
+                        BOOST_LOG_TRIVIAL(warning) << "Chameleon brim: object id " << objIDPair.first.id
+                            << " contributed zero layer-0 wall samples; keeping its brim on the "
+                               "object's own filament instead of nearest-wall assignment.";
+                    }
+                }
+
+                BrimVoteParams vote_params;
+                vote_params.object_area = object_area;
+
+                for (auto& brimEntry : m_brimMap) {
+                    if (zero_sample_objects.count(brimEntry.first))
+                        continue; // fallback: leave this object's brim on its own filament, untouched
+                    const auto obj_it = std::find_if(objPrintVec.begin(), objPrintVec.end(),
+                        [&brimEntry](const std::pair<ObjectID, unsigned int>& pr) { return pr.first == brimEntry.first; });
+                    if (obj_it == objPrintVec.end())
+                        continue;
+                    const unsigned own_extruder_0based = obj_it->second > 0 ? obj_it->second - 1 : 0;
+                    vote_params.fallback_extruder = own_extruder_0based;
+
+                    ExtrusionEntityCollection kept;
+                    std::map<unsigned, ExtrusionEntityCollection> foreign;
+                    partition_brim_by_wall(brimEntry.second, own_extruder_0based, wall_idx, vote_params, kept, foreign);
+                    // I2: release the original entities before the move-assign below replaces
+                    // them - ExtrusionEntityCollection::operator=(&&) just overwrites the
+                    // raw-pointer `entities` vector without deleting what it pointed to (unlike
+                    // the copy-assign operator, which does call clear() first), so skipping this
+                    // leaks every original brim entity on every nearest_wall slice. `kept`/`foreign`
+                    // above already hold independent entities (new paths, or the original pointers
+                    // themselves reassigned into `kept` - never both), so this clear() cannot
+                    // double-free anything partition_brim_by_wall handed back to us.
+                    brimEntry.second.clear();
+                    // Root-cause fix (GUI validation): the per-object brim print site in
+                    // GCode::process_layer runs under whichever extruder prints that object
+                    // FIRST on layer 0 - not necessarily own_extruder - so leaving the kept
+                    // (own-voted) runs in m_brimMap printed them in an arbitrary filament.
+                    // Route the own partition through m_brimMapByExtruder as well: every run
+                    // then prints under exactly the extruder it was voted for, via the
+                    // toolchange-ordered emission block. m_brimMap stays EMPTY for partitioned
+                    // objects (the legacy per-object site prints nothing for them).
+                    if (!kept.entities.empty())
+                        m_brimMapByExtruder[brimEntry.first][own_extruder_0based] = std::move(kept);
+                    for (auto& foreignEntry : foreign) {
+                        if (foreignEntry.second.entities.empty())
+                            continue;
+                        m_brimMapByExtruder[brimEntry.first][foreignEntry.first] = std::move(foreignEntry.second);
+                    }
+                }
+            }
+
+            // Chameleon brim: union foreign-extruder brim partitions into the first layer's
+            // LayerTools.extruders of the ToolOrdering object GCode actually consumes
+            // (m_tool_ordering; m_wipe_tower_data.tool_ordering is a reference to this same
+            // object - see WipeTowerData's private ctor above). This MUST run here, after the
+            // partition pass above has populated m_brimMapByExtruder, rather than inside
+            // ToolOrdering's own constructor: psWipeTower - which constructs/assigns
+            // m_tool_ordering, both via _make_wipe_tower() and the plain-ToolOrdering(*this, ...)
+            // branch - runs BEFORE psSkirtBrim, so a ctor-time hook always observed an empty map
+            // on a fresh slice.
+            if (!m_brimMapByExtruder.empty()) {
+                if (m_tool_ordering.empty()) {
+                    // Belt-and-braces: the ToolOrdering GCode consumes isn't available on this
+                    // path (should not happen given the ByObject gate above, but brim geometry
+                    // must never be silently dropped) - fold every foreign partition back into
+                    // its object's own-extruder brim collection instead of leaving it stranded
+                    // and unregistered (which GCode::process_layer would then never visit).
+                    for (auto& brimEntry : m_brimMapByExtruder) {
+                        ExtrusionEntityCollection& own = m_brimMap[brimEntry.first];
+                        for (auto& foreignEntry : brimEntry.second)
+                            own.append(std::move(foreignEntry.second.entities));
+                    }
+                    BOOST_LOG_TRIVIAL(warning) << "Chameleon brim: ToolOrdering unavailable after brim "
+                        "partitioning; merged all foreign-extruder brim runs back into their "
+                        "object's own extruder instead of dropping them.";
+                    m_brimMapByExtruder.clear();
+                } else {
+                    // Do NOT sort/dedup this vector with sort_remove_duplicates(): by this point
+                    // its order is semantically load-bearing, not incidental - reorder_extruders()
+                    // has already picked which extruder leads (the requested first_extruder, or a
+                    // soluble-first swap ahead of the prime tower) and, for layer 0 specifically,
+                    // applied apply_first_layer_order()'s user-configured sequence. A numeric sort
+                    // here would silently discard all of that ordering. Instead, append any brim
+                    // extruder not already present to the end (dedup via linear find,
+                    // order-preserving) so it simply prints last on layer 0.
+                    LayerTools& first_layer_tools = m_tool_ordering.tools_for_layer(m_tool_ordering.front().print_z);
+                    for (const auto& obj_entry : m_brimMapByExtruder)
+                        for (const auto& per_extruder : obj_entry.second) {
+                            unsigned int extruder_id = per_extruder.first;
+                            if (std::find(first_layer_tools.extruders.begin(), first_layer_tools.extruders.end(), extruder_id)
+                                == first_layer_tools.extruders.end())
+                                first_layer_tools.extruders.push_back(extruder_id);
+                        }
+                }
+            }
+
             for (Polygon& poly_ex : islands_area)
                 poly_ex.douglas_peucker(SCALED_RESOLUTION);
             for (Polygon &poly : union_(this->first_layer_islands(), islands_area))

@@ -7,6 +7,7 @@
 #include "SurfaceCollection.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include "BoundingBox.hpp"
+#include <map>
 namespace Slic3r {
 
 class ExPolygon;
@@ -280,6 +281,19 @@ public:
     ExPolygons                  support_islands;
     // Extrusion paths for the support base and for the support interface and contacts.
     ExtrusionEntityCollection   support_fills;
+    // chameleon: per-extruder matched interface partitions (empty = feature off)
+    std::map<unsigned, ExtrusionEntityCollection> interface_by_extruder;
+    // chameleon P2 fix (C1): set once chameleon_assign_support_interfaces has visited
+    // this layer (partitioned, reverted, zero-sample, or escalation-skipped alike), so
+    // a second pass over the SAME SupportLayer object - either an aliased copy sharing
+    // this pointer (copy_layers_from_shared_object) processed later in the same
+    // Print::process() call, or a later Print::process() re-run where posSupportMaterial
+    // stayed valid and support_fills carries pass-1's mutations - skips instead of
+    // re-partitioning already-mutated/matched data. Defaults false on every fresh
+    // SupportLayer, so it is naturally reset whenever generate_support_material rebuilds
+    // the layers (PrintObject::clear_support_layers deletes the old SupportLayer objects
+    // and add_support_layer/add_tree_support_layer allocate new ones).
+    bool                         chameleon_interface_visited = false;
     SupportInnerType            support_type = stInnerNormal;
 
     // for tree supports

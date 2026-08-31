@@ -349,6 +349,12 @@ static const t_config_enum_values s_keys_map_BrimType = {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(BrimType)
 
+static t_config_enum_values s_keys_map_BrimFilamentSource {
+    { "object",       int(BrimFilamentSource::bfsObject) },
+    { "nearest_wall", int(BrimFilamentSource::bfsNearestWall) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(BrimFilamentSource)
+
 // using 0,1 to compatible with old files
 static const t_config_enum_values s_keys_map_TimelapseType = {
     {"0",       tlTraditional},
@@ -1374,6 +1380,21 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.emplace_back(L("No-brim"));
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionEnum<BrimType>(btAutoBrim));
+
+    def = this->add("brim_filament_source", coEnum);
+    def->label = L("Brim filament");
+    def->category = L("Support");
+    def->tooltip = L("object: brim uses each object's filament (default). nearest_wall: each brim "
+                     "extrusion uses the filament of the nearest first-layer wall, so brims match "
+                     "what they touch (multi-filament prints only). Applies to by-layer printing; "
+                     "by-object (sequential) prints use the object's filament.");
+    def->enum_keys_map = &ConfigOptionEnum<BrimFilamentSource>::get_enum_values();
+    def->enum_values.emplace_back("object");
+    def->enum_values.emplace_back("nearest_wall");
+    def->enum_labels.emplace_back(L("Object"));
+    def->enum_labels.emplace_back(L("Nearest wall"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<BrimFilamentSource>(bfsObject));
 
     def = this->add("brim_object_gap", coFloat);
     def->label = L("Brim-object gap");
@@ -5437,6 +5458,19 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionInt(0));
 
+    def = this->add("support_filament_matching", coBool);
+    def->label = L("Support Filament Matching");
+    def->category = L("Support");
+    def->tooltip = L("When enabled, support material matches the filament of the model it "
+                     "touches or stands beside: interfaces and ironing take the color of the "
+                     "surface they support, and support walls near a painted wall take that "
+                     "wall's color. Reduces color contamination between supports and the "
+                     "model. Any support geometry left over after matching keeps the color "
+                     "already assigned to it and will not be repainted by Flush into objects' "
+                     "support.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     auto support_interface_top_layers = def = this->add("support_interface_top_layers", coInt);
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
     def->label = L("Top interface layers");
@@ -6215,7 +6249,10 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Flush into objects' support");
     def->tooltip = L("Purging after filament change will be done inside objects' support. "
         "This may lower the amount of waste and decrease the print time. "
-        "It will not take effect, unless the prime tower is enabled.");
+        "It will not take effect, unless the prime tower is enabled. "
+        "Ignored for an object whose Support interface filament source is set to "
+        "Nearest wall - its support keeps the color already matched to it instead "
+        "of being used for purging.");
     def->set_default_value(new ConfigOptionBool(true));
 
     def = this->add("flush_into_objects", coBool);
@@ -7356,6 +7393,21 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
         opt_key = "counterbore_hole_bridging";
     } else if (opt_key == "draft_shield" && value == "limited") {
         value = "disabled";
+    } else if (opt_key == "support_interface_filament_source") {
+        // v2.6: support_interface_filament_source (coEnum manual|nearest_wall) was
+        // replaced by support_filament_matching (coBool) - a plain on/off checkbox now
+        // that nearest_wall was the only non-manual value left. Key-rename precedent:
+        // sparse_infill_anchor -> infill_anchor / top_one_wall_type -> only_one_wall_top
+        // above (rename opt_key, remap value in the same branch).
+        //
+        // This also folds in the v2.4 (spec A) "nearest_surface" alias that used to be
+        // its own branch here: nearest_surface was removed from the enum first (USER:
+        // GUI A/B round 2 verdict), remapped to "nearest_wall" so old projects didn't
+        // silently fall back to Config.cpp set_deserialize_raw's DEFAULT substitution
+        // (manual) - that value-remap-only branch is superseded by this one, since both
+        // "nearest_wall" and "nearest_surface" now mean the same thing: matching ON.
+        opt_key = "support_filament_matching";
+        value = (value == "nearest_wall" || value == "nearest_surface") ? "1" : "0";
     } else if ((opt_key == "sparse_infill_pattern"         ||
                 opt_key == "top_surface_pattern"           ||
                 opt_key == "undertop_surface_pattern"      ||

@@ -246,6 +246,19 @@ enum BrimType {
     btNoBrim,
 };
 
+// Chameleon brim: which filament a brim extrusion is printed with.
+enum BrimFilamentSource { bfsObject = 0, bfsNearestWall };
+
+// v2.6: the old SupportInterfaceFilamentSource enum (manual/nearest_wall) was
+// replaced by a plain on/off checkbox, support_filament_matching (coBool, see
+// PrintObjectConfig below) - now that nearest_wall was the only non-manual value
+// left (v2.4 dropped nearest_surface, see PrintConfigDef::handle_legacy in
+// PrintConfig.cpp for the full old-string migration history, folded together
+// there into one branch), there was no longer a real choice to present as an
+// enum. A saved config still holding the old "support_interface_filament_source"
+// key (any of "manual" / "nearest_wall" / "nearest_surface") is migrated to the
+// new "support_filament_matching" bool key by PrintConfigDef::handle_legacy.
+
 enum TimelapseType : int {
     tlTraditional = 0,
     tlSmooth
@@ -477,6 +490,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SeamScarfType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLADisplayOrientation)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLAPillarConnectionMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimType)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimFilamentSource)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TimelapseType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BedType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SkirtType)
@@ -866,6 +880,10 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                support_interface_not_for_body))
     ((ConfigOptionBool,                support_interface_loop_pattern))
     ((ConfigOptionInt,                 support_interface_filament))
+    // Chameleon: when enabled, support material matches the filament of the model
+    // geometry it touches or stands beside (interfaces/ironing/walls), instead of
+    // always using the configured support filament.
+    ((ConfigOptionBool,                support_filament_matching))
     ((ConfigOptionInt,                 support_interface_top_layers))
     ((ConfigOptionInt,                 support_interface_bottom_layers))
     // Spacing between interface lines (the hatching distance). Set zero to get a solid interface.
@@ -1397,6 +1415,8 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionFloat,              resolution))
     ((ConfigOptionFloats,             retraction_minimum_travel))
     ((ConfigOptionBools,              retract_when_changing_layer))
+    // Chameleon brim: which filament a brim extrusion is printed with.
+    ((ConfigOptionEnum<BrimFilamentSource>, brim_filament_source))
     ((ConfigOptionFloat,              skirt_distance))
     ((ConfigOptionInt,                skirt_height))
     ((ConfigOptionInt,                skirt_loops))

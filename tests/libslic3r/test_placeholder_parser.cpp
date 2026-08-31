@@ -11,28 +11,27 @@ SCENARIO("Placeholder parser scripting", "[PlaceholderParser]") {
 
 	config.set_deserialize_strict( {
 		{ "printer_notes", "  PRINTER_VENDOR_PRUSA3D  PRINTER_MODEL_MK2  " },
-	    { "nozzle_diameter", "0.6;0.6;0.6;0.6" },
-	    { "temperature", "357;359;363;378" }
+	    { "nozzle_diameter", "0.6,0.6,0.6,0.6" },
+	    { "nozzle_temperature", "357,359,363,378" },
+	    // FloatOrPercent options exercising the "ratio_over" resolution paths below:
+	    { "outer_wall_speed", "60" },            // parent of small_perimeter_speed
+	    { "small_perimeter_speed", "50%" },      // percent over outer_wall_speed (coFloat)
+	    { "sparse_infill_line_width", "0.45" },  // absolute parent of infill_anchor
+	    { "infill_anchor", "300%" },             // percent over sparse_infill_line_width (coFloatOrPercent)
+	    { "initial_layer_line_width", "0.9" },   // absolute FloatOrPercent, returned as-is
+	    // line_width is a percent whose ratio_over parent (nozzle_diameter) is a vector
+	    // the PlaceholderParser cannot resolve, so referencing it throws.
+	    { "line_width", "112.5%" },
 	});
-    // To test the "first_layer_extrusion_width" over "first_layer_heigth".
-    // "first_layer_heigth" over "layer_height" is no more supported after first_layer_height was moved from PrintObjectConfig to PrintConfig.
-//  config.option<ConfigOptionFloatOrPercent>("first_layer_height")->value = 150.;
-//  config.option<ConfigOptionFloatOrPercent>("first_layer_height")->percent = true;
-    config.option<ConfigOptionFloatOrPercent>("first_layer_height")->value = 1.5 * config.opt_float("layer_height");
-    config.option<ConfigOptionFloatOrPercent>("first_layer_height")->percent = false;
-    // To let the PlaceholderParser throw when referencing first_layer_speed if it is set to percent, as the PlaceholderParser does not know
-    // a percent to what.
-    config.option<ConfigOptionFloatOrPercent>("first_layer_speed")->value = 50.;
-    config.option<ConfigOptionFloatOrPercent>("first_layer_speed")->percent = true;
 
     parser.apply_config(config);
 	parser.set("foo", 0);
 	parser.set("bar", 2);
 	parser.set("num_extruders", 4);
 
-    SECTION("nested config options (legacy syntax)") { REQUIRE(parser.process("[temperature_[foo]]") == "357"); }
-    SECTION("array reference") { REQUIRE(parser.process("{temperature[foo]}") == "357"); }
-    SECTION("whitespaces and newlines are maintained") { REQUIRE(parser.process("test [ temperature_ [foo] ] \n hu") == "test 357 \n hu"); }
+    SECTION("nested config options (legacy syntax)") { REQUIRE(parser.process("[nozzle_temperature_[foo]]") == "357"); }
+    SECTION("array reference") { REQUIRE(parser.process("{nozzle_temperature[foo]}") == "357"); }
+    SECTION("whitespaces and newlines are maintained") { REQUIRE(parser.process("test [ nozzle_temperature_ [foo] ] \n hu") == "test 357 \n hu"); }
 
     // Test the math expressions.
     SECTION("math: 2*3") { REQUIRE(parser.process("{2*3}") == "6"); }
@@ -69,18 +68,15 @@ SCENARIO("Placeholder parser scripting", "[PlaceholderParser]") {
     SECTION("math: interpolate_table(13, (0, 0), (20, 20), (30, 20))") { REQUIRE(std::stod(parser.process("{interpolate_table(13, (0, 0), (20, 20), (30, 20))}")) == Approx(13.)); }
     SECTION("math: interpolate_table(25, (0, 0), (20, 20), (30, 20))") { REQUIRE(std::stod(parser.process("{interpolate_table(25, (0, 0), (20, 20), (30, 20))}")) == Approx(20.)); }
 
-    // Test the "coFloatOrPercent" and "xxx_extrusion_width" substitutions.
-    // first_layer_extrusion_width ratio_over first_layer_heigth.
-    SECTION("perimeter_extrusion_width") { REQUIRE(std::stod(parser.process("{perimeter_extrusion_width}")) == Approx(0.67500001192092896)); }
-    SECTION("first_layer_extrusion_width") { REQUIRE(std::stod(parser.process("{first_layer_extrusion_width}")) == Approx(0.9)); }
-    SECTION("support_material_xy_spacing") { REQUIRE(std::stod(parser.process("{support_material_xy_spacing}")) == Approx(0.3375)); }
-    // external_perimeter_speed over perimeter_speed
-    SECTION("external_perimeter_speed") { REQUIRE(std::stod(parser.process("{external_perimeter_speed}")) == Approx(30.)); }
-    // infill_overlap over perimeter_extrusion_width
-    SECTION("infill_overlap") { REQUIRE(std::stod(parser.process("{infill_overlap}")) == Approx(0.16875)); }
-    // If first_layer_speed is set to percent, then it is applied over respective extrusion types by overriding their respective speeds.
-    // The PlaceholderParser has no way to know which extrusion type the caller has in mind, therefore it throws.
-    SECTION("first_layer_speed") { REQUIRE_THROWS(parser.process("{first_layer_speed}")); }
+    // Test the "coFloatOrPercent" substitutions via the "ratio_over" chains.
+    SECTION("initial_layer_line_width, absolute") { REQUIRE(std::stod(parser.process("{initial_layer_line_width}")) == Approx(0.9)); }
+    // small_perimeter_speed 50% over outer_wall_speed (coFloat) 60
+    SECTION("small_perimeter_speed") { REQUIRE(std::stod(parser.process("{small_perimeter_speed}")) == Approx(30.)); }
+    // infill_anchor 300% over sparse_infill_line_width (absolute coFloatOrPercent) 0.45
+    SECTION("infill_anchor") { REQUIRE(std::stod(parser.process("{infill_anchor}")) == Approx(1.35)); }
+    // line_width is a percent and its ratio_over parent (nozzle_diameter) is a vector the
+    // PlaceholderParser cannot resolve a scalar percent against, therefore it throws.
+    SECTION("line_width") { REQUIRE_THROWS(parser.process("{line_width}")); }
 
     // Test the boolean expression parser.
     auto boolean_expression = [&parser](const std::string& templ) { return parser.evaluate_boolean_expression(templ, parser.config()); };

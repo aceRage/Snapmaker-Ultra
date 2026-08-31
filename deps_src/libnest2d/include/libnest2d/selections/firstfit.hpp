@@ -200,6 +200,13 @@ public:
                 }
             }
         }
+
+        // BIN_ID_UNFIT is internal to the packing pass; callers (and the
+        // ArrangePolygon bed_idx contract) expect unplaced items to carry
+        // BIN_ID_UNSET.
+        for (auto &itref : store_)
+            if (itref.get().binId() == BIN_ID_UNFIT)
+                itref.get().binId(BIN_ID_UNSET);
     }
 
 };

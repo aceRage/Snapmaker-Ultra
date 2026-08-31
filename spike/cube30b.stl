@@ -1,0 +1,86 @@
+solid fixture
+ facet normal 0 0 0
+  outer loop
+   vertex 0.000 0.000 0.000
+   vertex 0.000 30.000 0.000
+   vertex 30.000 30.000 0.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 0.000 0.000 0.000
+   vertex 30.000 30.000 0.000
+   vertex 30.000 0.000 0.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 0.000 0.000 3.000
+   vertex 30.000 0.000 3.000
+   vertex 30.000 30.000 3.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 0.000 0.000 3.000
+   vertex 30.000 30.000 3.000
+   vertex 0.000 30.000 3.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 0.000 0.000 0.000
+   vertex 30.000 0.000 0.000
+   vertex 30.000 0.000 3.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 0.000 0.000 0.000
+   vertex 30.000 0.000 3.000
+   vertex 0.000 0.000 3.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.000 0.000 0.000
+   vertex 30.000 30.000 0.000
+   vertex 30.000 30.000 3.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.000 0.000 0.000
+   vertex 30.000 30.000 3.000
+   vertex 30.000 0.000 3.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.000 30.000 0.000
+   vertex 0.000 30.000 0.000
+   vertex 0.000 30.000 3.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 30.000 30.000 0.000
+   vertex 0.000 30.000 3.000
+   vertex 30.000 30.000 3.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 0.000 30.000 0.000
+   vertex 0.000 0.000 0.000
+   vertex 0.000 0.000 3.000
+  endloop
+ endfacet
+ facet normal 0 0 0
+  outer loop
+   vertex 0.000 30.000 0.000
+   vertex 0.000 0.000 3.000
+   vertex 0.000 30.000 3.000
+  endloop
+ endfacet
+endsolid fixture

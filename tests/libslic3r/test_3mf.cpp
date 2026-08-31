@@ -102,14 +102,16 @@ SCENARIO("2D convex hull of sinking object", "[3mf]") {
             Polygon hull_2d = object->convex_hull_2d(instance->get_transformation().get_matrix());
 
             // verify result
+            // Unlike upstream PrusaSlicer, this fork's convex_hull_2d projects the
+            // entire mesh: it does not clip a sinking object at the print bed, so the
+            // hull extends to the full rotated extents of the model.
             Points result = {
-                { -91501496, -15914144 },
-                { 91501496, -15914144 },
-                { 91501496, 4243 },
-                { 78229680, 4246883 },
-                { 56898100, 4246883 },
-                { -85501496, 4242641 },
-                { -91501496, 4243 }
+                { -91501495, -15914144 },
+                { 91501495, -15914144 },
+                { 91501495, 13792823 },
+                { 34846496, 14717717 },
+                { -85501495, 13917981 },
+                { -91501495, 13792823 }
             };
 
             // Allow 1um error due to floating point rounding.
@@ -125,6 +127,8 @@ SCENARIO("2D convex hull of sinking object", "[3mf]") {
                 }
 
             THEN("2D convex hull should match with reference") {
+                for (const Point &p : hull_2d.points)
+                    UNSCOPED_INFO("actual hull point: { " << p.x() << ", " << p.y() << " }");
                 REQUIRE(res);
             }
         }

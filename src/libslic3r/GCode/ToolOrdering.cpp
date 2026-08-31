@@ -4,6 +4,7 @@
 #include "Layer.hpp"
 #include "ClipperUtils.hpp"
 #include "ParameterUtils.hpp"
+#include "../BrimFilament.hpp"
 
 // #define SLIC3R_DEBUG
 
@@ -515,6 +516,13 @@ ToolOrdering::ToolOrdering(const Print &print, unsigned int first_extruder, bool
         this->fill_wipe_tower_partitions(print.config(), object_bottom_z, max_layer_height);
     }
 
+    // Chameleon brim: the union of foreign-extruder brim partitions into the first
+    // layer's LayerTools.extruders used to happen here (ctor-time). It was moved to
+    // Print::process() (psSkirtBrim, right after the partition pass fills
+    // m_brimMapByExtruder) because this constructor runs during psWipeTower, which
+    // executes BEFORE psSkirtBrim populates m_brimMapByExtruder - so a ctor-time hook
+    // always observed an empty map on a fresh slice. See Print.cpp for the replacement.
+
     this->collect_extruder_statistics(prime_multi_material);
 
     this->mark_skirt_layers(print.config(), max_layer_height);
@@ -693,7 +701,15 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
         layer_tools.layer_height = support_layer->height;
         ExtrusionRole role = support_layer->support_fills.role();
         bool         has_support        = role == erMixed || role == erSupportMaterial || role == erSupportTransition;
-        bool         has_interface      = role == erMixed || role == erSupportMaterialInterface;
+        // v2.2 Task 3 (spec C6, third anchor): support_role_needs_interface_extruder
+        // (BrimFilament.hpp/.cpp) adds erIroning to this classification - a layer whose
+        // support_fills collapsed to PURE erIroning (every erSupportMaterial/
+        // erSupportMaterialInterface entity matched away by C6's third
+        // partition_support_entities call and/or C7's whole-collection moves, residual
+        // fallback ironing left behind) must still register the interface extruder here
+        // or that ironing's toolchange never gets scheduled - see the shared predicate's
+        // own header comment for the full investigation finding.
+        bool         has_interface      = support_role_needs_interface_extruder(role);
         unsigned int extruder_support   = resolve_mixed(object.config().support_filament.value,
                                                         layer_tools.layer_index,
                                                         float(support_layer->print_z),
@@ -712,6 +728,14 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             layer_tools.has_support = true;
             layer_tools.wiping_extrusions().is_support_overriddable_and_mark(role, object);
         }
+
+        // Chameleon P2: register per-layer matched interface extruders (map keys are
+        // 0-based; this collection phase is 1-based until reorder_extruders reindexes).
+        for (const auto& kv : support_layer->interface_by_extruder)
+            if (!kv.second.entities.empty())
+                layer_tools.extruders.push_back(kv.first + 1);
+        if (!support_layer->interface_by_extruder.empty())
+            layer_tools.has_support = true;
     }
 
     // Extruder overrides are ordered by print_z.
@@ -1446,6 +1470,27 @@ bool WipingExtrusions::is_support_overriddable(const ExtrusionRole role, const P
     if (!object.config().flush_into_support)
         return false;
 
+    // v2.5a (spec item 1, "residual pin", root cause A of the khaki-in-white/teal-
+    // support symptom): a mode-active object (support_filament_matching.value, i.e.
+    // opted into per-bucket color matching) is NEVER overriddable
+    // by WipingExtrusions, for ANY role, regardless of the scalar support_filament/
+    // support_interface_filament checks below. Matched buckets are already removed
+    // from support_fills by chameleon_assign_support_interfaces (Print.cpp) and
+    // never consult WipingExtrusions at all - what's LEFT in support_fills for a
+    // mode-active object is either genuinely-unmatched-fallback geometry or a
+    // v2.5a apply_bucket_caps redirect target (still living inside a MATCHED
+    // bucket's own interface_by_extruder entry, never back in support_fills). Both
+    // must keep whatever color chameleon_assign_support_interfaces (or the
+    // dedicated-emission path) already decided for them - if this predicate stayed
+    // true here, flush_into_support's mark_wiping_extrusions (below) could still
+    // claim and repaint that residual geometry with an arbitrary purge-target
+    // extruder on every qualifying toolchange, including one with no nearby
+    // geometry at all (the reported symptom). Off (checkbox unchecked, the default) is
+    // completely unaffected - falls straight through to the pre-v2.5a role-based
+    // logic below, byte-identical.
+    if (object.config().support_filament_matching.value)
+        return false;
+
     if (role == erMixed) {
         return object.config().support_filament == 0 || object.config().support_interface_filament == 0;
     }
@@ -1564,8 +1609,36 @@ float WipingExtrusions::mark_wiping_extrusions(const Print& print, unsigned int 
                     if (this_support_layer == nullptr)
                         break;
 
-                    bool support_overriddable = object_config.support_filament == 0;
-                    bool support_intf_overriddable = object_config.support_interface_filament == 0;
+                    // v2.5a (spec item 1): route through is_support_overriddable
+                    // instead of re-checking the scalar configs inline, so this site
+                    // and is_support_overriddable's own role-dispatch table can never
+                    // drift apart again - in particular, this is what makes the
+                    // residual pin (is_support_overriddable's mode-active early
+                    // return, above) apply here too: gating only that one site while
+                    // leaving this inline duplicate unchanged would have been a
+                    // silent regression (mode-active objects would still get their
+                    // residual support_fills claimed/repainted by this branch).
+                    bool support_overriddable = is_support_overriddable(erSupportMaterial, *object);
+                    bool support_intf_overriddable = is_support_overriddable(erSupportMaterialInterface, *object);
+                    // v2.5a (spec item 3, "matched-run guard"): defensive - a mode-
+                    // active object must never reach set_support_extruder_override/
+                    // set_support_interface_extruder_override below (the two
+                    // functions that populate support_map/support_intf_map) with
+                    // either flag true; is_support_overriddable's own residual pin
+                    // (above) already guarantees this structurally, by construction
+                    // of the two calls just above. Asserted rather than trusted
+                    // silently so a future edit that reintroduces an inline
+                    // duplicate at this site (the exact drift this refactor exists
+                    // to make impossible) fails loudly in a debug build instead of
+                    // silently letting WipingExtrusions claim/repaint a mode-active
+                    // object's residual support_fills again - see is_support_
+                    // overriddable's own comment for the full symptom this pin
+                    // fixes. Matched buckets themselves never reach here at all
+                    // (chameleon_assign_support_interfaces, Print.cpp, removes them
+                    // from support_fills entirely and never calls into
+                    // WipingExtrusions/support_map/support_intf_map for them).
+                    assert(!object_config.support_filament_matching.value
+                           || (!support_overriddable && !support_intf_overriddable));
                     if (!support_overriddable && !support_intf_overriddable)
                         break;
 
