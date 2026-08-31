@@ -2863,6 +2863,21 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
             // H2C templates also reference these (single-mapped: hotend ids -1, no computed wipe-tower center).
             this->placeholder_parser().set("first_non_support_hotend",    new ConfigOptionInts(std::vector<int>(num_nozzles, -1)));
             this->placeholder_parser().set("wipe_tower_center_pos_valid", new ConfigOptionBool(false));
+
+            // X2D templates additionally reference newer BBS fan/chamber vars the fork lacks. Shim:
+            // initial_filament_id = the initial extruder; no first-layer aux-fan ramp (close=0, full from
+            // layer 1, first-x speed 0 so it collapses to additional_cooling_fan_speed); chamber
+            // autocooling max = full (U max_additional_fan/100). current/next_filament_id set globally
+            // as a fallback for layer_change; the change_filament scopes override them per-toolchange.
+            const size_t nf = (num_filaments > 0) ? num_filaments : size_t(1);
+            this->placeholder_parser().set("initial_filament_id",                new ConfigOptionInt(int(initial_extruder_id)));
+            this->placeholder_parser().set("current_filament_id",                new ConfigOptionInt(0));
+            this->placeholder_parser().set("next_filament_id",                   new ConfigOptionInt(0));
+            this->placeholder_parser().set("hold_chamber_temp_for_flat_print",   new ConfigOptionBool(false));
+            this->placeholder_parser().set("max_additional_fan",                 new ConfigOptionInt(100));
+            this->placeholder_parser().set("close_additional_fan_first_x_layers",new ConfigOptionInts(std::vector<int>(nf, 0)));
+            this->placeholder_parser().set("additional_fan_full_speed_layer",    new ConfigOptionInts(std::vector<int>(nf, 1)));
+            this->placeholder_parser().set("first_x_layer_fan_speed",            new ConfigOptionFloats(std::vector<double>(nf, 0.)));
         }
     }
 
