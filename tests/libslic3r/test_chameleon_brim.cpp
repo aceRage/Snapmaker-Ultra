@@ -937,6 +937,25 @@ static ExtrusionEntityCollection bucket_of_length(double len_mm)
     return c;
 }
 
+// v2.5a (spec: apply_bucket_caps redirect): same shape as bucket_of_length above (a
+// single straight x-axis path of exactly `len_mm`), but placed so its bbox CENTER
+// (chameleon_collection_bbox_center - what the redirect's nearest-survivor search
+// keys off) lands at exactly (center_x, 0) instead of always being anchored at the
+// origin - bucket_of_length's fixed (0,0) start makes its own centroid an
+// (uncontrollable) function of len_mm alone, too coupled to be useful for tests that
+// need to place a bucket's centroid at a chosen coordinate independent of its length
+// (the redirect tests below need both: a specific centroid AND a length that clears
+// or misses the gate on its own terms).
+static ExtrusionEntityCollection bucket_of_length_at(double len_mm, double center_x)
+{
+    ExtrusionEntityCollection c;
+    auto *p = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    p->polyline = Polyline({Point(scale_(center_x - len_mm / 2.0), scale_(0)),
+                             Point(scale_(center_x + len_mm / 2.0), scale_(0))});
+    c.entities.push_back(p);
+    return c;
+}
+
 TEST_CASE("total_path_length_mm sums a bucket's entities", "[chameleon]")
 {
     ExtrusionEntityCollection c = bucket_of_length(12.5);
@@ -976,8 +995,15 @@ TEST_CASE("apply_bucket_caps: under-cap map is left untouched", "[chameleon]")
     CHECK(result.buckets_trimmed_cap == 0);
 }
 
-TEST_CASE("apply_bucket_caps: sub-40mm bucket is dropped by the min-benefit gate", "[chameleon]")
+TEST_CASE("apply_bucket_caps: sub-40mm bucket is dropped by the min-benefit gate, REDIRECTED to the sole survivor (v2.5a)", "[chameleon]")
 {
+    // v2.5a: a gated bucket is no longer unconditionally merged back to
+    // merge_back_target (support_fills) - when at least one survivor exists, its
+    // geometry redirects into the nearest surviving bucket instead (here, bucket 1
+    // is the only survivor, so it's trivially "nearest"). This is the direct RED/
+    // GREEN case the residual-paint fix targets: a dropped bucket that pre-v2.5a
+    // code merged to support_fills (residual, subject to flush_into_support
+    // repainting) must now land inside a MATCHED bucket instead.
     std::map<unsigned, ExtrusionEntityCollection> map;
     map[1] = bucket_of_length(100.0);
     map[2] = bucket_of_length(39.9);   // just under the 40mm floor
@@ -987,32 +1013,41 @@ TEST_CASE("apply_bucket_caps: sub-40mm bucket is dropped by the min-benefit gate
     BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 40.0, merge_back);
 
     CHECK(map.count(1) == 1);
-    CHECK(map.count(2) == 0);                 // gated out
-    CHECK(!merge_back.entities.empty());      // its geometry landed back in fallback
+    CHECK(map.count(2) == 0);                 // gated out of its OWN bucket key...
+    CHECK(merge_back.entities.empty());       // ...but a survivor exists, so NOT legacy fallback
+    REQUIRE(map.at(1).entities.size() == 2);  // ...redirected into the sole survivor instead
     CHECK(result.kept == std::set<unsigned>{1});
     CHECK(result.buckets_dropped_min_benefit == 1);
     CHECK(result.buckets_trimmed_cap == 0);
+    CHECK(result.buckets_redirected == 1);
 }
 
-TEST_CASE("apply_bucket_caps: 3-extruder partition trims to the 2 longest", "[chameleon]")
+TEST_CASE("apply_bucket_caps: 3-extruder partition trims to the 2 longest, trimmed bucket REDIRECTS to its nearest-centroid survivor (v2.5a)", "[chameleon]")
 {
     std::map<unsigned, ExtrusionEntityCollection> map;
-    map[1] = bucket_of_length(50.0);
-    map[2] = bucket_of_length(100.0);
-    map[3] = bucket_of_length(75.0);
+    map[1] = bucket_of_length(50.0);   // trimmed away; bbox center x=25
+    map[2] = bucket_of_length(100.0);  // survives; bbox center x=50 (dist from 25: 25)
+    map[3] = bucket_of_length(75.0);   // survives; bbox center x=37.5 (dist from 25: 12.5 - nearer)
     std::set<unsigned> prev_kept;             // no hysteresis pressure - pure length rank
     ExtrusionEntityCollection merge_back;
 
     BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 40.0, merge_back);
 
-    // Longest two survive (2: 100mm, 3: 75mm); shortest (1: 50mm) is trimmed.
+    // Longest two survive (2: 100mm, 3: 75mm); shortest (1: 50mm) is trimmed - same
+    // kept set as before v2.5a (the redirect never changes WHICH buckets survive).
     CHECK(map.count(1) == 0);
     CHECK(map.count(2) == 1);
     CHECK(map.count(3) == 1);
-    CHECK(!merge_back.entities.empty());
+    // v2.5a: redirected to bucket 3 (nearest bbox-center survivor), NOT merged back
+    // to support_fills - bucket 2 is a survivor too but farther away, so it must be
+    // left untouched by the redirect.
+    CHECK(merge_back.entities.empty());
+    CHECK(map.at(2).entities.size() == 1);
+    REQUIRE(map.at(3).entities.size() == 2);
     CHECK(result.kept == std::set<unsigned>{2, 3});
     CHECK(result.buckets_dropped_min_benefit == 0);
     CHECK(result.buckets_trimmed_cap == 1);
+    CHECK(result.buckets_redirected == 1);
 }
 
 TEST_CASE("apply_bucket_caps: hysteresis preference flips which bucket the trim keeps", "[chameleon]")
@@ -1079,6 +1114,169 @@ TEST_CASE("apply_bucket_caps: gate runs before the trim, so a gated sliver never
     CHECK(result.buckets_trimmed_cap == 0);    // never reached - only 2 buckets left post-gate
 }
 
+// --- v2.5a: apply_bucket_caps redirect (residual-paint fix, spec item 2) ---------
+
+TEST_CASE("apply_bucket_caps: no survivors -> legacy merge_back_target fallback, byte-identical to pre-redirect behavior", "[chameleon]")
+{
+    // Sole bucket fails the gate; nothing survives at all. Map empty -> legacy
+    // path: the dropped geometry lands in merge_back_target exactly like every
+    // pre-v2.5a call, and buckets_redirected stays 0 (there is no survivor to
+    // redirect to - the residual pin (item 1) owns this layer's fallback color).
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(5.0);   // well under the 40mm floor
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 40.0, merge_back);
+
+    CHECK(map.empty());
+    CHECK(result.kept.empty());
+    REQUIRE(merge_back.entities.size() == 1);
+    CHECK(result.buckets_redirected == 0);
+    CHECK(result.buckets_dropped_min_benefit == 1);
+}
+
+TEST_CASE("apply_bucket_caps: ALL buckets gated (no survivors) -> every one legacy-falls-back, ascending order preserved", "[chameleon]")
+{
+    // Two buckets, BOTH fail the gate -> kept ends empty (map.size() > max_extruders
+    // is never true once map is already empty, so the trim never even runs) - both
+    // buckets' geometry must land in merge_back_target, same as any pre-v2.5a call
+    // with these inputs, and in the SAME order the old gate loop's own ascending
+    // std::map iteration always appended them in.
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(5.0);
+    map[2] = bucket_of_length(3.0);
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 40.0, merge_back);
+
+    CHECK(map.empty());
+    CHECK(result.kept.empty());
+    CHECK(merge_back.entities.size() == 2);
+    CHECK(result.buckets_redirected == 0);
+    CHECK(result.buckets_dropped_min_benefit == 2);
+}
+
+TEST_CASE("apply_bucket_caps: survivor centroids are snapshotted BEFORE any redirect append (order-independence)", "[chameleon]")
+{
+    // Two survivors (extruders 1 and 2) far apart on the x-axis; two dropped
+    // buckets (extruders 3 and 4, processed in that ascending order - both fail
+    // the gate). D1 (centroid x=400) is unambiguously nearest survivor 1 (centroid
+    // x=0, dist 400) over survivor 2 (centroid x=1000, dist 600) under EITHER a
+    // correct or a buggy implementation - it redirects first.
+    //
+    // D2 (centroid x=550) is the discriminating case: measured against survivor 1's
+    // ORIGINAL centroid (x=0, dist 550) vs survivor 2 (x=1000, dist 450), survivor 2
+    // is nearer - the spec-mandated, snapshot-based answer. But survivor 1's bucket,
+    // AFTER absorbing D1, has a bbox spanning [-25, 402.5] -> a LIVE bbox center of
+    // 188.75; measured against that shifted value (dist 361.25) vs survivor 2 (dist
+    // 450), survivor 1 would appear nearer instead - the wrong answer a
+    // recompute-after-each-append implementation would produce. This proves the
+    // survivor centroid snapshot is taken once, before ANY redirect append, exactly
+    // as the design requires ("order-independence").
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length_at(50.0, 0.0);      // survivor, bbox center x=0
+    map[2] = bucket_of_length_at(50.0, 1000.0);   // survivor, bbox center x=1000
+    map[3] = bucket_of_length_at(5.0, 400.0);     // dropped (gate), centroid x=400
+    map[4] = bucket_of_length_at(5.0, 550.0);     // dropped (gate), centroid x=550
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, 40.0, merge_back);
+
+    CHECK(result.kept == std::set<unsigned>{1, 2});
+    CHECK(merge_back.entities.empty());
+    REQUIRE(map.at(1).entities.size() == 2);   // survivor 1: its own path + D1
+    REQUIRE(map.at(2).entities.size() == 2);   // survivor 2: its own path + D2
+    CHECK(result.buckets_redirected == 2);
+}
+
+TEST_CASE("apply_bucket_caps: centroid tie-break prefers prev_kept DESC over the lower extruder id", "[chameleon]")
+{
+    // Two survivors symmetric around the dropped bucket's centroid (x=-10 and
+    // x=+10 around a dropped bucket centered at x=0) - an EXACT tie on squared
+    // centroid distance. Extruder 5 (the higher id) is in prev_kept; extruder 3
+    // is not - prev_kept membership must outrank the extruder-id tie-break.
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[5] = bucket_of_length_at(50.0, -10.0);  // survivor, in prev_kept
+    map[3] = bucket_of_length_at(50.0, 10.0);   // survivor, NOT in prev_kept
+    map[9] = bucket_of_length_at(5.0, 0.0);     // dropped (gate), equidistant from both
+    std::set<unsigned> prev_kept{5};
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 3, 40.0, merge_back);
+
+    CHECK(result.kept == std::set<unsigned>{5, 3});
+    CHECK(merge_back.entities.empty());
+    CHECK(map.at(5).entities.size() == 2);   // tie broken TO extruder 5 (prev_kept)
+    CHECK(map.at(3).entities.size() == 1);   // extruder 3 untouched despite the lower id
+    CHECK(result.buckets_redirected == 1);
+}
+
+TEST_CASE("apply_bucket_caps: centroid tie-break falls to extruder ASC when prev_kept doesn't distinguish", "[chameleon]")
+{
+    // Same symmetric-tie geometry as above, but prev_kept is empty this time -
+    // neither survivor has seniority, so the tie-break falls through to the final,
+    // deterministic rule: lower extruder id wins (3, not 5).
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[5] = bucket_of_length_at(50.0, -10.0);
+    map[3] = bucket_of_length_at(50.0, 10.0);
+    map[9] = bucket_of_length_at(5.0, 0.0);
+    std::set<unsigned> prev_kept;   // no seniority either way
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 3, 40.0, merge_back);
+
+    CHECK(result.kept == std::set<unsigned>{5, 3});
+    CHECK(merge_back.entities.empty());
+    CHECK(map.at(3).entities.size() == 2);   // tie broken to the LOWER extruder id
+    CHECK(map.at(5).entities.size() == 1);
+    CHECK(result.buckets_redirected == 1);
+}
+
+TEST_CASE("apply_bucket_caps: redirect target is independent of map insertion order (permuted-insertion determinism)", "[chameleon]")
+{
+    // Same logical bucket set (by key and geometry), built via two different C++
+    // insertion sequences. std::map is key-ordered regardless of insertion order,
+    // so this is a regression guard against an implementation detail (e.g. an
+    // insertion-order-sensitive intermediate container) accidentally leaking
+    // through and making the redirect outcome depend on something it must not.
+    auto build_ascending = [] {
+        std::map<unsigned, ExtrusionEntityCollection> m;
+        m[1] = bucket_of_length_at(50.0, 0.0);
+        m[2] = bucket_of_length_at(50.0, 1000.0);
+        m[3] = bucket_of_length_at(5.0, 400.0);
+        return m;
+    };
+    auto build_descending = [] {
+        std::map<unsigned, ExtrusionEntityCollection> m;
+        m[3] = bucket_of_length_at(5.0, 400.0);
+        m[2] = bucket_of_length_at(50.0, 1000.0);
+        m[1] = bucket_of_length_at(50.0, 0.0);
+        return m;
+    };
+
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back_a, merge_back_b;
+    std::map<unsigned, ExtrusionEntityCollection> map_a = build_ascending();
+    std::map<unsigned, ExtrusionEntityCollection> map_b = build_descending();
+
+    BucketCapResult result_a = apply_bucket_caps(map_a, prev_kept, 2, 40.0, merge_back_a);
+    BucketCapResult result_b = apply_bucket_caps(map_b, prev_kept, 2, 40.0, merge_back_b);
+
+    CHECK(result_a.kept == result_b.kept);
+    CHECK(result_a.buckets_redirected == result_b.buckets_redirected);
+    CHECK(merge_back_a.entities.empty());
+    CHECK(merge_back_b.entities.empty());
+    // Same survivor (extruder 1, nearest to the dropped bucket 3 at x=400) absorbed
+    // the redirect in both insertion orders.
+    CHECK(map_a.at(1).entities.size() == map_b.at(1).entities.size());
+    CHECK(map_a.at(1).entities.size() == 2);
+    CHECK(map_a.at(2).entities.size() == map_b.at(2).entities.size());
+    CHECK(map_a.at(2).entities.size() == 1);
+}
+
 // --- v2.2 Task 2: gap-aware lateral cap arithmetic (spec C4) ----------------
 
 TEST_CASE("gap_aware_lateral_cap_mm sums the gap, both half-widths, and the 0.35mm slack", "[chameleon]")
@@ -1114,6 +1312,55 @@ TEST_CASE("gap_aware_lateral_cap_mm is NOT symmetric in its two width args (docu
     CHECK_THAT(cap_a, Catch::Matchers::WithinAbs(1.05, 1e-9));
     CHECK_THAT(cap_b, Catch::Matchers::WithinAbs(1.05, 1e-9));
     CHECK_THAT(cap_c, Catch::Matchers::WithinAbs(1.25, 1e-9));
+}
+
+// --- v2.5a Task 2b: mechanism-B pin (residual-paint fix, dominant matched extruder) --
+
+TEST_CASE("chameleon_dominant_matched_extruder: empty map returns -1 (nothing to pin to)", "[chameleon]")
+{
+    std::map<unsigned, ExtrusionEntityCollection> buckets;
+    CHECK(chameleon_dominant_matched_extruder(buckets) == -1);
+}
+
+TEST_CASE("chameleon_dominant_matched_extruder: a map of only empty buckets also returns -1", "[chameleon]")
+{
+    std::map<unsigned, ExtrusionEntityCollection> buckets;
+    buckets[1] = ExtrusionEntityCollection();
+    buckets[2] = ExtrusionEntityCollection();
+    CHECK(chameleon_dominant_matched_extruder(buckets) == -1);
+}
+
+TEST_CASE("chameleon_dominant_matched_extruder: single non-empty bucket wins trivially", "[chameleon]")
+{
+    std::map<unsigned, ExtrusionEntityCollection> buckets;
+    buckets[7] = bucket_of_length(10.0);
+    CHECK(chameleon_dominant_matched_extruder(buckets) == 7);
+}
+
+TEST_CASE("chameleon_dominant_matched_extruder: the bucket with the LARGEST total path length wins", "[chameleon]")
+{
+    std::map<unsigned, ExtrusionEntityCollection> buckets;
+    buckets[1] = bucket_of_length(20.0);
+    buckets[2] = bucket_of_length(80.0);   // dominant
+    buckets[3] = bucket_of_length(50.0);
+    CHECK(chameleon_dominant_matched_extruder(buckets) == 2);
+}
+
+TEST_CASE("chameleon_dominant_matched_extruder: exact-length tie breaks to the LOWEST extruder id", "[chameleon]")
+{
+    std::map<unsigned, ExtrusionEntityCollection> buckets;
+    buckets[5] = bucket_of_length(30.0);
+    buckets[2] = bucket_of_length(30.0);   // same length, lower id -> wins
+    buckets[9] = bucket_of_length(30.0);
+    CHECK(chameleon_dominant_matched_extruder(buckets) == 2);
+}
+
+TEST_CASE("chameleon_dominant_matched_extruder: an empty bucket never outranks a non-empty one, regardless of key order", "[chameleon]")
+{
+    std::map<unsigned, ExtrusionEntityCollection> buckets;
+    buckets[1] = ExtrusionEntityCollection();  // empty - never a candidate
+    buckets[8] = bucket_of_length(1.0);        // tiny, but the only real candidate
+    CHECK(chameleon_dominant_matched_extruder(buckets) == 8);
 }
 
 // --- v2.2 Task 2: projection margin ring (spec C5) --------------------------

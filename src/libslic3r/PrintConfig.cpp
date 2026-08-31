@@ -5469,7 +5469,9 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Support");
     def->tooltip = L("Default: use the configured support interface filament. Nearest wall: "
                      "every support extrusion matches the nearest model wall filament, no "
-                     "distance limit.");
+                     "distance limit. When set to Nearest wall, any support geometry left "
+                     "over after matching keeps the color already assigned to it and will "
+                     "not be repainted by Flush into objects' support.");
     def->enum_keys_map = &ConfigOptionEnum<SupportInterfaceFilamentSource>::get_enum_values();
     def->enum_values.emplace_back("manual");
     def->enum_values.emplace_back("nearest_wall");
@@ -6256,7 +6258,10 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Flush into objects' support");
     def->tooltip = L("Purging after filament change will be done inside objects' support. "
         "This may lower the amount of waste and decrease the print time. "
-        "It will not take effect, unless the prime tower is enabled.");
+        "It will not take effect, unless the prime tower is enabled. "
+        "Ignored for an object whose Support interface filament source is set to "
+        "Nearest wall - its support keeps the color already matched to it instead "
+        "of being used for purging.");
     def->set_default_value(new ConfigOptionBool(true));
 
     def = this->add("flush_into_objects", coBool);

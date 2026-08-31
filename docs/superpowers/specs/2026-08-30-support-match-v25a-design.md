@@ -41,3 +41,34 @@ still follow the active-extruder rule (deterministic per run, layer-varying).
 Accepted cost: purge moves to infill/objects/tower for mode-active objects (tens of
 grams on support-heavy prints). Risk: redirected bucket prints a clean adjacent-but-
 wrong color; bbox centroid crude for L-shapes — nearest-centroid minimizes.
+
+## v2.5a amendment (mid-implementation, user profile check)
+
+Mechanism A ruled out for the user's own profiles: flush_into_support and
+flush_into_infill are both OFF by default there, so the WipingExtrusions/
+mark_wiping_extrusions purge-claim path (item 1's target) never fires in the first
+place for this user's prints — item 1 stays IN (still correct, still required for any
+profile that DOES enable flush-into-support/-infill), but it is not what produces the
+khaki this user is actually seeing.
+
+The observed khaki is mechanism B instead: the "don't care" scalar resolution
+(GCode.cpp ~5379-5421) that decides a support layer's RESIDUAL (already-matched-
+geometry-stripped) support_fills extruder by scanning for the layer's first/active
+non-soluble extruder — a value that varies layer to layer with toolchange order, with
+no relationship to what matched geometry is actually nearby on that layer. This was
+originally spec'd as a named-but-accepted "known remaining gap"; it is now PROMOTED to
+required and fixed as item 2b: a mode-active object whose support layer has at least
+one matched bucket (SupportLayer::interface_by_extruder non-empty) pins its still-
+"don't care" residual slot(s) to that layer's DOMINANT matched bucket's extruder
+(largest total_path_length_mm; ties → lowest extruder id) instead of the first/active-
+on-layer rule — free (that extruder is already registered on the layer via
+ToolOrdering.cpp's own interface_by_extruder registration loop, so no new toolchange).
+A wholly-fallback layer (interface_by_extruder empty) is untouched and keeps the
+pre-v2.5a first/active rule — the gap this amendment doesn't claim to close, now
+narrower (only fires when NOTHING matched on that layer at all, rather than on every
+residual layer regardless of matched geometry).
+
+Item 2 (apply_bucket_caps redirect) is unaffected by this amendment and is now the
+PRIMARY visible fix for this user's reported symptom, since it controls where a
+gated/trimmed bucket's geometry lands (a matched bucket, not residual) independent of
+which mechanism would otherwise have painted the residual.

@@ -2934,6 +2934,13 @@ static void chameleon_assign_support_interfaces(Print &print)
         // tracked as its own field since it's one subtraction away.
         size_t buckets_dropped_min_benefit_free = 0;
         size_t buckets_trimmed_cap              = 0; // C1 trim: bucket ranked below the top 2
+        // v2.5a Task 2 (spec item 2, residual-paint fix): SUBSET of the two counters
+        // above - how many of those gated/trimmed buckets landed inside a surviving
+        // MATCHED bucket (apply_bucket_caps' nearest-centroid redirect) rather than
+        // falling all the way back to residual support_fills. Always <=
+        // buckets_dropped_min_benefit + buckets_trimmed_cap; the gap between them is
+        // the legacy no-survivor fallback count (still residual, same as pre-v2.5a).
+        size_t buckets_redirected               = 0;
         // Raw matched-run counts (NOT switch-boundary/cap accounting - purely
         // informational, mirrors partition_support_entities' own return value) per
         // role, summed across every layer that reached the engine calls.
@@ -3204,6 +3211,7 @@ static void chameleon_assign_support_interfaces(Print &print)
             buckets_dropped_min_benefit      += cap_result.buckets_dropped_min_benefit;
             buckets_dropped_min_benefit_free += cap_result.buckets_dropped_min_benefit_free;
             buckets_trimmed_cap              += cap_result.buckets_trimmed_cap;
+            buckets_redirected               += cap_result.buckets_redirected;
 
             if (!partitioned.empty()) {
                 support_layer->interface_by_extruder = std::move(partitioned);
@@ -3265,6 +3273,10 @@ static void chameleon_assign_support_interfaces(Print &print)
             << " buckets_dropped_min_benefit=" << buckets_dropped_min_benefit
             << " buckets_dropped_min_benefit_free=" << buckets_dropped_min_benefit_free
             << " buckets_trimmed_cap=" << buckets_trimmed_cap
+            // v2.5a Task 2 (spec item 2): SUBSET of the two counters just above -
+            // see buckets_redirected's own declaration comment for the exact
+            // relationship.
+            << " buckets_redirected=" << buckets_redirected
             << " interface_runs_matched=" << interface_runs_matched
             << " base_runs_matched=" << base_runs_matched
             << " ironing_runs_matched=" << ironing_runs_matched;

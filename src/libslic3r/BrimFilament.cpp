@@ -1231,6 +1231,18 @@ PrevKeptState chameleon_update_prev_kept(const PrevKeptState &state,
     return { {}, false }; // (c) grace already spent, or nothing existed pre-gate at all
 }
 
+namespace {
+// v2.5a (spec item 2): one bucket's geometry, pulled out of `map` by the gate or
+// trim step below, held here instead of being appended anywhere yet - the redirect
+// phase decides its final destination only after BOTH steps have finished and the
+// kept set is final. See apply_bucket_caps' own header comment (BrimFilament.hpp)
+// for the full phase breakdown.
+struct DroppedBucket {
+    unsigned                   extruder;
+    ExtrusionEntityCollection  geometry;
+};
+} // namespace
+
 BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> &map,
                                    const std::set<unsigned> &prev_kept,
                                    size_t max_extruders,
@@ -1240,6 +1252,11 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
                                    double min_len_free_mm)
 {
     BucketCapResult result;
+    // v2.5a: gate/trim drops land here (moved out of `map`, NOT appended anywhere
+    // yet) instead of going straight to merge_back_target - see the redirect phase
+    // at the end of this function.
+    std::vector<DroppedBucket> gate_dropped;
+    std::vector<DroppedBucket> trim_dropped;
 
     // (a) C3 min-benefit gate, v2.3 Task 1 (spec C1-C2) two-tier rework: each bucket's
     // own eff_min starts at min_len_free_mm if its extruder is in `free_extruders`
@@ -1250,13 +1267,14 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
     // Default call (free_extruders empty) makes every bucket take the min_len_mm/
     // prev_kept-halved path only - byte-identical to the pre-v2.3 flat-threshold gate
     // this replaces, just re-expressed per-bucket instead of once for the whole call.
+    // gate_dropped accumulates in `map`'s own ascending-extruder iteration order.
     for (auto it = map.begin(); it != map.end(); ) {
         const bool is_free = free_extruders.count(it->first) != 0;
         double     eff_min = is_free ? min_len_free_mm : min_len_mm;
         if (prev_kept.count(it->first) != 0)
             eff_min *= 0.5;
         if (total_path_length_mm(it->second) < eff_min) {
-            merge_back_target.append(std::move(it->second.entities));
+            gate_dropped.push_back({ it->first, std::move(it->second) });
             it = map.erase(it);
             ++result.buckets_dropped_min_benefit;
             // v2.4 Task C (spec C): `is_free` is already computed above for this same
@@ -1272,7 +1290,11 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
     // DESC, total length DESC, extruder id ASC as the final deterministic tie-break)
     // and keep only the top max_extruders. Hysteresis outranks length outright - see
     // this function's header comment for why (stability up the column vs. the
-    // alternating-stripe artifact the old whole-layer revert caused).
+    // alternating-stripe artifact the old whole-layer revert caused). trim_dropped
+    // accumulates in RANK order (worst-of-the-discarded last) - the legacy fallback
+    // path below replays that order verbatim; the redirect path re-sorts its own
+    // copy to ascending extruder instead (see there for why the two need different
+    // orders).
     if (map.size() > max_extruders) {
         std::vector<std::pair<unsigned, double>> ranked;
         ranked.reserve(map.size());
@@ -1292,16 +1314,105 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
 
         for (size_t i = max_extruders; i < ranked.size(); ++i) {
             auto it = map.find(ranked[i].first);
-            merge_back_target.append(std::move(it->second.entities));
+            trim_dropped.push_back({ it->first, std::move(it->second) });
             map.erase(it);
             ++result.buckets_trimmed_cap;
         }
     }
 
+    // `kept` is exactly `map`'s remaining keys right now - final, and never changed
+    // by the redirect phase below (that phase only ever APPENDS into an existing
+    // kept bucket's geometry, never adds/removes a key).
     for (const auto &kv : map)
         result.kept.insert(kv.first);
 
+    // v2.5a redirect phase (spec item 2, residual-paint fix) - see this function's
+    // header comment (BrimFilament.hpp) for the full algorithm this implements.
+    if (map.empty()) {
+        // Phase 1 (no survivor anywhere): legacy fallback, byte-identical append
+        // order to every pre-v2.5a call - gate_dropped in its own ascending-extruder
+        // encounter order, then trim_dropped in its own rank order. In practice
+        // trim_dropped is only ever non-empty here when max_extruders == 0 (an
+        // empty `map` after the gate can never satisfy `map.size() > max_extruders`
+        // for any max_extruders >= 1, so the trim block above never even runs) -
+        // handled anyway so the "byte-identical to legacy" claim holds unconditionally,
+        // not just for today's real call site (which always passes max_extruders=2).
+        for (DroppedBucket &d : gate_dropped)
+            merge_back_target.append(std::move(d.geometry.entities));
+        for (DroppedBucket &d : trim_dropped)
+            merge_back_target.append(std::move(d.geometry.entities));
+        return result;
+    }
+
+    // Phase 2: snapshot every surviving bucket's bbox center ONCE, before ANY
+    // redirect append below runs - this is what makes the outcome independent of
+    // processing order (see header comment's worked example).
+    std::map<unsigned, Point> survivor_centroids;
+    for (const auto &kv : map)
+        survivor_centroids.emplace(kv.first, chameleon_collection_bbox_center(kv.second));
+
+    // Phase 3 processing order: gate_dropped first (already ascending extruder),
+    // then trim_dropped - re-sorted to ascending extruder for THIS phase only (its
+    // rank order, used by phase 1 above, has no meaning here; the redirect target
+    // is decided purely by centroid distance/tie-break, not by trim rank).
+    std::sort(trim_dropped.begin(), trim_dropped.end(),
+        [](const DroppedBucket &a, const DroppedBucket &b) { return a.extruder < b.extruder; });
+
+    auto redirect_one = [&](DroppedBucket &dropped) {
+        const Point centroid = chameleon_collection_bbox_center(dropped.geometry);
+        unsigned best_extruder = 0;
+        int64_t  best_dist2    = 0;
+        bool     have_best     = false;
+        for (const auto &sv : survivor_centroids) {
+            // Scaled-int squared distance - no float comparison anywhere in the
+            // redirect target decision.
+            const int64_t dist2 = (centroid - sv.second).cast<int64_t>().squaredNorm();
+            bool candidate_wins;
+            if (!have_best) {
+                candidate_wins = true;
+            } else if (dist2 != best_dist2) {
+                candidate_wins = dist2 < best_dist2;
+            } else {
+                // Exact tie: prev_kept DESC, then extruder id ASC.
+                const bool cand_prev = prev_kept.count(sv.first) != 0;
+                const bool best_prev = prev_kept.count(best_extruder) != 0;
+                candidate_wins = (cand_prev != best_prev) ? cand_prev : (sv.first < best_extruder);
+            }
+            if (candidate_wins) {
+                best_extruder = sv.first;
+                best_dist2    = dist2;
+                have_best     = true;
+            }
+        }
+        map.at(best_extruder).append(std::move(dropped.geometry.entities));
+        ++result.buckets_redirected;
+    };
+
+    for (DroppedBucket &d : gate_dropped)
+        redirect_one(d);
+    for (DroppedBucket &d : trim_dropped)
+        redirect_one(d);
+
     return result;
+}
+
+int chameleon_dominant_matched_extruder(const std::map<unsigned, ExtrusionEntityCollection> &buckets)
+{
+    int    dominant_extruder = -1;
+    double dominant_len      = -1.0;
+    for (const auto &kv : buckets) {
+        if (kv.second.entities.empty())
+            continue;
+        const double len = total_path_length_mm(kv.second);
+        if (dominant_extruder < 0 || len > dominant_len) {
+            dominant_extruder = int(kv.first);
+            dominant_len      = len;
+        }
+        // Tie (len == dominant_len): keep the earlier pick - `buckets` is key-
+        // ordered ascending and only a STRICTLY greater length replaces it, so the
+        // lowest extruder id among exact-tied buckets wins, deterministically.
+    }
+    return dominant_extruder;
 }
 
 double gap_aware_lateral_cap_mm(double support_object_xy_distance_mm,

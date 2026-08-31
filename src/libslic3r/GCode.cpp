@@ -5376,6 +5376,64 @@ LayerResult GCode::process_layer(const Print& print,
                     }
                 }
 
+                // v2.5a Task 2b (spec: "mechanism B pin" - promoted from the original
+                // spec's named "known remaining gap" to REQUIRED once the user's own
+                // profile confirmed flush_into_support/flush_into_infill are both off:
+                // mechanism A's WipingExtrusions override just above never fires for a
+                // mode-active object in that profile shape - is_support_overriddable's
+                // own v2.5a residual pin, ToolOrdering.cpp, already makes both
+                // get_support_extruder_overrides/get_support_interface_extruder_
+                // overrides above return -1 unconditionally for such an object,
+                // flush_into_support or not - so mechanism B below - the "don't care"
+                // resolution falling through to whatever extruder happens to be
+                // first/active on THIS SPECIFIC layer - is the actual, dominant cause
+                // of the reported khaki-randomly-mixed-into-white/teal-support
+                // symptom: it varies layer to layer with toolchange order, with no
+                // relationship to what geometry is actually nearby).
+                //
+                // A mode-active object (support_interface_filament_source !=
+                // sifsManual) whose support layer has at least one matched bucket
+                // (support_layer.interface_by_extruder, populated per-layer by
+                // chameleon_assign_support_interfaces, Print.cpp) pins any STILL-
+                // "don't care" residual slot(s) - base and/or interface, whichever of
+                // the two remain dontcare at this point - to that layer's DOMINANT
+                // matched bucket's extruder instead: the bucket with the largest
+                // total_path_length_mm (ties -> lowest extruder id, deterministic).
+                // Both slots share the SAME one dominant extruder - interface_by_
+                // extruder is a single map holding both roles' matched buckets (v2.1
+                // Task 3), not two separate per-role maps, so there is only one
+                // "dominant bucket" per layer to pick from. This introduces NO new
+                // toolchange: that extruder is already registered on this exact layer
+                // via ToolOrdering.cpp's own interface_by_extruder registration loop
+                // (collect_extruders, ~734-736), since the bucket exists there in the
+                // first place.
+                //
+                // A wholly-fallback layer (interface_by_extruder empty - nothing
+                // matched on this layer at all) is untouched by this and keeps
+                // falling through to the pre-v2.5a first/active-extruder rule below -
+                // a documented, now much smaller, remaining gap (see this task's own
+                // report: still deterministic per run, but layer-varying, same as
+                // before this fix).
+                if (object.config().support_interface_filament_source.value != sifsManual
+                    && (support_dontcare || interface_dontcare)) {
+                    // chameleon_dominant_matched_extruder (BrimFilament.hpp/.cpp) is
+                    // the pure/testable core of this pin: largest total_path_length_mm
+                    // bucket, ties -> lowest extruder id, -1 when interface_by_extruder
+                    // is empty or holds only empty buckets (nothing matched this
+                    // layer - falls through to the pre-v2.5a rule below unchanged).
+                    const int dominant_extruder = chameleon_dominant_matched_extruder(support_layer.interface_by_extruder);
+                    if (dominant_extruder >= 0) {
+                        if (support_dontcare) {
+                            support_extruder   = unsigned(dominant_extruder);
+                            support_dontcare   = false;
+                        }
+                        if (interface_dontcare) {
+                            interface_extruder = unsigned(dominant_extruder);
+                            interface_dontcare = false;
+                        }
+                    }
+                }
+
                 // BBS: try to print support base with a filament other than interface filament
                 if (support_dontcare && !interface_dontcare) {
                     unsigned int dontcare_extruder = first_extruder_id;

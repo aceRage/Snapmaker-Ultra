@@ -438,6 +438,17 @@ struct BucketCapResult {
     // Buckets merged back by the C1 distinct-extruder trim (survived the gate, but
     // ranked below the top max_extruders by (prev_kept membership, then length)).
     size_t buckets_trimmed_cap = 0;
+    // v2.5a (spec item 2, residual-paint fix): how many gated/trimmed buckets were
+    // REDIRECTED into a surviving bucket instead of being merged back to
+    // `merge_back_target` - see apply_bucket_caps' own doc comment below for the
+    // full redirect algorithm. A bucket only ever counts here when `kept` ended
+    // non-empty (a survivor existed to redirect into); the legacy fallback path
+    // (no survivors at all) never increments this. Always <=
+    // buckets_dropped_min_benefit + buckets_trimmed_cap; the two counters that feed
+    // it are unchanged by this task (same buckets are gated/trimmed as before -
+    // this field only reports where their geometry ENDED UP, not a new drop
+    // reason).
+    size_t buckets_redirected = 0;
 };
 
 // v2.2 Task 1 (spec C1-C3, replaces the old per-layer ">3 switch-boundaries" whole-
@@ -446,28 +457,76 @@ struct BucketCapResult {
 // straight out of one or more partition_support_entities calls sharing the same out
 // map. Applied in order:
 //   a. C3 min-benefit gate: any bucket whose total_path_length_mm() < min_len_mm is
-//      merged into `merge_back_target` and erased from `map` - a matched sliver isn't
+//      DROPPED (moved out of `map`, NOT yet appended anywhere - see the v2.5a
+//      redirect phase below for where it actually lands) - a matched sliver isn't
 //      worth a toolchange/purge, and must never survive the trim below by being one of
 //      the "top N longest" among other slivers.
 //   b. C1 distinct-extruder trim: if more than `max_extruders` buckets survive the
 //      gate, rank them by (extruder present in `prev_kept` DESC, total path length
-//      DESC, extruder id ASC as the final deterministic tie-break) and merge every
-//      bucket past the top `max_extruders` into `merge_back_target`. This measures the
-//      TRUE per-layer cost - the number of DISTINCT matched extruders (support fills
-//      emit one path-group per extruder; run-boundary/switch counts are a red herring,
-//      support fills are one ExtrusionPath per LINE so boundary-crossing runs trip
-//      that counter constantly without costing an extra toolchange). Hysteresis:
-//      prev_kept membership outranks length outright (a short bucket this object kept
-//      last layer beats a longer bucket that's new this layer) - stability up the
-//      column is what stops the alternating-stripe artifact a whole-layer revert
-//      caused; length only breaks ties among buckets with the same prev_kept status.
-// The merge-back itself is the same ownership-transferring append(ExtrusionEntitiesPtr
-// &&) the old whole-layer revert used (role-preserving - every path already carries
-// its true source role from partition_support_entities' role-copy, never hardcoded),
-// just applied per-bucket instead of per-layer, so a partial-degradation layer keeps
-// its winning bucket(s) matched instead of falling back to fallback entirely. `map` is
-// left holding only the committed buckets - the caller moves it straight into
-// SupportLayer::interface_by_extruder.
+//      DESC, extruder id ASC as the final deterministic tie-break) and DROP every
+//      bucket past the top `max_extruders` (same "moved out, not yet appended" as the
+//      gate above). This measures the TRUE per-layer cost - the number of DISTINCT
+//      matched extruders (support fills emit one path-group per extruder; run-
+//      boundary/switch counts are a red herring, support fills are one ExtrusionPath
+//      per LINE so boundary-crossing runs trip that counter constantly without costing
+//      an extra toolchange). Hysteresis: prev_kept membership outranks length outright
+//      (a short bucket this object kept last layer beats a longer bucket that's new
+//      this layer) - stability up the column is what stops the alternating-stripe
+//      artifact a whole-layer revert caused; length only breaks ties among buckets
+//      with the same prev_kept status.
+// `map` is left holding only the committed (kept) buckets after (a)/(b) - the caller
+// moves it straight into SupportLayer::interface_by_extruder. Steps (a) and (b) above
+// are themselves UNCHANGED by v2.5a: the same buckets are gated/trimmed, in the same
+// order, by the same thresholds - `kept`/max_extruders/prev_kept/retention semantics
+// are untouched, and no new toolchange is ever introduced (a toolchange is driven by
+// the DISTINCT-EXTRUDER SET in `kept`, which this task never alters).
+//
+// v2.5a (spec item 2, residual-paint fix root cause A): what happens to a dropped
+// bucket's geometry is what CHANGES. Pre-v2.5a, every drop from (a) and (b) was
+// appended straight into `merge_back_target` (the layer's residual support_fills) -
+// meaning a matched-but-gated/trimmed bucket fell all the way back to the UNMATCHED
+// fallback path, where flush_into_support's mark_wiping_extrusions (ToolOrdering.cpp)
+// could repaint the WHOLE residual with whatever extruder is purging that layer,
+// including a color with no nearby geometry at all (the "khaki mixed into strictly
+// white/teal support" symptom). v2.5a instead REDIRECTS a dropped bucket into the
+// nearest SURVIVING bucket whenever one exists, so the geometry stays inside a
+// MATCHED bucket (never touched by WipingExtrusions - see is_support_overriddable's
+// own v2.5a residual pin) instead of degrading to residual. Phases, run strictly
+// after (a) and (b) above have already finished (so `map`'s remaining keys - `kept` -
+// are final and never change again):
+//   1. If `map` is EMPTY (no survivor at all - every bucket was gated/trimmed away),
+//      there is nothing to redirect into: fall back to the LEGACY behavior exactly -
+//      append every dropped bucket's geometry into `merge_back_target`, in the same
+//      order the old code would have (this can only happen via the gate step (a)
+//      alone - see the "empty map" note in the .cpp for why the trim step (b) can
+//      never be the one to empty `map` in practice - so "the same order" is simply
+//      the gate's own ascending-extruder std::map iteration order). Byte-identical to
+//      every pre-v2.5a call site's output for this case; the residual pin (item 1)
+//      is what makes an all-gated layer safe now, not this function.
+//   2. Otherwise, snapshot every surviving bucket's bbox center (chameleon_
+//      collection_bbox_center, reused as-is - both a survivor and a dropped bucket
+//      are plain ExtrusionEntityCollection) ONCE, before ANY redirect append runs -
+//      this is what makes the outcome independent of processing order: redirecting
+//      an earlier dropped bucket into a survivor changes that survivor's LIVE bbox,
+//      but every decision is made against the frozen snapshot, never the live value.
+//   3. Process dropped buckets in a fixed, deterministic order - every gate-drop
+//      (ascending extruder, their natural encounter order) THEN every trim-drop
+//      (also re-sorted ascending extruder for this phase, even though the trim's OWN
+//      append order in step 1's legacy path is its rank order, not extruder order) -
+//      and for each, compute ITS OWN bbox center and pick the snapshot survivor with
+//      the smallest SQUARED centroid distance, computed in SCALED-INTEGER coordinates
+//      (Point::cast<int64_t>().squaredNorm() - no float comparison). Ties (an exact
+//      equal squared distance to two or more survivors) break to whichever survivor
+//      is in `prev_kept` (DESC - a returning color wins over a merely-closer new one),
+//      then to the lower extruder id (ASC) if that still doesn't resolve it. The
+//      dropped bucket's entities are appended (same ownership-transferring
+//      append(ExtrusionEntitiesPtr&&) the legacy path always used) into the chosen
+//      survivor's LIVE bucket in `map` - so later redirects see that bucket grow, but
+//      per step 2 above, never re-evaluate its centroid because of it.
+// `result.buckets_redirected` counts every bucket that took path 2/3 above (never
+// incremented by the legacy path 1). `map`'s KEYS (the committed extruder set) are
+// identical to pre-v2.5a for the same inputs either way - only which bucket a given
+// dropped geometry's entities end up living inside changes.
 // v2.3 Task 1 (spec C1): the "free extruder" table this task adds - one entry per
 // DISTINCT object-layer z across every object on the plate (EPSILON-merged: several
 // objects/layers that land on the "same" z, within float slicing noise, contribute to
@@ -586,6 +645,24 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection>&
                                   ExtrusionEntityCollection& merge_back_target,
                                   const std::set<unsigned>& free_extruders = {},
                                   double min_len_free_mm = 0.0);
+
+// v2.5a Task 2b (spec: "mechanism B pin"): the extruder of whichever bucket in
+// `buckets` has the largest total_path_length_mm ("dominant"); ties (an exact equal
+// length) go to the LOWEST extruder id - `buckets` is key-ordered ascending and only
+// a STRICTLY greater length replaces the current pick, so this falls out of the scan
+// itself rather than needing a separate tie-break step. A bucket with empty entities
+// is never a candidate (mirrors every other bucket-length comparison in this file -
+// total_path_length_mm(empty) is 0.0, which a genuinely non-empty bucket of any
+// positive length would already beat, but an ALL-empty `buckets` must still resolve
+// to "no candidate", not extruder 0). Returns -1 when `buckets` is empty or every
+// bucket in it is empty - GCode.cpp's own residual "don't care" pin (~5379+) treats
+// that as "nothing to pin to" and falls through to its pre-v2.5a first/active-
+// extruder rule unchanged. Pulled out as its own pure function (rather than left
+// inline at the one GCode.cpp call site) specifically so this decision is unit-
+// testable without a Print/PrintObject/GCode scaffold - the call site itself
+// (a support layer's own SupportLayer::interface_by_extruder) is not otherwise
+// exercisable outside a full GUI-class multi-filament slice.
+int chameleon_dominant_matched_extruder(const std::map<unsigned, ExtrusionEntityCollection>& buckets);
 
 // v2.2 Task 2 (spec C4, root cause 1): gap-aware lateral cap arithmetic, pure so it's
 // unit-testable without a full PrintObject/Print scaffold (the three mm inputs need
