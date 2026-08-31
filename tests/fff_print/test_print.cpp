@@ -13,7 +13,15 @@ SCENARIO("PrintObject: Perimeter generation", "[PrintObject]") {
     GIVEN("20mm cube and default config") {
         WHEN("make_perimeters() is called")  {
             Slic3r::Print print;
-            Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, { { "fill_density", 0 } });
+            // Pin the Slic3r-era geometry this scenario was written against:
+            // 0.5 + 65*0.3 = 20mm -> 66 layers, and 3 classic perimeter loops.
+            Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
+                { "fill_density",               0 },
+                { "nozzle_diameter",            0.6 },
+                { "layer_height",               0.3 },
+                { "initial_layer_print_height", 0.5 },
+                { "wall_loops",                 3 }
+            });
 			const PrintObject &object = *print.objects().front();
 			THEN("67 layers exist in the model") {
                 REQUIRE(object.layers().size() == 66);
