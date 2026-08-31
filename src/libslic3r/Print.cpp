@@ -3191,11 +3191,12 @@ static void chameleon_assign_support_interfaces(Print &print)
             // the column, the fix for the alternating-stripe artifact a whole-layer
             // revert caused; v2.3 Task 1 spec C2 additionally halves the GATE's own
             // floor for a prev_kept bucket - see apply_bucket_caps' own doc comment).
-            // Every dropped/trimmed bucket's geometry is merged straight back into
-            // support_fills (fallback) via the same ownership-transferring
-            // append(ExtrusionEntitiesPtr&&) the old revert used, just applied per-
-            // bucket instead of per-layer - each path still carries its true source
-            // role, so nothing is lost or mis-painted.
+            // Every dropped/trimmed bucket's geometry is redirected to the nearest
+            // SURVIVING matched bucket (v2.5a: prints a real nearby matched color
+            // instead of the residual don't-care path); only when NO bucket survives
+            // does it merge back into support_fills (fallback) via the same ownership-
+            // transferring append(ExtrusionEntitiesPtr&&) the old revert used - each
+            // path still carries its true source role, so nothing is lost.
             //
             // v2.3 Task 1 (spec C2): captured BEFORE the call, since apply_bucket_caps
             // erases gated/trimmed buckets from `partitioned` in place - this is what
