@@ -1,0 +1,12 @@
+{
+    "type": "process",
+    "name": "paint depth spike overrides (defaults)",
+    "from": "User",
+    "inherits": "0.20mm Standard @BBL X1C",
+    "compatible_printers": [
+        "Bambu Lab X1 Carbon 0.4 nozzle"
+    ],
+    "enable_prime_tower": "0",
+    "wall_loops": "2",
+    "use_relative_e_distances": "0"
+}
