@@ -37,9 +37,9 @@ static std::string MachineBedTypeString[7] = {
 
 wxString get_nozzle_volume_type_name(NozzleVolumeType type)
 {
-    if (NozzleVolumeType::nvtNormal == type) {
+    if (NozzleVolumeType::nvtStandard == type) {
         return _L("Normal");
-    } else if (NozzleVolumeType::nvtBigTraffic == type) {
+    } else if (NozzleVolumeType::nvtHighFlow == type) {
         return _L("BigTraffic");
     }
     return wxString();

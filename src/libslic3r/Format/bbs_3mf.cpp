@@ -7894,8 +7894,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 // against the installed nozzle (auto-matched to the connected printer at send time).
                 {
                     int nozzle_vol_type = 0; // default Standard
-                    if (const auto* nvt = config.option<ConfigOptionEnum<NozzleVolumeType>>("nozzle_volume_type"))
-                        nozzle_vol_type = int(nvt->value);
+                    // Ultra: nozzle_volume_type is now per-extruder (coEnums); emit the first extruder's
+                    // value for this single-nozzle metadata attribute.
+                    if (const auto* nvt = config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type"))
+                        if (!nvt->values.empty()) nozzle_vol_type = nvt->values.front();
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << NOZZLE_VOLUME_TYPE_ATTR << "\" " << VALUE_ATTR << "=\"" << nozzle_vol_type << "\"/>\n";
                 }
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << TIMELAPSE_TYPE_ATTR << "\" " << VALUE_ATTR << "=\"" << timelapse_type << "\"/>\n";

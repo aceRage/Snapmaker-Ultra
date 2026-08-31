@@ -152,7 +152,7 @@ struct Nozzle
     float diameter = {0.4f}; // 0-0.2mm  1-0.4mm 2-0.6 mm3-0.8mm
     int   max_temp = 0;
     int   wear = 0;
-    NozzleVolumeType nozzle_flow{NozzleVolumeType::nvtNormal}; // Ultra: Standard / High Flow
+    NozzleVolumeType nozzle_flow{NozzleVolumeType::nvtStandard}; // Ultra: Standard / High Flow
 };
 
 struct NozzleData
@@ -189,9 +189,9 @@ struct Extder
     //current nozzle
     NozzleType     current_nozzle_type{NozzleType::ntUndefine};            // 0-hardened_steel 1-stainless_steel
     float current_nozzle_diameter = {0.4f}; // 0-0.2mm  1-0.4mm 2-0.6 mm3-0.8mm
-    // Ultra: reported nozzle flow variant (nvtNormal=Standard, nvtBigTraffic=High Flow),
+    // Ultra: reported nozzle flow variant (nvtStandard=Standard, nvtBigTraffic=High Flow),
     // used to auto-match the sliced nozzle_volume_type to the installed nozzle.
-    NozzleVolumeType current_nozzle_flow{NozzleVolumeType::nvtNormal};
+    NozzleVolumeType current_nozzle_flow{NozzleVolumeType::nvtStandard};
 };
 
 struct ExtderData

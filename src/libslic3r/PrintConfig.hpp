@@ -342,13 +342,35 @@ enum FilamentMapMode {
     fmmAutoForFlush,
     fmmAutoForMatch,
     fmmManual,
+    fmmNozzleManual,
+    fmmAutoForQuality,
     fmmDefault
 };
 
+enum ExtruderType {
+    etDirectDrive = 0,
+    etBowden,
+    etMaxExtruderType = etBowden
+};
+
+// Ultra: widened from the fork's 2-value {nvtNormal,nvtBigTraffic} to BBS's set for dual-nozzle
+// support. The first two indices AND string labels are unchanged (nvtStandard == old nvtNormal ==
+// 0 == "Standard"; nvtHighFlow == old nvtBigTraffic == 1 == "High Flow"), so existing
+// string-serialized presets/projects round-trip without a value migration. Index 4 is intentionally
+// skipped upstream (E3DHighFlow = 5).
 enum NozzleVolumeType {
-    nvtNormal = 0,
-    nvtBigTraffic,
-    nvtMaxNozzleVolumeType = nvtBigTraffic
+    nvtStandard = 0,
+    nvtHighFlow,
+    nvtHybrid,
+    nvtTPUHighFlow,
+    nvtE3DHighFlow = 5,
+    nvtMaxNozzleVolumeType = nvtE3DHighFlow
+};
+
+enum PrimeVolumeMode {
+    pvmDefault = 0,
+    pvmSaving,
+    pvmFast
 };
 
 enum RetractLiftEnforceType {

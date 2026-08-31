@@ -432,10 +432,36 @@ CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(NozzleType)
 // gcode CONFIG_BLOCK and slice_info.config is what modern Bambu firmware validates.
 // nvtNormal maps to "Standard", nvtBigTraffic to "High Flow".
 static t_config_enum_values s_keys_map_NozzleVolumeType {
-    { "Standard",  int(NozzleVolumeType::nvtNormal) },
-    { "High Flow", int(NozzleVolumeType::nvtBigTraffic) }
+    { "Standard",      int(NozzleVolumeType::nvtStandard) },
+    { "High Flow",     int(NozzleVolumeType::nvtHighFlow) },
+    { "TPU High Flow", int(NozzleVolumeType::nvtTPUHighFlow) },
+    { "Hybrid",        int(NozzleVolumeType::nvtHybrid) },
+    { "E3D High Flow", int(NozzleVolumeType::nvtE3DHighFlow) }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(NozzleVolumeType)
+
+// Ultra: dual-nozzle enums (BBS-faithful label maps; fmmDefault/etMax* are sentinels, not serialized).
+static t_config_enum_values s_keys_map_ExtruderType {
+    { "Direct Drive", int(ExtruderType::etDirectDrive) },
+    { "Bowden",       int(ExtruderType::etBowden) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(ExtruderType)
+
+static t_config_enum_values s_keys_map_FilamentMapMode {
+    { "Auto For Flush",   int(FilamentMapMode::fmmAutoForFlush) },
+    { "Auto For Match",   int(FilamentMapMode::fmmAutoForMatch) },
+    { "Manual",           int(FilamentMapMode::fmmManual) },
+    { "Nozzle Manual",    int(FilamentMapMode::fmmNozzleManual) },
+    { "Auto For Quality", int(FilamentMapMode::fmmAutoForQuality) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FilamentMapMode)
+
+static t_config_enum_values s_keys_map_PrimeVolumeMode {
+    { "Default", int(PrimeVolumeMode::pvmDefault) },
+    { "Saving",  int(PrimeVolumeMode::pvmSaving) },
+    { "Fast",    int(PrimeVolumeMode::pvmFast) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(PrimeVolumeMode)
 
 static t_config_enum_values s_keys_map_PrinterStructure {
     {"undefine",        int(PrinterStructure::psUndefine)},
@@ -3186,18 +3212,238 @@ void PrintConfigDef::init_fff_params()
     // this fork (our presets aren't per-variant, so it drives no slicing math). Emitted into
     // the gcode CONFIG_BLOCK and slice_info.config so a Bambu print declares the installed
     // nozzle's flow type; auto-matched to the connected printer at print-send time.
-    def = this->add("nozzle_volume_type", coEnum);
+    // Ultra: converted from single coEnum to BBS-faithful per-extruder coEnums for dual-nozzle
+    // support. Single-nozzle machines carry a 1-element value; dual-nozzle (H2D/H2C) carry one per
+    // physical extruder. First two indices/labels unchanged so existing presets round-trip.
+    def = this->add("nozzle_volume_type", coEnums);
     def->label = L("Nozzle flow type");
-    def->tooltip = L("The flow variant of the nozzle (Standard or High Flow). Declared to the "
-                     "printer so the sliced file matches the installed nozzle. Matched to the "
+    def->tooltip = L("The flow variant of each nozzle (Standard/High Flow/...). Declared to the "
+                     "printer so the sliced file matches the installed nozzle(s). Matched to the "
                      "connected printer automatically; has no effect on non-Bambu printers.");
     def->enum_keys_map = &ConfigOptionEnum<NozzleVolumeType>::get_enum_values();
     def->enum_values.push_back("Standard");
     def->enum_values.push_back("High Flow");
+    def->enum_values.push_back("Hybrid");
+    def->enum_values.push_back("TPU High Flow");
+    def->enum_values.push_back("E3D High Flow");
     def->enum_labels.push_back(L("Standard"));
     def->enum_labels.push_back(L("High Flow"));
+    def->enum_labels.push_back(L("Hybrid"));
+    def->enum_labels.push_back(L("TPU High Flow"));
+    def->enum_labels.push_back(L("E3D High Flow"));
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionEnum<NozzleVolumeType>(nvtNormal));
+    def->set_default_value(new ConfigOptionEnumsGeneric{ NozzleVolumeType::nvtStandard });
+
+    // ============ Ultra: dual-nozzle / multi-extruder options (BBS-faithful port) ============
+    // Config foundation for H2D/H2D Pro/H2C. The grouping engine (MultiNozzleUtils/FilamentGroup,
+    // added in a later phase) reads these; profiles (fdm_bbl_3dp_002_common) carry them.
+    def = this->add("extruder_type", coEnums);
+    def->label = L("Extruder type");
+    def->tooltip = L("Direct Drive or Bowden. Initial value for pressure-advance calibration; does not affect normal slicing.");
+    def->enum_keys_map = &ConfigOptionEnum<ExtruderType>::get_enum_values();
+    def->enum_values.push_back("Direct Drive");
+    def->enum_values.push_back("Bowden");
+    def->enum_labels.push_back(L("Direct Drive"));
+    def->enum_labels.push_back(L("Bowden"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnumsGeneric{ ExtruderType::etDirectDrive });
+
+    def = this->add("default_nozzle_volume_type", coEnums);
+    def->label = L("Default nozzle volume type");
+    def->tooltip = L("Default nozzle volume type for the extruders of this printer.");
+    def->enum_keys_map = &ConfigOptionEnum<NozzleVolumeType>::get_enum_values();
+    def->enum_values.push_back("Standard");
+    def->enum_values.push_back("High Flow");
+    def->enum_values.push_back("Hybrid");
+    def->enum_values.push_back("TPU High Flow");
+    def->enum_values.push_back("E3D High Flow");
+    def->enum_labels.push_back(L("Standard"));
+    def->enum_labels.push_back(L("High Flow"));
+    def->enum_labels.push_back(L("Hybrid"));
+    def->enum_labels.push_back(L("TPU High Flow"));
+    def->enum_labels.push_back(L("E3D High Flow"));
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionEnumsGeneric{ NozzleVolumeType::nvtStandard });
+
+    def = this->add("extruder_nozzle_volume_type", coEnums);
+    def->label = L("Extruder nozzle volume type");
+    def->tooltip = L("Per-extruder nozzle volume type.");
+    def->enum_keys_map = &ConfigOptionEnum<NozzleVolumeType>::get_enum_values();
+    def->enum_values.push_back("Standard");
+    def->enum_values.push_back("High Flow");
+    def->enum_values.push_back("Hybrid");
+    def->enum_values.push_back("TPU High Flow");
+    def->enum_values.push_back("E3D High Flow");
+    def->enum_labels.push_back(L("Standard"));
+    def->enum_labels.push_back(L("High Flow"));
+    def->enum_labels.push_back(L("Hybrid"));
+    def->enum_labels.push_back(L("TPU High Flow"));
+    def->enum_labels.push_back(L("E3D High Flow"));
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionEnumsGeneric{ NozzleVolumeType::nvtStandard });
+
+    def = this->add("extruder_variant_list", coStrings);
+    def->label = "Extruder variant list";
+    def->tooltip = "Extruder variant list";
+    def->set_default_value(new ConfigOptionStrings { "Direct Drive Standard" });
+    def->cli = ConfigOptionDef::nocli;
+
+    def = this->add("extruder_ams_count", coStrings);
+    def->label = "Extruder ams count";
+    def->tooltip = "AMS counts per extruder";
+    def->set_default_value(new ConfigOptionStrings { });
+
+    def = this->add("enable_filament_dynamic_map", coBool);
+    def->label = "Enable filament dynamic map";
+    def->tooltip = "Support mapping filament to different nozzles";
+    def->set_default_value(new ConfigOptionBool{ false });
+
+    def = this->add("has_filament_switcher", coBool);
+    def->label = "Has filament switcher";
+    def->tooltip = "Whether a filament switcher is connected to the printer";
+    def->set_default_value(new ConfigOptionBool{ false });
+
+    def = this->add("prime_volume_mode", coEnum);
+    def->label = L("Prime volume mode");
+    def->enum_keys_map = &ConfigOptionEnum<PrimeVolumeMode>::get_enum_values();
+    def->enum_values.push_back("Default");
+    def->enum_values.push_back("Saving");
+    def->enum_values.push_back("Fast");
+    def->enum_labels.push_back(L("Default"));
+    def->enum_labels.push_back(L("Saving"));
+    def->enum_labels.push_back(L("Fast"));
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionEnum<PrimeVolumeMode>{ PrimeVolumeMode::pvmDefault });
+
+    def = this->add("extruder_nozzle_count", coInts);
+    def->label = "Extruder nozzle count";
+    def->tooltip = "Extruder nozzle count";
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionInts{ 1 });
+
+    def = this->add("extruder_max_nozzle_count", coInts);
+    def->mode = comDevelop;
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionIntsNullable{ 1 });
+
+    def = this->add("printer_extruder_id", coInts);
+    def->label = "Printer extruder id";
+    def->tooltip = "Printer extruder id";
+    def->set_default_value(new ConfigOptionInts { 1 });
+    def->cli = ConfigOptionDef::nocli;
+
+    def = this->add("printer_extruder_variant", coStrings);
+    def->label = "Printer's extruder variant";
+    def->tooltip = "Printer's extruder variant";
+    def->set_default_value(new ConfigOptionStrings { "Direct Drive Standard" });
+    def->cli = ConfigOptionDef::nocli;
+
+    def = this->add("master_extruder_id", coInt);
+    def->label = "Master extruder id";
+    def->tooltip = "Default extruder id to place filament";
+    def->set_default_value(new ConfigOptionInt{ 1 });
+
+    def = this->add("print_extruder_id", coInts);
+    def->label = "Print extruder id";
+    def->tooltip = "Print extruder id";
+    def->set_default_value(new ConfigOptionInts { 1 });
+    def->cli = ConfigOptionDef::nocli;
+
+    def = this->add("print_extruder_variant", coStrings);
+    def->label = "Print's extruder variant";
+    def->tooltip = "Print's extruder variant";
+    def->set_default_value(new ConfigOptionStrings { "Direct Drive Standard" });
+    def->cli = ConfigOptionDef::nocli;
+
+    def = this->add("filament_extruder_variant", coStrings);
+    def->label = "Filament's extruder variant";
+    def->tooltip = "Filament's extruder variant";
+    def->set_default_value(new ConfigOptionStrings { "Direct Drive Standard" });
+    def->cli = ConfigOptionDef::nocli;
+
+    def = this->add("filament_self_index", coInts);
+    def->label = "Filament self index";
+    def->tooltip = "Filament self index";
+    def->set_default_value(new ConfigOptionInts { 1 });
+    def->cli = ConfigOptionDef::nocli;
+
+    def = this->add("filament_map", coInts);
+    def->label = L("Filament map to extruder");
+    def->tooltip = L("Filament map to extruder (1-based).");
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionInts{ 1 });
+
+    def = this->add("filament_map_2", coInts);
+    def->label = "Filament map plus for multi nozzle";
+    def->tooltip = "Filament map to the index identified by extruder and nozzle_volume_type";
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionInts{ 1 });
+
+    def = this->add("filament_volume_map", coInts);
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionInts{ (int)(NozzleVolumeType::nvtStandard) });
+
+    def = this->add("filament_nozzle_map", coInts);
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionInts{ 1 });
+
+    def = this->add("physical_extruder_map", coInts);
+    def->label = "Map the logical extruder to physical extruder";
+    def->tooltip = "Map the logical extruder to physical extruder";
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionInts{ 0 });
+
+    def = this->add("filament_map_mode", coEnum);
+    def->label = L("Filament mapping mode");
+    def->tooltip = "Filament mapping mode used as plate param";
+    def->enum_keys_map = &ConfigOptionEnum<FilamentMapMode>::get_enum_values();
+    def->enum_values.push_back("Auto For Flush");
+    def->enum_values.push_back("Auto For Match");
+    def->enum_values.push_back("Manual");
+    def->enum_values.push_back("Nozzle Manual");
+    def->enum_values.push_back("Auto For Quality");
+    def->enum_labels.push_back(L("Auto For Flush"));
+    def->enum_labels.push_back(L("Auto For Match"));
+    def->enum_labels.push_back(L("Manual"));
+    def->enum_labels.push_back(L("Nozzle Manual"));
+    def->enum_labels.push_back(L("Auto For Quality"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<FilamentMapMode>(fmmAutoForFlush));
+
+    def = this->add("extruder_printable_area", coPointsGroups);
+    def->label = L("Extruder printable area");
+    def->mode = comAdvanced;
+    def->gui_type = ConfigOptionDef::GUIType::one_string;
+    def->set_default_value(new ConfigOptionPointsGroups{});
+
+    def           = this->add("extruder_printable_height", coFloats);
+    def->label    = L("Extruder printable height");
+    def->tooltip  = L("Maximum printable height of this extruder, limited by the printer mechanism.");
+    def->sidetext = L("mm");
+    def->min      = 0;
+    def->max      = 1000;
+    def->mode     = comAdvanced;
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsNullable{ 0 });
+
+    def = this->add("grab_length", coFloats);
+    def->label = L("Grab length");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloats({ 0 }));
+
+    def = this->add("hotend_cooling_rate", coFloats);
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsNullable{ 2 });
+
+    def = this->add("hotend_heating_rate", coFloats);
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsNullable{ 2 });
+
+    def = this->add("nozzle_flush_dataset", coInts);
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionIntsNullable{ 0 });
 
 
     def                = this->add("nozzle_hrc", coInt);

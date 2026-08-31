@@ -21234,9 +21234,13 @@ bool Plater::reslice()
             if (MachineObject* obj = dev->get_selected_machine()) {
                 if (obj->is_connected() && !obj->m_extder_data.extders.empty()) {
                     NozzleVolumeType flow = obj->m_extder_data.extders[0].current_nozzle_flow;
-                    auto* cur = pb->project_config.option<ConfigOptionEnum<NozzleVolumeType>>("nozzle_volume_type");
-                    if (!cur || cur->value != flow) {
-                        pb->project_config.set_key_value("nozzle_volume_type", new ConfigOptionEnum<NozzleVolumeType>(flow));
+                    // Ultra: nozzle_volume_type is now per-extruder (coEnums). This single-nozzle
+                    // auto-match sets the first extruder's value; dual-nozzle per-extruder matching
+                    // is handled by the grouping orchestration.
+                    auto* cur = pb->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+                    int cur0 = (cur && !cur->values.empty()) ? cur->values.front() : -1;
+                    if (cur0 != int(flow)) {
+                        pb->project_config.set_key_value("nozzle_volume_type", new ConfigOptionEnumsGeneric{ flow });
                         BOOST_LOG_TRIVIAL(info) << "[UltraNet] auto-matched nozzle_volume_type to printer flow=" << int(flow);
                     }
                 }

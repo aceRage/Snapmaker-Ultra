@@ -57,6 +57,17 @@ namespace std {
         }
     };
 
+    // Ultra (dual-nozzle): ConfigOptionVector<Vec2ds>::hash() (used by ConfigOptionPointsGroups)
+    // instantiates std::hash<Vec2ds>; provide it (std::vector has none by default).
+    template<> struct hash<Slic3r::Vec2ds> {
+        std::size_t operator()(const Slic3r::Vec2ds& v) const noexcept {
+            std::size_t seed = 0;
+            std::hash<Slic3r::Vec2d> h;
+            for (const auto& p : v) boost::hash_combine(seed, h(p));
+            return seed;
+        }
+    };
+
     template<> struct hash<Slic3r::Vec3d> {
         std::size_t operator()(const Slic3r::Vec3d& v) const noexcept {
             std::size_t seed = std::hash<double>{}(v.x());
@@ -191,6 +202,8 @@ enum ConfigOptionType {
     coEnum          = 9,
     // BBS: vector of enums
     coEnums         = coEnum + coVectorType,
+    // Ultra (dual-nozzle): vector of 2d-point groups (per-extruder printable areas). Value matches BBS.
+    coPointsGroups  = 10 + coVectorType,
 };
 
 enum ConfigOptionMode {
@@ -1342,6 +1355,112 @@ private:
 	}
 };
 
+// Ultra (dual-nozzle): a vector of point-groups. Used by extruder_printable_area (one polygon
+// per physical extruder). Ported from BambuStudio; text (de)serialize is BBS-compatible
+// ("x1xy1,x2xy2#..." groups joined by '#'). cereal uses a nested BINARY form mirroring
+// ConfigOptionPoints (the fork has no Vec2d cereal adapter, hence saveBinary/loadBinary).
+class ConfigOptionPointsGroups : public ConfigOptionVector<Vec2ds>
+{
+public:
+    ConfigOptionPointsGroups() : ConfigOptionVector<Vec2ds>() {}
+    explicit ConfigOptionPointsGroups(std::initializer_list<Vec2ds> il) : ConfigOptionVector<Vec2ds>(std::move(il)) {}
+    explicit ConfigOptionPointsGroups(const std::vector<Vec2ds> &values) : ConfigOptionVector<Vec2ds>(values) {}
+
+    static ConfigOptionType static_type() { return coPointsGroups; }
+    ConfigOptionType        type()  const override { return static_type(); }
+    ConfigOption*           clone() const override { return new ConfigOptionPointsGroups(*this); }
+    ConfigOptionPointsGroups& operator=(const ConfigOption *opt) { this->set(opt); return *this; }
+    bool                    operator==(const ConfigOptionPointsGroups &rhs) const throw() { return this->values == rhs.values; }
+    bool                    operator==(const ConfigOption &rhs) const override {
+        if (rhs.type() != this->type())
+            throw ConfigurationError("ConfigOptionPointsGroups: Comparing incompatible types");
+        assert(dynamic_cast<const ConfigOptionVector<Vec2ds>*>(&rhs));
+        return this->values == static_cast<const ConfigOptionVector<Vec2ds>*>(&rhs)->values;
+    }
+    bool                    nullable() const override { return false; }
+    bool                    is_nil(size_t) const override { return false; }
+
+    std::string serialize() const override
+    {
+        std::ostringstream ss;
+        for (auto it = this->values.begin(); it != this->values.end(); ++it) {
+            if (it != this->values.begin()) ss << "#";
+            serialize_single_value(ss, *it);
+        }
+        return ss.str();
+    }
+
+    std::vector<std::string> vserialize() const override
+    {
+        std::vector<std::string> ret;
+        for (const auto &pts : this->values) {
+            std::ostringstream ss;
+            serialize_single_value(ss, pts);
+            ret.emplace_back(ss.str());
+        }
+        return ret;
+    }
+
+    bool deserialize(const std::string &str, bool append = false) override
+    {
+        if (! append)
+            this->values.clear();
+        std::istringstream is(str);
+        std::string group_str;
+        while (std::getline(is, group_str, '#')) {
+            Vec2ds group;
+            std::istringstream iss(group_str);
+            std::string point_str;
+            while (std::getline(iss, point_str, ',')) {
+                Vec2d point(Vec2d::Zero());
+                std::istringstream ip(point_str);
+                std::string coord_str;
+                if (std::getline(ip, coord_str, 'x')) {
+                    std::istringstream(coord_str) >> point(0);
+                    if (std::getline(ip, coord_str, 'x'))
+                        std::istringstream(coord_str) >> point(1);
+                }
+                group.push_back(point);
+            }
+            this->values.emplace_back(std::move(group));
+        }
+        return true;
+    }
+
+protected:
+    void serialize_single_value(std::ostringstream &ss, const Vec2ds &v) const {
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (it != v.begin()) ss << ",";
+            ss << (*it)(0);
+            ss << "x";
+            ss << (*it)(1);
+        }
+    }
+
+private:
+    friend class cereal::access;
+    template<class Archive> void save(Archive& archive) const {
+        size_t group_cnt = this->values.size();
+        archive(group_cnt);
+        for (const auto& g : this->values) {
+            size_t cnt = g.size();
+            archive(cnt);
+            archive.saveBinary((const char*)g.data(), sizeof(Vec2d) * cnt);
+        }
+    }
+    template<class Archive> void load(Archive& archive) {
+        size_t group_cnt;
+        archive(group_cnt);
+        this->values.assign(group_cnt, Vec2ds());
+        for (auto& g : this->values) {
+            size_t cnt;
+            archive(cnt);
+            g.assign(cnt, Vec2d());
+            archive.loadBinary((char*)g.data(), sizeof(Vec2d) * cnt);
+        }
+    }
+};
+
 class ConfigOptionPoint3 : public ConfigOptionSingle<Vec3d>
 {
 public:
@@ -1828,6 +1947,8 @@ public:
 		    case coEnum:            { auto opt = new ConfigOptionEnumGeneric(this->enum_keys_map); archive(*opt); return opt; }
             // BBS
             case coEnums:           { auto opt = new ConfigOptionEnumsGeneric(this->enum_keys_map); archive(*opt); return opt; }
+            // Ultra (dual-nozzle)
+            case coPointsGroups:    { auto opt = new ConfigOptionPointsGroups(); archive(*opt); return opt; }
 		    default:                throw ConfigurationError(std::string("ConfigOptionDef::load_option_from_archive(): Unknown option type for option ") + this->opt_key);
 		    }
 		}
@@ -1861,6 +1982,8 @@ public:
 		    case coEnum:            archive(*static_cast<const ConfigOptionEnumGeneric*>(opt)); 	break;
             // BBS
             case coEnums:           archive(*static_cast<const ConfigOptionEnumsGeneric*>(opt));    break;
+            // Ultra (dual-nozzle)
+            case coPointsGroups:    archive(*static_cast<const ConfigOptionPointsGroups*>(opt));   break;
 		    default:                throw ConfigurationError(std::string("ConfigOptionDef::save_option_to_archive(): Unknown option type for option ") + this->opt_key);
 		    }
 		}

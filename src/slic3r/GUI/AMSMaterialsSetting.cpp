@@ -1149,7 +1149,7 @@ void AMSMaterialsSetting::on_select_filament(wxCommandEvent &evt)
 
     // TODO: Orca hack
     int extruder_id = 0;
-    NozzleVolumeType nozzle_volume_type = NozzleVolumeType::nvtNormal;
+    NozzleVolumeType nozzle_volume_type = NozzleVolumeType::nvtStandard;
     if (obj->cali_version >= 0) {
         // add default item
         PACalibResult default_item;
