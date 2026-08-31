@@ -2632,6 +2632,10 @@ void TabPrint::build()
         optgroup->append_single_option_line("paint_depth_mode", "multimaterial_settings_advanced#paint-depth-mode");
         optgroup->append_single_option_line("paint_depth_walls", "multimaterial_settings_advanced#paint-depth-walls");
         optgroup->append_single_option_line("paint_depth_mm", "multimaterial_settings_advanced#paint-depth-distance");
+        // Paint Depth Stage 2 (Task 3 item 2): only meaningful once paint depth is bounded
+        // (see ConfigManipulation.cpp's update_print_fff_config, which greys this out in
+        // "Unlimited" mode).
+        optgroup->append_single_option_line("paint_infill_override", "multimaterial_settings_advanced#paint-sparse-infill");
         optgroup->append_single_option_line("mmu_segmented_region_interlocking_depth", "multimaterial_settings_advanced#interlocking-depth-of-segmented-region");
         optgroup->append_single_option_line("interlocking_beam_width", "multimaterial_settings_advanced#interlocking-beam-width");
         optgroup->append_single_option_line("interlocking_orientation", "multimaterial_settings_advanced#interlocking-direction");

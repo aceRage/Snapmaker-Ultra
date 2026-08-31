@@ -482,6 +482,17 @@ public:
     bool                        is_mm_painted()         const { return this->model_object()->is_mm_painted(); }
     // Checks if the model object is painted using the fuzzy skin painting gizmo.
     bool                        is_fuzzy_skin_painted() const { return this->model_object()->is_fuzzy_skin_painted(); }
+    // Paint Depth Stage 2 (Task 3 item 1, docs/superpowers/specs/2026-08-31-paint-depth-design.md
+    // Stage 2(a), docs/superpowers/plans/2026-08-31-paint-depth.md Task 3 item 1): true when this
+    // object has painted regions AND paint depth is bounded (paint_depth_mode != unlimited) - i.e.
+    // bleed path (c), bare dark/light Z interfaces. When true, PrintObject.cpp's
+    // detect_surfaces_type() and discover_vertical_shells() treat the object as if
+    // interface_shells were enabled (solid skin at every region boundary, color boundaries
+    // included), the same mechanism the "Interface shells" setting already provides - see those
+    // call sites for why this OR's into interface_shells rather than reclassifying only
+    // paint-caused boundaries (LayerRegion::slices carries no "why did this region differ"
+    // provenance to distinguish a color split from an unrelated modifier/volume split).
+    bool                        has_bounded_paint_depth() const { return this->is_mm_painted() && m_config.paint_depth_mode.value != pdmUnlimited; }
 
     // returns 0-based indices of extruders used to print the object (without brim, support and other helper extrusions)
     std::vector<unsigned int>   object_extruders() const;

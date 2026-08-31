@@ -749,6 +749,11 @@ bool verify_update_print_object_regions(
     const PrintRegionConfig            &default_region_config,
     size_t                              num_extruders,
     PrintObjectRegions                 &print_object_regions,
+    // Paint Depth Stage 2 (Task 3 item 2): see generate_print_object_regions()'s parameter of
+    // the same name - must stay consistent with it so a toggle of paint_infill_override /
+    // paint_depth_mode is picked up on the fast (region-reuse) path too, not just when
+    // regions are regenerated from scratch.
+    const bool                          paint_sparse_infill,
     const std::function<void(const PrintRegionConfig&, const PrintRegionConfig&, const t_config_option_keys&)> &callback_invalidate)
 {
     // Sort by ModelVolume ID.
@@ -830,7 +835,10 @@ bool verify_update_print_object_regions(
             PrintRegionConfig                       cfg             = parent_region.region->config();
             cfg.wall_filament.value    = region.extruder_id;
             cfg.solid_infill_filament.value = region.extruder_id;
-            cfg.sparse_infill_filament.value       = region.extruder_id;
+            // Paint Depth Stage 2 (Task 3 item 2): mirrors generate_print_object_regions() -
+            // sparse infill only follows the painted claim when paint_sparse_infill is active.
+            if (paint_sparse_infill)
+                cfg.sparse_infill_filament.value = region.extruder_id;
             if (cfg != region.region->config()) {
                 // Region configuration changed.
                 if (print_region_ref_cnt(*region.region) == 0) {
@@ -974,7 +982,12 @@ static PrintObjectRegions* generate_print_object_regions(
     size_t                                       num_extruders,
     const float                                  xy_contour_compensation,
     const std::vector<unsigned int>             &painting_extruders,
-    const bool                                   has_painted_fuzzy_skin)
+    const bool                                   has_painted_fuzzy_skin,
+    // Paint Depth Stage 2 (Task 3 item 2): whether a painted region's sparse infill should be
+    // set to the painted extruder (true = today's behavior) or left at the parent (base)
+    // region's filament. False only when paint_infill_override is unchecked AND paint depth
+    // is actually bounded (see the call site in Print::apply for the gating).
+    const bool                                   paint_sparse_infill)
 {
     // Reuse the old object or generate a new one.
     auto out = print_object_regions_old ? std::unique_ptr<PrintObjectRegions>(print_object_regions_old) : std::make_unique<PrintObjectRegions>();
@@ -1075,18 +1088,27 @@ static PrintObjectRegions* generate_print_object_regions(
                     PrintRegionConfig cfg = parent_region.region->config();
                     cfg.wall_filament.value    = painted_extruder_id;
                     cfg.solid_infill_filament.value = painted_extruder_id;
-                    cfg.sparse_infill_filament.value       = painted_extruder_id;
+                    // Paint Depth Stage 2 (Task 3 item 2): sparse infill only follows the
+                    // painted claim when paint_sparse_infill is active; otherwise it keeps
+                    // whatever cfg already inherited from the parent (base) region above -
+                    // walls and solid infill (which can be visible on top surfaces) always
+                    // stay painted regardless.
+                    const unsigned int expected_sparse_infill_filament =
+                        paint_sparse_infill ? painted_extruder_id : cfg.sparse_infill_filament.value;
+                    if (paint_sparse_infill)
+                        cfg.sparse_infill_filament.value = painted_extruder_id;
                     // Keep PrintRegion config-interned. If a painted target resolves to the same
                     // config as its parent, alias it instead of creating a duplicate PrintRegion.
                     PrintRegion *painted_region = get_create_region(std::move(cfg));
                     if (painted_region->config().wall_filament.value != painted_extruder_id ||
                         painted_region->config().solid_infill_filament.value != painted_extruder_id ||
-                        painted_region->config().sparse_infill_filament.value != painted_extruder_id) {
+                        painted_region->config().sparse_infill_filament.value != expected_sparse_infill_filament) {
                         BOOST_LOG_TRIVIAL(warning) << "Painted region filament mismatch"
                                                    << " requested_extruder_id=" << painted_extruder_id
                                                    << " wall_filament=" << painted_region->config().wall_filament.value
                                                    << " solid_infill_filament=" << painted_region->config().solid_infill_filament.value
                                                    << " sparse_infill_filament=" << painted_region->config().sparse_infill_filament.value
+                                                   << " expected_sparse_infill_filament=" << expected_sparse_infill_filament
                                                    << " parent_region_id=" << parent_region_id
                                                    << " parent_print_region_id=" << parent_region.region->print_object_region_id()
                                                    << " painted_print_region_id=" << painted_region->print_object_region_id();
@@ -1833,6 +1855,12 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         const ModelObject  &model_object         = *print_object.model_object();
         ModelObjectStatus  &model_object_status  = const_cast<ModelObjectStatus&>(model_object_status_db.reuse(model_object));
         PrintObjectRegions *print_object_regions = model_object_status.print_object_regions;
+        // Paint Depth Stage 2 (Task 3 item 2): paint_infill_override is only meaningful once
+        // paint depth is actually bounded (matches the UI greying in ConfigManipulation.cpp);
+        // in "Unlimited" mode (or when the box is checked) sparse infill keeps following the
+        // painted claim, i.e. today's behavior.
+        const bool          paint_sparse_infill  = print_object.config().paint_infill_override.value ||
+                                                     print_object.config().paint_depth_mode.value == pdmUnlimited;
         for (++ it_print_object_end; it_print_object_end != m_objects.end() && (*it_print_object)->model_object() == (*it_print_object_end)->model_object(); ++ it_print_object_end)
             assert((*it_print_object_end)->m_shared_regions == nullptr || (*it_print_object_end)->m_shared_regions == print_object_regions);
         if (print_object_regions == nullptr) {
@@ -1947,6 +1975,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                     m_default_region_config,
                     num_total_filaments,
                     *print_object_regions,
+                    paint_sparse_infill,
                     [it_print_object, it_print_object_end, &update_apply_status](const PrintRegionConfig &old_config, const PrintRegionConfig &new_config, const t_config_option_keys &diff_keys) {
                         for (auto it = it_print_object; it != it_print_object_end; ++it)
                             if ((*it)->m_shared_regions != nullptr)
@@ -1973,7 +2002,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 num_total_filaments ,
                 print_object.is_mm_painted() ? 0.f : float(print_object.config().xy_contour_compensation.value),
                 painting_extruders,
-                print_object.is_fuzzy_skin_painted());
+                print_object.is_fuzzy_skin_painted(),
+                paint_sparse_infill);
         }
         for (auto it = it_print_object; it != it_print_object_end; ++it)
             if ((*it)->m_shared_regions) {

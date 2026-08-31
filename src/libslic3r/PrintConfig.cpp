@@ -3929,6 +3929,17 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(1.5));
 
+    def           = this->add("paint_infill_override", coBool);
+    def->label    = L("Paint sparse infill");
+    def->tooltip  = L("If enabled (default), a painted claim's sparse infill is printed in the "
+                    "painted filament, matching walls and solid infill. If disabled, a bounded "
+                    "painted claim (\"Paint depth mode\" other than \"Unlimited\") keeps its "
+                    "sparse infill in the object's base filament - walls and solid infill (which "
+                    "can be visible on top surfaces) still print in the painted filament.");
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
     def           = this->add("mmu_segmented_region_interlocking_depth", coFloat);
     def->label    = L("Interlocking depth of a segmented region");
     def->tooltip  = L("Interlocking depth of a segmented region. It will be ignored if "

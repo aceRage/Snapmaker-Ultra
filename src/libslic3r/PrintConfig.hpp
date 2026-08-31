@@ -903,6 +903,11 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionEnum<PaintDepthMode>, paint_depth_mode))
     ((ConfigOptionInt,                 paint_depth_walls))
     ((ConfigOptionFloat,               paint_depth_mm))
+    // Paint Depth Stage 2 (Task 3 item 2): default true keeps today's behavior (sparse
+    // infill painted like walls/solid infill). false keeps a bounded claim's sparse infill
+    // in the base filament (PrintApply.cpp's generate_print_object_regions /
+    // verify_update_print_object_regions - the region-override site).
+    ((ConfigOptionBool,                paint_infill_override))
     ((ConfigOptionFloat,               raft_contact_distance))
     ((ConfigOptionFloat,               raft_expansion))
     ((ConfigOptionPercent,             raft_first_layer_density))

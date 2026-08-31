@@ -959,6 +959,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "paint_depth_mode"
             || opt_key == "paint_depth_walls"
             || opt_key == "paint_depth_mm"
+            || opt_key == "paint_infill_override"
             || opt_key == "raft_layers"
             || opt_key == "raft_contact_distance"
             || opt_key == "slice_closing_radius"
@@ -1314,7 +1315,11 @@ void PrintObject::detect_surfaces_type()
     // This is useful if one of the parts is to be dissolved, or if it is transparent and the internal shells
     // should be visible.
     bool spiral_mode      = this->print()->config().spiral_mode.value;
-    bool interface_shells = ! spiral_mode && m_config.interface_shells.value;
+    // Paint Depth Stage 2 (Task 3 item 1): a bounded painted claim needs solid skin at its
+    // color Z-interfaces (bleed path (c)) exactly the way interface_shells already provides
+    // for any region boundary - see PrintObject::has_bounded_paint_depth()'s comment (Print.hpp)
+    // for why this ORs into the existing flag instead of a scoped reclassification.
+    bool interface_shells = ! spiral_mode && (m_config.interface_shells.value || this->has_bounded_paint_depth());
     size_t num_layers     = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
 
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
@@ -1743,7 +1748,11 @@ void PrintObject::discover_vertical_shells()
     bool     spiral_mode      = this->print()->config().spiral_mode.value;
     size_t   num_layers       = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
     std::vector<DiscoverVerticalShellsCacheEntry> cache_top_botom_regions(num_layers, DiscoverVerticalShellsCacheEntry());
-    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value;
+    // Paint Depth Stage 2 (Task 3 item 1): mirror detect_surfaces_type()'s effective
+    // interface_shells value (see PrintObject::has_bounded_paint_depth()) so vertical shell
+    // thickness is computed per-region (not merged across the whole object) whenever a color
+    // Z-interface needs its own solid skin.
+    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! (m_config.interface_shells.value || this->has_bounded_paint_depth());
 //    static constexpr const float top_bottom_expansion_coeff = 1.05f;
     // Just a tiny fraction of an infill extrusion width to merge neighbor regions reliably.
     static constexpr const float top_bottom_expansion_coeff = 0.05f;

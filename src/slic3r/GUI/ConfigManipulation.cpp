@@ -911,6 +911,10 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
     auto paint_depth_mode = config->opt_enum<PaintDepthMode>("paint_depth_mode");
     toggle_line("paint_depth_walls", paint_depth_mode == PaintDepthMode::pdmWalls);
     toggle_line("paint_depth_mm", paint_depth_mode == PaintDepthMode::pdmMillimeters);
+    // Paint Depth Stage 2 (Task 3 item 2): the sparse-infill override only has an effect on
+    // a bounded claim (see PrintApply.cpp's generate_print_object_regions /
+    // verify_update_print_object_regions), so grey it out in "Unlimited" mode.
+    toggle_line("paint_infill_override", paint_depth_mode != PaintDepthMode::pdmUnlimited);
 
     bool use_beam_interlocking = config->opt_bool("interlocking_beam");
     toggle_line("mmu_segmented_region_interlocking_depth", !use_beam_interlocking);

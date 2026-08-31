@@ -47,7 +47,9 @@ namespace {
 const std::vector<int> PLUS_X_FACE   = {4, 5};
 const std::vector<int> ALL_SIDE_FACE = {4, 5, 6, 7, 8, 9, 10, 11};
 
-DynamicPrintConfig paint_depth_test_config(PaintDepthMode mode, int walls)
+// paint_infill_override defaults to true (today's behavior, matches the option's own
+// PrintConfig.cpp default) so existing callers that only pass mode/walls are unaffected.
+DynamicPrintConfig paint_depth_test_config(PaintDepthMode mode, int walls, bool paint_infill_override = true)
 {
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
     config.set_num_extruders(2);
@@ -75,13 +77,15 @@ DynamicPrintConfig paint_depth_test_config(PaintDepthMode mode, int walls)
     config.option<ConfigOptionFloatOrPercent>("outer_wall_line_width")->percent = false;
     config.option<ConfigOptionEnum<PaintDepthMode>>("paint_depth_mode")->value = mode;
     config.option<ConfigOptionInt>("paint_depth_walls")->value               = walls;
+    config.option<ConfigOptionBool>("paint_infill_override")->value          = paint_infill_override;
     return config;
 }
 
 // Builds a 40x40x20mm cube, paints the given facets with Extruder2 (state 2), applies
 // paint_depth_test_config, and slices the object. The returned PrintObject's layers
 // already carry the fully-applied MM segmentation (see the file-level note above).
-PrintObject *slice_painted_cube(const std::vector<int> &painted_facets, PaintDepthMode mode, int walls, Print &print)
+PrintObject *slice_painted_cube(const std::vector<int> &painted_facets, PaintDepthMode mode, int walls, Print &print,
+                                 bool paint_infill_override = true)
 {
     Model model;
     ModelObject *object = model.add_object();
@@ -96,13 +100,32 @@ PrintObject *slice_painted_cube(const std::vector<int> &painted_facets, PaintDep
     REQUIRE(volume->mmu_segmentation_facets.set(selector));
 
     print.set_status_silent();
-    print.apply(model, paint_depth_test_config(mode, walls));
+    print.apply(model, paint_depth_test_config(mode, walls, paint_infill_override));
     REQUIRE(print.objects().size() == 1);
 
     PrintObject *out_object = print.objects_mutable().front();
     out_object->slice();
     REQUIRE(out_object->layer_count() > 0);
     return out_object;
+}
+
+// Paint Depth Stage 2 (Task 3 item 2/3): the PrintRegionConfig apply_mm_segmentation built
+// for the Extruder2 paint claim (config().wall_filament == 2) - i.e. what filament each
+// feature (walls / solid infill / sparse infill) will actually print in, independent of any
+// per-layer geometry. paint_infill_override's effect is entirely a region-config decision
+// (PrintApply.cpp's generate_print_object_regions / verify_update_print_object_regions), so
+// this is the right level to pin it at, unlike extruder2_claim_for_layer() below which is
+// about clamped geometry (Task 2 concern).
+const PrintRegionConfig &extruder2_region_config(const PrintObject &object)
+{
+    for (size_t region_idx = 0; region_idx < object.num_printing_regions(); ++region_idx) {
+        const PrintRegion &region = object.printing_region(region_idx);
+        if (region.config().wall_filament.value == 2)
+            return region.config();
+    }
+    FAIL("no PrintRegion with wall_filament == 2 (Extruder2 paint claim) found");
+    static PrintRegionConfig unreachable;
+    return unreachable;
 }
 
 // Returns the ExPolygons of whichever PrintRegion apply_mm_segmentation carved out for
@@ -134,6 +157,91 @@ bool any_contains(const ExPolygons &polys, const Point &pt)
         if (poly.contains(pt))
             return true;
     return false;
+}
+
+// Paint Depth Stage 2, plan Task 3 item 1 (docs/superpowers/plans/2026-08-31-paint-depth.md,
+// docs/superpowers/specs/2026-08-31-paint-depth-design.md Stage 2(a)): builds a genuine color
+// Z-interface WITHOUT a custom subdivided mesh, by stacking two 40x40x10mm cube ModelVolumes
+// (both model parts) in one ModelObject: "lower" (z 0-10, entirely unpainted/base) and "upper"
+// (z 10-20, +X face painted Extruder2). The boundary at z=10 along the +X wall is exactly
+// bleed path (c) - a color transition in Z with nothing of the painted region below it.
+//
+// Unlike slice_painted_cube() above, this runs the object through Print::process() rather than
+// PrintObject::slice() alone: surface classification (detect_surfaces_type() /
+// discover_vertical_shells(), PrintObject.cpp) - what has_bounded_paint_depth() actually
+// changes (Print.hpp) - only executes at the private prepare_infill() step (posPrepareInfill),
+// which slice() does not reach; process() is the only public entry point that gets there.
+PrintObject *process_z_interface_cube(PaintDepthMode mode, int walls, Print &print)
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-z-interface.stl";
+    ModelVolume *lower    = object->add_volume(make_cube(40., 40., 10.));
+    ModelVolume *upper    = object->add_volume(make_cube(40., 40., 10.));
+    upper->translate(0., 0., 10.);
+    (void) lower;
+
+    TriangleSelector selector(upper->mesh());
+    for (int facet_idx : PLUS_X_FACE)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(upper->mmu_segmentation_facets.set(selector));
+
+    object->add_instance();
+    object->ensure_on_bed();
+
+    print.set_status_silent();
+    print.apply(model, paint_depth_test_config(mode, walls));
+    REQUIRE(print.objects().size() == 1);
+
+    print.process();
+    PrintObject *out_object = print.objects_mutable().front();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// Finds the local (per-object) region id of whichever PrintRegion carries the Extruder2 paint
+// claim (config().wall_filament == 2). Returns -1 if none exists.
+int extruder2_local_region_id(const PrintObject &object)
+{
+    for (size_t region_idx = 0; region_idx < object.num_printing_regions(); ++region_idx) {
+        const PrintRegion &region = object.printing_region(region_idx);
+        if (region.config().wall_filament.value == 2)
+            return region.print_object_region_id();
+    }
+    return -1;
+}
+
+// True if the Extruder2 region has ANY non-internal (top/bottom-family) typed surface on the
+// given layer - i.e. solid skin, what has_bounded_paint_depth()/interface_shells produce at a
+// color Z-interface. detect_surfaces_type() (PrintObject.cpp) is what assigns these types into
+// layerm->slices.surfaces (see that function's "save surfaces to layer" section); this must run
+// after Print::process(), not after PrintObject::slice() alone.
+bool extruder2_layer_has_solid_skin(const PrintObject &object, size_t layer_idx)
+{
+    const int local_id = extruder2_local_region_id(object);
+    if (local_id < 0)
+        return false;
+    const Layer *layer = object.get_layer(int(layer_idx));
+    if (local_id >= layer->region_count())
+        return false;
+    const LayerRegion *layerm = layer->get_region(local_id);
+    if (layerm == nullptr)
+        return false;
+    for (const Surface &s : layerm->slices.surfaces)
+        if (s.surface_type != stInternal)
+            return true;
+    return false;
+}
+
+// Index of the first layer whose print_z is above target_z (with a half-layer-height epsilon
+// so the layer immediately following a volume boundary is picked, not the one straddling it).
+size_t first_layer_above_z(const PrintObject &object, double target_z)
+{
+    for (size_t idx = 0; idx < object.layer_count(); ++idx)
+        if (object.get_layer(int(idx))->print_z > target_z + EPSILON)
+            return idx;
+    FAIL("no layer found above z=" << target_z);
+    return 0;
 }
 
 } // namespace
@@ -226,4 +334,78 @@ TEST_CASE("multi_material_segmentation_by_painting: unlimited mode reproduces th
     // Documents the pre-existing behavior pdmUnlimited deliberately preserves: without
     // any clamp, the whole-layer short-circuit really does hand over the object center.
     CHECK(any_contains(extruder2_claim, object_center));
+}
+
+// Paint Depth Stage 2, plan Task 3 item 2 (docs/superpowers/plans/2026-08-31-paint-depth.md,
+// docs/superpowers/specs/2026-08-31-paint-depth-design.md Stage 2(b)): paint_infill_override.
+// These pin the region-config decision at the PrintApply.cpp region-override site
+// (generate_print_object_regions / verify_update_print_object_regions), not clamped geometry -
+// walls mode is used only to have a realistic bounded claim; the override's effect does not
+// depend on the clamp band's width.
+TEST_CASE("multi_material_segmentation_by_painting: paint_infill_override=false keeps base-color sparse infill while walls/solid stay painted", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_cube(PLUS_X_FACE, pdmWalls, 3, print, /*paint_infill_override=*/false);
+
+    const PrintRegionConfig &painted_cfg = extruder2_region_config(*object);
+    CHECK(painted_cfg.wall_filament.value == 2);
+    CHECK(painted_cfg.solid_infill_filament.value == 2);
+    // The base (unpainted) filament in paint_depth_test_config's filament_colour list is
+    // extruder 1 ("#FFFFFF") - see that config's comment. sparse_infill_filament must stay
+    // there instead of following the painted claim when the override is off.
+    CHECK(painted_cfg.sparse_infill_filament.value == 1);
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: paint_infill_override=true (default) paints sparse infill too (today's behavior)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_cube(PLUS_X_FACE, pdmWalls, 3, print, /*paint_infill_override=*/true);
+
+    const PrintRegionConfig &painted_cfg = extruder2_region_config(*object);
+    CHECK(painted_cfg.wall_filament.value == 2);
+    CHECK(painted_cfg.solid_infill_filament.value == 2);
+    CHECK(painted_cfg.sparse_infill_filament.value == 2);
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: paint_infill_override is a no-op in unlimited mode (matches the UI greying)", "[paintdepth]")
+{
+    // ConfigManipulation.cpp greys the paint_infill_override control out whenever
+    // paint_depth_mode == unlimited; the underlying behavior must match that presentation -
+    // ANDing the override's gate on bounded mode (Print::apply's paint_sparse_infill local)
+    // means sparse infill keeps following the painted claim even with override=false here.
+    Print        print;
+    PrintObject *object = slice_painted_cube(PLUS_X_FACE, pdmUnlimited, 3, print, /*paint_infill_override=*/false);
+
+    const PrintRegionConfig &painted_cfg = extruder2_region_config(*object);
+    CHECK(painted_cfg.sparse_infill_filament.value == 2);
+}
+
+// Paint Depth Stage 2, plan Task 3 item 1 (docs/superpowers/plans/2026-08-31-paint-depth.md,
+// docs/superpowers/specs/2026-08-31-paint-depth-design.md Stage 2(a)): bleed path (c), color
+// Z-interfaces. Uses process_z_interface_cube() (stacked base/painted volumes, see its comment)
+// so the boundary at z=10 is a genuine paint color transition, and Print::process() so surface
+// classification (detect_surfaces_type()) actually runs.
+TEST_CASE("multi_material_segmentation_by_painting: a bounded color Z-interface gets solid skin", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = process_z_interface_cube(pdmWalls, 3, print);
+
+    // is_mm_painted() is true (upper volume is painted) and paint_depth_mode is bounded
+    // (walls), so PrintObject::has_bounded_paint_depth() should be active for this object -
+    // the first layer above the base/painted boundary must carry solid skin instead of an
+    // all-internal (bleeding) claim.
+    const size_t first_painted_layer = first_layer_above_z(*object, 10.0);
+    CHECK(extruder2_layer_has_solid_skin(*object, first_painted_layer));
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: an unbounded (unlimited mode) color Z-interface has no solid skin (legacy parity)", "[paintdepth]")
+{
+    // Documents the pre-existing bleed-path-(c) bug that pdmUnlimited deliberately
+    // preserves: has_bounded_paint_depth() requires paint_depth_mode != unlimited, so this
+    // object's color Z-interface stays plain stInternal, exactly like before Stage 2.
+    Print        print;
+    PrintObject *object = process_z_interface_cube(pdmUnlimited, 3, print);
+
+    const size_t first_painted_layer = first_layer_above_z(*object, 10.0);
+    CHECK_FALSE(extruder2_layer_has_solid_skin(*object, first_painted_layer));
 }
