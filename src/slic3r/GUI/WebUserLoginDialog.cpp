@@ -296,6 +296,74 @@ void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
             }
             Close();
         }
+        else if (strCmd == "user_ticket_login") {
+            // Ultra: the Bambu /sign-in page delivers an IN-PAGE (email/password) login as
+            // command:"user_ticket_login" carrying data.ticket — a short-lived exchange ticket,
+            // NOT a token, and NOT the command:"user_login" the fork previously assumed. It must be
+            // exchanged for real tokens, exactly like the OAuth loopback does in
+            // HttpServer::bbl_auth_handle_request. Without this branch the message was silently
+            // dropped (no else/default), the dialog stayed open, and the page relit its button.
+            std::string ticket = (j.contains("data") && j["data"].contains("ticket") && j["data"]["ticket"].is_string())
+                                     ? j["data"]["ticket"].get<std::string>() : std::string();
+            bool ok = false;
+            if (auto agent = wxGetApp().getAgent()) {
+                std::string access_token, refresh_token, expires_in_str, refresh_expires_in_str;
+                unsigned int tk_code = 0; std::string tk_body;
+                if (!ticket.empty() && agent->get_my_token(ticket, &tk_code, &tk_body) == 0) {
+                    try {
+                        json tj = json::parse(tk_body);
+                        if (tj.contains("accessToken"))  access_token  = tj["accessToken"].get<std::string>();
+                        if (tj.contains("refreshToken")) refresh_token = tj["refreshToken"].get<std::string>();
+                        if (tj.contains("expiresIn"))
+                            expires_in_str = tj["expiresIn"].is_string() ? tj["expiresIn"].get<std::string>()
+                                                                          : std::to_string(tj["expiresIn"].get<long long>());
+                        if (tj.contains("refreshExpiresIn"))
+                            refresh_expires_in_str = tj["refreshExpiresIn"].is_string() ? tj["refreshExpiresIn"].get<std::string>()
+                                                                                        : std::to_string(tj["refreshExpiresIn"].get<long long>());
+                    } catch (const std::exception &e) {
+                        BOOST_LOG_TRIVIAL(error) << "user_ticket_login: token JSON parse failed: " << e.what();
+                    }
+                }
+                if (!access_token.empty()) {
+                    unsigned int http_code = 0; std::string http_body;
+                    if (agent->get_my_profile(access_token, &http_code, &http_body) == 0) {
+                        std::string user_id, user_name, user_account, user_avatar;
+                        try {
+                            json uj = json::parse(http_body);
+                            if (uj.contains("uidStr"))  user_id      = uj["uidStr"].get<std::string>();
+                            if (uj.contains("name"))    user_name    = uj["name"].get<std::string>();
+                            if (uj.contains("avatar"))  user_avatar  = uj["avatar"].get<std::string>();
+                            if (uj.contains("account")) user_account = uj["account"].get<std::string>();
+                        } catch (const std::exception &e) {
+                            BOOST_LOG_TRIVIAL(error) << "user_ticket_login: profile JSON parse failed: " << e.what();
+                        }
+                        json cu;
+                        cu["data"]["refresh_token"]      = refresh_token;
+                        cu["data"]["token"]              = access_token;   // literal "token" — matches the agent scraper
+                        cu["data"]["expires_in"]         = expires_in_str;
+                        cu["data"]["refresh_expires_in"] = refresh_expires_in_str;
+                        cu["data"]["user"]["uid"]        = user_id;
+                        cu["data"]["user"]["name"]       = user_name;
+                        cu["data"]["user"]["account"]    = user_account;
+                        cu["data"]["user"]["avatar"]     = user_avatar;
+                        cu["data"]["autotest_token"]     = m_AutotestToken;
+                        agent->change_user(cu.dump());
+                        ok = agent->is_user_login();
+                    }
+                }
+            }
+            if (ok) {
+                // kick cloud device discovery (My Devices), same as the OAuth loopback path
+                wxGetApp().kick_user_device_refresh();
+                std::thread([] {
+                    if (auto dev = Slic3r::GUI::wxGetApp().getDeviceManager())
+                        dev->update_user_machine_list_info();
+                }).detach();
+                Close();
+            } else {
+                wxMessageBox("Login failed. Please try again.", "Login", wxICON_WARNING);
+            }
+        }
         else if (strCmd == "get_localhost_url") {
             BOOST_LOG_TRIVIAL(info) << "thirdparty_login: get_localhost_url";
             // Ultra P4: actually start the loopback OAuth-callback server (was gutted) so
