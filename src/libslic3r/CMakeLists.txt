@@ -246,6 +246,8 @@ set(lisbslic3r_sources
     GCode/Thumbnails.hpp
     GCode/ToolOrdering.cpp
     GCode/ToolOrdering.hpp
+    GCode/ToolOrderUtils.cpp
+    GCode/ToolOrderUtils.hpp
     GCode/WipeTower2.cpp
     GCode/WipeTower2.hpp
     GCode/WipeTower.cpp
@@ -295,6 +297,12 @@ set(lisbslic3r_sources
     MixedFilament.hpp
     MultiNozzleUtils.cpp
     MultiNozzleUtils.hpp
+    FilamentGroup.cpp
+    FilamentGroup.hpp
+    FilamentGroupUtils.cpp
+    FilamentGroupUtils.hpp
+    FlushVolPredictor.cpp
+    FlushVolPredictor.hpp
     filament_mixer.cpp
     filament_mixer.h
     filament_mixer_model.h

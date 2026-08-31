@@ -373,6 +373,13 @@ enum PrimeVolumeMode {
     pvmFast
 };
 
+// Ultra (dual-nozzle): how a filament is used across the model (drives grouping cost).
+enum FilamentUsageType {
+    SupportOnly,
+    ModelOnly,
+    Hybrid
+};
+
 // Ultra (dual-nozzle) helpers used across the ported grouping engine (MultiNozzleUtils,
 // FilamentGroup, ToolOrderUtils). Single source so every phase formats diameters and
 // nozzle-volume labels identically.
