@@ -834,6 +834,21 @@ std::vector<size_t> select_contact_layers(const std::vector<double> &print_zs,
     return select_layers_in_band(print_zs, support_top_z, support_top_z + gap_mm);
 }
 
+double chameleon_base_cast_mm(const std::vector<double> &contact_layer_heights)
+{
+    // See this function's own header comment (BrimFilament.hpp) for why MINIMUM over the
+    // leading kBaseCastMaxLayers entries, not the first alone or an average.
+    if (contact_layer_heights.empty())
+        return 0.0;
+
+    const size_t n = std::min(contact_layer_heights.size(), kBaseCastMaxLayers);
+    double        representative_height_mm = contact_layer_heights[0];
+    for (size_t i = 1; i < n; ++i)
+        representative_height_mm = std::min(representative_height_mm, contact_layer_heights[i]);
+
+    return std::min(kBaseCastMaxMm, double(kBaseCastMaxLayers) * representative_height_mm);
+}
+
 std::vector<size_t> select_layers_overlapping_span(const std::vector<double> &print_zs,
                                                      double lo_z, double hi_z,
                                                      double first_bottom_z)
@@ -970,14 +985,21 @@ size_t nearest_region_to_point(const ProjectionLayerView &lv, const Point &p)
 
 bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &layers,
                                        const Point &p,
-                                       size_t &out_layer, size_t &out_region)
+                                       size_t &out_layer, size_t &out_region,
+                                       size_t layer_limit)
 {
+    // v2.5g: both passes below are bounded to `effective_size`, not `layers.size()`
+    // directly - see this function's own `layer_limit` header-comment paragraph. A
+    // caller that never passes layer_limit gets the default (unbounded), so
+    // effective_size == layers.size() and every pre-v2.5g caller/test is unaffected.
+    const size_t effective_size = std::min(layers.size(), layer_limit);
+
     // PASS 1 (v2.2 final-review C1 fix): raw containment ONLY, lowest band layer first.
     // This must run to completion over every layer before the margin ring (PASS 2,
     // below) is ever consulted - a ring hit on a lower layer must never pre-empt genuine
     // raw containment on a higher layer. See this function's own header comment for why
     // that ordering matters (the first contact-band layer is typically wall-only).
-    for (size_t li = 0; li < layers.size(); ++li) {
+    for (size_t li = 0; li < effective_size; ++li) {
         const ProjectionLayerView &lv = layers[li];
         if (lv.lslices == nullptr || lv.lslices->empty())
             continue; // no raw geometry on this layer at all
@@ -1046,8 +1068,8 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView> &la
     // is repeated here: a region's own raw slice polys are always a subset of its
     // layer's raw lslices, which PASS 1 has already established as a miss on every
     // layer, regardless of scan order.
-    for (size_t idx = 0; idx < layers.size(); ++idx) {
-        const size_t li = layers.size() - 1 - idx; // highest layer first (opposite of PASS 1)
+    for (size_t idx = 0; idx < effective_size; ++idx) {
+        const size_t li = effective_size - 1 - idx; // highest layer WITHIN THE LIMIT first (opposite of PASS 1)
         const ProjectionLayerView &lv = layers[li];
         if (lv.expanded_lslices.empty())
             continue; // no margin-ring geometry on this layer at all
@@ -1541,6 +1563,7 @@ ChameleonSupportResolvers chameleon_build_support_resolvers(
     const WallSampleIndex &band_idx,
     const WallSampleIndex &coplanar_wall_idx,
     const std::function<bool(const Point &, unsigned &)> &projection_lookup,
+    const std::function<bool(const Point &, unsigned &)> &base_projection_lookup,
     const BrimVoteParams &vote_params,
     unsigned fallback_extruder,
     unsigned base_fallback_extruder)
@@ -1585,9 +1608,7 @@ ChameleonSupportResolvers chameleon_build_support_resolvers(
 
     // v2.5f (GUI round 7 - user's standing fidelity ruling, see this function's own
     // header comment in BrimFilament.hpp for the full decision rule + taper note): base
-    // now tries PROJECTION FIRST too, same shape as interface_resolver above - reuses
-    // the SAME projection_lookup (the projection view answers a role-agnostic "what's
-    // directly above this XY" question, so no new seam is needed here), falling through
+    // tries PROJECTION FIRST too, same shape as interface_resolver above, falling through
     // to coplanar_wall_idx (base's own coplanar-only electorate, v2.5d - NEVER band_idx)
     // only on a projection miss - a base/wrap run with nothing above it still abuts a
     // wall AT ITS OWN Z (the wrap case). Root cause for this extension: TREE support is
@@ -1595,9 +1616,19 @@ ChameleonSupportResolvers chameleon_build_support_resolvers(
     // v2.5e's projection-first fix alone covered only the thin interface skin, leaving
     // the visible bulk of a support column voting coplanar under a painted overhang
     // start.
-    out.base_resolver = [&coplanar_wall_idx, base_wall_params, projection_lookup](const Point &p) -> unsigned {
+    //
+    // v2.5g (spec: base projection depth limit): NOT the same `projection_lookup`
+    // interface/ironing consult above - `base_projection_lookup` instead, a SEPARATE
+    // callable of the identical shape, wired by the caller to a depth-limited view of
+    // the SAME underlying geometry (see this function's own header comment, v2.5g
+    // paragraph, and chameleon_pick_projection_region's `layer_limit` parameter). A
+    // surface out of base's shallower reach is a MISS here even where interface's own
+    // unlimited-depth `projection_lookup` still hits it - that is precisely the behavior
+    // change this task exists to make ("base that far below a surface should follow the
+    // nearest-wall anti-contamination rule, not the surface color").
+    out.base_resolver = [&coplanar_wall_idx, base_wall_params, base_projection_lookup](const Point &p) -> unsigned {
         unsigned proj_extruder = 0;
-        if (projection_lookup && projection_lookup(p, proj_extruder))
+        if (base_projection_lookup && base_projection_lookup(p, proj_extruder))
             return proj_extruder;
         return brim_vote(coplanar_wall_idx, p, base_wall_params);
     };

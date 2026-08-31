@@ -2378,7 +2378,7 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
 // Line format - every value is a single token with no embedded whitespace, so a line
 // splits cleanly into `key=value` fields on whitespace:
 //   obj=<ordinal> print_z=<mm> height=<mm> fallback=<extruder> base_fallback=<extruder>
-//   free_windowed=<id,id,...> free_strict=<id,id,...>
+//   free_windowed=<id,id,...> free_strict=<id,id,...> base_cast_mm=<mm>
 //   contact_layers=<li,li,...> coplanar_layers=<li,li,...>
 //   band_samples=<li:e<id>=<count>,e<id>=<count>;li:...>
 //   coplanar_samples=<li:e<id>=<count>,e<id>=<count>;li:...>
@@ -2418,6 +2418,15 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
 // learn about roles, which its own header comment explicitly says it has no reason to
 // do). Always 0/0/0/0 on a zero-sample layer (the engine calls, and therefore every
 // resolver, never run).
+// v2.5g: base_cast_mm is this support layer's own base projection depth limit
+// (chameleon_base_cast_mm, BrimFilament.hpp/.cpp - min(kBaseCastMaxMm, kBaseCastMaxLayers
+// * representative object layer height); see that function's own header comment for the
+// "which layer height" choice). Computed and logged unconditionally, even on a zero-
+// sample layer (it depends only on contact_idx's own leading layer heights, not on
+// band_idx/coplanar_wall_idx having any samples) - cheap (at most 4 double reads), and
+// aids exactly the next GUI round's diagnosis the same way every other per-layer field
+// here does: a VLH plate's base_cast_mm sequence directly shows whether the layer-count
+// or the 1.0mm ceiling is binding at each height.
 // (any list-valued field is empty-after-`=` when that set/vector/map is empty - e.g.
 // "free_strict=" means no extruder is strictly free at this layer). One line per
 // support layer of a mode-active object that reaches this pass' own per-layer body
@@ -2782,10 +2791,17 @@ static void chameleon_build_projection_views(const PrintObject &object,
 static bool chameleon_projection_extruder_from_view(const std::vector<ProjectionLayerView> &view,
                                                       const std::vector<const Layer *> &view_layers,
                                                       const Point &p,
-                                                      unsigned &out_extruder)
+                                                      unsigned &out_extruder,
+                                                      // v2.5g: forwarded verbatim to chameleon_pick_projection_region's
+                                                      // own `layer_limit` (BrimFilament.hpp/.cpp) - default unbounded, so
+                                                      // every pre-v2.5g call site (interface/ironing's projection_lookup
+                                                      // below) is byte-identical to before. base_projection_lookup
+                                                      // (chameleon_assign_support_interfaces, below) is the only caller
+                                                      // that ever passes a real limit - see that lambda's own comment.
+                                                      size_t layer_limit = std::numeric_limits<size_t>::max())
 {
     size_t hit_layer = 0, hit_region = 0;
-    if (!chameleon_pick_projection_region(view, p, hit_layer, hit_region))
+    if (!chameleon_pick_projection_region(view, p, hit_layer, hit_region, layer_limit))
         return false; // no band layer's lslices cover p -> caller falls through to lateral
 
     if (hit_layer >= view_layers.size())
@@ -3314,6 +3330,24 @@ static void chameleon_assign_support_interfaces(Print &print)
             // projection view - see this function's own header comment).
             std::vector<size_t> contact_idx = select_contact_layers(layer_print_zs, support_layer->print_z, kContactBandMm);
 
+            // v2.5g (spec: "base projection depth limit" - GUI round 8): this support
+            // layer's own base_cast_mm, honestly derived from the ACTUAL heights of its
+            // leading contact_idx layers (contact_idx is already ascending/lowest-first -
+            // see chameleon_base_cast_mm's own header comment in BrimFilament.hpp for why
+            // MINIMUM-of-the-first-few rather than the first layer alone or an average),
+            // not a config scalar. Only the first kBaseCastMaxLayers entries are ever
+            // read - chameleon_base_cast_mm itself only ever looks at that many - so this
+            // reserves/collects at most 4 doubles per support layer regardless of how
+            // deep contact_idx runs. Empty contact_idx (support above the model's own top
+            // walls - the same case coplanar_wall_idx already tolerates) yields an empty
+            // `contact_layer_heights` and base_cast_mm = 0.0, which correctly zeroes out
+            // base_view_count below.
+            std::vector<double> contact_layer_heights;
+            contact_layer_heights.reserve(std::min(contact_idx.size(), kBaseCastMaxLayers));
+            for (size_t i = 0; i < contact_idx.size() && i < kBaseCastMaxLayers; ++i)
+                contact_layer_heights.push_back(object->layers()[contact_idx[i]]->height);
+            const double base_cast_mm = chameleon_base_cast_mm(contact_layer_heights);
+
             // (b) Coplanar lateral band: object layers whose z-INTERVAL OVERLAPS this
             // support layer's OWN span (print_z - height, print_z] - v2.1's "any support
             // within 1mm of a wall at its own layer matches that wall" rule (spec's
@@ -3483,6 +3517,10 @@ static void chameleon_assign_support_interfaces(Print &print)
                     " base_fallback=" + std::to_string(base_fallback_extruder) +
                     " free_windowed=" + chameleon_debug_format_ids(free_extruders) +
                     " free_strict="   + chameleon_debug_format_ids(free_extruders_exempt) +
+                    // v2.5g: base's own projection depth limit for THIS layer - see this
+                    // function's own header comment (base_cast_mm= field) for why this is
+                    // logged unconditionally, ahead of the zero-sample early-exit below.
+                    " base_cast_mm="  + chameleon_debug_format_mm(base_cast_mm) +
                     " contact_layers="  + chameleon_debug_format_indices(contact_idx) +
                     " coplanar_layers=" + chameleon_debug_format_indices(coplanar_idx) +
                     // v2.5d: split from the old single `wall_samples=` field -
@@ -3506,6 +3544,41 @@ static void chameleon_assign_support_interfaces(Print &print)
                 // rebuilding this view per sample (offset_ex + per-region polygon-
                 // pointer collection) would be wasteful.
                 chameleon_build_projection_views(*object, contact_idx, projection_view, projection_view_layers);
+
+                // v2.5g (spec: base projection depth limit): base_view_count is how many
+                // of contact_idx's LEADING (lowest-first) entries fall within the
+                // shallower base_cast_mm gap - i.e. top_z in (support_layer->print_z,
+                // support_layer->print_z + base_cast_mm]. contact_idx is walked directly
+                // (not re-selected via a second select_contact_layers call) since
+                // projection_view/projection_view_layers were just built 1:1 over
+                // contact_idx in that SAME order (chameleon_build_projection_views' own
+                // contract, modulo defensive skips - see the clamp below) - "slicing the
+                // vector prefix is the cheap honest form" (spec) only holds if contact_idx
+                // really is ascending by top_z here, so that assumption is asserted, not
+                // assumed: base_cast_mm <= kContactBandMm always (both are gaps measured
+                // from the same support_layer->print_z origin), and select_layers_in_band
+                // (which select_contact_layers calls) scans print_zs ascending and
+                // appends in that same order, so the set of entries satisfying the
+                // TIGHTER bound is necessarily contact_idx's own leading prefix - once one
+                // entry's top_z exceeds base_cast_mm's threshold, every later (higher-z,
+                // by the assert below) entry does too, so the loop can safely `break`
+                // rather than scan the rest.
+                size_t base_view_count = 0;
+                while (base_view_count < contact_idx.size()) {
+                    const double top_z = layer_print_zs[contact_idx[base_view_count]];
+                    assert(base_view_count == 0 ||
+                           top_z + EPSILON >= layer_print_zs[contact_idx[base_view_count - 1]]);
+                    if (top_z > support_layer->print_z + base_cast_mm + EPSILON)
+                        break;
+                    ++base_view_count;
+                }
+                // Clamp to projection_view's own size: chameleon_build_projection_views
+                // skips an out-of-range/null layer index defensively (never expected in
+                // practice - see that function's own comment), which would otherwise let
+                // a contact_idx-derived count outrun the parallel projection_view/
+                // projection_view_layers vectors chameleon_projection_extruder_from_view's
+                // `layer_limit` actually indexes into.
+                base_view_count = std::min(base_view_count, projection_view.size());
 
                 // v2.5e: projection_lookup wraps chameleon_projection_extruder_from_view
                 // as the narrow `bool(const Point&, unsigned&)` seam chameleon_build_
@@ -3538,19 +3611,48 @@ static void chameleon_assign_support_interfaces(Print &print)
                         return hit;
                     };
 
-                // v2.5e/v2.5f: the actual resolver-construction wiring - ALL THREE roles
-                // now try PROJECTION FIRST via the same projection_lookup, falling
-                // through on a miss to their own nearest-wall vote (interface/ironing:
-                // band_idx; base, as of v2.5f: coplanar_wall_idx, never band_idx) - lives
-                // in BrimFilament.hpp/.cpp's chameleon_build_support_resolvers (v2.5d
+                // v2.5g (spec: base projection depth limit): base's OWN projection lookup
+                // - same seam shape as projection_lookup above, same shared projection_
+                // view/projection_view_layers (no second geometry build), but with
+                // `layer_limit=base_view_count` forwarded to chameleon_projection_extruder_
+                // from_view/chameleon_pick_projection_region (BrimFilament.hpp/.cpp) so
+                // base can only ever hit a band layer within its own shallower reach - a
+                // surface further away is invisible to this lookup even though the SAME
+                // point would still hit via the unlimited `projection_lookup` above (that
+                // is precisely interface/ironing's unchanged full-depth behavior). Tallies
+                // into the SAME shared debug_projection_hits/misses pair projection_lookup
+                // does (v2.5f precedent: these two counters have counted all three roles
+                // combined since base's own projection tier was introduced; base's
+                // isolated share is still recovered downstream via the existing before/
+                // after snapshot around base's own partition_support_entities call,
+                // unaffected by which of the two lookups actually produced the hit/miss).
+                std::function<bool(const Point &, unsigned &)> base_projection_lookup =
+                    [&projection_view, &projection_view_layers, base_view_count, &debug_projection_hits,
+                     &debug_projection_misses](const Point &p, unsigned &out_extruder) -> bool {
+                        const bool hit = chameleon_projection_extruder_from_view(
+                            projection_view, projection_view_layers, p, out_extruder, base_view_count);
+                        if (hit)
+                            ++debug_projection_hits;
+                        else
+                            ++debug_projection_misses;
+                        return hit;
+                    };
+
+                // v2.5e/v2.5f/v2.5g: the actual resolver-construction wiring - interface/
+                // ironing try PROJECTION FIRST via projection_lookup (full contact-band
+                // depth, unchanged), base via base_projection_lookup (v2.5g's shallower,
+                // depth-limited view of the SAME underlying geometry) - each falling
+                // through on a miss to its own nearest-wall vote (interface/ironing:
+                // band_idx; base: coplanar_wall_idx, never band_idx) - lives in
+                // BrimFilament.hpp/.cpp's chameleon_build_support_resolvers (v2.5d
                 // final-review I1 fix: pulled out specifically so a unit test can pin
                 // this wiring, not just the brim_vote/partition_support_entities
                 // primitives it composes). See that function's own header comment for
-                // the full decision rule, the v2.5f taper note, and the k=1/
-                // max_dist_mm=0 role-param construction this call replaces (formerly
-                // built inline, right here, pre-v2.5e).
+                // the full decision rule, the v2.5f taper note, the v2.5g depth-limit
+                // paragraph, and the k=1/max_dist_mm=0 role-param construction this call
+                // replaces (formerly built inline, right here, pre-v2.5e).
                 const ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-                    band_idx, coplanar_wall_idx, projection_lookup, vote_params,
+                    band_idx, coplanar_wall_idx, projection_lookup, base_projection_lookup, vote_params,
                     fallback_extruder, base_fallback_extruder);
                 interface_resolver = resolvers.interface_resolver;
                 base_resolver      = resolvers.base_resolver;

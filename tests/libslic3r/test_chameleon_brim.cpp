@@ -179,6 +179,60 @@ TEST_CASE("select_contact_layers picks the 1-2 layers above", "[chameleon]")
     CHECK(vlh[0] == 1);
 }
 
+// --- v2.5g: chameleon_base_cast_mm (base's own projection depth limit) ---
+
+TEST_CASE("chameleon_base_cast_mm: empty input yields 0.0 (nothing to derive a depth from)", "[chameleon]")
+{
+    CHECK_THAT(chameleon_base_cast_mm({}), Catch::Matchers::WithinAbs(0.0, 1e-9));
+}
+
+TEST_CASE("chameleon_base_cast_mm: thin layers - layer COUNT binds, well under the 1.0mm ceiling", "[chameleon]")
+{
+    // 4 layers @ 0.12mm (a typical fine-layer profile): 4 * 0.12 = 0.48mm < kBaseCastMaxMm
+    // (1.0) - the spec's own "4 thin layers < 1mm -> layer count binds" case.
+    std::vector<double> heights = {0.12, 0.12, 0.12, 0.12};
+    CHECK_THAT(chameleon_base_cast_mm(heights), Catch::Matchers::WithinAbs(0.48, 1e-9));
+}
+
+TEST_CASE("chameleon_base_cast_mm: thick layers - the 1.0mm ceiling binds instead of 4 layers' full depth", "[chameleon]")
+{
+    // 4 layers @ 0.3mm: 4 * 0.3 = 1.2mm > kBaseCastMaxMm (1.0) - the spec's own "thick
+    // layers -> the 1mm cap binds" case. base_cast_mm must be capped at 1.0, not 1.2 -
+    // i.e. base reaches LESS than 4 real layers deep here, by design.
+    std::vector<double> heights = {0.3, 0.3, 0.3, 0.3};
+    CHECK_THAT(chameleon_base_cast_mm(heights), Catch::Matchers::WithinAbs(1.0, 1e-9));
+}
+
+TEST_CASE("chameleon_base_cast_mm: fewer than kBaseCastMaxLayers band layers - uses only what's there", "[chameleon]")
+{
+    // Only 2 band layers available (e.g. a steep overhang near the object's own top) -
+    // representative height is the min of just those 2, times kBaseCastMaxLayers (4,
+    // the SAME multiplier - the depth budget is always "4 layers' worth", not "however
+    // many layers happen to be available").
+    std::vector<double> heights = {0.1, 0.15};
+    CHECK_THAT(chameleon_base_cast_mm(heights), Catch::Matchers::WithinAbs(0.4, 1e-9)); // 4 * min(0.1,0.15)
+}
+
+TEST_CASE("chameleon_base_cast_mm: MINIMUM of the leading layers, not the first alone (VLH outlier robustness)", "[chameleon]")
+{
+    // The first layer is thick (0.3mm) but the next three are much thinner (0.1mm) -
+    // "first layer alone" would give 4*0.3=1.2 -> capped to 1.0; the actual (min-based)
+    // choice gives 4*0.1=0.4 instead - a materially different, SHALLOWER answer. This is
+    // the concrete case chameleon_base_cast_mm's own header comment argues for: a single
+    // outlier (here, the first entry) must not let base overreach past what the other
+    // nearby layers actually support.
+    std::vector<double> heights = {0.3, 0.1, 0.1, 0.1};
+    CHECK_THAT(chameleon_base_cast_mm(heights), Catch::Matchers::WithinAbs(0.4, 1e-9));
+}
+
+TEST_CASE("chameleon_base_cast_mm: only the first kBaseCastMaxLayers entries are ever considered", "[chameleon]")
+{
+    // 5th (and beyond) entries are a red herring - a tiny outlier past the 4-layer
+    // window must NOT drag the representative height (and therefore base_cast_mm) down.
+    std::vector<double> heights = {0.3, 0.3, 0.3, 0.3, 0.001};
+    CHECK_THAT(chameleon_base_cast_mm(heights), Catch::Matchers::WithinAbs(1.0, 1e-9)); // unaffected by the 0.001 tail
+}
+
 static ExtrusionEntityCollection make_support_fills(float y_iface)
 {
     ExtrusionEntityCollection c;
@@ -851,6 +905,39 @@ TEST_CASE("chameleon_pick_projection_region falls through to the upper band laye
     REQUIRE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region));
     CHECK(out_layer == 1);
     CHECK(out_region == 0);
+}
+
+TEST_CASE("chameleon_pick_projection_region: layer_limit hides layers beyond it, PASS 1 (v2.5g)", "[chameleon]")
+{
+    // Same fixture as "falls through to the upper band layer when the lower one misses"
+    // just above - the unlimited (default layer_limit) search resolves to the upper
+    // layer, proven there. Here, layer_limit=1 makes ONLY the lower layer (index 0)
+    // visible to the search - since the lower layer's own raw lslices genuinely miss p,
+    // the whole call must now report a MISS instead of falling through, exactly as if
+    // `layers` had only ever contained the lower layer. This is the mechanism
+    // base_projection_lookup (Print.cpp's chameleon_assign_support_interfaces) relies on
+    // to give base a shallower reach than interface/ironing over the SAME already-built
+    // view - see chameleon_build_support_resolvers' own v2.5g header-comment paragraph.
+    ExPolygons lower_lslices = { square_expoly(-20, 0, 5) };  // does NOT cover (0,0)
+    ExPolygons upper_lslices = { square_expoly(0, 0, 5) };    // does, but must be hidden
+
+    ProjectionLayerView lower, upper;
+    lower.lslices = &lower_lslices;
+    lower.region_slice_polys = { { &lower_lslices[0] } };
+    upper.lslices = &upper_lslices;
+    upper.region_slice_polys = { { &upper_lslices[0] } };
+
+    std::vector<ProjectionLayerView> layers = { lower, upper };
+    size_t out_layer = 999, out_region = 999;
+    CHECK_FALSE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region, /*layer_limit=*/1));
+    CHECK(out_layer == 999);
+    CHECK(out_region == 999);
+
+    // Sanity: the SAME two-layer vector, unlimited, really does hit the upper layer -
+    // proves layer_limit=1 above is doing the hiding, not some other difference.
+    out_layer = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, Point(0, 0), out_layer, out_region));
+    CHECK(out_layer == 1);
 }
 
 TEST_CASE("chameleon_pick_projection_region prefers the region with a bottom-surface hint at p", "[chameleon]")
@@ -1672,6 +1759,44 @@ TEST_CASE("chameleon_pick_projection_region: PASS 2 scans the margin ring HIGHES
     size_t out_layer = 999, out_region = 999;
     REQUIRE(chameleon_pick_projection_region(layers, p, out_layer, out_region));
     CHECK(out_layer == 1);   // overhang layer, NOT the lower wall layer's ring hit
+    CHECK(out_region == 0);
+}
+
+TEST_CASE("chameleon_pick_projection_region: layer_limit also bounds PASS 2's margin-ring rescue (v2.5g)", "[chameleon]")
+{
+    // Same fixture as "PASS 2 scans the margin ring HIGHEST band layer first (C4)" just
+    // above - unlimited, it resolves to layer 1 (the overhang), proven there. Here,
+    // layer_limit=1 makes ONLY layer 0 visible, so PASS 2's own highest-first scan must
+    // now start (and end) at layer 0 - its OWN ring still covers p, so the call still
+    // succeeds, but resolves to layer 0's own region instead, never reaching for layer
+    // 1's. Proves the depth limit restricts PASS 2's rescue exactly as it restricts
+    // PASS 1's raw-containment scan (the test just above) - a caller relying on
+    // layer_limit for a shallower reach (base_projection_lookup, Print.cpp) must not be
+    // able to "leak" a deeper layer's color back in through the margin-ring rescue path.
+    Point p(0, 0);
+
+    ExPolygons layer0_raw      = { square_expoly(20, 0, 5) };   // wall geometry - doesn't cover p
+    ExPolygons layer0_expanded = { square_expoly(0, 0, 15) };   // grown ring - covers p
+    ExPolygons layer0_region0  = { square_expoly(20, 0, 5) };   // wall region's own raw slice, far from p
+
+    ProjectionLayerView layer0;
+    layer0.lslices            = &layer0_raw;
+    layer0.expanded_lslices   = layer0_expanded;
+    layer0.region_slice_polys = { { &layer0_region0[0] } };
+
+    ExPolygons layer1_raw      = { square_expoly(20, 0, 5) };   // overhang's raw slice also just misses p
+    ExPolygons layer1_expanded = { square_expoly(0, 0, 15) };   // grown ring - covers p
+    ExPolygons layer1_region0  = { square_expoly(3, 0, 1) };    // overhang region's own raw slice, near p
+
+    ProjectionLayerView layer1;
+    layer1.lslices            = &layer1_raw;
+    layer1.expanded_lslices   = layer1_expanded;
+    layer1.region_slice_polys = { { &layer1_region0[0] } };
+
+    std::vector<ProjectionLayerView> layers = { layer0, layer1 };
+    size_t out_layer = 999, out_region = 999;
+    REQUIRE(chameleon_pick_projection_region(layers, p, out_layer, out_region, /*layer_limit=*/1));
+    CHECK(out_layer == 0);   // layer 0's OWN ring, never layer 1's (hidden by the limit)
     CHECK(out_region == 0);
 }
 
@@ -3227,15 +3352,24 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5f wiring pin): ALL THREE roles
     //    coplanar_wall_idx alone, it would return band_only_ext (10) instead of 20.
     //  - if interface_resolver ever stopped trying projection FIRST (e.g. fell straight
     //    to the band vote), it would return band_only_ext (10) instead of 30.
-    //  - v2.5f (the real RED this task's TDD pass pins): if base_resolver stayed on
+    //  - v2.5f (the real RED that task's TDD pass pinned): if base_resolver stayed on
     //    v2.5e's wiring - a coplanar vote ONLY, no projection branch at all - it would
     //    return coplanar_only_ext (20) even on a projection HIT, exactly the real-model
-    //    defect this task fixes (a base sample under a khaki surface still voting its
+    //    defect that task fixed (a base sample under a khaki surface still voting its
     //    nearer teal coplanar wall instead of taking khaki). The "projection hit"
     //    section below fails against v2.5e's chameleon_build_support_resolvers by hand-
     //    execution; the "projection miss" section is unchanged in outcome from v2.5e
     //    (base's own coplanar-vote fallback), kept here as the regression guard for
     //    "base sample with NO surface above -> coplanar vote".
+    //
+    // v2.5g: base's projection tier now consults its OWN `base_projection_lookup`
+    // parameter (below), not `projection_lookup` - see chameleon_build_support_resolvers'
+    // own v2.5g header-comment paragraph. This test isn't about DEPTH (that's the
+    // dedicated v2.5g test just below this one) - it's about WIRING, "does base's
+    // projection tier exist / get consulted at all" - so both sections here script
+    // `base_projection_lookup` to behave IDENTICALLY to `projection_lookup` (same
+    // callable, passed twice), keeping every assertion below exactly as meaningful as it
+    // was pre-v2.5g.
     const unsigned band_only_ext     = 10; // present ONLY in band_idx - base must never see this
     const unsigned coplanar_only_ext = 20; // present ONLY in coplanar_wall_idx - base's MISS answer
     const unsigned projection_ext    = 30; // returned by projection_lookup - every role's HIT answer
@@ -3261,7 +3395,8 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5f wiring pin): ALL THREE roles
             };
 
         ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-            band_idx, coplanar_wall_idx, projection_lookup, params, iface_fallback, base_fallback);
+            band_idx, coplanar_wall_idx, projection_lookup, /*base_projection_lookup=*/projection_lookup,
+            params, iface_fallback, base_fallback);
 
         // Interface/ironing: projection wins outright over band_idx's own (otherwise-
         // nearest) wall - unchanged pin from v2.5e.
@@ -3269,7 +3404,7 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5f wiring pin): ALL THREE roles
         CHECK(resolvers.ironing_resolver(query) == projection_ext);
         // v2.5f: base now ALSO resolves the projected color on a hit - a v2.5e build of
         // this function returns coplanar_only_ext (20) here instead, so this line is
-        // the wiring-pin's real RED for this task.
+        // the wiring-pin's real RED for that task.
         CHECK(resolvers.base_resolver(query) == projection_ext);
     }
 
@@ -3280,14 +3415,77 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5f wiring pin): ALL THREE roles
             [](const Point &, unsigned &) -> bool { return false; };
 
         ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-            band_idx, coplanar_wall_idx, projection_lookup, params, iface_fallback, base_fallback);
+            band_idx, coplanar_wall_idx, projection_lookup, /*base_projection_lookup=*/projection_lookup,
+            params, iface_fallback, base_fallback);
 
         CHECK(resolvers.interface_resolver(query) == band_only_ext);
         CHECK(resolvers.ironing_resolver(query) == band_only_ext);
         // Base: coplanar_wall_idx only - band_only_ext (10) must NEVER surface here,
         // exactly as before v2.5f (base's own coplanar vote is unchanged; only WHETHER
-        // it's the first tier or the fallback tier changed this task).
+        // it's the first tier or the fallback tier changed that task).
         CHECK(resolvers.base_resolver(query) == coplanar_only_ext);
+    }
+}
+
+TEST_CASE("chameleon_build_support_resolvers (v2.5g wiring pin): base's projection tier is depth-limited independently of interface's", "[chameleon]")
+{
+    // The real RED this task's TDD pass pins - NOT expressible at all against v2.5f's
+    // signature (a single shared `projection_lookup` for all three roles: base and
+    // interface could never disagree on hit/miss for the same point). v2.5g's whole
+    // point is that they now CAN: base consults its own `base_projection_lookup`,
+    // wired by Print.cpp to a depth-limited view of the same contact band (see
+    // chameleon_base_cast_mm/chameleon_pick_projection_region's `layer_limit`, and this
+    // function's own v2.5g header-comment paragraph). Mirrors the user spec's own
+    // hand-walk examples verbatim: "a surface 1.5mm above with a coplanar wall -> base
+    // votes the WALL (out of base reach) while interface still projects" and "a surface
+    // 0.5mm above -> base projects".
+    const unsigned khaki_ext = 3; // the model surface above (within interface's reach either way)
+    const unsigned teal_ext  = 5; // a coplanar wall - base's answer when out of its own reach
+    const unsigned fallback  = 9;
+
+    WallSampleIndex band_idx; // irrelevant here - a projection hit always wins for interface
+    WallSampleIndex coplanar_wall_idx;
+    coplanar_wall_idx.add_polyline(segment(-5, 0, 5, 0), teal_ext, 1);
+
+    BrimVoteParams params;
+    const Point    query(scale_(0), scale_(0));
+
+    SECTION("surface 1.5mm above: out of base's shallower reach - base votes the coplanar wall, interface still projects")
+    {
+        // Simulates base_cast_mm < 1.5mm (e.g. thin-layer VLH plate where 4 layers still
+        // don't reach 1.5mm, or simply the 1.0mm ceiling) - the surface is within
+        // kContactBandMm (2mm) so interface's own unlimited-depth projection_lookup
+        // still hits, but base_projection_lookup (Print.cpp's depth-limited wrapper)
+        // reports a miss for the SAME point.
+        std::function<bool(const Point &, unsigned &)> projection_lookup =
+            [khaki_ext](const Point &, unsigned &out_extruder) -> bool { out_extruder = khaki_ext; return true; };
+        std::function<bool(const Point &, unsigned &)> base_projection_lookup =
+            [](const Point &, unsigned &) -> bool { return false; }; // out of base's reach
+
+        ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
+            band_idx, coplanar_wall_idx, projection_lookup, base_projection_lookup,
+            params, fallback, fallback);
+
+        CHECK(resolvers.interface_resolver(query) == khaki_ext); // still projects
+        CHECK(resolvers.base_resolver(query) == teal_ext);       // falls through to the wall vote
+    }
+
+    SECTION("surface 0.5mm above: within base's own reach - base projects too")
+    {
+        // Simulates base_cast_mm >= 0.5mm - both lookups hit for the same point, base
+        // resolves the projected color exactly like interface does (v2.5f's own
+        // behavior, now reached through base's own base_projection_lookup instead of
+        // the shared projection_lookup).
+        std::function<bool(const Point &, unsigned &)> projection_lookup =
+            [khaki_ext](const Point &, unsigned &out_extruder) -> bool { out_extruder = khaki_ext; return true; };
+        std::function<bool(const Point &, unsigned &)> base_projection_lookup = projection_lookup;
+
+        ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
+            band_idx, coplanar_wall_idx, projection_lookup, base_projection_lookup,
+            params, fallback, fallback);
+
+        CHECK(resolvers.interface_resolver(query) == khaki_ext);
+        CHECK(resolvers.base_resolver(query) == khaki_ext);
     }
 }
 
@@ -3322,8 +3520,11 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5e): projection hit overrides a
     sanity.fallback_extruder = fallback;
     REQUIRE(brim_vote(band_idx, query, sanity) == teal_ext);
 
+    // base_projection_lookup irrelevant to this interface-only test - reuse
+    // projection_lookup (v2.5g grew this parameter; any callable works here).
     ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-        band_idx, coplanar_wall_idx, projection_lookup, params, fallback, fallback);
+        band_idx, coplanar_wall_idx, projection_lookup, /*base_projection_lookup=*/projection_lookup,
+        params, fallback, fallback);
 
     CHECK(resolvers.interface_resolver(query) == khaki_ext);
     CHECK(resolvers.ironing_resolver(query) == khaki_ext);
@@ -3363,8 +3564,13 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5f): projection hit overrides a
     sanity.fallback_extruder = fallback;
     REQUIRE(brim_vote(coplanar_wall_idx, query, sanity) == teal_ext);
 
+    // v2.5g: base now consults its OWN base_projection_lookup, not projection_lookup -
+    // this test is about "does a projection hit override a nearer wall for base", not
+    // about depth, so base_projection_lookup is scripted identically to
+    // projection_lookup (same unconditional hit) to keep the assertion below meaningful.
     ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-        band_idx, coplanar_wall_idx, projection_lookup, params, fallback, fallback);
+        band_idx, coplanar_wall_idx, projection_lookup, /*base_projection_lookup=*/projection_lookup,
+        params, fallback, fallback);
 
     CHECK(resolvers.base_resolver(query) == khaki_ext);
 }
@@ -3385,34 +3591,62 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5e): a projection miss falls th
     BrimVoteParams params;
     const Point    query(scale_(15), scale_(0));
 
+    // base_projection_lookup irrelevant to this interface-only test - reuse
+    // projection_lookup.
     ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-        band_idx, coplanar_wall_idx, projection_lookup, params, fallback, fallback);
+        band_idx, coplanar_wall_idx, projection_lookup, /*base_projection_lookup=*/projection_lookup,
+        params, fallback, fallback);
 
     CHECK(resolvers.interface_resolver(query) == band_ext);
     CHECK(resolvers.ironing_resolver(query) == band_ext);
 }
 
-TEST_CASE("chameleon_build_support_resolvers (v2.5e): an empty/default-constructed projection_lookup is treated as an unconditional miss", "[chameleon]")
+TEST_CASE("chameleon_build_support_resolvers (v2.5e/v2.5g): an empty/default-constructed projection_lookup or base_projection_lookup is treated as an unconditional miss", "[chameleon]")
 {
     // Documents the header's own contract for a caller with nothing to project onto -
-    // no special case needed, the `if (projection_lookup)` guard inside the resolver
-    // short-circuits before ever invoking an empty std::function.
-    const unsigned band_ext = 7;
-    const unsigned fallback = 9;
+    // no special case needed, the `if (projection_lookup)`/`if (base_projection_lookup)`
+    // guard inside each resolver short-circuits before ever invoking an empty
+    // std::function. v2.5g: this contract now applies independently to EACH of the two
+    // lookups - a default-constructed `base_projection_lookup` must fall base through to
+    // coplanar_wall_idx even when `projection_lookup` (interface/ironing's own) is a
+    // real, hitting callable, and vice versa.
+    const unsigned band_ext     = 7;
+    const unsigned coplanar_ext = 8;
+    const unsigned fallback     = 9;
 
     WallSampleIndex band_idx;
     band_idx.add_polyline(segment(0, 0, 30, 0), band_ext, 1);
     WallSampleIndex coplanar_wall_idx;
+    coplanar_wall_idx.add_polyline(segment(0, 0, 30, 0), coplanar_ext, 1);
 
     std::function<bool(const Point &, unsigned &)> projection_lookup; // default-constructed, empty
 
     BrimVoteParams params;
     const Point    query(scale_(15), scale_(0));
 
-    ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-        band_idx, coplanar_wall_idx, projection_lookup, params, fallback, fallback);
+    SECTION("both empty: interface falls to band_idx, base falls to coplanar_wall_idx")
+    {
+        ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
+            band_idx, coplanar_wall_idx, projection_lookup, /*base_projection_lookup=*/projection_lookup,
+            params, fallback, fallback);
 
-    CHECK(resolvers.interface_resolver(query) == band_ext);
+        CHECK(resolvers.interface_resolver(query) == band_ext);
+        CHECK(resolvers.base_resolver(query) == coplanar_ext);
+    }
+
+    SECTION("base_projection_lookup empty while projection_lookup hits: base still falls through to coplanar_wall_idx")
+    {
+        const unsigned proj_ext = 30;
+        std::function<bool(const Point &, unsigned &)> hitting_lookup =
+            [proj_ext](const Point &, unsigned &out_extruder) -> bool { out_extruder = proj_ext; return true; };
+
+        ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
+            band_idx, coplanar_wall_idx, hitting_lookup, /*base_projection_lookup=*/projection_lookup,
+            params, fallback, fallback);
+
+        CHECK(resolvers.interface_resolver(query) == proj_ext); // interface's own lookup hit
+        CHECK(resolvers.base_resolver(query) == coplanar_ext);  // base's own is empty -> miss -> wall vote
+    }
 }
 
 TEST_CASE("chameleon_build_support_resolvers (v2.5e): ironing_resolver always equals interface_resolver, hit/miss/fallback alike", "[chameleon]")
@@ -3432,8 +3666,11 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5e): ironing_resolver always eq
     {
         std::function<bool(const Point &, unsigned &)> projection_lookup =
             [proj_ext](const Point &, unsigned &out_extruder) -> bool { out_extruder = proj_ext; return true; };
+        // base_projection_lookup irrelevant here - this test only compares
+        // ironing_resolver against interface_resolver, never base_resolver.
         ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-            band_idx, coplanar_wall_idx, projection_lookup, params, fallback, fallback);
+            band_idx, coplanar_wall_idx, projection_lookup, /*base_projection_lookup=*/projection_lookup,
+            params, fallback, fallback);
         CHECK(resolvers.ironing_resolver(p) == resolvers.interface_resolver(p));
         CHECK(resolvers.ironing_resolver(p) == proj_ext);
     }
@@ -3443,7 +3680,8 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5e): ironing_resolver always eq
         std::function<bool(const Point &, unsigned &)> projection_lookup =
             [](const Point &, unsigned &) -> bool { return false; };
         ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-            band_idx, coplanar_wall_idx, projection_lookup, params, fallback, fallback);
+            band_idx, coplanar_wall_idx, projection_lookup, /*base_projection_lookup=*/projection_lookup,
+            params, fallback, fallback);
         CHECK(resolvers.ironing_resolver(p) == resolvers.interface_resolver(p));
         CHECK(resolvers.ironing_resolver(p) == band_ext);
     }
@@ -3454,7 +3692,8 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5e): ironing_resolver always eq
         std::function<bool(const Point &, unsigned &)> projection_lookup =
             [](const Point &, unsigned &) -> bool { return false; };
         ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-            empty_band_idx, coplanar_wall_idx, projection_lookup, params, fallback, fallback);
+            empty_band_idx, coplanar_wall_idx, projection_lookup, /*base_projection_lookup=*/projection_lookup,
+            params, fallback, fallback);
         CHECK(resolvers.ironing_resolver(p) == resolvers.interface_resolver(p));
         CHECK(resolvers.ironing_resolver(p) == fallback);
     }

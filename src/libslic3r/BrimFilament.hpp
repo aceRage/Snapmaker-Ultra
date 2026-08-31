@@ -6,6 +6,7 @@
 #include "ExPolygon.hpp"
 #include "BoundingBox.hpp"
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -146,6 +147,61 @@ void partition_brim_by_wall(const ExtrusionEntityCollection& brim,
 // window covering PRECISELY the same band select_contact_layers already selects for
 // voting; two independently-tuned constants could silently drift apart.
 constexpr double kContactBandMm = 2.0;
+
+// v2.5g (spec: "base projection depth limit" - GUI round 8): base's own reach into the
+// contact band, hoisted the same way kContactBandMm above is - chameleon_base_cast_mm's
+// own doc comment (below) explains how the two constants combine into one per-support-
+// layer mm value. kBaseCastMaxMm is the hard ceiling ("1.0mm, whichever comes first");
+// kBaseCastMaxLayers is the layer-count side of that "whichever" (4 object layers).
+// Both are user-spec numbers, not tuned - see the spec's own wording: "base that far
+// below a surface should follow the nearest-wall anti-contamination rule, not the
+// surface color... limit the BASE role's projection reach to min(4 object layers,
+// 1.0mm)".
+constexpr double kBaseCastMaxMm     = 1.0;
+constexpr size_t kBaseCastMaxLayers = 4;
+
+// v2.5g: base_cast_mm = min(kBaseCastMaxMm, kBaseCastMaxLayers * representative object
+// layer height), where "representative" is the MINIMUM height among the first
+// min(kBaseCastMaxLayers, contact_layer_heights.size()) entries of
+// `contact_layer_heights` - the caller's own contact-band layers, ALREADY ordered lowest
+// (nearest the support top) first, the same order select_contact_layers/
+// chameleon_build_projection_views return/consume (Print.cpp's caller passes a prefix of
+// the same heights it read off contact_idx, in that order - see that call site's own
+// comment for why).
+//
+// Why the MINIMUM, not the first layer's height alone or an average: this is the ONE
+// piece of this task that isn't dictated by the spec text ("derive the layer height
+// honestly... document the choice"), so the choice is made deliberately conservative -
+// taking the smallest of the first few real layer heights can only ever make
+// base_cast_mm UNDER-count the true depth of kBaseCastMaxLayers real layers, never
+// over-count it. Over-counting would let a base sample reach past the "4 layers deep"
+// promise into territory the spec explicitly wants routed to the nearest-wall rule
+// instead ("base that far below a surface should follow the nearest-wall anti-
+// contamination rule, not the surface color") - an honest depth limit must never
+// silently loosen itself just because one nearby layer happened to be unusually thick.
+// The FIRST layer's height alone was the other candidate considered and rejected: on a
+// VLH (variable layer height) plate a single outlier - thin or thick - would skew every
+// later layer's estimate too, since only ONE sample informs it; the minimum over up to
+// four samples is far less sensitive to a single outlier while still costing nothing
+// extra (the heights are already being read off contact_idx for the projection view
+// build regardless).
+//
+// VLH sanity check (both binding cases the spec calls out by name): four THIN layers
+// (representative height well under 0.25mm, e.g. a fine top-surface region) multiply out
+// to well under 1.0mm, so kBaseCastMaxLayers*height < kBaseCastMaxMm and the LAYER COUNT
+// binds (base reaches exactly 4 real layers deep, capped nowhere). Four THICK layers
+// (representative height above 0.25mm, e.g. a coarse draft profile) multiply out past
+// 1.0mm, so the MM CEILING binds instead (base reaches less than 4 real layers deep,
+// capped at 1.0mm) - both are "sensible" in the sense the spec asks for: base never
+// reaches deeper than 1.0mm, and never claims to reach 4 layers deep when those 4 layers
+// together would blow past that ceiling.
+//
+// Empty `contact_layer_heights` (no contact-band layers at all for this support layer -
+// e.g. support above the model's own top walls, same case coplanar_wall_idx already
+// tolerates being empty for) returns 0.0: nothing to derive a depth from, and 0.0 is the
+// correct answer anyway - the caller's own prefix-walk against a 0.0 gap selects zero
+// band layers for base, which is exactly right when there IS no band.
+double chameleon_base_cast_mm(const std::vector<double> &contact_layer_heights);
 
 // Indices of object layers whose TOP z lies in (lo_z, hi_z].
 // print_zs = ascending layer TOP z values; layer i spans (print_zs[i-1], print_zs[i]].
@@ -319,9 +375,25 @@ struct ProjectionLayerView {
 // Returns false (out_layer/out_region left unwritten) when no band layer's raw or
 // expanded lslices cover p, or when every covering layer (raw in PASS 1, ring in PASS 2)
 // offers no region with any raw slice geometry at all.
+//
+// v2.5g (spec: base projection depth limit): `layer_limit` (default: unbounded) caps
+// BOTH passes to `layers`' own leading min(layers.size(), layer_limit) entries - i.e. the
+// same "lowest layer(s) first" prefix `layers` is already ordered by (see this function's
+// own header comment above), just fewer of them. PASS 1 already scans that prefix
+// lowest-first, so bounding its loop is a straight truncation; PASS 2 scans
+// highest-first, so bounding it means "highest WITHIN the truncated prefix first", not
+// "highest of the full `layers` first" - a caller that wants base's shallower reach to
+// see the SAME margin-ring rescue priority interface/ironing get, just over fewer
+// candidate layers, gets exactly that. A layer beyond the limit is invisible to both
+// passes, identically to it never having been appended to `layers` at all - this is how
+// Print.cpp's caller reuses one already-built view for both interface/ironing's full
+// depth and base's shallower one without rebuilding or copying any geometry (see
+// chameleon_build_support_resolvers' own header comment, base_projection_lookup
+// paragraph, for the caller-side wiring).
 bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView>& layers,
                                       const Point& p,
-                                      size_t& out_layer, size_t& out_region);
+                                      size_t& out_layer, size_t& out_region,
+                                      size_t layer_limit = std::numeric_limits<size_t>::max());
 
 // v2.5c (root cause fix, diagnostic-log-proven): CHAMELEON_DEBUG logging on the
 // user's own GUI slice showed white wall samples plentiful (194-593/layer in the
@@ -877,7 +949,11 @@ struct ChameleonSupportResolvers {
     // v2.5f: no longer "the walls-only one" - see chameleon_build_support_resolvers'
     // own decision-rule comment below for base's now-identical-in-SHAPE (projection ->
     // wall vote -> fallback) three-tier chain; only the wall vote's ELECTORATE
-    // (coplanar_wall_idx, never band_idx) still sets it apart from interface_resolver.
+    // (coplanar_wall_idx, never band_idx) still sets it apart from interface_resolver -
+    // v2.5g adds a second difference: base's own projection TIER is depth-limited
+    // (base_projection_lookup, below), so a surface out of base's shallower reach falls
+    // through to the wall vote even where interface's OWN (unlimited-depth) projection
+    // still hits.
     std::function<unsigned(const Point &)> base_resolver;
     // Deliberately the SAME callable as interface_resolver, not merely equivalent
     // behavior - "ironing follows its interface" (v2.2 Task 3's own rule, still true
@@ -933,6 +1009,33 @@ struct ChameleonSupportResolvers {
 // so the old multi-layer teal-bleed-upward defect (v2.5d's own fix target) cannot return
 // through this path.
 //
+// v2.5g (GUI round 8, spec: "base projection depth limit"): the decision rule above no
+// longer applies to base UNCONDITIONALLY - v2.5f's own projection tier reached the FULL
+// contact band (up to kContactBandMm = 2mm, ~16 layers at 0.12mm), which was too deep for
+// base specifically: "base that far below a surface should follow the nearest-wall
+// anti-contamination rule, not the surface color" (user spec). Interface/ironing are
+// UNCHANGED - they genuinely touch the surface above them, so they keep the full 2mm
+// band and still consult `projection_lookup` exactly as v2.5f left it. Base now consults
+// a SEPARATE callable, `base_projection_lookup` (added below, same
+// `bool(const Point&, unsigned&)` shape as `projection_lookup` - same seam, same
+// "unconditional miss when empty" contract), wired to a SHALLOWER view: band layers
+// whose top z falls within min(4 object layers, 1.0mm) of the support layer's own print
+// z, computed by the caller (chameleon_base_cast_mm above + Print.cpp's own prefix-walk
+// over contact_idx - see that call site's own comment) and applied as a layer-count
+// LIMIT over the SAME already-built projection view interface/ironing's own
+// `projection_lookup` also draws from (chameleon_pick_projection_region's new
+// `layer_limit` parameter, above) - never a second, separately-rebuilt view. Two
+// DISTINCT callables rather than one seam plus a depth parameter threaded through it
+// deliberately: interface/ironing's own `projection_lookup` needed no change in TYPE or
+// behavior at all (zero regression surface on the two roles this task does not touch),
+// and a wiring-pin unit test can still trivially simulate "surface within base's reach"
+// vs. "surface beyond it" as two independently-scripted hit/miss lambdas - exactly the
+// existing v2.5e/v2.5f pin-test idiom (unconditional-hit / unconditional-miss lambdas
+// standing in for real geometry), now with `projection_lookup` scripted as "interface
+// still projects" (hit) and `base_projection_lookup` scripted as "out of base's own
+// reach" (miss) simultaneously, for the exact "surface 1.5mm above, base votes the wall
+// while interface still projects" scenario the spec calls out.
+//
 // `projection_lookup` is a deliberately narrow seam, NOT the raw ProjectionLayerView/
 // Layer* pair chameleon_projection_extruder_from_view (Print.cpp) actually consults:
 // resolving a projection HIT to an extruder needs a real PrintRegion's solid-infill-
@@ -961,16 +1064,19 @@ struct ChameleonSupportResolvers {
 // Lifetime: `band_idx`/`coplanar_wall_idx` are captured BY REFERENCE into the returned
 // resolvers (same contract Print.cpp's own inline lambdas relied on pre-v2.5e) -
 // callers must keep both alive for as long as the returned resolvers are used.
-// `projection_lookup` is captured BY VALUE (a std::function copy) into
-// interface_resolver/ironing_resolver/base_resolver (v2.5f: base_resolver joins the
-// other two), since the reference parameter itself does not outlive this call -
-// whatever `projection_lookup` closes over (Print.cpp's own projection_view/
-// projection_view_layers) must be kept alive by the caller the same way, per that
-// lambda's own capture-by-reference.
+// `projection_lookup`/`base_projection_lookup` (v2.5g: the latter joins the former) are
+// each captured BY VALUE (a std::function copy) into the resolver(s) that use them -
+// `projection_lookup` into interface_resolver/ironing_resolver (v2.5g: base_resolver no
+// longer among them - it captures `base_projection_lookup` instead), since the reference
+// parameters themselves do not outlive this call; whatever each closes over (Print.cpp's
+// own projection_view/projection_view_layers, shared by both - see
+// chameleon_pick_projection_region's `layer_limit` paragraph above) must be kept alive by
+// the caller the same way, per that lambda's own capture-by-reference.
 ChameleonSupportResolvers chameleon_build_support_resolvers(
     const WallSampleIndex &band_idx,
     const WallSampleIndex &coplanar_wall_idx,
     const std::function<bool(const Point &, unsigned &)> &projection_lookup,
+    const std::function<bool(const Point &, unsigned &)> &base_projection_lookup,
     const BrimVoteParams &vote_params,
     unsigned fallback_extruder,
     unsigned base_fallback_extruder);
