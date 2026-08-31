@@ -349,6 +349,13 @@ static const t_config_enum_values s_keys_map_BrimType = {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(BrimType)
 
+static t_config_enum_values s_keys_map_PaintDepthMode {
+    { "unlimited",   int(PaintDepthMode::pdmUnlimited) },
+    { "walls",       int(PaintDepthMode::pdmWalls) },
+    { "millimeters", int(PaintDepthMode::pdmMillimeters) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(PaintDepthMode)
+
 static t_config_enum_values s_keys_map_BrimFilamentSource {
     { "object",       int(BrimFilamentSource::bfsObject) },
     { "nearest_wall", int(BrimFilamentSource::bfsNearestWall) }
@@ -3860,6 +3867,15 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    // Paint Depth Stage 1: mmu_segmented_region_max_width stays defined (legacy-
+    // parse-only) so old project/preset files still deserialize this key without
+    // erroring - see PrintConfigDef::handle_legacy_composite below, which migrates a
+    // nonzero stored value into {paint_depth_mode=millimeters, paint_depth_mm=value}
+    // (zero migrates to the new bounded-by-default: paint_depth_mode=walls). The
+    // segmentation code (MultiMaterialSegmentation.cpp) is wired to the new options
+    // directly, not to this one; it is deliberately no longer exposed on the
+    // Multimaterial settings page (see Tab.cpp) in favor of paint_depth_mode/
+    // paint_depth_walls/paint_depth_mm below.
     def           = this->add("mmu_segmented_region_max_width", coFloat);
     def->label    = L("Maximum width of a segmented region");
     def->tooltip  = L("Maximum width of a segmented region. Zero disables this feature.");
@@ -3869,16 +3885,65 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.));
 
+    def           = this->add("paint_depth_mode", coEnum);
+    def->label    = L("Paint depth mode");
+    def->tooltip  = L("Controls how far inward a painted (multi-material/multi-color) claim is "
+                    "allowed to reach before the object reverts to its base filament for walls, "
+                    "solid infill and sparse infill. Without a bound, a small dark painted spot "
+                    "can extrude dark filament all the way to the object's core, showing through "
+                    "light-colored walls/infill above and around it. \"Limited by walls\" bounds "
+                    "the claim to a number of wall widths (recommended); \"Limited by distance\" "
+                    "bounds it to an explicit depth in millimeters; \"Unlimited\" restores the old "
+                    "unbounded behavior (the painted claim reaches the object's medial axis).");
+    def->enum_keys_map = &ConfigOptionEnum<PaintDepthMode>::get_enum_values();
+    def->enum_values.emplace_back("unlimited");
+    def->enum_values.emplace_back("walls");
+    def->enum_values.emplace_back("millimeters");
+    def->enum_labels.emplace_back(L("Unlimited"));
+    def->enum_labels.emplace_back(L("Limited by walls"));
+    def->enum_labels.emplace_back(L("Limited by distance"));
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<PaintDepthMode>(pdmWalls));
+
+    def           = this->add("paint_depth_walls", coInt);
+    def->label    = L("Paint depth walls");
+    def->tooltip  = L("Number of wall widths a painted claim is allowed to reach inward from the "
+                    "sliced boundary, when \"Paint depth mode\" is \"Limited by walls\". The depth "
+                    "in millimeters is derived from the painted region's own external perimeter "
+                    "width plus (walls-1) perimeter spacings, the same width/spacing precedent "
+                    "already used to bound fuzzy skin depth.");
+    def->sidetext = "walls";
+    def->min      = 1;
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(3));
+
+    def           = this->add("paint_depth_mm", coFloat);
+    def->label    = L("Paint depth distance");
+    def->tooltip  = L("Depth a painted claim is allowed to reach inward from the sliced boundary, "
+                    "when \"Paint depth mode\" is \"Limited by distance\".");
+    def->sidetext = "mm";	// milimeters, don't need translation
+    def->min      = 0;
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.5));
+
     def           = this->add("mmu_segmented_region_interlocking_depth", coFloat);
     def->label    = L("Interlocking depth of a segmented region");
     def->tooltip  = L("Interlocking depth of a segmented region. It will be ignored if "
                     "\"mmu_segmented_region_max_width\" is zero or if \"mmu_segmented_region_interlocking_depth\" "
                     "is bigger than \"mmu_segmented_region_max_width\". Zero disables this feature.");
-    def->sidetext = "mm";	// milimeters, don't need translation 
+    def->sidetext = "mm";	// milimeters, don't need translation
     def->min      = 0;
     def->category = L("Advanced");
     def->mode     = comAdvanced;
-    def->set_default_value(new ConfigOptionFloat(0.));
+    // Paint Depth Stage 1 (spec decision 3): default flips 0 -> 0.3 now that depth is
+    // bounded by default (paint_depth_mode default = walls) - the gate that makes this
+    // value only active when the depth clamp is actually applied is unchanged (see the
+    // segmentation call site, Task 2), so this default only takes effect together with
+    // the bounded-by-default flip.
+    def->set_default_value(new ConfigOptionFloat(0.3));
 
     def           = this->add("interlocking_beam", coBool);
     def->label    = L("Use beam interlocking");
@@ -7797,6 +7862,33 @@ void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
             }
         }
         config.set_key_value("wiping_volumes_use_custom_matrix", new ConfigOptionBool(custom));
+    }
+
+    // Paint Depth Stage 1 (spec decision 1/2, plan Task 1 item 2): migrate a stored
+    // legacy mmu_segmented_region_max_width into the new paint_depth_* options, once,
+    // for any project/preset saved before this feature existed. Guarded on
+    // !config.has("paint_depth_mode") so a config that already carries the new key
+    // (saved by a build that has this feature) is never overwritten - same guard shape
+    // as the wiping_volumes_use_custom_matrix migration above.
+    //
+    // A NONZERO stored value carries forward as an explicit millimeters-mode depth
+    // (the value the user actually configured under the old single-float option) -
+    // {paint_depth_mode=millimeters, paint_depth_mm=<value>}.
+    //
+    // A ZERO (or absent, since paint_depth_mode's own default already covers that
+    // case) stored value does NOT map to paint_depth_mode=unlimited despite 0 being the
+    // legacy "disabled" convention: the approved bounded-by-default flip (spec decision
+    // 1) applies to every project being (re)loaded, old ones included, not only newly
+    // created ones - so a legacy zero is left alone and simply falls through to
+    // paint_depth_mode's own default (walls), matching a config that never had the key
+    // at all. This is the "bounded by default" behavior actually taking effect for
+    // reslices, not just new projects, as the spec requires.
+    if (config.has("mmu_segmented_region_max_width") && !config.has("paint_depth_mode")) {
+        double legacy_max_width = config.opt_float("mmu_segmented_region_max_width");
+        if (legacy_max_width > 0.) {
+            config.set_key_value("paint_depth_mode", new ConfigOptionEnum<PaintDepthMode>(pdmMillimeters));
+            config.set_key_value("paint_depth_mm", new ConfigOptionFloat(legacy_max_width));
+        }
     }
 }
 

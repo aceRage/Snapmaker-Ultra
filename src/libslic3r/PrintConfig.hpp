@@ -19,6 +19,7 @@
 #include "libslic3r.h"
 #include "Config.hpp"
 #include "Polygon.hpp"
+#include "PaintDepth.hpp"
 #include <boost/preprocessor/facilities/empty.hpp>
 #include <boost/preprocessor/punctuation/comma_if.hpp>
 #include <boost/preprocessor/seq/for_each.hpp>
@@ -526,6 +527,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLADisplayOrientation)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLAPillarConnectionMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimFilamentSource)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PaintDepthMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TimelapseType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BedType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SkirtType)
@@ -893,6 +895,14 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,               layer_height))
     ((ConfigOptionFloat,               mmu_segmented_region_max_width))
     ((ConfigOptionFloat,               mmu_segmented_region_interlocking_depth))
+    // Paint Depth Stage 1 (docs/superpowers/specs/2026-08-31-paint-depth-design.md):
+    // supersede mmu_segmented_region_max_width as the user-facing depth control -
+    // mmu_segmented_region_max_width stays defined only so old project/preset files
+    // still deserialize (see PrintConfigDef::handle_legacy_composite), but is no
+    // longer read directly by the segmentation code (Task 2).
+    ((ConfigOptionEnum<PaintDepthMode>, paint_depth_mode))
+    ((ConfigOptionInt,                 paint_depth_walls))
+    ((ConfigOptionFloat,               paint_depth_mm))
     ((ConfigOptionFloat,               raft_contact_distance))
     ((ConfigOptionFloat,               raft_expansion))
     ((ConfigOptionPercent,             raft_first_layer_density))

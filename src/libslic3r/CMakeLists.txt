@@ -84,6 +84,8 @@ set(lisbslic3r_sources
     WallSampleIndex.hpp
     BrimFilament.cpp
     BrimFilament.hpp
+    PaintDepth.cpp
+    PaintDepth.hpp
     BuildVolume.cpp
     BuildVolume.hpp
     calib.cpp
