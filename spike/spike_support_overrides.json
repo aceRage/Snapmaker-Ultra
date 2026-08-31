@@ -1,0 +1,14 @@
+{
+    "type": "process",
+    "name": "spike support overrides p2 manual (legacy key)",
+    "from": "User",
+    "inherits": "0.20mm Standard @BBL X1C",
+    "compatible_printers": ["Bambu Lab X1 Carbon 0.4 nozzle"],
+    "enable_prime_tower": "0",
+    "use_relative_e_distances": "0",
+    "enable_support": "1",
+    "support_type": "normal(auto)",
+    "support_interface_top_layers": "3",
+    "brim_type": "no_brim",
+    "support_interface_filament_source": "manual"
+}

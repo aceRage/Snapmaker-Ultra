@@ -1160,6 +1160,37 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		}
 	}
 
+	// Orca: drop degenerate internal-solid slivers — patches under ~3 extrusion widths in both
+	// directions. After the fill boundary inset such a patch can only emit a single sub-width
+	// micro-zigzag with no structural value, and whether the patch survives the upstream boolean
+	// chain sits on a numeric knife edge, which makes the G-code non-reproducible between
+	// otherwise identical slices. Long thin regions are kept: only patches tiny in BOTH
+	// dimensions are removed.
+	for (SurfaceFill &fill : surface_fills) {
+		if (fill.surface.surface_type != stInternalSolid)
+			continue;
+		const coord_t sspacing  = scale_(fill.params.spacing);
+		const double  max_area  = 4.0 * sqr(double(sspacing));
+		const coord_t max_dim   = 3 * sspacing;
+		fill.expolygons.erase(std::remove_if(fill.expolygons.begin(), fill.expolygons.end(),
+			[max_area, max_dim, &fill](const ExPolygon &ex) {
+				BoundingBox bb = get_extents(ex);
+				bool drop = bb.size().x() < max_dim && bb.size().y() < max_dim &&
+				            std::abs(ex.area()) < max_area;
+				if (getenv("ORCA_SLIVER_DEBUG"))
+					fprintf(stderr, "SLIVER %s area=%.4fmm2 bbox=%.3fx%.3fmm spacing=%.3f\n",
+					        drop ? "DROP" : "keep",
+					        unscale<double>(1) * unscale<double>(1) * std::abs(ex.area()),
+					        unscale<double>(bb.size().x()), unscale<double>(bb.size().y()),
+					        fill.params.spacing);
+				return drop;
+			}),
+			fill.expolygons.end());
+	}
+	surface_fills.erase(std::remove_if(surface_fills.begin(), surface_fills.end(),
+		[](const SurfaceFill &fill) { return fill.expolygons.empty(); }),
+		surface_fills.end());
+
 	return surface_fills;
 }
 

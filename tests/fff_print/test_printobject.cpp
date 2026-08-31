@@ -14,7 +14,7 @@ SCENARIO("PrintObject: object layer heights", "[PrintObject]") {
         WHEN("generate_object_layers() is called for 2mm layer heights and nozzle diameter of 3mm") {
             Slic3r::Print print;
             Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
-        		{ "first_layer_height", 2 },
+        		{ "initial_layer_print_height", 2 },
 				{ "layer_height", 		2 },
 	            { "nozzle_diameter", 	3 }
 	        });
@@ -33,7 +33,7 @@ SCENARIO("PrintObject: object layer heights", "[PrintObject]") {
         WHEN("generate_object_layers() is called for 10mm layer heights and nozzle diameter of 11mm") {
             Slic3r::Print print;
             Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
-        		{ "first_layer_height", 2 },
+        		{ "initial_layer_print_height", 2 },
 				{ "layer_height", 		10 },
 	            { "nozzle_diameter", 	11 }
 	        });
@@ -51,7 +51,7 @@ SCENARIO("PrintObject: object layer heights", "[PrintObject]") {
         WHEN("generate_object_layers() is called for 15mm layer heights and nozzle diameter of 16mm") {
             Slic3r::Print print;
             Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
-        		{ "first_layer_height", 2 },
+        		{ "initial_layer_print_height", 2 },
 				{ "layer_height", 		15 },
 	            { "nozzle_diameter", 	16 }
 	        });
@@ -70,7 +70,7 @@ SCENARIO("PrintObject: object layer heights", "[PrintObject]") {
         WHEN("generate_object_layers() is called for 15mm layer heights and nozzle diameter of 5mm") {
             Slic3r::Print print;
             Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
-        		{ "first_layer_height", 2 },
+        		{ "initial_layer_print_height", 2 },
 				{ "layer_height", 		15 },
 	            { "nozzle_diameter", 	5 }
 	        });

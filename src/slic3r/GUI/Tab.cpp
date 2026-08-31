@@ -2526,6 +2526,15 @@ void TabPrint::build()
         optgroup = page->new_optgroup(L("Support filament"), L"param_support_filament");
         optgroup->append_single_option_line("support_filament", "support_settings_filament#base");
         optgroup->append_single_option_line("support_interface_filament", "support_settings_filament#interface");
+        // I3 fix: wire support_filament_matching into the GUI, mirroring Part
+        // 1's brim_filament_source wiring at Tab.cpp:2650 (same pattern: no wiki
+        // fragment yet, comAdvanced). Without this the setting was invisible/unsettable
+        // in the GUI, blocking the plan's GUI validation - the only place the
+        // cross-extruder path can fire (CLI collapses to one extruder per task-4).
+        // v2.6: the option itself became a plain checkbox (was a manual/nearest_wall
+        // enum) - no change needed here, append_single_option_line renders whatever
+        // GUI widget the option's coType calls for.
+        optgroup->append_single_option_line("support_filament_matching");
         optgroup->append_single_option_line("support_interface_not_for_body", "support_settings_filament#avoid-interface-filament-for-base");
 
         optgroup = page->new_optgroup(L("Support ironing"), L"param_ironing");
@@ -2644,6 +2653,7 @@ optgroup->append_single_option_line("skirt_loops", "others_settings_skirt#loops"
 
         optgroup = page->new_optgroup(L("Brim"), L"param_adhension");
         optgroup->append_single_option_line("brim_type", "others_settings_brim#type");
+        optgroup->append_single_option_line("brim_filament_source");
         optgroup->append_single_option_line("brim_width", "others_settings_brim#width");
         optgroup->append_single_option_line("brim_object_gap", "others_settings_brim#brim-object-gap");
         optgroup->append_single_option_line("brim_ears_max_angle", "others_settings_brim#ear-max-angle");

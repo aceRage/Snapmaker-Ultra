@@ -14,7 +14,11 @@
 namespace libnest2d {
 
     static const constexpr int BIN_ID_UNSET = -1;
-    static const constexpr int BIN_ID_UNFIT = -1;
+    // Internal marker for items rejected by the selection's unpackable-item
+    // pre-filter. Must differ from BIN_ID_UNSET: fresh items enter packItems()
+    // with BIN_ID_UNSET, and the "skip unfit" test would otherwise skip all of
+    // them. Selections normalize it back to BIN_ID_UNSET before returning.
+    static const constexpr int BIN_ID_UNFIT = -2;
 
 /**
  * \brief An item to be placed on a bin.

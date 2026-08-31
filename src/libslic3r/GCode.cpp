@@ -18,6 +18,7 @@
 #include "MixedFilament.hpp"
 #include "Print.hpp"
 #include "Utils.hpp"
+#include "BrimFilament.hpp"
 #include "ClipperUtils.hpp"
 #include "libslic3r.h"
 #include "LocalesUtils.hpp"
@@ -5482,7 +5483,16 @@ LayerResult GCode::process_layer(const Print& print,
             if (!support_layer.support_fills.entities.empty()) {
                 ExtrusionRole role          = support_layer.support_fills.role();
                 bool          has_support   = role == erMixed || role == erSupportMaterial || role == erSupportTransition;
-                bool          has_interface = role == erMixed || role == erSupportMaterialInterface;
+                // v2.2 Task 3 (spec C6, third anchor): mirrors ToolOrdering.cpp's own
+                // has_interface classification (~701-703, shared predicate in
+                // BrimFilament.hpp/.cpp) - kept identical so the two duplicated role
+                // classifications can't drift. In THIS specific block the erIroning
+                // addition is inert for `single_extruder`/the bucket-key choice just
+                // below (both are driven by has_support, which erIroning was never part
+                // of, not by has_interface), but the mirror comment at this block's own
+                // site (spec, "GCode support-bucket mirror check") is the reason to keep
+                // it in lock-step with ToolOrdering.cpp's copy regardless.
+                bool          has_interface = support_role_needs_interface_extruder(role);
                 // Extruder ID of the support base. -1 if "don't care".
                 unsigned int support_extruder = object.config().support_filament.value - 1;
                 // Shall the support be printed with the active extruder, preferably with non-soluble, to avoid tool changes?
@@ -5507,6 +5517,64 @@ LayerResult GCode::process_layer(const Print& print,
                     if (extruder_override >= 0) {
                         interface_extruder = extruder_override;
                         interface_dontcare = false;
+                    }
+                }
+
+                // v2.5a Task 2b (spec: "mechanism B pin" - promoted from the original
+                // spec's named "known remaining gap" to REQUIRED once the user's own
+                // profile confirmed flush_into_support/flush_into_infill are both off:
+                // mechanism A's WipingExtrusions override just above never fires for a
+                // mode-active object in that profile shape - is_support_overriddable's
+                // own v2.5a residual pin, ToolOrdering.cpp, already makes both
+                // get_support_extruder_overrides/get_support_interface_extruder_
+                // overrides above return -1 unconditionally for such an object,
+                // flush_into_support or not - so mechanism B below - the "don't care"
+                // resolution falling through to whatever extruder happens to be
+                // first/active on THIS SPECIFIC layer - is the actual, dominant cause
+                // of the reported khaki-randomly-mixed-into-white/teal-support
+                // symptom: it varies layer to layer with toolchange order, with no
+                // relationship to what geometry is actually nearby).
+                //
+                // A mode-active object (support_filament_matching.value) whose
+                // support layer has at least one matched bucket
+                // (support_layer.interface_by_extruder, populated per-layer by
+                // chameleon_assign_support_interfaces, Print.cpp) pins any STILL-
+                // "don't care" residual slot(s) - base and/or interface, whichever of
+                // the two remain dontcare at this point - to that layer's DOMINANT
+                // matched bucket's extruder instead: the bucket with the largest
+                // total_path_length_mm (ties -> lowest extruder id, deterministic).
+                // Both slots share the SAME one dominant extruder - interface_by_
+                // extruder is a single map holding both roles' matched buckets (v2.1
+                // Task 3), not two separate per-role maps, so there is only one
+                // "dominant bucket" per layer to pick from. This introduces NO new
+                // toolchange: that extruder is already registered on this exact layer
+                // via ToolOrdering.cpp's own interface_by_extruder registration loop
+                // (collect_extruders, ~734-736), since the bucket exists there in the
+                // first place.
+                //
+                // A wholly-fallback layer (interface_by_extruder empty - nothing
+                // matched on this layer at all) is untouched by this and keeps
+                // falling through to the pre-v2.5a first/active-extruder rule below -
+                // a documented, now much smaller, remaining gap (see this task's own
+                // report: still deterministic per run, but layer-varying, same as
+                // before this fix).
+                if (object.config().support_filament_matching.value
+                    && (support_dontcare || interface_dontcare)) {
+                    // chameleon_dominant_matched_extruder (BrimFilament.hpp/.cpp) is
+                    // the pure/testable core of this pin: largest total_path_length_mm
+                    // bucket, ties -> lowest extruder id, -1 when interface_by_extruder
+                    // is empty or holds only empty buckets (nothing matched this
+                    // layer - falls through to the pre-v2.5a rule below unchanged).
+                    const int dominant_extruder = chameleon_dominant_matched_extruder(support_layer.interface_by_extruder);
+                    if (dominant_extruder >= 0) {
+                        if (support_dontcare) {
+                            support_extruder   = unsigned(dominant_extruder);
+                            support_dontcare   = false;
+                        }
+                        if (interface_dontcare) {
+                            interface_extruder = unsigned(dominant_extruder);
+                            interface_dontcare = false;
+                        }
                     }
                 }
 
@@ -6485,6 +6553,171 @@ LayerResult GCode::process_layer(const Print& print,
         // let analyzer tag generator aware of a role type change
         if (layer_tools.has_wipe_tower && m_wipe_tower)
             m_last_processor_extrusion_role = erWipeTower;
+
+        // Chameleon brim: print this extruder's foreign brim partitions (layer 0 only).
+        // MUST run after the toolchange gcode above: this extruder isn't actually
+        // active (loaded/primed) until gcode_toolchange has been appended, so emitting
+        // here - rather than before the toolchange block - avoids extruding a foreign
+        // partition while the previous extruder is still selected.
+        // Iterate print.objects() (stable, model-derived order) rather than the
+        // ObjectID-keyed map directly: ObjectID is an allocation-order id, not stable
+        // across runs (see Print.cpp's object_ordinal comment), so iterating the map
+        // by its own key order would make emission order - and thus travel moves/seams -
+        // run-unstable even though the underlying geometry ordering is deterministic.
+        if (first_layer && !print.get_brimMapByExtruder().empty()) {
+            const auto& brim_map_by_extruder = print.get_brimMapByExtruder();
+            for (const PrintObject* obj : print.objects()) {
+                auto obj_entry = brim_map_by_extruder.find(obj->id());
+                if (obj_entry == brim_map_by_extruder.end())
+                    continue;
+                auto it = obj_entry->second.find(extruder_id);
+                if (it == obj_entry->second.end() || it->second.entities.empty())
+                    continue;
+                this->set_origin(0., 0.);
+                m_avoid_crossing_perimeters.use_external_mp();
+                for (const ExtrusionEntity* ee : it->second.entities)
+                    gcode += this->extrude_entity(*ee, "brim", m_config.support_speed.value);
+                m_avoid_crossing_perimeters.use_external_mp(false);
+                m_avoid_crossing_perimeters.disable_once();
+            }
+        }
+
+        // Chameleon P2.1: print this extruder's matched support-interface AND matched
+        // base partitions - interface_by_extruder (T1 storage) now holds BOTH roles (v2.1
+        // Task 3: Print.cpp's chameleon_assign_support_interfaces calls
+        // partition_support_entities once per role, sharing this one map/extruder-key
+        // space). MUST run after the toolchange gcode above (same reasoning as the brim
+        // block just above: this extruder isn't actually active/primed until
+        // gcode_toolchange has been appended, so emitting before it would extrude under
+        // the wrong tool).
+        // The Print.cpp partition pass (Task 2/3) REMOVES matched entities from
+        // support_fills - interface_by_extruder is the only place they still live, so
+        // this block is not optional: skipping it silently loses that geometry.
+        // Dedicated block, not routed through the (object, extruder) ObjectByExtruder
+        // support buckets built below (~5416-5423 in the support-collection pass): those
+        // buckets carry one scalar support_extrusion_role per (object, extruder) and would
+        // collide with per-partition emission here (documented Part 1 bucket-collision
+        // risk). Iterate `layers` in its existing run-stable order - mirrors the brim
+        // block's use of print.objects() order rather than any allocation-order map key.
+        for (const LayerToPrint& ltp : layers) {
+            if (ltp.support_layer == nullptr)
+                continue;
+            const SupportLayer& sl = *ltp.support_layer;
+            auto                 it = sl.interface_by_extruder.find(extruder_id);
+            if (it == sl.interface_by_extruder.end() || it->second.entities.empty())
+                continue;
+            const PrintObject& obj  = *ltp.original_object;
+            // I1 fix: apply this object's config before extruding its matched interface
+            // partitions, mirroring the normal per-instance path (~6487:
+            // m_config.apply(instance_to_print.print_object.config(), true) before support
+            // extrusion). Without this, support_interface_speed/accel etc. resolve from
+            // whatever object's config m_config last saw (a previous object on this layer,
+            // or a previous layer's object), not this partition's own object.
+            m_config.apply(obj.config(), true);
+            m_layer                  = ltp.support_layer;
+            m_object_layer_over_raft = false;
+            for (const PrintInstance& instance : obj.instances()) {
+                this->set_origin(unscale(instance.shift));
+                // Mirror the normal per-instance loop's gcode_label_objects comment idiom
+                // (~6542-6545 start / ~6697-6700 end) so comment-parsing cancel-object
+                // tools (OctoPrint style) can attribute these partition extrusions too.
+                if (this->config().gcode_label_objects) {
+                    gcode += std::string("; printing object ") + obj.model_object()->name +
+                             " id:" + std::to_string(obj.get_id()) + " copy " + std::to_string(instance.id) + "\n";
+                }
+                // I2 fix: wrap this instance's partition extrusions in the same
+                // exclude-object (M624/M625, EXCLUDE_OBJECT_*, M486) label machinery the
+                // normal per-instance loop uses (~6493-6513 start / ~6648-6667 end), so
+                // firmware skip-object suppresses matched interface for an excluded
+                // instance instead of extruding it into the void left by its skipped
+                // supports. Part 1's brim block shares this gap but is layer-0-only
+                // (out of scope here); this block runs on every layer.
+                if (m_enable_exclude_object) {
+                    if (is_BBL_Printer()) {
+                        m_writer.set_object_start_str(std::string("; start printing object, unique label id: ") +
+                                                      std::to_string(instance.model_instance->get_labeled_id()) + "\n" + "M624 " +
+                                                      _encode_label_ids_to_base64({instance.model_instance->get_labeled_id()}) + "\n");
+                    } else {
+                        const auto gflavor = print.config().gcode_flavor.value;
+                        if (gflavor == gcfKlipper) {
+                            m_writer.set_object_start_str(std::string("EXCLUDE_OBJECT_START NAME=") +
+                                                          get_instance_name(&obj, instance) + "\n");
+                        } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
+                            m_writer.set_object_start_str(std::string("M486 S") + std::to_string(instance.unique_id) + "\n");
+                        }
+                    }
+                }
+
+                // v2.1 Task 3: pass erMixed, not erSupportMaterialInterface - it->second
+                // can now hold BOTH erSupportMaterial and erSupportMaterialInterface paths
+                // (base entities the lateral rule matched to this extruder share this same
+                // map bucket as matched interface entities). Passing
+                // erSupportMaterialInterface here would silently DROP every base path in
+                // it->second: extrude_support's own selection filter (~7375,
+                // `role == support_extrusion_role`) would reject each erSupportMaterial
+                // path and it would just never print. erMixed is this codebase's existing
+                // precedent for "let each path's own role drive everything" (~5419:
+                // `obj.support_extrusion_role = single_extruder ? erMixed :
+                // erSupportMaterial` for the ordinary interleaved-support case) - under
+                // erMixed, ~7375's filter becomes a pass-through
+                // (`support_extrusion_role == erMixed && role != erIroning`), and every
+                // downstream decision already keys off each PATH's own role(), not this
+                // argument: the gcode comment label (~7389-7393, switches on `ee->role()`),
+                // the speed resolution in _extrude (~7659-7662,
+                // `path.role() == erSupportMaterial ? support_speed :
+                // support_interface_speed`), the interface cooling-fan marker (~7962,
+                // `path.role() == erSupportMaterialInterface`), and the support-island
+                // retraction-skip check (~8554, keyed off the role travel_to receives,
+                // which is `path.role()` per ~7528). So per-path flow/speed/labeling is
+                // already correct with erMixed and no further change is needed here.
+                gcode += this->extrude_support(it->second, erMixed);
+
+                // v2.2 Task 3 (spec C6): make sure ironing is last, mirroring the
+                // direct/non-chameleon support path's own erMixed+erIroning pair
+                // (~6654-6657, "Make sure ironing is the last"). Verified by reading
+                // GCode::extrude_support (~7388-7441, comment above cites its old line
+                // numbers as ~7375/~7389-7393 - current numbers are ~7401/~7415-7419):
+                // its erMixed branch is `(role == support_extrusion_role) ||
+                // (support_extrusion_role == erMixed && role != erIroning)` - the
+                // `role != erIroning` term means erMixed NEVER matches an erIroning
+                // entity (leaf OR a whole nested collection, since role() is the same
+                // virtual call either way - v2.2 Task 3's C7 change), so the call just
+                // above unconditionally excludes this bucket's matched ironing (v2.2
+                // Task 3's third partition_support_entities call, role_filter =
+                // erIroning) no matter what else it->second holds. This second call with
+                // support_extrusion_role = erIroning is what actually emits it - only
+                // entities whose own role() == erIroning pass the first half of that
+                // same OR (`role == support_extrusion_role`). When this bucket carries
+                // no erIroning entity at all, `extrusions` (~7397-7404) ends up empty
+                // and the function returns "" immediately (~7405-7406) before touching
+                // m_last_pos/chain_and_reorder_extrusion_entities - a true no-op, not a
+                // crash or a duplicate emission of the erMixed call's own paths.
+                gcode += this->extrude_support(it->second, erIroning);
+
+                if (this->config().gcode_label_objects) {
+                    gcode += std::string("; stop printing object ") + obj.model_object()->name +
+                             " id:" + std::to_string(obj.get_id()) + " copy " + std::to_string(instance.id) + "\n";
+                }
+                // Don't set m_gcode_label_objects_end if the start string never got
+                // consumed (nothing was extruded for this instance's partition).
+                if (!m_writer.is_object_start_str_empty()) {
+                    m_writer.set_object_start_str("");
+                } else if (m_enable_exclude_object) {
+                    if (is_BBL_Printer()) {
+                        m_writer.set_object_end_str(std::string("; stop printing object, unique label id: ") +
+                                                    std::to_string(instance.model_instance->get_labeled_id()) + "\n" + "M625\n");
+                    } else {
+                        const auto gflavor = print.config().gcode_flavor.value;
+                        if (gflavor == gcfKlipper) {
+                            m_writer.set_object_end_str(std::string("EXCLUDE_OBJECT_END NAME=") +
+                                                        get_instance_name(&obj, instance) + "\n");
+                        } else if (gflavor == gcfMarlinLegacy || gflavor == gcfMarlinFirmware || gflavor == gcfRepRapFirmware) {
+                            m_writer.set_object_end_str(std::string("M486 S-1\n"));
+                        }
+                    }
+                }
+            }
+        }
 
         auto objects_by_extruder_it = by_extruder.find(extruder_id);
         if (objects_by_extruder_it == by_extruder.end())

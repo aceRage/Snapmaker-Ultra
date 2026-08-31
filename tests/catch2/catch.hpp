@@ -16664,6 +16664,12 @@ void ConsoleReporter::printHeaderString(std::string const& _string, std::size_t 
         i += 2;
     else
         i = 0;
+    // A follow-line indent at or past the column width underflows TextFlow's
+    // size_t wrap arithmetic (Column width is CATCH_CONFIG_CONSOLE_WIDTH-1) and
+    // aborts the whole run on the first failing assertion in a long-named test;
+    // fall back to no hanging indent instead of crashing.
+    if (indent + i >= CATCH_CONFIG_CONSOLE_WIDTH - 1)
+        i = 0;
     stream << Column(_string).indent(indent + i).initialIndent(indent) << '\n';
 }
 

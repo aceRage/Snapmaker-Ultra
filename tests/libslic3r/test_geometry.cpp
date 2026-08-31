@@ -374,6 +374,9 @@ SCENARIO("Line distances", "[Geometry]"){
 }
 
 SCENARIO("Polygon convex/concave detection", "[Geometry]"){
+    // Angle between edge direction vectors above which a vertex counts as convex/concave,
+    // matching the reworked Polygon::convex_points()/concave_points() semantics.
+    static constexpr const double angle_threshold = PI / 3.;
     GIVEN(("A Square with dimension 100")){
         auto square = Slic3r::Polygon /*new_scale*/(Points({
             Point(100,100),
@@ -381,13 +384,13 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(200,200),
             Point(100,200)}));
         THEN("It has 4 convex points counterclockwise"){
-            REQUIRE(square.concave_points(PI*4/3).size() == 0);
-            REQUIRE(square.convex_points(PI*2/3).size() == 4);
+            REQUIRE(square.concave_points(angle_threshold).size() == 0);
+            REQUIRE(square.convex_points(angle_threshold).size() == 4);
         }
         THEN("It has 4 concave points clockwise"){
             square.make_clockwise();
-            REQUIRE(square.concave_points(PI*4/3).size() == 4);
-            REQUIRE(square.convex_points(PI*2/3).size() == 0);
+            REQUIRE(square.concave_points(angle_threshold).size() == 4);
+            REQUIRE(square.convex_points(angle_threshold).size() == 0);
         }
     }
     GIVEN("A Square with an extra colinearvertex"){
@@ -398,8 +401,8 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(100,200),
             Point(100,100)}));
         THEN("It has 4 convex points counterclockwise"){
-            REQUIRE(square.concave_points(PI*4/3).size() == 0);
-            REQUIRE(square.convex_points(PI*2/3).size() == 4);
+            REQUIRE(square.concave_points(angle_threshold).size() == 0);
+            REQUIRE(square.convex_points(angle_threshold).size() == 4);
         }
     }
     GIVEN("A Square with an extra collinear vertex in different order"){
@@ -410,8 +413,8 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(150,100),
             Point(200,100)}));
         THEN("It has 4 convex points counterclockwise"){
-            REQUIRE(square.concave_points(PI*4/3).size() == 0);
-            REQUIRE(square.convex_points(PI*2/3).size() == 4);
+            REQUIRE(square.concave_points(angle_threshold).size() == 0);
+            REQUIRE(square.convex_points(angle_threshold).size() == 4);
         }
     }
 
@@ -422,8 +425,8 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(31286371,461008)
         }));
         THEN("it has three convex vertices"){
-            REQUIRE(triangle.concave_points(PI*4/3).size() == 0);
-            REQUIRE(triangle.convex_points(PI*2/3).size() == 3);
+            REQUIRE(triangle.concave_points(angle_threshold).size() == 0);
+            REQUIRE(triangle.convex_points(angle_threshold).size() == 3);
         }
     }
 
@@ -435,13 +438,17 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(31286371,461012)
         }));
         THEN("it has three convex vertices"){
-            REQUIRE(triangle.concave_points(PI*4/3).size() == 0);
-            REQUIRE(triangle.convex_points(PI*2/3).size() == 3);
+            REQUIRE(triangle.concave_points(angle_threshold).size() == 0);
+            REQUIRE(triangle.convex_points(angle_threshold).size() == 3);
         }
     }
     GIVEN("A polygon with concave vertices with angles of specifically 4/3pi"){
-        // Two concave vertices of this polygon have angle = PI*4/3, so this test fails
-        // if epsilon is not used.
+        // Two concave vertices of this polygon have an interior angle of PI*4/3, i.e. a
+        // turn angle of exactly PI/3. filter_convex_concave_points_by_angle_threshold
+        // compares dot < cos(threshold) with no epsilon, so querying at exactly PI/3
+        // would sit on a floating-point knife edge; back the threshold off slightly so
+        // the two boundary vertices are counted deterministically.
+        static constexpr const double boundary_threshold = PI / 3. - 0.01;
         auto polygon = Slic3r::Polygon(Points({
             Point(60246458,14802768),Point(64477191,12360001),
             Point(63727343,11060995),Point(64086449,10853608),
@@ -453,8 +460,8 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(38092663,692699),Point(52100125,692699)
         }));
         THEN("the correct number of points are detected"){
-            REQUIRE(polygon.concave_points(PI*4/3).size() == 6);
-            REQUIRE(polygon.convex_points(PI*2/3).size() == 10);
+            REQUIRE(polygon.concave_points(boundary_threshold).size() == 6);
+            REQUIRE(polygon.convex_points(boundary_threshold).size() == 10);
         }
     }
 }
