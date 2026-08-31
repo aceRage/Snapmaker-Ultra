@@ -1874,17 +1874,14 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
             std::string new_color = new_col.GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
             new_colors.push_back(new_color);
         }
-        if (wxGetApp().preset_bundle->printers.get_edited_preset().name.find("Snapmaker U1") != std::string::npos) {
-            if (old_filament_size > num_extruder) {
-                num_extruder = old_filament_size;
-                new_colors.clear();
-                for (int i = 0; i < old_filament_size; ++i) {
-                    wxColour    new_col   = Plater::get_next_color_for_filament();
-                    std::string new_color = new_col.GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
-                    new_colors.push_back(new_color);
-                }
-            }
-        } 
+        // Ultra: never SHRINK the project's filament list below its current size on a printer switch.
+        // A dual-nozzle Bambu machine (H2D/H2D Pro/H2C: nozzle_diameter.size()==2, single_extruder_
+        // multi_material=0) still drives many filaments via AMS + the filament map, so the filament
+        // count must not follow the physical nozzle count. This generalizes the former U1-only
+        // "don't shrink" guard to every printer; a genuine nozzle increase still appends one filament
+        // per new nozzle via new_colors above. (The multi-nozzle grouping engine handles the actual
+        // filament->nozzle assignment; the count must simply be preserved here.)
+        num_extruder = std::max<size_t>(num_extruder, size_t(old_filament_size));
         wxGetApp().preset_bundle->set_num_filaments(num_extruder, new_colors);
         wxGetApp().plater()->on_filaments_change(num_extruder);
         wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
