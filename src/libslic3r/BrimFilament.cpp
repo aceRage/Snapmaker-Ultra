@@ -1583,10 +1583,22 @@ ChameleonSupportResolvers chameleon_build_support_resolvers(
     // ChameleonSupportResolvers::ironing_resolver's own comment (BrimFilament.hpp).
     out.ironing_resolver = out.interface_resolver;
 
-    // Base: UNCHANGED from v2.5d - walls are the tiebreaker only when nothing is above,
-    // and a base/wrap run never has anything "above" it to project onto in the first
-    // place (it abuts a wall AT ITS OWN Z) - no projection branch here, ever.
-    out.base_resolver = [&coplanar_wall_idx, base_wall_params](const Point &p) -> unsigned {
+    // v2.5f (GUI round 7 - user's standing fidelity ruling, see this function's own
+    // header comment in BrimFilament.hpp for the full decision rule + taper note): base
+    // now tries PROJECTION FIRST too, same shape as interface_resolver above - reuses
+    // the SAME projection_lookup (the projection view answers a role-agnostic "what's
+    // directly above this XY" question, so no new seam is needed here), falling through
+    // to coplanar_wall_idx (base's own coplanar-only electorate, v2.5d - NEVER band_idx)
+    // only on a projection miss - a base/wrap run with nothing above it still abuts a
+    // wall AT ITS OWN Z (the wrap case). Root cause for this extension: TREE support is
+    // ~99% base role (592mm interface vs 191,556mm base on the reference plate), so
+    // v2.5e's projection-first fix alone covered only the thin interface skin, leaving
+    // the visible bulk of a support column voting coplanar under a painted overhang
+    // start.
+    out.base_resolver = [&coplanar_wall_idx, base_wall_params, projection_lookup](const Point &p) -> unsigned {
+        unsigned proj_extruder = 0;
+        if (projection_lookup && projection_lookup(p, proj_extruder))
+            return proj_extruder;
         return brim_vote(coplanar_wall_idx, p, base_wall_params);
     };
 

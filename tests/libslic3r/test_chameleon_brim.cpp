@@ -3219,7 +3219,7 @@ TEST_CASE("v2.5d: empty coplanar_idx (support above the model's top walls) bucke
 // hand-rolled proxy that only exercises brim_vote/partition_support_entities directly
 // (the I1 gap: such a proxy could pass even if Print.cpp's real wiring diverged).
 
-TEST_CASE("chameleon_build_support_resolvers (v2.5e wiring pin): interface/ironing try projection first, base NEVER consults band_idx", "[chameleon]")
+TEST_CASE("chameleon_build_support_resolvers (v2.5f wiring pin): ALL THREE roles try projection first; base's fallthrough is coplanar_wall_idx, NEVER band_idx", "[chameleon]")
 {
     // Three DISTINCT extruders, one per source, so ANY wiring mistake swaps in a value
     // this test catches directly:
@@ -3227,9 +3227,18 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5e wiring pin): interface/ironi
     //    coplanar_wall_idx alone, it would return band_only_ext (10) instead of 20.
     //  - if interface_resolver ever stopped trying projection FIRST (e.g. fell straight
     //    to the band vote), it would return band_only_ext (10) instead of 30.
+    //  - v2.5f (the real RED this task's TDD pass pins): if base_resolver stayed on
+    //    v2.5e's wiring - a coplanar vote ONLY, no projection branch at all - it would
+    //    return coplanar_only_ext (20) even on a projection HIT, exactly the real-model
+    //    defect this task fixes (a base sample under a khaki surface still voting its
+    //    nearer teal coplanar wall instead of taking khaki). The "projection hit"
+    //    section below fails against v2.5e's chameleon_build_support_resolvers by hand-
+    //    execution; the "projection miss" section is unchanged in outcome from v2.5e
+    //    (base's own coplanar-vote fallback), kept here as the regression guard for
+    //    "base sample with NO surface above -> coplanar vote".
     const unsigned band_only_ext     = 10; // present ONLY in band_idx - base must never see this
-    const unsigned coplanar_only_ext = 20; // present ONLY in coplanar_wall_idx - base's true answer
-    const unsigned projection_ext    = 30; // returned by projection_lookup - interface's true answer
+    const unsigned coplanar_only_ext = 20; // present ONLY in coplanar_wall_idx - base's MISS answer
+    const unsigned projection_ext    = 30; // returned by projection_lookup - every role's HIT answer
     const unsigned iface_fallback    = 91;
     const unsigned base_fallback     = 92;
 
@@ -3239,26 +3248,47 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5e wiring pin): interface/ironi
     WallSampleIndex coplanar_wall_idx;
     coplanar_wall_idx.add_polyline(segment(-5, 0, 5, 0), coplanar_only_ext, 1);
 
-    // Unconditional hit - any query point resolves to projection_ext.
-    std::function<bool(const Point &, unsigned &)> projection_lookup =
-        [projection_ext](const Point &, unsigned &out_extruder) -> bool {
-            out_extruder = projection_ext;
-            return true;
-        };
-
     BrimVoteParams params;
     const Point    query(scale_(0), scale_(0));
 
-    ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
-        band_idx, coplanar_wall_idx, projection_lookup, params, iface_fallback, base_fallback);
+    SECTION("projection hit: ALL THREE roles resolve to the projected color outright, never their own wall vote")
+    {
+        // Unconditional hit - any query point resolves to projection_ext.
+        std::function<bool(const Point &, unsigned &)> projection_lookup =
+            [projection_ext](const Point &, unsigned &out_extruder) -> bool {
+                out_extruder = projection_ext;
+                return true;
+            };
 
-    // Interface: projection wins outright over band_idx's own (otherwise-nearest) wall.
-    CHECK(resolvers.interface_resolver(query) == projection_ext);
-    // Ironing: same callable as interface - see the dedicated "ironing == interface"
-    // test below for the fuller pin across hit/miss/fallback cases.
-    CHECK(resolvers.ironing_resolver(query) == projection_ext);
-    // Base: coplanar_wall_idx only - band_only_ext (10) must NEVER surface here.
-    CHECK(resolvers.base_resolver(query) == coplanar_only_ext);
+        ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
+            band_idx, coplanar_wall_idx, projection_lookup, params, iface_fallback, base_fallback);
+
+        // Interface/ironing: projection wins outright over band_idx's own (otherwise-
+        // nearest) wall - unchanged pin from v2.5e.
+        CHECK(resolvers.interface_resolver(query) == projection_ext);
+        CHECK(resolvers.ironing_resolver(query) == projection_ext);
+        // v2.5f: base now ALSO resolves the projected color on a hit - a v2.5e build of
+        // this function returns coplanar_only_ext (20) here instead, so this line is
+        // the wiring-pin's real RED for this task.
+        CHECK(resolvers.base_resolver(query) == projection_ext);
+    }
+
+    SECTION("projection miss: base falls through to coplanar_wall_idx, interface/ironing to band_idx - neither ever crosses into the other's electorate")
+    {
+        // Unconditional miss - "no surface above" for every role.
+        std::function<bool(const Point &, unsigned &)> projection_lookup =
+            [](const Point &, unsigned &) -> bool { return false; };
+
+        ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
+            band_idx, coplanar_wall_idx, projection_lookup, params, iface_fallback, base_fallback);
+
+        CHECK(resolvers.interface_resolver(query) == band_only_ext);
+        CHECK(resolvers.ironing_resolver(query) == band_only_ext);
+        // Base: coplanar_wall_idx only - band_only_ext (10) must NEVER surface here,
+        // exactly as before v2.5f (base's own coplanar vote is unchanged; only WHETHER
+        // it's the first tier or the fallback tier changed this task).
+        CHECK(resolvers.base_resolver(query) == coplanar_only_ext);
+    }
 }
 
 TEST_CASE("chameleon_build_support_resolvers (v2.5e): projection hit overrides a NEARER band_idx wall", "[chameleon]")
@@ -3297,6 +3327,46 @@ TEST_CASE("chameleon_build_support_resolvers (v2.5e): projection hit overrides a
 
     CHECK(resolvers.interface_resolver(query) == khaki_ext);
     CHECK(resolvers.ironing_resolver(query) == khaki_ext);
+}
+
+TEST_CASE("chameleon_build_support_resolvers (v2.5f): projection hit overrides a NEARER coplanar_wall_idx wall for BASE too", "[chameleon]")
+{
+    // Base's own mirror of the interface test just above - the exact GUI round 7
+    // scenario this task fixes: a khaki-painted overhang starts here; the BASE sample
+    // directly under it (a wrap/foot run, not an interface) must resolve to khaki even
+    // though a teal wall in coplanar_wall_idx sits GEOMETRICALLY nearer - "a support
+    // sample with model surface within the contact band directly above takes that
+    // surface's color" outranks base's own coplanar-wall vote outright, not merely a
+    // tie-break, mirroring interface's rule exactly as of v2.5f.
+    const unsigned khaki_ext = 3; // the model surface directly above the sample (projection)
+    const unsigned teal_ext  = 5; // a NEARER wall in coplanar_wall_idx - must lose
+    const unsigned fallback  = 9;
+
+    WallSampleIndex band_idx; // unused by base_resolver, left empty
+    WallSampleIndex coplanar_wall_idx;
+    coplanar_wall_idx.add_polyline(segment(0, 0.2, 30, 0.2), teal_ext, 1); // 0.2mm away
+
+    std::function<bool(const Point &, unsigned &)> projection_lookup =
+        [khaki_ext](const Point &, unsigned &out_extruder) -> bool {
+            out_extruder = khaki_ext;
+            return true;
+        };
+
+    BrimVoteParams params;
+    const Point    query(scale_(15), scale_(0));
+
+    // Sanity: coplanar_wall_idx alone really would pick teal here - proves this is a
+    // genuine "nearer wall" fixture, not a vacuous one where projection had nothing to
+    // beat.
+    BrimVoteParams sanity = params;
+    sanity.k                 = 1;
+    sanity.fallback_extruder = fallback;
+    REQUIRE(brim_vote(coplanar_wall_idx, query, sanity) == teal_ext);
+
+    ChameleonSupportResolvers resolvers = chameleon_build_support_resolvers(
+        band_idx, coplanar_wall_idx, projection_lookup, params, fallback, fallback);
+
+    CHECK(resolvers.base_resolver(query) == khaki_ext);
 }
 
 TEST_CASE("chameleon_build_support_resolvers (v2.5e): a projection miss falls through to the band_idx nearest-wall vote", "[chameleon]")

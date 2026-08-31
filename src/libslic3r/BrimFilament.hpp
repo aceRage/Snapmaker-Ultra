@@ -290,6 +290,13 @@ struct ProjectionLayerView {
 // below, inverting "surface above wins" for exactly the rim samples this rescue pass
 // exists to help.
 //
+// v2.5f: this same PASS 2 rescue is now also reachable from base's own projection-first
+// branch (chameleon_build_support_resolvers, this header - base did not consult
+// projection at all before v2.5f), so a tapering wall's base wrap samples can pick up
+// the upper layer's color up to CHAMELEON_PROJECTION_MARGIN_MM early the same way an
+// interface sample already could since v2.5e - see chameleon_build_support_resolvers'
+// own "Taper note" for why this is accepted, not a defect.
+//
 // Nearest-region search (used both for PASS 1's same-layer degenerate case and for every
 // PASS 2 resolution): among the layer's regions, the one whose raw slice polys are
 // NEAREST to p, over ALL of this layer's regions (not just the island that produced the
@@ -860,12 +867,17 @@ bool support_role_needs_interface_extruder(ExtrusionRole role);
 
 // v2.5e (upward cast for ironing/top interfaces into nearest_wall - the last planned
 // matching change per the v2.4 nearest_surface-drop decision: "the projection machinery
-// is retained as scaffolding for exactly this"): resolver bundle returned by
-// chameleon_build_support_resolvers below - the three per-support-layer role resolvers
-// chameleon_assign_support_interfaces (Print.cpp) feeds into its three
+// is retained as scaffolding for exactly this"); v2.5f (GUI round 7 - upward cast
+// extended to BASE too, see the decision-rule paragraph below): resolver bundle
+// returned by chameleon_build_support_resolvers below - the three per-support-layer
+// role resolvers chameleon_assign_support_interfaces (Print.cpp) feeds into its three
 // partition_support_entities calls (interface, base, ironing).
 struct ChameleonSupportResolvers {
     std::function<unsigned(const Point &)> interface_resolver;
+    // v2.5f: no longer "the walls-only one" - see chameleon_build_support_resolvers'
+    // own decision-rule comment below for base's now-identical-in-SHAPE (projection ->
+    // wall vote -> fallback) three-tier chain; only the wall vote's ELECTORATE
+    // (coplanar_wall_idx, never band_idx) still sets it apart from interface_resolver.
     std::function<unsigned(const Point &)> base_resolver;
     // Deliberately the SAME callable as interface_resolver, not merely equivalent
     // behavior - "ironing follows its interface" (v2.2 Task 3's own rule, still true
@@ -882,22 +894,44 @@ struct ChameleonSupportResolvers {
 // hand-rolled proxy that merely exercises the same underlying primitives (brim_vote/
 // partition_support_entities) the way v2.5d's own tests did.
 //
-// Decision rule (spec: user directive from the v2.4 nearest_surface-drop decision -
-// "upward-cast the surface-directly-above-a-sample-wins logic into nearest_wall for
-// IRONING + TOP INTERFACES"): AN INTERFACE TOUCHES THE SURFACE ABOVE IT - so interface
-// (and ironing, which "follows its interface") resolve PROJECTION FIRST via
-// `projection_lookup` (the model surface directly above a sample, when one covers it),
-// falling through to the nearest-wall vote over `band_idx` (the coplanar+contact-band
-// union, k=1, uncapped - unchanged from v2.5d) only when the projection MISSES (no band
-// layer's lslices cover the sample - see chameleon_pick_projection_region's own
-// contract above), and further to band_idx's own empty-index fallback_extruder return
-// when band_idx itself has no samples at all - a three-tier fallback chain (projection
-// -> band vote -> fallback scalar). Base is UNCHANGED from v2.5d: a base/wrap run abuts
-// a wall AT ITS OWN Z, never a model surface above it, so it is walls-only, always - the
-// nearest-wall vote over `coplanar_wall_idx` (k=1, uncapped), no projection branch at
-// all. WALLS ARE THE TIEBREAKER ONLY WHEN NOTHING IS ABOVE: that is exactly the
-// projection-miss fallthrough for interface/ironing, and the unconditional rule for
-// base (which never has anything "above" it to begin with).
+// Decision rule (v2.5f, GUI round 7 - user's standing fidelity ruling: "a support sample
+// with model surface within the contact band directly above takes that surface's color
+// [it will abut it or supports toward it]; the wall vote is for samples with nothing
+// overhead - base votes same-layer walls [wrap case], interface votes the band"): ALL
+// THREE ROLES now resolve PROJECTION FIRST via `projection_lookup` (the model surface
+// directly above a sample, when one covers it) - v2.5e made this true for interface (and
+// ironing, which "follows its interface"); v2.5f extends it to base. Root cause for the
+// extension: TREE support is ~99% base role (v2.5f forensics on the reference plate:
+// 592mm interface vs 191,556mm base), so v2.5e's projection-first fix covered only the
+// thin interface skin, leaving the visible BULK of a support column still voting
+// coplanar under a painted overhang start. Each role falls through to its own
+// nearest-wall vote only when the projection MISSES (no band layer's lslices cover the
+// sample - see chameleon_pick_projection_region's own contract above), and further to
+// that vote's own empty-index fallback_extruder return when its index has no samples at
+// all - a three-tier fallback chain (projection -> wall vote -> fallback scalar) for
+// every role alike. The two role-copies below share this SHAPE but differ in which
+// wall vote they fall through to, and that is now the ONLY thing that still tells them
+// apart: interface/ironing vote `band_idx` (the coplanar+contact-band union, k=1,
+// uncapped - unchanged from v2.5d); base votes `coplanar_wall_idx` (coplanar-idx-only,
+// v2.5d) - a base/wrap run with NOTHING above it still abuts a wall AT ITS OWN Z (the
+// wrap case), never the contact band above, so its fallthrough electorate stays
+// narrower than interface's. WALLS ARE THE TIEBREAKER ONLY WHEN NOTHING IS ABOVE: that
+// is exactly the projection-miss fallthrough, for every role, with no exception left.
+//
+// Taper note (v2.5f, accepted per the same fidelity ruling): at a tapering wall (e.g. a
+// claw or column that narrows as it rises), chameleon_pick_projection_region's PASS 2
+// (margin ring - see that function's own header comment) can resolve a base wrap sample
+// to the UPPER layer's color up to CHAMELEON_PROJECTION_MARGIN_MM (1.2mm, Print.cpp)
+// early - the ring grown around the higher, narrower layer's overhang reaches down and
+// catches a sample that is still geometrically closer to the lower layer's own wall.
+// This was already true for interface/ironing since v2.5e; v2.5f makes it true for base
+// too, for the same reason (same shared PASS 2 mechanism, now reached from base's own
+// projection-first branch as well). Accepted, not a regression to chase: colors switch
+// TOWARD the upcoming paint, which is the direction fidelity wants, and the v2.5d
+// coplanar-only fix for base's WALL VOTE (coplanar_wall_idx, not band_idx) is completely
+// unaffected by this - it is base's fallthrough tier, only reached on a projection miss,
+// so the old multi-layer teal-bleed-upward defect (v2.5d's own fix target) cannot return
+// through this path.
 //
 // `projection_lookup` is a deliberately narrow seam, NOT the raw ProjectionLayerView/
 // Layer* pair chameleon_projection_extruder_from_view (Print.cpp) actually consults:
@@ -912,22 +946,27 @@ struct ChameleonSupportResolvers {
 // union" regression is exactly the bug this extraction exists to catch) - so the seam is
 // drawn at "a callable answering hit-or-miss(+extruder) for one point", the same
 // std::function abstraction partition_support_entities' own `resolver` parameter
-// already uses elsewhere in this file. Print.cpp's caller supplies this as a small
+// already uses elsewhere in this file. v2.5f: base now consults this SAME seam too (see
+// the decision rule above - the projection view answers a role-agnostic "what's directly
+// above this XY" question), so `projection_lookup` staying generic/role-unaware was the
+// right call in v2.5e - extending it to a second role needed no change to the seam
+// itself, only to which resolver(s) call it. Print.cpp's caller supplies this as a small
 // lambda closing over its own already-built projection_view/projection_view_layers and
 // calling chameleon_projection_extruder_from_view - see that call site's own comment
 // (chameleon_assign_support_interfaces, Print.cpp). An empty/default-constructed
 // `projection_lookup` is treated as an unconditional miss (the `if (projection_lookup)`
 // check below short-circuits before ever calling it), so a caller with nothing to
-// project onto needs no special case.
+// project onto needs no special case - true for base_resolver now too.
 //
 // Lifetime: `band_idx`/`coplanar_wall_idx` are captured BY REFERENCE into the returned
 // resolvers (same contract Print.cpp's own inline lambdas relied on pre-v2.5e) -
 // callers must keep both alive for as long as the returned resolvers are used.
 // `projection_lookup` is captured BY VALUE (a std::function copy) into
-// interface_resolver/ironing_resolver, since the reference parameter itself does not
-// outlive this call - whatever `projection_lookup` closes over (Print.cpp's own
-// projection_view/projection_view_layers) must be kept alive by the caller the same way,
-// per that lambda's own capture-by-reference.
+// interface_resolver/ironing_resolver/base_resolver (v2.5f: base_resolver joins the
+// other two), since the reference parameter itself does not outlive this call -
+// whatever `projection_lookup` closes over (Print.cpp's own projection_view/
+// projection_view_layers) must be kept alive by the caller the same way, per that
+// lambda's own capture-by-reference.
 ChameleonSupportResolvers chameleon_build_support_resolvers(
     const WallSampleIndex &band_idx,
     const WallSampleIndex &coplanar_wall_idx,
