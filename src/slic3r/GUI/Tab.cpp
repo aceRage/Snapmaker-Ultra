@@ -5707,14 +5707,12 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
 
         // Orca: update presets for the selected printer
         if (m_type == Preset::TYPE_PRINTER && wxGetApp().app_config->get_bool("remember_printer_config")) {
-            // Ultra: the fork preserves the current project's filament colours across a printer switch
-            // only for "Snapmaker U1"; every other target printer falls to the bare update_selections()
-            // below, which restores that printer's OWN remembered filaments and clobbers the project's
-            // colours. Extend the preservation branch to multi-nozzle machines (H2D/H2D Pro/H2C), whose
-            // edited preset carries a 2-element nozzle_diameter, so switching to them keeps project colours.
-            const ConfigOptionFloats* ultra_nd = m_preset_bundle->printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter");
-            const bool ultra_multi_nozzle = (ultra_nd && ultra_nd->values.size() > 1);
-            if (preset_name.find("Snapmaker U1") != std::string::npos || ultra_multi_nozzle) {
+            // Ultra: preserve the current project's filament colours across EVERY printer switch.
+            // The stock/fork default (update_selections) restores the target printer's OWN
+            // AppConfig-remembered filaments, clobbering the project's colours. This was gated to
+            // "Snapmaker U1", then also to multi-nozzle machines; broadened to all printers so no
+            // switch drops project colours. (Per-printer colour memory yields to the active project.)
+            {
                 DynamicPrintConfig& projectConfig = m_preset_bundle->project_config;
                 std::vector<std::string> oldFilamentColors = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
                 std::vector<std::string> oldFilamentMultiColors;
@@ -5757,10 +5755,6 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
                 wxGetApp().app_config->set_printer_setting(preset_name, "filament_multi_colors", filamentMultiColors);
                 wxGetApp().app_config->set_printer_setting(preset_name, "filament_colour_mode", filamentColourModes);
 
-                wxGetApp().plater()->sidebar().on_filaments_change(m_preset_bundle->filament_presets.size());
-            } else {
-                // 非 U1 机型：使用默认行为
-                m_preset_bundle->update_selections(*wxGetApp().app_config);
                 wxGetApp().plater()->sidebar().on_filaments_change(m_preset_bundle->filament_presets.size());
             }
         }
