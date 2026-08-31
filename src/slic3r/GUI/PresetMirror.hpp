@@ -18,8 +18,9 @@ namespace Slic3r { namespace GUI {
 // Sources: %APPDATA%\BambuStudio\user\<uid>\ preferred, %APPDATA%\BambuStudioBeta\user\<uid>\ fallback.
 // Call BEFORE preset_bundle->load_presets() so the copies are on disk when it loads. Gated by the
 // AppConfig "sync_bambu_user_presets" toggle (default on). logged_in_uid may be empty (then the
-// newest numeric uid dir is used).
-void mirror_bambu_user_presets(const std::string& logged_in_uid);
+// newest numeric uid dir is used). Returns the number of preset files copied/updated this run
+// (0 = nothing new — caller can skip a preset reload).
+int mirror_bambu_user_presets(const std::string& logged_in_uid);
 
 }} // namespace Slic3r::GUI
 

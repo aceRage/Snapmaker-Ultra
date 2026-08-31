@@ -167,11 +167,11 @@ static const char* mirror_one(const bfs::path& src, const bfs::path& dst, const 
     return "copied";
 }
 
-void mirror_bambu_user_presets(const std::string& logged_in_uid)
+int mirror_bambu_user_presets(const std::string& logged_in_uid)
 {
     try {
         bfs::path src_uid = find_bambu_user_dir(logged_in_uid);
-        if (src_uid.empty()) { BOOST_LOG_TRIVIAL(info) << "[preset-mirror] no Bambu Studio user dir found; skipping"; return; }
+        if (src_uid.empty()) { BOOST_LOG_TRIVIAL(info) << "[preset-mirror] no Bambu Studio user dir found; skipping"; return 0; }
 
         bfs::path dst_root = bfs::path(Slic3r::data_dir()) / "user" / "default";
         boost::system::error_code ec;
@@ -222,11 +222,13 @@ void mirror_bambu_user_presets(const std::string& logged_in_uid)
             << " -> copied=" << copied << " uptodate=" << uptodate
             << " fork_native_protected=" << native_protected << " user_deletions_respected=" << respected
             << " errors=" << errors;
+        return copied;
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(error) << "[preset-mirror] failed: " << e.what();
     } catch (...) {
         BOOST_LOG_TRIVIAL(error) << "[preset-mirror] failed (unknown)";
     }
+    return 0;
 }
 
 }} // namespace Slic3r::GUI

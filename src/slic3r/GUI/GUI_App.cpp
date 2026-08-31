@@ -4848,6 +4848,23 @@ void GUI_App::enable_user_preset_folder(bool enable)
     GUI::wxGetApp().preset_bundle->update_user_presets_directory(DEFAULT_USER_FOLDER_NAME);
 }
 
+void GUI_App::sync_bambu_user_presets(bool force_refresh)
+{
+    if (!app_config || !app_config->get_bool("sync_bambu_user_presets"))
+        return;
+    std::string uid = (m_agent && m_agent->is_user_login()) ? m_agent->get_user_id() : std::string();
+    int copied = mirror_bambu_user_presets(uid);
+    if (copied > 0 || force_refresh) {
+        try {
+            preset_bundle->load_user_presets(DEFAULT_USER_FOLDER_NAME, ForwardCompatibilitySubstitutionRule::Enable);
+            if (mainframe) mainframe->update_side_preset_ui();
+            BOOST_LOG_TRIVIAL(info) << "[preset-mirror] refreshed preset UI after sync (copied=" << copied << ")";
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << "[preset-mirror] post-sync refresh failed: " << e.what();
+        }
+    }
+}
+
 void GUI_App::check_track_enable()
 {
     // Orca: alaways disable track event

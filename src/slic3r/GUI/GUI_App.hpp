@@ -625,6 +625,10 @@ private:
     void            handle_http_error(unsigned int status, std::string body);
     void            on_http_error(wxCommandEvent &evt);
     void            enable_user_preset_folder(bool enable);
+    // Ultra: re-mirror the logged-in Bambu Studio user presets into user\default\; when new/updated
+    // files were pulled (or force_refresh), reload user presets + refresh the preset UI. Used by the
+    // "Sync now" button and the printer-switch trigger. No-op if the toggle is off.
+    void            sync_bambu_user_presets(bool force_refresh);
 
     // BBS
     bool            is_studio_active();
