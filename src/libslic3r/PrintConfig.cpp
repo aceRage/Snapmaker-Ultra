@@ -463,6 +463,29 @@ static t_config_enum_values s_keys_map_PrimeVolumeMode {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(PrimeVolumeMode)
 
+// Ultra (dual-nozzle) shared helpers (see PrintConfig.hpp).
+std::string get_nozzle_volume_type_string(NozzleVolumeType nozzle_volume_type)
+{
+    for (const auto& kv : s_keys_map_NozzleVolumeType)
+        if (kv.second == int(nozzle_volume_type))
+            return kv.first;
+    return "Standard";
+}
+
+std::string format_diameter_to_str(double diameter)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f", diameter);
+    std::string s(buf);
+    // Trim trailing zeros (and a dangling dot) so 0.40 -> "0.4", matching nozzle_diameter strings.
+    if (s.find('.') != std::string::npos) {
+        size_t last = s.find_last_not_of('0');
+        if (s[last] == '.') --last;
+        s.erase(last + 1);
+    }
+    return s;
+}
+
 static t_config_enum_values s_keys_map_PrinterStructure {
     {"undefine",        int(PrinterStructure::psUndefine)},
     {"corexy",          int(PrinterStructure::psCoreXY)},

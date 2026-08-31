@@ -373,6 +373,12 @@ enum PrimeVolumeMode {
     pvmFast
 };
 
+// Ultra (dual-nozzle) helpers used across the ported grouping engine (MultiNozzleUtils,
+// FilamentGroup, ToolOrderUtils). Single source so every phase formats diameters and
+// nozzle-volume labels identically.
+std::string get_nozzle_volume_type_string(NozzleVolumeType nozzle_volume_type);
+std::string format_diameter_to_str(double diameter);
+
 enum RetractLiftEnforceType {
     rletAllSurfaces = 0,
     rletTopOnly,

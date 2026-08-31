@@ -293,6 +293,8 @@ set(lisbslic3r_sources
     MinimumSpanningTree.hpp
     MixedFilament.cpp
     MixedFilament.hpp
+    MultiNozzleUtils.cpp
+    MultiNozzleUtils.hpp
     filament_mixer.cpp
     filament_mixer.h
     filament_mixer_model.h

@@ -55,6 +55,11 @@ struct FilamentInfo
     /*for new ams mapping*/
     std::string ams_id;
     std::string slot_id;
+
+    /* Ultra (dual-nozzle): fields the ported grouping engine (MultiNozzleUtils) reads. */
+    std::vector<int> group_id;                 // logical nozzle ids this filament may map to
+    double           nozzle_diameter = 0.;     // nozzle diameter used for this filament
+    std::string      nozzle_volume_type = "Standard"; // volume-type label (BBS uses the string form here)
 };
 
 class BBLSliceInfo {
