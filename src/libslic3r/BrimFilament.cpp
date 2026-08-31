@@ -1537,4 +1537,60 @@ bool support_role_needs_interface_extruder(ExtrusionRole role)
     return role == erMixed || role == erSupportMaterialInterface || role == erIroning;
 }
 
+ChameleonSupportResolvers chameleon_build_support_resolvers(
+    const WallSampleIndex &band_idx,
+    const WallSampleIndex &coplanar_wall_idx,
+    const std::function<bool(const Point &, unsigned &)> &projection_lookup,
+    const BrimVoteParams &vote_params,
+    unsigned fallback_extruder,
+    unsigned base_fallback_extruder)
+{
+    // v2.2 final-review I1 / v2.5d: k=1, max_dist_mm=0 explicitly on both role copies -
+    // "nearest wall segment wins outright, no distance limit, no weighted vote" (spec
+    // C8, see this function's own header comment in BrimFilament.hpp) - only
+    // fallback_extruder and (v2.5d) which index each role votes against differ between
+    // the two role params below.
+    BrimVoteParams interface_wall_params    = vote_params;
+    interface_wall_params.k                 = 1;
+    interface_wall_params.max_dist_mm       = 0.0;
+    interface_wall_params.fallback_extruder = fallback_extruder;
+
+    BrimVoteParams base_wall_params    = vote_params;
+    base_wall_params.k                 = 1;
+    base_wall_params.max_dist_mm       = 0.0;
+    base_wall_params.fallback_extruder = base_fallback_extruder;
+
+    ChameleonSupportResolvers out;
+
+    // v2.5e: PROJECTION FIRST for interface - see this function's own header comment
+    // (BrimFilament.hpp) for the full three-tier fallback chain. `projection_lookup` is
+    // captured BY VALUE (a std::function copy, not a reference): it is only a reference
+    // PARAMETER of this function, so capturing it by reference into a lambda that
+    // outlives this call would dangle the instant chameleon_build_support_resolvers
+    // returns - copying the small callable itself is cheap, and whatever IT closes over
+    // (Print.cpp's own projection_view/projection_view_layers) is kept alive by the
+    // caller's own lifetime contract, unchanged (see this function's trailing "Lifetime"
+    // paragraph in the header).
+    out.interface_resolver = [&band_idx, interface_wall_params, projection_lookup](const Point &p) -> unsigned {
+        unsigned proj_extruder = 0;
+        if (projection_lookup && projection_lookup(p, proj_extruder))
+            return proj_extruder;
+        return brim_vote(band_idx, p, interface_wall_params);
+    };
+    // "Ironing follows its interface" (v2.2 Task 3, unchanged rule) - literally the SAME
+    // callable as interface_resolver above, not a separately-built copy that merely
+    // behaves the same, so the two can never drift apart by construction. See
+    // ChameleonSupportResolvers::ironing_resolver's own comment (BrimFilament.hpp).
+    out.ironing_resolver = out.interface_resolver;
+
+    // Base: UNCHANGED from v2.5d - walls are the tiebreaker only when nothing is above,
+    // and a base/wrap run never has anything "above" it to project onto in the first
+    // place (it abuts a wall AT ITS OWN Z) - no projection branch here, ever.
+    out.base_resolver = [&coplanar_wall_idx, base_wall_params](const Point &p) -> unsigned {
+        return brim_vote(coplanar_wall_idx, p, base_wall_params);
+    };
+
+    return out;
+}
+
 } // namespace Slic3r

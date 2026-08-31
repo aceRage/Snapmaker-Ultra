@@ -857,5 +857,84 @@ double gap_aware_lateral_cap_mm(double support_object_xy_distance_mm,
 // and so this classification is unit-testable without a full Print/ToolOrdering
 // scaffold.
 bool support_role_needs_interface_extruder(ExtrusionRole role);
+
+// v2.5e (upward cast for ironing/top interfaces into nearest_wall - the last planned
+// matching change per the v2.4 nearest_surface-drop decision: "the projection machinery
+// is retained as scaffolding for exactly this"): resolver bundle returned by
+// chameleon_build_support_resolvers below - the three per-support-layer role resolvers
+// chameleon_assign_support_interfaces (Print.cpp) feeds into its three
+// partition_support_entities calls (interface, base, ironing).
+struct ChameleonSupportResolvers {
+    std::function<unsigned(const Point &)> interface_resolver;
+    std::function<unsigned(const Point &)> base_resolver;
+    // Deliberately the SAME callable as interface_resolver, not merely equivalent
+    // behavior - "ironing follows its interface" (v2.2 Task 3's own rule, still true
+    // here) - chameleon_build_support_resolvers assigns this by copying
+    // interface_resolver verbatim, so the two can never drift apart by construction.
+    // The "ironing resolver == interface resolver" unit test pins exactly this.
+    std::function<unsigned(const Point &)> ironing_resolver;
+};
+
+// v2.5e (v2.5d final-review I1 fix: "no committed test pins Print.cpp's ACTUAL wiring -
+// extract the wiring block into a testable free function NEXT ROUND"): the resolver-
+// construction block chameleon_assign_support_interfaces (Print.cpp) used to build
+// inline is pulled out here, so a unit test can pin the ACTUAL production wiring - not a
+// hand-rolled proxy that merely exercises the same underlying primitives (brim_vote/
+// partition_support_entities) the way v2.5d's own tests did.
+//
+// Decision rule (spec: user directive from the v2.4 nearest_surface-drop decision -
+// "upward-cast the surface-directly-above-a-sample-wins logic into nearest_wall for
+// IRONING + TOP INTERFACES"): AN INTERFACE TOUCHES THE SURFACE ABOVE IT - so interface
+// (and ironing, which "follows its interface") resolve PROJECTION FIRST via
+// `projection_lookup` (the model surface directly above a sample, when one covers it),
+// falling through to the nearest-wall vote over `band_idx` (the coplanar+contact-band
+// union, k=1, uncapped - unchanged from v2.5d) only when the projection MISSES (no band
+// layer's lslices cover the sample - see chameleon_pick_projection_region's own
+// contract above), and further to band_idx's own empty-index fallback_extruder return
+// when band_idx itself has no samples at all - a three-tier fallback chain (projection
+// -> band vote -> fallback scalar). Base is UNCHANGED from v2.5d: a base/wrap run abuts
+// a wall AT ITS OWN Z, never a model surface above it, so it is walls-only, always - the
+// nearest-wall vote over `coplanar_wall_idx` (k=1, uncapped), no projection branch at
+// all. WALLS ARE THE TIEBREAKER ONLY WHEN NOTHING IS ABOVE: that is exactly the
+// projection-miss fallthrough for interface/ironing, and the unconditional rule for
+// base (which never has anything "above" it to begin with).
+//
+// `projection_lookup` is a deliberately narrow seam, NOT the raw ProjectionLayerView/
+// Layer* pair chameleon_projection_extruder_from_view (Print.cpp) actually consults:
+// resolving a projection HIT to an extruder needs a real PrintRegion's solid-infill-
+// filament chain (chameleon_projection_region_extruder, Print.cpp -
+// PrintRegion::extruder(frSolidInfill)), which needs a fully config-connected
+// PrintRegion/PrintObject - infrastructure no BrimFilament unit test builds today, and
+// dragging Layer.hpp/PrintRegion.hpp into this header for it would buy nothing this
+// function's OWN tests actually need to pin. What this function's tests care about is
+// only the WIRING - does interface try projection before band, does a miss fall
+// through, does base ever consult band_idx at all (it must not, or a "base wired to the
+// union" regression is exactly the bug this extraction exists to catch) - so the seam is
+// drawn at "a callable answering hit-or-miss(+extruder) for one point", the same
+// std::function abstraction partition_support_entities' own `resolver` parameter
+// already uses elsewhere in this file. Print.cpp's caller supplies this as a small
+// lambda closing over its own already-built projection_view/projection_view_layers and
+// calling chameleon_projection_extruder_from_view - see that call site's own comment
+// (chameleon_assign_support_interfaces, Print.cpp). An empty/default-constructed
+// `projection_lookup` is treated as an unconditional miss (the `if (projection_lookup)`
+// check below short-circuits before ever calling it), so a caller with nothing to
+// project onto needs no special case.
+//
+// Lifetime: `band_idx`/`coplanar_wall_idx` are captured BY REFERENCE into the returned
+// resolvers (same contract Print.cpp's own inline lambdas relied on pre-v2.5e) -
+// callers must keep both alive for as long as the returned resolvers are used.
+// `projection_lookup` is captured BY VALUE (a std::function copy) into
+// interface_resolver/ironing_resolver, since the reference parameter itself does not
+// outlive this call - whatever `projection_lookup` closes over (Print.cpp's own
+// projection_view/projection_view_layers) must be kept alive by the caller the same way,
+// per that lambda's own capture-by-reference.
+ChameleonSupportResolvers chameleon_build_support_resolvers(
+    const WallSampleIndex &band_idx,
+    const WallSampleIndex &coplanar_wall_idx,
+    const std::function<bool(const Point &, unsigned &)> &projection_lookup,
+    const BrimVoteParams &vote_params,
+    unsigned fallback_extruder,
+    unsigned base_fallback_extruder);
+
 } // namespace Slic3r
 #endif
