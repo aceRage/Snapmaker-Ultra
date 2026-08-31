@@ -194,6 +194,9 @@ static std::vector<std::string> s_project_options {
     "flush_multiplier",
     // Ultra: nozzle flow variant declared to the printer (metadata only; auto-matched at send)
     "nozzle_volume_type",
+    // Ultra (dual-nozzle): plate-level filament grouping state.
+    "filament_map", "filament_map_2", "filament_volume_map", "filament_nozzle_map", "filament_map_mode",
+    "enable_filament_dynamic_map", "has_filament_switcher", "prime_volume_mode",
     // Mixed filament / local-Z settings
     "mixed_filament_gradient_mode",
     "mixed_filament_height_lower_bound",

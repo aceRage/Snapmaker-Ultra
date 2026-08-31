@@ -860,6 +860,9 @@ protected: \
 PRINT_CONFIG_CLASS_DEFINE(
     PrintObjectConfig,
 
+    // Ultra (dual-nozzle): process-scope extruder-variant expansion keys.
+    ((ConfigOptionInts,                print_extruder_id))
+    ((ConfigOptionStrings,             print_extruder_variant))
     ((ConfigOptionFloat,               brim_object_gap))
     ((ConfigOptionEnum<BrimType>,      brim_type))
     ((ConfigOptionFloat,               brim_width))
@@ -1334,6 +1337,40 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionStrings,              small_area_infill_flow_compensation_model))
 
     ((ConfigOptionBool,                has_scarf_joint_seam))
+
+    // Ultra (dual-nozzle): struct members for the new multi-extruder options so they enter
+    // FullPrintConfig::defaults() and are not stripped by Preset::remove_invalid_keys. Preset-TYPE
+    // (printer/filament/project) is decided by the s_Preset_*_options / s_project_options lists, not
+    // by which struct they sit in, so they are grouped here. Nullable defs use their base type
+    // (machine_max_acceleration_x convention).
+    ((ConfigOptionEnumsGeneric,        nozzle_volume_type))
+    ((ConfigOptionEnumsGeneric,        extruder_type))
+    ((ConfigOptionEnumsGeneric,        default_nozzle_volume_type))
+    ((ConfigOptionEnumsGeneric,        extruder_nozzle_volume_type))
+    ((ConfigOptionStrings,             extruder_variant_list))
+    ((ConfigOptionStrings,             extruder_ams_count))
+    ((ConfigOptionInts,                extruder_nozzle_count))
+    ((ConfigOptionInts,                extruder_max_nozzle_count))
+    ((ConfigOptionInts,                printer_extruder_id))
+    ((ConfigOptionStrings,             printer_extruder_variant))
+    ((ConfigOptionInt,                 master_extruder_id))
+    ((ConfigOptionInts,                physical_extruder_map))
+    ((ConfigOptionPointsGroups,        extruder_printable_area))
+    ((ConfigOptionFloats,              extruder_printable_height))
+    ((ConfigOptionFloats,              grab_length))
+    ((ConfigOptionFloats,              hotend_cooling_rate))
+    ((ConfigOptionFloats,              hotend_heating_rate))
+    ((ConfigOptionInts,                nozzle_flush_dataset))
+    ((ConfigOptionStrings,             filament_extruder_variant))
+    ((ConfigOptionInts,                filament_self_index))
+    ((ConfigOptionBool,                enable_filament_dynamic_map))
+    ((ConfigOptionBool,                has_filament_switcher))
+    ((ConfigOptionEnum<PrimeVolumeMode>, prime_volume_mode))
+    ((ConfigOptionEnum<FilamentMapMode>, filament_map_mode))
+    ((ConfigOptionInts,                filament_map))
+    ((ConfigOptionInts,                filament_map_2))
+    ((ConfigOptionInts,                filament_volume_map))
+    ((ConfigOptionInts,                filament_nozzle_map))
 )
 
 // This object is mapped to Perl as Slic3r::Config::Print.

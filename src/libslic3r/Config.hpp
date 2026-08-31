@@ -1371,6 +1371,13 @@ public:
     ConfigOption*           clone() const override { return new ConfigOptionPointsGroups(*this); }
     ConfigOptionPointsGroups& operator=(const ConfigOption *opt) { this->set(opt); return *this; }
     bool                    operator==(const ConfigOptionPointsGroups &rhs) const throw() { return this->values == rhs.values; }
+    bool                    operator<(const ConfigOptionPointsGroups &rhs) const throw() {
+        return std::lexicographical_compare(this->values.begin(), this->values.end(), rhs.values.begin(), rhs.values.end(),
+            [](const Vec2ds &l, const Vec2ds &r) {
+                return std::lexicographical_compare(l.begin(), l.end(), r.begin(), r.end(),
+                    [](const Vec2d &a, const Vec2d &b) { return a.x() != b.x() ? a.x() < b.x() : a.y() < b.y(); });
+            });
+    }
     bool                    operator==(const ConfigOption &rhs) const override {
         if (rhs.type() != this->type())
             throw ConfigurationError("ConfigOptionPointsGroups: Comparing incompatible types");

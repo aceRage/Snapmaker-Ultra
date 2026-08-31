@@ -869,6 +869,7 @@ bool Preset::has_cali_lines(PresetBundle* preset_bundle)
 }
 
 static std::vector<std::string> s_Preset_print_options {
+    "print_extruder_id", "print_extruder_variant", // Ultra (dual-nozzle)
     "layer_height", "initial_layer_print_height", "wall_loops", "alternate_extra_wall", "slice_closing_radius", "spiral_mode", "spiral_mode_smooth", "spiral_mode_max_xy_smoothing", "spiral_starting_flow_ratio", "spiral_finishing_flow_ratio", "slicing_mode",
     "top_shell_layers", "top_shell_thickness", "top_surface_density", "bottom_surface_density", "bottom_shell_layers", "bottom_shell_thickness",
     "extra_perimeters_on_overhangs", "ensure_vertical_shell_thickness", "reduce_crossing_wall", "detect_thin_wall", "offset_layers", "detect_overhang_wall", "unsupported_wall_last", "overhang_reverse", "overhang_reverse_threshold","overhang_reverse_internal_only", "wall_direction",
@@ -935,6 +936,7 @@ static std::vector<std::string> s_Preset_print_options {
 };
 
 static std::vector<std::string> s_Preset_filament_options {
+    "filament_extruder_variant", "filament_self_index", // Ultra (dual-nozzle)
     /*"filament_colour", */ "default_filament_colour","required_nozzle_HRC","filament_diameter", "pellet_flow_coefficient", "filament_type", "filament_soluble", "filament_is_support",
     "filament_max_volumetric_speed",
     "filament_flow_ratio", "filament_density", "filament_cost", "filament_z_offset", "filament_minimal_purge_on_wipe_tower",
@@ -983,6 +985,11 @@ static std::vector<std::string> s_Preset_machine_limits_options {
 };
 
 static std::vector<std::string> s_Preset_printer_options {
+    // Ultra (dual-nozzle): per-extruder machine descriptors + variant matrix.
+    "extruder_type", "default_nozzle_volume_type", "extruder_nozzle_volume_type", "extruder_variant_list",
+    "extruder_ams_count", "extruder_nozzle_count", "extruder_max_nozzle_count", "printer_extruder_id",
+    "printer_extruder_variant", "master_extruder_id", "physical_extruder_map", "extruder_printable_area",
+    "extruder_printable_height", "grab_length", "hotend_cooling_rate", "hotend_heating_rate", "nozzle_flush_dataset",
     "printer_technology",
     "printable_area", "bed_exclude_area","bed_custom_texture", "bed_custom_model", "gcode_flavor",
     "fan_kickstart", "fan_speedup_time", "fan_speedup_overhangs",
