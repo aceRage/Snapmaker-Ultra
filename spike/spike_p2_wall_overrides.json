@@ -1,6 +1,6 @@
 {
     "type": "process",
-    "name": "spike support overrides p2 nearest_wall",
+    "name": "spike support overrides p2 legacy nearest_wall",
     "from": "User",
     "inherits": "0.20mm Standard @BBL X1C",
     "compatible_printers": ["Bambu Lab X1 Carbon 0.4 nozzle"],

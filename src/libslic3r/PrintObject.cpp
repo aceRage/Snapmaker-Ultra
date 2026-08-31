@@ -1025,10 +1025,10 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "support_interface_pattern"
             || opt_key == "support_interface_loop_pattern"
             || opt_key == "support_interface_filament"
-            // chameleon P2: switching manual/nearest_wall changes what
+            // chameleon P2: toggling support_filament_matching changes what
             // interface_by_extruder holds (or whether it's populated at all), so
             // re-run posSupportMaterial exactly like a support_interface_filament change.
-            || opt_key == "support_interface_filament_source"
+            || opt_key == "support_filament_matching"
             || opt_key == "support_interface_not_for_body"
             || opt_key == "support_interface_spacing"
             || opt_key == "support_bottom_interface_spacing" //BBS

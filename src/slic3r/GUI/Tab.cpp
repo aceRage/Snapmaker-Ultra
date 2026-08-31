@@ -2529,12 +2529,15 @@ void TabPrint::build()
         optgroup = page->new_optgroup(L("Support filament"), L"param_support_filament");
         optgroup->append_single_option_line("support_filament", "support_settings_filament#base");
         optgroup->append_single_option_line("support_interface_filament", "support_settings_filament#interface");
-        // I3 fix: wire support_interface_filament_source into the GUI, mirroring Part
+        // I3 fix: wire support_filament_matching into the GUI, mirroring Part
         // 1's brim_filament_source wiring at Tab.cpp:2650 (same pattern: no wiki
         // fragment yet, comAdvanced). Without this the setting was invisible/unsettable
         // in the GUI, blocking the plan's GUI validation - the only place the
         // cross-extruder path can fire (CLI collapses to one extruder per task-4).
-        optgroup->append_single_option_line("support_interface_filament_source");
+        // v2.6: the option itself became a plain checkbox (was a manual/nearest_wall
+        // enum) - no change needed here, append_single_option_line renders whatever
+        // GUI widget the option's coType calls for.
+        optgroup->append_single_option_line("support_filament_matching");
         optgroup->append_single_option_line("support_interface_not_for_body", "support_settings_filament#avoid-interface-filament-for-base");
 
         optgroup = page->new_optgroup(L("Support ironing"), L"param_ironing");

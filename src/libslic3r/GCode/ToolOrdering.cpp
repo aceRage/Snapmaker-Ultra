@@ -1471,8 +1471,8 @@ bool WipingExtrusions::is_support_overriddable(const ExtrusionRole role, const P
         return false;
 
     // v2.5a (spec item 1, "residual pin", root cause A of the khaki-in-white/teal-
-    // support symptom): a mode-active object (support_interface_filament_source !=
-    // sifsManual, i.e. opted into per-bucket color matching) is NEVER overriddable
+    // support symptom): a mode-active object (support_filament_matching.value, i.e.
+    // opted into per-bucket color matching) is NEVER overriddable
     // by WipingExtrusions, for ANY role, regardless of the scalar support_filament/
     // support_interface_filament checks below. Matched buckets are already removed
     // from support_fills by chameleon_assign_support_interfaces (Print.cpp) and
@@ -1485,10 +1485,10 @@ bool WipingExtrusions::is_support_overriddable(const ExtrusionRole role, const P
     // true here, flush_into_support's mark_wiping_extrusions (below) could still
     // claim and repaint that residual geometry with an arbitrary purge-target
     // extruder on every qualifying toolchange, including one with no nearby
-    // geometry at all (the reported symptom). Off (manual mode, the default) is
+    // geometry at all (the reported symptom). Off (checkbox unchecked, the default) is
     // completely unaffected - falls straight through to the pre-v2.5a role-based
     // logic below, byte-identical.
-    if (object.config().support_interface_filament_source.value != sifsManual)
+    if (object.config().support_filament_matching.value)
         return false;
 
     if (role == erMixed) {
@@ -1637,7 +1637,7 @@ float WipingExtrusions::mark_wiping_extrusions(const Print& print, unsigned int 
                     // (chameleon_assign_support_interfaces, Print.cpp, removes them
                     // from support_fills entirely and never calls into
                     // WipingExtrusions/support_map/support_intf_map for them).
-                    assert(object_config.support_interface_filament_source.value == sifsManual
+                    assert(!object_config.support_filament_matching.value
                            || (!support_overriddable && !support_intf_overriddable));
                     if (!support_overriddable && !support_intf_overriddable)
                         break;

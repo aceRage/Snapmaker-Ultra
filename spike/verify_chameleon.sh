@@ -8,19 +8,28 @@
 #      guard bound, brim feature present) AND determinism of two consecutive
 #      nearest_wall slices.
 #   3. (Part 2) Support Interface Auto-Match on the tshape.stl fixture:
-#      manual-mode support-region identity vs p2_baseline.gcode (tower off/on),
-#      and (v2.4 spec A/D) a LEGACY-ALIAS check: spike_p2_overrides.json still
-#      literally sets support_interface_filament_source = "nearest_surface" -
-#      the enum value v2.4 removed - proving PrintConfigDef::handle_legacy's
-#      new alias (PrintConfig.cpp, mirrors the draft_shield "limited" value-
-#      remap precedent) migrates it to "nearest_wall" instead of silently
-#      substituting the default (manual). Retargeted from this section's
-#      pre-v2.4 "nearest_surface-mode sanity" checks - see the section's own
-#      comment below for exactly what's asserted and why.
-#   4. (Part 2, v2.2 Task 4, spec C8) nearest_wall-mode sanity (exit 0,
-#      bounded M620 growth, feature-tag presence; tower off/on) plus a
-#      determinism repeat. Checks are prefixed "p2-wall-" to avoid colliding
-#      with section 2's unrelated "nearestwall-*" (Part 1
+#      manual/off-mode support-region identity vs p2_baseline.gcode (tower off/on,
+#      plus a v2.6 LEGACY-KEY check that the old "manual" string still resolves
+#      to matching DISABLED), and (v2.4 spec A/D, retargeted for v2.6) a
+#      LEGACY-KEY check: spike_p2_overrides.json still literally sets
+#      support_interface_filament_source = "nearest_surface" - the enum key
+#      v2.6 removed entirely (replacing it with the support_filament_matching
+#      checkbox) - proving PrintConfigDef::handle_legacy's rename+remap branch
+#      (PrintConfig.cpp, folds together the v2.4 "nearest_surface" alias and
+#      the v2.6 enum-to-bool migration) migrates it to
+#      support_filament_matching = "1" instead of silently substituting the
+#      default (matching disabled). Retargeted from this section's pre-v2.4
+#      "nearest_surface-mode sanity" checks - see the section's own comment
+#      below for exactly what's asserted and why.
+#   4. (Part 2, v2.2 Task 4, spec C8; retargeted for v2.6) a SECOND LEGACY-KEY
+#      check: spike_p2_wall_overrides.json still literally sets
+#      support_interface_filament_source = "nearest_wall" - also removed by
+#      v2.6 - proving the same handle_legacy branch migrates THIS old value to
+#      support_filament_matching = "1" too (both old non-manual values land on
+#      matching ENABLED). Bounded M620 growth + feature-tag presence (tower
+#      off/on) plus a determinism repeat round out the group, same sanity bar
+#      as section 3's checks. Checks are prefixed "p2-wall-" to avoid
+#      colliding with section 2's unrelated "nearestwall-*" (Part 1
 #      brim_filament_source=nearest_wall) checks.
 #
 # Run from anywhere; the script cd's into its own directory (spike/) first so
@@ -59,17 +68,23 @@ M620_MAX=10
 # Support Interface Auto-Match (Part 2) fixtures
 # ---------------------------------------------------------------------------
 TSHAPE="tshape.stl"
-P2_MANUAL_OVERRIDES="spike_support_overrides.json"    # support_interface_filament_source = manual (default)
-# v2.4 (spec A/D): this fixture's value is DELIBERATELY left as the literal string
-# "nearest_surface" - the enum value v2.4 removed - so it now serves as the
-# legacy-alias check's own fixture (section 3 below) instead of the pre-v2.4
-# "nearest_surface-mode sanity" checks it used to drive. Do NOT edit its content to
-# "nearest_wall": the whole point of the section 3 checks is proving the OLD string
-# still slices correctly via PrintConfigDef::handle_legacy's new alias.
+# v2.6: this fixture's value is now DELIBERATELY the OLD key/value -
+# support_interface_filament_source = "manual" - so it doubles as a THIRD
+# legacy-key check (section 3a below): the old "manual" string must resolve to
+# support_filament_matching = disabled, same as the option's own default.
+P2_MANUAL_OVERRIDES="spike_support_overrides.json"
+# v2.4 (spec A/D), retargeted v2.6: this fixture's value is DELIBERATELY left as the
+# literal old key/string support_interface_filament_source = "nearest_surface" - both
+# the enum value (v2.4) and the enum option itself (v2.6, replaced by the
+# support_filament_matching checkbox) are gone - so it now serves as one of the two
+# legacy-key check fixtures (section 3 below). Do NOT edit its content to the new
+# key: the whole point of the section 3 checks is proving the OLD key/string still
+# slices correctly via PrintConfigDef::handle_legacy's rename+remap branch.
 P2_NEAREST_OVERRIDES="spike_p2_overrides.json"
-# v2.2 Task 4 (spec C8): support_interface_filament_source = nearest_wall - the
-# surviving mode (v2.4 dropped nearest_surface). Same fixture/shape as
-# P2_NEAREST_OVERRIDES, just the current enum value spelled directly.
+# v2.2 Task 4 (spec C8), retargeted v2.6: support_interface_filament_source =
+# nearest_wall - the OLD key/value, also gone as of v2.6. Same fixture/shape as
+# P2_NEAREST_OVERRIDES, just the other old non-manual value spelled directly - the
+# second of the two legacy-key check fixtures (section 4 below).
 P2_WALL_OVERRIDES="spike_p2_wall_overrides.json"
 P2_BASELINE="out/p2_baseline.gcode"                   # recorded pre-Task-4 (HEAD a157ac6cf8): manual mode, tower off, single PLA filament
 
@@ -124,13 +139,20 @@ record() {
 #   - "; brim_filament_source = ..." config-dump line (value differs
 #     object vs nearest_wall by design, and is entirely absent from the
 #     pre-Task-3 baseline_clean.gcode, which predates that config key)
-#   - "; support_interface_filament_source = ..." config-dump line (Task 2
-#     added this key after baseline_clean.gcode was recorded in Part 1, so
-#     every current slice — including plain object-mode ones with support
-#     untouched — now dumps one extra CONFIG_BLOCK line baseline_clean.gcode
-#     doesn't have; confirmed via Task 4's diff investigation to be the
-#     *only* diff for the pre-existing Part 1 object-mode checks, i.e. a
-#     stale-normalize gap from Task 2/3, not a Task 4 regression)
+#   - "; support_interface_filament_source = ..." AND "; support_filament_matching
+#     = ..." config-dump lines (Task 2 added the former key after
+#     baseline_clean.gcode was recorded in Part 1, so every current slice —
+#     including plain object-mode ones with support untouched — dumps one extra
+#     CONFIG_BLOCK line baseline_clean.gcode doesn't have; confirmed via Task
+#     4's diff investigation to be the *only* diff for the pre-existing Part 1
+#     object-mode checks, i.e. a stale-normalize gap from Task 2/3, not a Task
+#     4 regression. v2.6 renamed the key to the latter when the enum became a
+#     checkbox - but baseline_clean.gcode was re-recorded at some point under
+#     the OLD name (it literally contains "; support_interface_filament_source
+#     = manual", verified via direct diff), while every current build now
+#     emits the NEW name - so BOTH patterns must stay stripped: dropping the
+#     old-name line here would silently reintroduce the exact gap this filter
+#     exists to close, just flipped to the opposite fixture.)
 #   - the "id:<N> copy 0" suffix on "; printing object ..." / "; stop printing
 #     object ..." comments — this per-object numeric id is run-to-run
 #     nondeterministic (confirmed by back-to-back identical-command runs in
@@ -164,6 +186,7 @@ normalize() {
         -e '/^; at /d' \
         -e '/^; brim_filament_source/d' \
         -e '/^; support_interface_filament_source/d' \
+        -e '/^; support_filament_matching/d' \
         -e '/^M73/d' \
         -e '/^; model printing time/d' \
         -e '/^; estimated first layer printing time/d' \
@@ -379,43 +402,59 @@ fi
 # migration evidence (unlike a real multi-filament GUI plate) - see 3c's own
 # comment for what they use instead.
 #
-# 3c (v2.4 spec A/D): LEGACY-ALIAS check. spike_p2_overrides.json still
-# literally sets support_interface_filament_source = "nearest_surface" - the
-# enum value v2.4 removed (PrintConfig.hpp/.cpp) - so slicing with it
-# exercises PrintConfigDef::handle_legacy's new alias (mirrors the
-# draft_shield "limited" value-remap precedent) end to end. Without that
-# alias, ConfigOptionEnum<T>::from_string would fail to find "nearest_surface"
-# in s_keys_map_SupportInterfaceFilamentSource and Config.cpp's
-# set_deserialize_raw would silently substitute the option's DEFAULT
-# (manual) instead - so "it still slices" alone is NOT sufficient proof the
-# alias worked (a silent-manual substitution also slices without error).
-# Three independent, config-level signals distinguish the two outcomes
-# (chosen specifically because the CLI LIMITATION above rules out the
-# per-object BOOST_LOG line as evidence on this fixture):
+# 3a (v2.6): LEGACY-KEY check, "manual" value. spike_support_overrides.json now
+# literally sets support_interface_filament_source = "manual" - the option key
+# itself v2.6 removed entirely (replaced by the support_filament_matching
+# checkbox, PrintConfig.hpp/.cpp) - so this doubles as the "old value -> matching
+# DISABLED" leg of the legacy-key proof, on top of its original identity-vs-
+# baseline role.
+#
+# 3c (v2.4 spec A/D, retargeted v2.6): LEGACY-KEY check, "nearest_surface" value.
+# spike_p2_overrides.json still literally sets support_interface_filament_source
+# = "nearest_surface" - both the enum value (v2.4) and the enum option itself
+# (v2.6) are gone - so slicing with it exercises PrintConfigDef::handle_legacy's
+# rename+remap branch (folds together the old v2.4 value-remap and the v2.6
+# enum-to-bool migration) end to end. Without that branch,
+# ConfigOptionEnum<T>::from_string would fail to find "nearest_surface" (the enum
+# no longer even exists) and Config.cpp's set_deserialize_raw would silently
+# substitute the option's DEFAULT (matching disabled) instead - so "it still
+# slices" alone is NOT sufficient proof the migration worked (a silent-disabled
+# substitution also slices without error). Three independent, config-level
+# signals distinguish the two outcomes (chosen specifically because the CLI
+# LIMITATION above rules out the per-object BOOST_LOG line as evidence on this
+# fixture):
 #   1. exit 0 (baseline: didn't crash/error).
 #   2. The load_config_file log line for this fixture reads "no substitutions
 #      performed from file spike_p2_overrides.json" - PROVES handle_legacy
-#      consumed "nearest_surface" and rewrote it to a value the enum DOES
-#      recognize BEFORE deserialize ever ran, so the later substitution-
-#      logging path (Config.cpp set_deserialize_raw, which WOULD log "Found
-#      legacy configuration values, substituted...") never triggers. A
-#      substitution-logged run means the alias did NOT fire and the value
-#      silently fell back to manual.
+#      consumed "nearest_surface" and rewrote it (opt_key AND value) to
+#      something the CURRENT config def DOES recognize BEFORE deserialize ever
+#      ran, so the later substitution-logging path (Config.cpp
+#      set_deserialize_raw, which WOULD log "Found legacy configuration values,
+#      substituted...") never triggers. A substitution-logged run means the
+#      migration did NOT fire and the value silently fell back to the default
+#      (matching disabled).
 #   3. The output gcode's CONFIG_BLOCK dump contains the literal line
-#      "; support_interface_filament_source = nearest_wall" (GCode.cpp
-#      append_full_config, "; <key> = <value>") - the RESOLVED value after
-#      migration. "= manual" here would mean the alias silently lost the
-#      user's intent even if signal 2 above somehow still passed.
-# Bounded M620 growth + feature-tag presence (the same sanity bar the pre-
-# v2.4 nearest_surface checks used) round out the group as cheap defense-in-
-# depth, plus a determinism repeat.
+#      "; support_filament_matching = 1" (GCode.cpp append_full_config,
+#      "; <key> = <value>") - the RESOLVED value after migration, under its NEW
+#      key. "= 0" (or the key missing entirely) here would mean the migration
+#      silently lost the user's intent even if signal 2 above somehow still
+#      passed.
+# Section 4 below repeats signals 2-3 for the OTHER old non-manual value,
+# "nearest_wall" (spike_p2_wall_overrides.json) - both old values must resolve
+# to matching ENABLED. Bounded M620 growth + feature-tag presence (the same
+# sanity bar the pre-v2.4 nearest_surface checks used) round out the group as
+# cheap defense-in-depth, plus a determinism repeat.
 # ---------------------------------------------------------------------------
 
-# --- 3a. Manual mode, tower OFF: identity (support-scoped) vs the frozen
-#         pre-Task-4 baseline. Single PLA filament, matching exactly how
+# --- 3a. Manual (old key) mode, tower OFF: identity (support-scoped) vs the
+#         frozen pre-Task-4 baseline. Single PLA filament, matching exactly how
 #         p2_baseline.gcode was itself recorded (Task 3), so this is a true
-#         apples-to-apples comparison.
-run_slice_p2 "$P2_MANUAL_OVERRIDES" "$FIL_PLA" "$OUT_P2_MAN_OFF" "out/p2_manual_off.log"
+#         apples-to-apples comparison. --debug=3 (see 3c's header comment for
+#         why) also lets this run double as the "manual" leg of the v2.6
+#         legacy-key proof: two signals below the identity check confirm the
+#         old "manual" string resolves to support_filament_matching = disabled
+#         (not just silently defaulted to it, which would look identical here).
+run_slice_p2 "$P2_MANUAL_OVERRIDES" "$FIL_PLA" "$OUT_P2_MAN_OFF" "out/p2_manual_off.log" --debug=3
 p2man_off_rc=$?
 if [ $p2man_off_rc -eq 0 ]; then record "p2-manual-off-exit0" PASS "exit 0"
 else record "p2-manual-off-exit0" FAIL "exit $p2man_off_rc — see out/p2_manual_off.log"; fi
@@ -426,8 +465,29 @@ if [ $p2man_off_rc -eq 0 ]; then
     else
         record "p2-manual-off-vs-baseline" FAIL "support-region diff vs $P2_BASELINE — see diff manually"
     fi
+
+    # v2.6 legacy-key signal 2 (mirrors 3c's signal 2): handle_legacy consumed
+    # "manual" cleanly under the OLD key - no deserialize-failure substitution
+    # was ever logged for this file.
+    if grep -qE "no substitutions performed from file .*spike_support_overrides\.json" "out/p2_manual_off.log"; then
+        record "p2-manual-legacy-no-substitution-notice" PASS "handle_legacy migration fired silently (no Config.cpp fallback substitution logged)"
+    else
+        record "p2-manual-legacy-no-substitution-notice" FAIL "expected 'no substitutions performed from file ...spike_support_overrides.json' in out/p2_manual_off.log — see log manually"
+    fi
+
+    # v2.6 legacy-key signal 3 (mirrors 3c's signal 3): the RESOLVED config
+    # value in the output gcode's CONFIG_BLOCK, under the NEW key, is 0
+    # (disabled) - proves the old "manual" string migrated to matching-off
+    # rather than merely happening to already be the default.
+    if grep -qE "^; support_filament_matching = 0" "$OUT_P2_MAN_OFF"; then
+        record "p2-manual-legacy-resolved-disabled" PASS "CONFIG_BLOCK shows support_filament_matching = 0"
+    else
+        record "p2-manual-legacy-resolved-disabled" FAIL "'; support_filament_matching = 0' not found in $OUT_P2_MAN_OFF"
+    fi
 else
     record "p2-manual-off-vs-baseline" FAIL "skipped: slice did not complete"
+    record "p2-manual-legacy-no-substitution-notice" FAIL "skipped: slice did not complete"
+    record "p2-manual-legacy-resolved-disabled" FAIL "skipped: slice did not complete"
 fi
 
 # --- 3b. Manual mode, tower ON. NOTE: PrintApply.cpp's normalize_fdm_2
@@ -487,13 +547,13 @@ if [ $p2legacy_off1_rc -eq 0 ]; then
         record "p2-legacy-no-substitution-notice" FAIL "expected 'no substitutions performed from file ...spike_p2_overrides.json' in out/p2_legacy_off_1.log — see log manually"
     fi
 
-    # Signal 3: the RESOLVED config value in the output gcode's CONFIG_BLOCK
-    # is nearest_wall, not manual - proves the alias migrated the value
-    # rather than a substitution silently defaulting it.
-    if grep -qE "^; support_interface_filament_source = nearest_wall" "$OUT_P2_LEGACY_OFF_1"; then
-        record "p2-legacy-resolved-nearest-wall" PASS "CONFIG_BLOCK shows support_interface_filament_source = nearest_wall"
+    # Signal 3: the RESOLVED config value in the output gcode's CONFIG_BLOCK,
+    # under the NEW key, is 1 (enabled), not 0 - proves the migration turned
+    # the checkbox on rather than a substitution silently defaulting it off.
+    if grep -qE "^; support_filament_matching = 1" "$OUT_P2_LEGACY_OFF_1"; then
+        record "p2-legacy-resolved-matching-enabled" PASS "CONFIG_BLOCK shows support_filament_matching = 1"
     else
-        record "p2-legacy-resolved-nearest-wall" FAIL "'; support_interface_filament_source = nearest_wall' not found in $OUT_P2_LEGACY_OFF_1"
+        record "p2-legacy-resolved-matching-enabled" FAIL "'; support_filament_matching = 1' not found in $OUT_P2_LEGACY_OFF_1"
     fi
 
     total_layers=$(total_layers_of "$OUT_P2_LEGACY_OFF_1")
@@ -514,7 +574,7 @@ if [ $p2legacy_off1_rc -eq 0 ]; then
     fi
 else
     record "p2-legacy-no-substitution-notice" FAIL "skipped: run did not slice"
-    record "p2-legacy-resolved-nearest-wall" FAIL "skipped: run did not slice"
+    record "p2-legacy-resolved-matching-enabled" FAIL "skipped: run did not slice"
     record "p2-legacy-m620-bounds" FAIL "skipped: run did not slice"
     record "p2-legacy-feature-present" FAIL "skipped: run did not slice"
 fi
@@ -537,20 +597,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Support Interface Auto-Match (Part 2) — nearest_wall mode (v2.2 Task 4,
-#    spec C8; v2.4 spec A the sole surviving mode). Same tshape.stl fixture
-#    and the same CLI LIMITATION/CAVEAT notes as section 3 above apply here
-#    verbatim (single used extruder on this CLI fixture, so this validates
-#    no-crash / well-formed output / feature-tag presence / determinism, not
-#    real cross-extruder matching — see section 3's own comment block for the
-#    full rationale). Checks are prefixed "p2-wall-" (NOT "nearestwall-", which section 2 above
+# 4. Support Interface Auto-Match (Part 2) — LEGACY-KEY check, "nearest_wall"
+#    value (v2.2 Task 4, spec C8; v2.4 spec A the sole surviving enum value;
+#    retargeted v2.6: the enum option itself is gone, replaced by the
+#    support_filament_matching checkbox, so this fixture's old key/value is now
+#    this section's own legacy-key fixture, mirroring section 3c's
+#    "nearest_surface" one - both old non-manual values must resolve to
+#    matching ENABLED). Same tshape.stl fixture and the same CLI
+#    LIMITATION/CAVEAT notes as section 3 above apply here verbatim (single
+#    used extruder on this CLI fixture, so this validates no-crash /
+#    well-formed output / feature-tag presence / determinism, not real
+#    cross-extruder matching — see section 3's own comment block for the full
+#    rationale). Checks are prefixed "p2-wall-" (NOT "nearestwall-", which section 2 above
 #    already uses for the unrelated Part 1 brim_filament_source=nearest_wall
 #    checks) so the two features' checks never collide in the results table.
 # ---------------------------------------------------------------------------
 
-# --- 4a. nearest_wall mode, tower OFF: no-crash + bounded M620 growth +
-#         feature-tag presence.
-run_slice_p2 "$P2_WALL_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_WALL_OFF_1" "out/p2_wall_off_1.log"
+# --- 4a. nearest_wall (old key) mode, tower OFF: no-crash + bounded M620
+#         growth + feature-tag presence, plus the same two legacy-key signals
+#         section 3c uses (--debug=3, no-substitution-notice, resolved value) -
+#         see 3c's own header comment for why these are the evidence used
+#         instead of the per-object BOOST_LOG line.
+run_slice_p2 "$P2_WALL_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_WALL_OFF_1" "out/p2_wall_off_1.log" --debug=3
 p2wall_off1_rc=$?
 if [ $p2wall_off1_rc -eq 0 ]; then record "p2-wall-off-exit0" PASS "exit 0"
 else record "p2-wall-off-exit0" FAIL "exit $p2wall_off1_rc — see out/p2_wall_off_1.log"; fi
@@ -572,9 +640,29 @@ if [ $p2wall_off1_rc -eq 0 ]; then
     else
         record "p2-wall-off-feature-present" FAIL "'; FEATURE: Support interface' not found"
     fi
+
+    # Legacy-key signal 2 (mirrors 3c): handle_legacy consumed "nearest_wall"
+    # cleanly under the OLD key - no deserialize-failure substitution was ever
+    # logged for this file.
+    if grep -qE "no substitutions performed from file .*spike_p2_wall_overrides\.json" "out/p2_wall_off_1.log"; then
+        record "p2-wall-legacy-no-substitution-notice" PASS "handle_legacy migration fired silently (no Config.cpp fallback substitution logged)"
+    else
+        record "p2-wall-legacy-no-substitution-notice" FAIL "expected 'no substitutions performed from file ...spike_p2_wall_overrides.json' in out/p2_wall_off_1.log — see log manually"
+    fi
+
+    # Legacy-key signal 3 (mirrors 3c): the RESOLVED config value in the
+    # output gcode's CONFIG_BLOCK, under the NEW key, is 1 (enabled) - proves
+    # the old "nearest_wall" string migrated to matching-on too.
+    if grep -qE "^; support_filament_matching = 1" "$OUT_P2_WALL_OFF_1"; then
+        record "p2-wall-legacy-resolved-matching-enabled" PASS "CONFIG_BLOCK shows support_filament_matching = 1"
+    else
+        record "p2-wall-legacy-resolved-matching-enabled" FAIL "'; support_filament_matching = 1' not found in $OUT_P2_WALL_OFF_1"
+    fi
 else
     record "p2-wall-off-m620-bounds" FAIL "skipped: run did not slice"
     record "p2-wall-off-feature-present" FAIL "skipped: run did not slice"
+    record "p2-wall-legacy-no-substitution-notice" FAIL "skipped: run did not slice"
+    record "p2-wall-legacy-resolved-matching-enabled" FAIL "skipped: run did not slice"
 fi
 
 # --- 4b. nearest_wall mode, tower ON: same sanity bar, tower override applied

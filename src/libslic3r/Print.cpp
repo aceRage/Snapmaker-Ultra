@@ -807,15 +807,15 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             // and keep flowing into ToolOrdering + GCode emission even though the gate
             // says the feature should be off. Force posSupportMaterial to re-run (in
             // either direction) for any object opted into cross-extruder matching
-            // (v2.4: sifsNearestWall is the only non-manual value left - the gate below
-            // is `!= sifsManual`, so this check mirrors it), so fresh layers are
-            // generated and the gate's decision actually takes effect. Only objects that opted in
+            // (v2.6: support_filament_matching is a plain bool now - the gate below is
+            // `.value`, so this check mirrors it), so fresh layers are generated and the
+            // gate's decision actually takes effect. Only objects that opted in
             // are checked; other objects on mixed plates are over-invalidated as a result
             // (osteps applies to all objects below), which is accepted rather than
             // threading a per-object condition through the loop.
             if (opt_key == "print_sequence"
                 && std::any_of(m_objects.begin(), m_objects.end(), [](const PrintObject *object) {
-                       return object->config().support_interface_filament_source.value != sifsManual;
+                       return object->config().support_filament_matching.value;
                    }))
                 osteps.emplace_back(posSupportMaterial);
         } else if (opt_key == "filament_soluble"
@@ -2943,11 +2943,13 @@ static LayerFilamentTable chameleon_collect_layer_filaments(const Print &print)
 // resolves BOTH support roles now, see docs/superpowers/specs/2026-08-30-support-match-
 // v2-design.md's "Decision rules" section for the original binding contract; v2.4 (spec
 // A, docs/superpowers/specs/2026-08-30-support-match-v24-design.md) simplified the
-// per-layer resolution rule itself to a single mode - see below). For every object opted
-// into support_interface_filament_source != sifsManual (v2.4: the only surviving
-// non-manual value is sifsNearestWall - nearest_surface's OWN vertical-projection-
-// primary/lateral-fallback MODE was REMOVED outright, GUI A/B round 2 verdict: it still
-// mixed layers even in large single-color areas even after v2.2/v2.3's fixes), per
+// per-layer resolution rule itself to a single mode - see below; v2.6 then replaced the
+// resulting two-valued enum with a plain checkbox, since a single mode is what it always
+// was). For every object opted into support_filament_matching (v2.4: nearest_surface's
+// OWN vertical-projection-primary/lateral-fallback MODE was REMOVED outright, GUI A/B
+// round 2 verdict: it still mixed layers even in large single-color areas even after
+// v2.2/v2.3's fixes, leaving nearest_wall as the sole non-manual mode this checkbox now
+// simply turns on or off), per
 // support layer: all three roles - interface (erSupportMaterialInterface), base
 // (erSupportMaterial), and ironing (erIroning, "ironing follows its interface": erIroning
 // entities are the ironed top surface of a matched interface run, not a role with its own
@@ -3022,12 +3024,14 @@ static LayerFilamentTable chameleon_collect_layer_filaments(const Print &print)
 // this sits in the pipeline; unlike Part 1's brim pass, no post-hoc union hack is needed
 // because this pass always runs first).
 //
-// Off (manual mode / single extruder / ByObject sequence): this function returns
+// Off (checkbox unchecked / single extruder / ByObject sequence): this function returns
 // immediately without touching support_fills or interface_by_extruder on ANY object -
-// byte-identical gcode is a hard requirement (spec's off-mode purity). The `!= sifsManual`
-// gate (below) is the WHOLE opt-in - v2.4 deleted the second per-object mode branch that
-// gate used to feed (the old `nearest_wall_mode` local and its else-arm), so every object
-// that opts in takes the identical path below, no per-object branching left.
+// byte-identical gcode is a hard requirement (spec's off-mode purity). The
+// `support_filament_matching.value` gate (below) is the WHOLE opt-in - v2.4 deleted the
+// second per-object mode branch that gate used to feed (the old `nearest_wall_mode`
+// local and its else-arm), and v2.6 replaced the manual/nearest_wall enum itself with
+// this plain bool, so every object that opts in takes the identical path below, no
+// per-object branching left.
 static void chameleon_assign_support_interfaces(Print &print)
 {
     if (print.extruders().size() <= 1 || print.config().print_sequence == PrintSequence::ByObject)
@@ -3052,12 +3056,13 @@ static void chameleon_assign_support_interfaces(Print &print)
         PrintObject *object = objects[obj_idx];
         if (object == nullptr)
             continue;
-        // v2.4 (spec A): `!= sifsManual` is the WHOLE opt-in now that nearest_surface is
-        // gone - sifsNearestWall is the only other value the enum can hold, so there is
-        // no longer a second mode to pick between below. Every guard/step below this
-        // point (shared-object skip, plate guard, visited flag, apply_bucket_caps,
-        // storage, emission, logging) applies uniformly to every opted-in object.
-        if (object->config().support_interface_filament_source.value == sifsManual)
+        // v2.6: support_filament_matching.value is the WHOLE opt-in - a plain checkbox
+        // now that (v2.4) nearest_surface was gone and nearest_wall was the only other
+        // enum value left, so there was no longer a second mode to pick between below.
+        // Every guard/step below this point (shared-object skip, plate guard, visited
+        // flag, apply_bucket_caps, storage, emission, logging) applies uniformly to
+        // every opted-in object.
+        if (!object->config().support_filament_matching.value)
             continue;
         if (object->layers().empty() || object->support_layers().empty())
             continue;
@@ -3849,9 +3854,9 @@ static void chameleon_assign_support_interfaces(Print &print)
         }
 
         // v2.4 (spec A): "mode=nearest_wall" is now a constant, not a per-object
-        // ternary - sifsNearestWall is the only value that ever reaches this line
-        // (sifsManual objects `continue`d out above the loop entirely, and
-        // sifsNearestSurface no longer exists) - kept as a literal string, not removed,
+        // ternary - nearest_wall is the only resolution mode that ever reaches this line
+        // (objects with support_filament_matching off `continue`d out above the loop
+        // entirely, and nearest_surface no longer exists) - kept as a literal string, not removed,
         // so the line stays a stable grep target and a triage/verify script can still
         // assert "the pass ran for this object" (mode= present) vs. "the object was
         // gated out as manual" (no line at all for that ordinal) - see the legacy-alias

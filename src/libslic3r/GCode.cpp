@@ -5391,8 +5391,8 @@ LayerResult GCode::process_layer(const Print& print,
                 // symptom: it varies layer to layer with toolchange order, with no
                 // relationship to what geometry is actually nearby).
                 //
-                // A mode-active object (support_interface_filament_source !=
-                // sifsManual) whose support layer has at least one matched bucket
+                // A mode-active object (support_filament_matching.value) whose
+                // support layer has at least one matched bucket
                 // (support_layer.interface_by_extruder, populated per-layer by
                 // chameleon_assign_support_interfaces, Print.cpp) pins any STILL-
                 // "don't care" residual slot(s) - base and/or interface, whichever of
@@ -5414,7 +5414,7 @@ LayerResult GCode::process_layer(const Print& print,
                 // a documented, now much smaller, remaining gap (see this task's own
                 // report: still deterministic per run, but layer-varying, same as
                 // before this fix).
-                if (object.config().support_interface_filament_source.value != sifsManual
+                if (object.config().support_filament_matching.value
                     && (support_dontcare || interface_dontcare)) {
                     // chameleon_dominant_matched_extruder (BrimFilament.hpp/.cpp) is
                     // the pure/testable core of this pin: largest total_path_length_mm

@@ -20,7 +20,7 @@ TEST_CASE("SupportMaterial: Three raft layers created", "[SupportMaterial]")
 }
 
 // v2.5a Task 1 (spec: "residual pin", ToolOrdering.cpp's is_support_overriddable):
-// a mode-active object (support_interface_filament_source != sifsManual) must never
+// a mode-active object (support_filament_matching == true) must never
 // be overriddable by WipingExtrusions, for ANY support role, regardless of the
 // scalar support_filament/support_interface_filament configs that would otherwise
 // make it overriddable - this is what stops flush_into_support's mark_wiping_
@@ -52,14 +52,14 @@ TEST_CASE("WipingExtrusions::is_support_overriddable: mode-active object is neve
 {
     WipingExtrusions we;
 
-    SECTION("mode ACTIVE (nearest_wall): false for every support role, even though the scalar configs below would otherwise make it overriddable")
+    SECTION("mode ACTIVE (support_filament_matching = true): false for every support role, even though the scalar configs below would otherwise make it overriddable")
     {
         Slic3r::Print print;
         Slic3r::Test::init_and_process_print({ TestMesh::cube_20x20x20 }, print, {
             { "flush_into_support",                true },
             { "support_filament",                   0 },
             { "support_interface_filament",         0 },
-            { "support_interface_filament_source",  "nearest_wall" },
+            { "support_filament_matching",           true },
         });
         const PrintObject &object = *print.objects().front();
         CHECK_FALSE(we.is_support_overriddable(erSupportMaterial, object));
@@ -67,14 +67,14 @@ TEST_CASE("WipingExtrusions::is_support_overriddable: mode-active object is neve
         CHECK_FALSE(we.is_support_overriddable(erMixed, object));
     }
 
-    SECTION("mode OFF (manual, the default): byte-identical to the pre-v2.5a role-based logic - true whenever the scalar filament is 0 (\"Default\")")
+    SECTION("mode OFF (unchecked, the default): byte-identical to the pre-v2.5a role-based logic - true whenever the scalar filament is 0 (\"Default\")")
     {
         Slic3r::Print print;
         Slic3r::Test::init_and_process_print({ TestMesh::cube_20x20x20 }, print, {
             { "flush_into_support",                true },
             { "support_filament",                   0 },
             { "support_interface_filament",         0 },
-            { "support_interface_filament_source",  "manual" },
+            { "support_filament_matching",           false },
         });
         const PrintObject &object = *print.objects().front();
         CHECK(we.is_support_overriddable(erSupportMaterial, object));
@@ -89,7 +89,7 @@ TEST_CASE("WipingExtrusions::is_support_overriddable: mode-active object is neve
             { "flush_into_support",                true },
             { "support_filament",                   1 },
             { "support_interface_filament",         1 },
-            { "support_interface_filament_source",  "manual" },
+            { "support_filament_matching",           false },
         });
         const PrintObject &object = *print.objects().front();
         CHECK_FALSE(we.is_support_overriddable(erSupportMaterial, object));

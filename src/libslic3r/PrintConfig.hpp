@@ -249,26 +249,15 @@ enum BrimType {
 // Chameleon brim: which filament a brim extrusion is printed with.
 enum BrimFilamentSource { bfsObject = 0, bfsNearestWall };
 
-// Chameleon support interface: which filament a support-interface extrusion is printed with.
-// v2.4 (spec A, GUI A/B round 2 verdict): nearest_surface REMOVED - it kept mixing
-// layers even in large single-color areas, so the user chose nearest_wall as the sole
-// keeper (nearest_wall's own claw-symptom root cause is fixed separately, spec B). A
-// saved config still holding the old "nearest_surface" string is migrated to
-// "nearest_wall" by PrintConfigDef::handle_legacy (PrintConfig.cpp, mirroring the
-// draft_shield "limited" value-remap precedent there) - required because without it,
-// ConfigOptionEnum<T>::from_string fails to find "nearest_surface" in
-// s_keys_map_SupportInterfaceFilamentSource below, and Config.cpp's set_deserialize_raw
-// then silently substitutes the option's DEFAULT (sifsManual) instead - turning an old
-// nearest_wall-equivalent project into a silently-manual one.
-//
-// sifsNearestWall's raw integer value CHANGES here (was 2, now 1) since
-// sifsNearestSurface (1) is deleted from the middle of the enum, not appended at the
-// end. Safe only because the wire format (save files, 3MF) is keyed by STRING name via
-// s_keys_map_SupportInterfaceFilamentSource (PrintConfig.cpp), never by this raw int -
-// verified: the GUI (Tab.cpp/ConfigManipulation.cpp) reads/writes this option only by
-// its string key "support_interface_filament_source", never by enum value name, so no
-// UI code needs updating for this shrink.
-enum SupportInterfaceFilamentSource { sifsManual = 0, sifsNearestWall };
+// v2.6: the old SupportInterfaceFilamentSource enum (manual/nearest_wall) was
+// replaced by a plain on/off checkbox, support_filament_matching (coBool, see
+// PrintObjectConfig below) - now that nearest_wall was the only non-manual value
+// left (v2.4 dropped nearest_surface, see PrintConfigDef::handle_legacy in
+// PrintConfig.cpp for the full old-string migration history, folded together
+// there into one branch), there was no longer a real choice to present as an
+// enum. A saved config still holding the old "support_interface_filament_source"
+// key (any of "manual" / "nearest_wall" / "nearest_surface") is migrated to the
+// new "support_filament_matching" bool key by PrintConfigDef::handle_legacy.
 
 enum TimelapseType : int {
     tlTraditional = 0,
@@ -502,7 +491,6 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLADisplayOrientation)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLAPillarConnectionMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimFilamentSource)
-CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SupportInterfaceFilamentSource)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TimelapseType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BedType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SkirtType)
@@ -892,8 +880,10 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                support_interface_not_for_body))
     ((ConfigOptionBool,                support_interface_loop_pattern))
     ((ConfigOptionInt,                 support_interface_filament))
-    // Chameleon: which filament a support-interface extrusion is printed with.
-    ((ConfigOptionEnum<SupportInterfaceFilamentSource>, support_interface_filament_source))
+    // Chameleon: when enabled, support material matches the filament of the model
+    // geometry it touches or stands beside (interfaces/ironing/walls), instead of
+    // always using the configured support filament.
+    ((ConfigOptionBool,                support_filament_matching))
     ((ConfigOptionInt,                 support_interface_top_layers))
     ((ConfigOptionInt,                 support_interface_bottom_layers))
     // Spacing between interface lines (the hatching distance). Set zero to get a solid interface.
