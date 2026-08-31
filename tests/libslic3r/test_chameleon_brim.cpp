@@ -1998,6 +1998,129 @@ TEST_CASE("apply_bucket_caps: free-tier and prev_kept stack (half of the FREE fl
     CHECK(result.kept == std::set<unsigned>{2});
 }
 
+// --- v2.5b: free-extruder trim exemption (spec: "exempt free extruders from the
+// count - they cost no toolchange, which is what C1 prices") ---------------------
+
+TEST_CASE("apply_bucket_caps (v2.5b): a strict-free bucket is exempt from the trim and survives alongside two buckets that fill the budget", "[chameleon]")
+{
+    // Reproduces the reported symptom directly: a small white claw bucket (8mm)
+    // whose extruder is STRICT-free at this layer (white prints model geometry AT
+    // this exact z somewhere on the plate - see Print.cpp's free_extruders_exempt,
+    // computed with up_mm=0.0) must survive the trim even though two larger,
+    // unrelated buckets (teal 60mm, khaki 50mm) already fill the max_extruders=2
+    // budget on length alone. Pre-v2.5b, white ranks last (shortest) and gets
+    // trimmed - then v2.5a's redirect sends its geometry to the nearest survivor
+    // (teal), which is exactly the "claws wrap in teal" symptom this task fixes.
+    // min_len_mm=0.0 so the gate (step a) never touches any of the three - this
+    // isolates the trim (step b) exemption being tested here.
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(60.0); // teal
+    map[2] = bucket_of_length(50.0); // khaki
+    map[3] = bucket_of_length(8.0);  // white claw - small, but exempt
+    std::set<unsigned> prev_kept;
+    std::set<unsigned> free_extruders_exempt{3};
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, /*max_extruders=*/2,
+        /*min_len_mm=*/0.0, merge_back, /*free_extruders=*/{}, /*min_len_free_mm=*/0.0,
+        free_extruders_exempt);
+
+    // All three survive - white never enters the ranked trim competition at all, so
+    // it never consumes (or costs teal/khaki) one of the two max_extruders slots.
+    CHECK(map.count(1) == 1);
+    CHECK(map.count(2) == 1);
+    CHECK(map.count(3) == 1);
+    CHECK(merge_back.entities.empty());
+    CHECK(result.kept == std::set<unsigned>{1, 2, 3});
+    CHECK(result.buckets_trimmed_cap == 0);
+    CHECK(result.buckets_redirected == 0);
+    CHECK(result.buckets_exempt_kept == 1);
+}
+
+TEST_CASE("apply_bucket_caps (v2.5b): a bucket free only via the up-window (NOT strict-coincident) is not exempt - still competes in the trim and loses", "[chameleon]")
+{
+    // Same 3 buckets as the exemption test above, but free_extruders_exempt is left
+    // EMPTY this time - documents the distinction this task's correctness rests on:
+    // Print.cpp deliberately computes free_extruders_exempt from the STRICT
+    // (up_mm=0.0) query, never the WINDOWED (up_mm=kContactBandMm) one `free_extruders`
+    // uses for the gate's tier selection - an extruder that is only "free" via the
+    // up-window (its wall exists on a HIGHER object layer inside the contact band,
+    // not at this exact z) must never be passed as free_extruders_exempt, because
+    // registering that bucket's geometry into THIS layer's own tool order would add a
+    // genuinely NEW toolchange, not a free one (see apply_bucket_caps' own .hpp doc
+    // comment for the ToolOrdering.cpp citation). A caller that wrongly reused the
+    // windowed set here would not be caught by the exemption test above (both sets
+    // contain white there) - this is the case that would catch it: white (8mm) still
+    // ranks last on pure length and is trimmed away, exactly the pre-v2.5b outcome.
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(60.0); // teal
+    map[2] = bucket_of_length(50.0); // khaki
+    map[3] = bucket_of_length(8.0);  // white claw - free only via the up-window
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back;
+
+    // free_extruders_exempt intentionally omitted (defaults empty).
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, /*max_extruders=*/2,
+        /*min_len_mm=*/0.0, merge_back);
+
+    CHECK(map.count(1) == 1);
+    CHECK(map.count(2) == 1);
+    CHECK(map.count(3) == 0); // trimmed away - never exempt
+    CHECK(result.kept == std::set<unsigned>{1, 2});
+    CHECK(result.buckets_trimmed_cap == 1);
+    CHECK(result.buckets_exempt_kept == 0);
+}
+
+TEST_CASE("apply_bucket_caps (v2.5b): 4 non-exempt buckets still trim to 2 - default free_extruders_exempt is a no-op", "[chameleon]")
+{
+    // No bucket's extruder is ever in free_extruders_exempt (left at its default,
+    // empty) - proves the v2.5b signature addition doesn't perturb the pre-existing
+    // trim ranking for the common (nothing exempt) case, mirroring the
+    // free_extruders/min_len_free_mm precedent (v2.3 Task 1) this same file already
+    // established for the gate.
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(10.0);
+    map[2] = bucket_of_length(80.0);
+    map[3] = bucket_of_length(60.0);
+    map[4] = bucket_of_length(40.0);
+    std::set<unsigned> prev_kept;
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, /*max_extruders=*/2,
+        /*min_len_mm=*/0.0, merge_back);
+
+    // Longest two survive (2: 80mm, 3: 60mm); unchanged from pre-v2.5b ranking.
+    CHECK(map.count(1) == 0);
+    CHECK(map.count(2) == 1);
+    CHECK(map.count(3) == 1);
+    CHECK(map.count(4) == 0);
+    CHECK(result.kept == std::set<unsigned>{2, 3});
+    CHECK(result.buckets_trimmed_cap == 2);
+    CHECK(result.buckets_exempt_kept == 0);
+}
+
+TEST_CASE("apply_bucket_caps (v2.5b): buckets_exempt_kept stays 0 when the trim never runs at all (map already at/under budget)", "[chameleon]")
+{
+    // map.size() == max_extruders here, so the trim's own partition loop (the only
+    // place buckets_exempt_kept is incremented) never executes - an exempt bucket
+    // that would have survived anyway is still "kept", just not counted here (see
+    // BucketCapResult::buckets_exempt_kept's own doc comment for why this is
+    // intentional, not an under-count bug).
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(60.0);
+    map[2] = bucket_of_length(8.0); // exempt, but the budget is already satisfied
+    std::set<unsigned> prev_kept;
+    std::set<unsigned> free_extruders_exempt{2};
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, /*max_extruders=*/2,
+        /*min_len_mm=*/0.0, merge_back, /*free_extruders=*/{}, /*min_len_free_mm=*/0.0,
+        free_extruders_exempt);
+
+    CHECK(result.kept == std::set<unsigned>{1, 2});
+    CHECK(result.buckets_exempt_kept == 0);
+}
+
 TEST_CASE("chameleon_update_prev_kept: a real commit becomes prev_kept outright and resets the retention grace", "[chameleon]")
 {
     PrevKeptState state{ std::set<unsigned>{7}, /*retained_last_layer=*/true };

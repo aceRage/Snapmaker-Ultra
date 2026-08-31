@@ -2941,6 +2941,12 @@ static void chameleon_assign_support_interfaces(Print &print)
         // buckets_dropped_min_benefit + buckets_trimmed_cap; the gap between them is
         // the legacy no-survivor fallback count (still residual, same as pre-v2.5a).
         size_t buckets_redirected               = 0;
+        // v2.5b (spec: "free-extruder trim exemption"): how many buckets skipped the
+        // C1 trim entirely because their extruder was already paying for a toolchange
+        // at THIS layer's own z from model geometry (apply_bucket_caps'
+        // free_extruders_exempt argument, strict-coincidence set below) - triage
+        // signal for "is the trim exemption actually firing on this plate".
+        size_t buckets_exempt_kept              = 0;
         // Raw matched-run counts (NOT switch-boundary/cap accounting - purely
         // informational, mirrors partition_support_entities' own return value) per
         // role, summed across every layer that reached the engine calls.
@@ -3018,6 +3024,27 @@ static void chameleon_assign_support_interfaces(Print &print)
             const std::set<unsigned> free_extruders = chameleon_layer_free_extruders(
                 layer_filament_table, support_layer->print_z,
                 /*down_mm=*/support_layer->height, /*up_mm=*/kContactBandMm);
+
+            // v2.5b (spec: "free-extruder trim exemption"): a SECOND, STRICTER free-
+            // extruder query for apply_bucket_caps' new free_extruders_exempt argument
+            // below - deliberately NOT the same `free_extruders` set above. See
+            // apply_bucket_caps' own doc comment (BrimFilament.hpp) for the full
+            // rationale; short version: up_mm = 0.0 here (vs. kContactBandMm above)
+            // because the trim exemption's whole premise is "this bucket's toolchange
+            // is already free AT THIS LAYER", which is only true when the extruder is
+            // already going to land in THIS support layer's own LayerTools from model
+            // geometry (ToolOrdering.cpp's collect_extruders, ~734-736, deduped against
+            // model geometry by sort_remove_duplicates/remove_duplicates_preserve_order,
+            // ~870-874) - true only for an extruder that prints AT this exact z
+            // somewhere on the plate, never for one that only prints on a HIGHER object
+            // layer inside the contact band above (the up-window's own reach). down_mm
+            // stays support_layer->height, unchanged from free_extruders above - that
+            // term only corrects for THIS layer's own z-thickness / unsynced object-
+            // layer grids, it doesn't reach into the future the way up_mm does, so it
+            // stays part of the "strict, this-layer-only" query too.
+            const std::set<unsigned> free_extruders_exempt = chameleon_layer_free_extruders(
+                layer_filament_table, support_layer->print_z,
+                /*down_mm=*/support_layer->height, /*up_mm=*/0.0);
 
             // (a) Contact-band layers: v2.0-style band (support_top_z, support_top_z +
             // kContactBandMm]) - unioned below with the coplanar band (b) into ONE
@@ -3208,11 +3235,12 @@ static void chameleon_assign_support_interfaces(Print &print)
 
             BucketCapResult cap_result = apply_bucket_caps(partitioned, prev_kept,
                 /*max_extruders=*/2, /*min_len_mm=*/12.0, support_layer->support_fills,
-                free_extruders, /*min_len_free_mm=*/3.0);
+                free_extruders, /*min_len_free_mm=*/3.0, free_extruders_exempt);
             buckets_dropped_min_benefit      += cap_result.buckets_dropped_min_benefit;
             buckets_dropped_min_benefit_free += cap_result.buckets_dropped_min_benefit_free;
             buckets_trimmed_cap              += cap_result.buckets_trimmed_cap;
             buckets_redirected               += cap_result.buckets_redirected;
+            buckets_exempt_kept              += cap_result.buckets_exempt_kept;
 
             if (!partitioned.empty()) {
                 support_layer->interface_by_extruder = std::move(partitioned);
@@ -3278,6 +3306,7 @@ static void chameleon_assign_support_interfaces(Print &print)
             // see buckets_redirected's own declaration comment for the exact
             // relationship.
             << " buckets_redirected=" << buckets_redirected
+            << " buckets_exempt_kept=" << buckets_exempt_kept
             << " interface_runs_matched=" << interface_runs_matched
             << " base_runs_matched=" << base_runs_matched
             << " ironing_runs_matched=" << ironing_runs_matched;

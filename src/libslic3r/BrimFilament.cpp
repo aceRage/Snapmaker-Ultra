@@ -1249,7 +1249,8 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
                                    double min_len_mm,
                                    ExtrusionEntityCollection &merge_back_target,
                                    const std::set<unsigned> &free_extruders,
-                                   double min_len_free_mm)
+                                   double min_len_free_mm,
+                                   const std::set<unsigned> &free_extruders_exempt)
 {
     BucketCapResult result;
     // v2.5a: gate/trim drops land here (moved out of `map`, NOT appended anywhere
@@ -1295,11 +1296,26 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
     // path below replays that order verbatim; the redirect path re-sorts its own
     // copy to ascending extruder instead (see there for why the two need different
     // orders).
+    //
+    // v2.5b (spec: "free-extruder trim exemption"): a bucket whose extruder is in
+    // `free_extruders_exempt` is pulled out BEFORE ranking - it is never a trim
+    // candidate at all, so it neither competes for nor consumes one of the
+    // max_extruders slots (see this function's own header comment in the .hpp for
+    // the toolchange-pricing rationale and the strict-vs-windowed distinction
+    // between this set and the gate's `free_extruders`). The trim budget below then
+    // applies only to `ranked` (the non-exempt survivors) - if map.size() overall
+    // still exceeds max_extruders only because of exempt buckets, nothing is
+    // trimmed at all.
     if (map.size() > max_extruders) {
         std::vector<std::pair<unsigned, double>> ranked;
         ranked.reserve(map.size());
-        for (auto &kv : map)
+        for (auto &kv : map) {
+            if (free_extruders_exempt.count(kv.first) != 0) {
+                ++result.buckets_exempt_kept;
+                continue; // exempt: never ranked, never trimmed, no slot consumed
+            }
             ranked.emplace_back(kv.first, total_path_length_mm(kv.second));
+        }
 
         std::sort(ranked.begin(), ranked.end(),
             [&prev_kept](const std::pair<unsigned, double> &a, const std::pair<unsigned, double> &b) {

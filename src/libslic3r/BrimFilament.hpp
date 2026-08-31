@@ -449,6 +449,16 @@ struct BucketCapResult {
     // this field only reports where their geometry ENDED UP, not a new drop
     // reason).
     size_t buckets_redirected = 0;
+    // v2.5b (spec: "free-extruder trim exemption"): how many buckets skipped the C1
+    // trim entirely because their extruder was in `free_extruders_exempt` - see
+    // apply_bucket_caps' own doc comment below for why an exempt bucket neither
+    // competes for nor consumes one of the `max_extruders` slots. Only counted when
+    // the trim step actually ran its partition (map.size() > max_extruders going
+    // in) - an exempt bucket that would have survived the trim anyway (map already
+    // <= max_extruders) is still "kept", just never counted here, since the trim
+    // never touched anything that layer. Cheap to track (the trim's own partition
+    // loop already tests free_extruders_exempt membership per bucket).
+    size_t buckets_exempt_kept = 0;
 };
 
 // v2.2 Task 1 (spec C1-C3, replaces the old per-layer ">3 switch-boundaries" whole-
@@ -474,6 +484,18 @@ struct BucketCapResult {
 //      this layer) - stability up the column is what stops the alternating-stripe
 //      artifact a whole-layer revert caused; length only breaks ties among buckets
 //      with the same prev_kept status.
+//      v2.5b (spec: "free-extruder trim exemption"): BEFORE ranking, any bucket whose
+//      extruder is in `free_extruders_exempt` is pulled out and kept unconditionally -
+//      it never enters the ranked list, never occupies one of the `max_extruders`
+//      slots, and can never be trimmed. `max_extruders` prices DISTINCT toolchanges;
+//      a free extruder's toolchange already happens for model geometry at this exact
+//      layer (see this function's own trailing doc comment below for the strict-vs-
+//      windowed distinction and the ToolOrdering.cpp citation for why that's true),
+//      so trimming it buys nothing - the toolchange it "saves" doesn't exist - and
+//      only costs fidelity (a small matched bucket like a claw's own wall color
+//      loses to two larger, unrelated buckets and gets redirected away from its own
+//      geometry). The trim's budget then applies only to the remaining NON-exempt
+//      buckets, exactly the pre-v2.5b algorithm otherwise unchanged.
 // `map` is left holding only the committed (kept) buckets after (a)/(b) - the caller
 // moves it straight into SupportLayer::interface_by_extruder. Steps (a) and (b) above
 // are themselves UNCHANGED by v2.5a: the same buckets are gated/trimmed, in the same
@@ -638,13 +660,48 @@ PrevKeptState chameleon_update_prev_kept(const PrevKeptState& state,
 // its tier's floor (0.5x eff_min, where eff_min is whichever of min_len_mm/
 // min_len_free_mm the free-set membership above selected) - hysteresis stacks with,
 // never replaces, the free-tier selection.
+//
+// v2.5b (spec: "free-extruder trim exemption"): signature grows ONE more trailing,
+// DEFAULTED parameter - `free_extruders_exempt` - so every pre-v2.5b call site (this
+// function's own existing unit tests included) compiles and behaves byte-identically
+// unchanged: an empty `free_extruders_exempt` (the default) exempts nothing, so step
+// (b) always ranks/trims every surviving bucket exactly as before this task. When
+// non-empty, see step (b)'s own bullet above for the exemption algorithm.
+//
+// This is DELIBERATELY a SEPARATE, NARROWER set from `free_extruders` above, not the
+// same set reused - the two gates price different things. `free_extruders` (the min-
+// benefit gate's tier selector) may use the WINDOWED query (chameleon_layer_free_
+// extruders' up_mm = kContactBandMm) - a bucket whose wall exists only in the contact
+// band ABOVE this exact z is still worth a reduced 3mm floor there, since the vote
+// itself samples that same band. `free_extruders_exempt` MUST use the STRICT-
+// coincidence query instead (up_mm = 0.0; down_mm = the support layer's own height is
+// still correct - that term only corrects for the layer's own z-thickness / unsynced
+// object-layer grid, it doesn't reach into the future) - because the claim this
+// exemption rests on is "keeping this bucket costs no NEW toolchange", and that is
+// only true when the extruder is ALREADY going to be registered in THIS support
+// layer's own LayerTools from model geometry. Per-support-layer registration
+// (ToolOrdering.cpp's collect_extruders, ~734-736: `for (const auto& kv :
+// support_layer->interface_by_extruder) ... layer_tools.extruders.push_back(kv.first +
+// 1)`) runs unconditionally for every kept bucket; that push is a genuine no-op only
+// because sort_remove_duplicates/remove_duplicates_preserve_order (~870-874) later
+// collapses it against an entry model geometry ALREADY placed in that same layer's
+// `extruders` vector at THIS print_z (collect_extruders is called once per object,
+// same shared LayerTools keyed by z, so any object's wall/solid/sparse-infill
+// extruder at this z lands there too). An extruder that is "free" only via the up-
+// window prints on a HIGHER object layer that has not contributed to THIS print_z's
+// LayerTools at all - registering its bucket here would push a genuinely NEW entry
+// that survives the dedup, i.e. a real extra toolchange, not a free one. Exempting it
+// from the trim on the strength of the windowed set would therefore be wrong; the
+// gate's 3mm floor tier can still afford to be generous there (worst case: a short
+// bucket kept an extra layer or two), but the trim's exemption cannot.
 BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection>& map,
                                   const std::set<unsigned>& prev_kept,
                                   size_t max_extruders,
                                   double min_len_mm,
                                   ExtrusionEntityCollection& merge_back_target,
                                   const std::set<unsigned>& free_extruders = {},
-                                  double min_len_free_mm = 0.0);
+                                  double min_len_free_mm = 0.0,
+                                  const std::set<unsigned>& free_extruders_exempt = {});
 
 // v2.5a Task 2b (spec: "mechanism B pin"): the extruder of whichever bucket in
 // `buckets` has the largest total_path_length_mm ("dominant"); ties (an exact equal
