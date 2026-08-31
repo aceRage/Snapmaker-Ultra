@@ -2380,8 +2380,15 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
 //   obj=<ordinal> print_z=<mm> height=<mm> fallback=<extruder> base_fallback=<extruder>
 //   free_windowed=<id,id,...> free_strict=<id,id,...>
 //   contact_layers=<li,li,...> coplanar_layers=<li,li,...>
-//   wall_samples=<li:e<id>=<count>,e<id>=<count>;li:...>
+//   band_samples=<li:e<id>=<count>,e<id>=<count>;li:...>
+//   coplanar_samples=<li:e<id>=<count>,e<id>=<count>;li:...>
 //   buckets=<e<id>:before=<mm>,after=<mm>,outcome=<kept|kept_exempt|gated|trimmed>,redirect=<id|none>;...>
+// v2.5d: band_samples/coplanar_samples replace the old single wall_samples= field -
+// band_samples is the union (contact-band + coplanar) index interface/ironing vote
+// against, unchanged in content/meaning from the old field; coplanar_samples is the
+// NEW coplanar-only index base votes against (root cause fix below) - see
+// chameleon_assign_support_interfaces' band_idx/coplanar_wall_idx declaration comment
+// for why base needed its own, narrower electorate.
 // (any list-valued field is empty-after-`=` when that set/vector/map is empty - e.g.
 // "free_strict=" means no extruder is strictly free at this layer). One line per
 // support layer of a mode-active object that reaches this pass' own per-layer body
@@ -2898,11 +2905,17 @@ static LayerFilamentTable chameleon_collect_layer_filaments(const Print &print)
 // support layer: all three roles - interface (erSupportMaterialInterface), base
 // (erSupportMaterial), and ironing (erIroning, "ironing follows its interface": erIroning
 // entities are the ironed top surface of a matched interface run, not a role with its own
-// independent rule) - are resolved by the SAME nearest-wall vote: brim_vote, k=1,
-// UNCAPPED (max_dist_mm=0), against ONE WallSampleIndex built from the union of the
-// contact-band and coplanar-span layers (see the per-layer loop below) - "the nearest
-// wall segment wins outright, no distance limit, no projection". All three roles are
-// partitioned via three calls to the SAME partition_support_entities engine (T1/v2.2 Task
+// independent rule) - are resolved by the SAME nearest-wall vote shape: brim_vote, k=1,
+// UNCAPPED (max_dist_mm=0) - "the nearest wall segment wins outright, no distance limit,
+// no projection". v2.5d split WHICH WallSampleIndex each role's vote runs against:
+// interface and ironing (via interface_resolver, reused verbatim for both) vote against
+// `band_idx`, the union of the contact-band and coplanar-span layers, unchanged from
+// pre-v2.5d; base votes against `coplanar_wall_idx`, the coplanar-span layers ONLY - a
+// wrap/base run abuts the wall AT ITS OWN Z, and unioning in the contact band above let a
+// higher (differently-colored) wall's XY-nearer samples win over the genuinely coplanar
+// wall on a tapering surface (root cause + fix detail: see the per-layer loop below,
+// band_idx/coplanar_wall_idx declaration comment). All three roles are still partitioned
+// via three calls to the SAME partition_support_entities engine (T1/v2.2 Task
 // 3) - interface first (role_filter = erSupportMaterialInterface), then base (role_filter
 // = erSupportMaterial), then ironing (role_filter = erIroning, reusing interface_resolver/
 // fallback_extruder/vote_params verbatim) - sharing ONE SupportLayer::interface_by_extruder
@@ -3231,46 +3244,104 @@ static void chameleon_assign_support_interfaces(Print &print)
                 object->layers().front()->print_z - object->layers().front()->height);
 
             // v2.4 (spec A): un-nested from the old per-object mode branch - nearest_wall
-            // is the only path left, so wall_union_idx/interface_resolver/base_resolver
-            // are populated unconditionally below instead of by one of two branches.
-            // interface_resolver/base_resolver stay std::function (not `auto`) since the
-            // three-engine-call tail further down just calls them, agnostic to how they
-            // were built. BrimVoteParams is captured BY VALUE (cheap, immutable after
-            // construction) so it never dangles; wall_union_idx is captured BY REFERENCE
-            // and so is declared here, at the per-layer scope that outlives both the
-            // construction below and the engine calls that use the resolvers.
-            WallSampleIndex                        wall_union_idx;
+            // is the only path left, so band_idx/coplanar_wall_idx/interface_resolver/
+            // base_resolver are populated unconditionally below instead of by one of two
+            // branches. interface_resolver/base_resolver stay std::function (not `auto`)
+            // since the three-engine-call tail further down just calls them, agnostic to
+            // how they were built. BrimVoteParams is captured BY VALUE (cheap, immutable
+            // after construction) so it never dangles; band_idx/coplanar_wall_idx are
+            // captured BY REFERENCE and so are declared here, at the per-layer scope
+            // that outlives both the construction below and the engine calls that use
+            // the resolvers.
+            //
+            // v2.5d (root cause fix, debug-log-driven - GUI round 5, transition zone z
+            // 34.62-42.18): pre-v2.5d, interface AND base both voted against the SAME
+            // single WallSampleIndex - the union of the coplanar layer and the 16-layer
+            // contact band above it. That union is the RIGHT electorate for an interface
+            // (an interface touches the surface ABOVE it, so the contact band's walls
+            // are genuinely relevant), but WRONG for a base/wrap run, which abuts the
+            // wall AT ITS OWN Z: the claw tapers, so a higher (whiter) wall's samples
+            // land XY-inward - and, in the flattened 2D index, farther - while a teal
+            // wall genuinely coplanar with a LOWER support layer can still sit XY-nearer
+            // to a query point on a higher, white-zone layer. k=1 always picks the
+            // nearest sample regardless of which band contributed it, so the teal wrap
+            // bled upward past the diagonal paint transition even though every bucket
+            // otherwise formed correctly (engine healthy, nothing gated). Fix: split the
+            // single index into two - `band_idx` (unchanged: union of contact_idx and
+            // coplanar_idx, still feeds interface/ironing) and `coplanar_wall_idx`
+            // (coplanar_idx layers ONLY, feeds base) - so a base run only ever matches a
+            // wall that is genuinely at its own z.
+            WallSampleIndex                        band_idx;
+            WallSampleIndex                        coplanar_wall_idx;
             bool                                    zero_sample = false;
             std::function<unsigned(const Point &)> interface_resolver;
             std::function<unsigned(const Point &)> base_resolver;
 
             // CHAMELEON_DEBUG: per-band-layer, per-extruder wall sample counts feeding
-            // wall_union_idx below - the (a)-vs-(b) discriminator from the round-4
-            // refutation (progress.md v2.5a section): if a claw's own extruder is ZERO
-            // here at its claw layers, the bucket dies at sampling/selection (mechanism
-            // a), not at the vote or the gate. Populated only when chameleon_debug_on
-            // (see chameleon_collect_wall_samples' own trailing parameter and
-            // WallSampleIndex::add_polyline's own comment) - an empty vector plus one
-            // pointer check per li when off.
-            std::vector<std::pair<size_t, std::map<unsigned, size_t>>> debug_wall_samples;
+            // band_idx/coplanar_wall_idx below - the (a)-vs-(b) discriminator from the
+            // round-4 refutation (progress.md v2.5a section): if a claw's own extruder
+            // is ZERO here at its claw layers, the bucket dies at sampling/selection
+            // (mechanism a), not at the vote or the gate. v2.5d: tracked SEPARATELY per
+            // index now (debug_band_samples/debug_coplanar_samples) - see the loop below
+            // for how a coplanar_idx layer contributes to both. Populated only when
+            // chameleon_debug_on (see chameleon_collect_wall_samples' own trailing
+            // parameter and WallSampleIndex::add_polyline's own comment) - an empty
+            // vector plus one pointer check per li when off.
+            std::vector<std::pair<size_t, std::map<unsigned, size_t>>> debug_band_samples;
+            std::vector<std::pair<size_t, std::map<unsigned, size_t>>> debug_coplanar_samples;
 
-            // v2.2 Task 4 (spec C8): ONE WallSampleIndex over the UNION of the
-            // contact-band layers (a) and the coplanar layers (b) - dedupe via
-            // union_layer_indices (BrimFilament.hpp/.cpp) so a layer index selected
-            // by both bands doesn't double-weight its walls in brim_vote's 1/d^2
-            // scoring. No projection view is ever built (v2.5 upward-cast scaffolding
-            // only, see this function's own header comment).
+            // v2.2 Task 4 (spec C8): band_idx over the UNION of the contact-band layers
+            // (a) and the coplanar layers (b) - dedupe via union_layer_indices
+            // (BrimFilament.hpp/.cpp) so a layer index selected by both bands doesn't
+            // double-weight its walls in brim_vote's 1/d^2 scoring. No projection view
+            // is ever built (v2.5 upward-cast scaffolding only, see this function's own
+            // header comment).
+            //
+            // v2.5d: single pass over the union - a layer that is ALSO in coplanar_idx
+            // (membership tested via `coplanar_idx_set`, built once here since
+            // coplanar_idx is already ascending/duplicate-free per
+            // select_layers_overlapping_span's own contract) additionally samples into
+            // coplanar_wall_idx, so a contact-band-only layer (contributes to band_idx
+            // alone) is never charged the cost of a second, pointless lookup, and a
+            // coplanar layer is sampled into both indices exactly once each.
+            const std::set<size_t> coplanar_idx_set(coplanar_idx.begin(), coplanar_idx.end());
             for (size_t li : union_layer_indices(contact_idx, coplanar_idx)) {
-                std::map<unsigned, size_t>  debug_li_counts;
-                std::map<unsigned, size_t> *debug_li_counts_ptr = chameleon_debug_on ? &debug_li_counts : nullptr;
+                std::map<unsigned, size_t>  debug_band_li_counts;
+                std::map<unsigned, size_t> *debug_band_li_counts_ptr = chameleon_debug_on ? &debug_band_li_counts : nullptr;
                 for (const LayerRegion *lr : object->layers()[li]->regions())
                     chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
-                        no_shift, obj_idx, wall_union_idx, debug_li_counts_ptr);
+                        no_shift, obj_idx, band_idx, debug_band_li_counts_ptr);
                 if (chameleon_debug_on)
-                    debug_wall_samples.emplace_back(li, std::move(debug_li_counts));
+                    debug_band_samples.emplace_back(li, std::move(debug_band_li_counts));
+
+                if (coplanar_idx_set.count(li)) {
+                    std::map<unsigned, size_t>  debug_coplanar_li_counts;
+                    std::map<unsigned, size_t> *debug_coplanar_li_counts_ptr = chameleon_debug_on ? &debug_coplanar_li_counts : nullptr;
+                    for (const LayerRegion *lr : object->layers()[li]->regions())
+                        chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
+                            no_shift, obj_idx, coplanar_wall_idx, debug_coplanar_li_counts_ptr);
+                    if (chameleon_debug_on)
+                        debug_coplanar_samples.emplace_back(li, std::move(debug_coplanar_li_counts));
+                }
             }
 
-            zero_sample = wall_union_idx.empty();
+            // v2.5d: skip the whole layer (keep fallback, same as pre-v2.5d) only when
+            // BOTH indices are empty - band_idx is a strict superset of coplanar_wall_idx
+            // (every coplanar_idx layer is also a member of union_layer_indices(contact_
+            // idx, coplanar_idx), so it is sampled into band_idx too; coplanar_wall_idx
+            // non-empty therefore implies band_idx non-empty), so this condition can only
+            // ever reduce to band_idx.empty() in practice - checked as an explicit `&&`
+            // anyway (not relied on as a silent invariant) so a future change to either
+            // selector's relationship fails safe rather than silently skipping a layer
+            // that still had real interface/ironing geometry to match. A layer where
+            // band_idx is non-empty but coplanar_wall_idx is empty - support above the
+            // model's own top walls, nothing coplanar under it at all - is NOT skipped
+            // here: interface/ironing still resolve normally against band_idx, and
+            // base_resolver (built below) uniformly returns base_fallback_extruder for
+            // that empty index (brim_vote's own empty-knn_result fallback, verified in
+            // the "v2.5d: empty coplanar_idx..." unit test) - a real, deterministic
+            // bucket like any other (v2.5c: fallback buckets too), not a special case.
+            zero_sample = band_idx.empty() && coplanar_wall_idx.empty();
 
             // CHAMELEON_DEBUG: common per-layer line prefix, built once here so both the
             // zero-sample early-exit just below and the full engine-call path further
@@ -3291,33 +3362,46 @@ static void chameleon_assign_support_interfaces(Print &print)
                     " free_strict="   + chameleon_debug_format_ids(free_extruders_exempt) +
                     " contact_layers="  + chameleon_debug_format_indices(contact_idx) +
                     " coplanar_layers=" + chameleon_debug_format_indices(coplanar_idx) +
-                    " wall_samples="    + chameleon_debug_format_wall_samples(debug_wall_samples);
+                    // v2.5d: split from the old single `wall_samples=` field -
+                    // band_samples is band_idx's per-layer counts (interface/ironing's
+                    // electorate, same shape/values the old field always had); coplanar_
+                    // samples is coplanar_wall_idx's own (base's electorate, v2.5d new) -
+                    // a claw layer whose coplanar_samples is empty for a color that IS
+                    // present in band_samples is exactly the "base correctly excludes
+                    // the contact-band-only wall" signal this split exists to surface.
+                    " band_samples="     + chameleon_debug_format_wall_samples(debug_band_samples) +
+                    " coplanar_samples=" + chameleon_debug_format_wall_samples(debug_coplanar_samples);
             }
 
             if (!zero_sample) {
-                // Resolver for ALL THREE roles (interface, base, and - via
-                // interface_resolver, reused verbatim, "ironing follows its interface" -
-                // erIroning) = brim_vote against wall_union_idx, UNCAPPED: max_dist_mm
-                // explicitly left at 0 (brim_vote's own "0 = uncapped" convention,
-                // BrimVoteParams' default) - the nearest wall wins outright, no distance
-                // limit.
+                // Interface (and, via interface_resolver, reused verbatim, "ironing
+                // follows its interface" - erIroning) = brim_vote against band_idx,
+                // UNCAPPED: max_dist_mm explicitly left at 0 (brim_vote's own "0 =
+                // uncapped" convention, BrimVoteParams' default) - the nearest wall in
+                // the coplanar+contact-band union wins outright, no distance limit.
+                // Base (v2.5d) = the SAME uncapped k=1 rule, but against
+                // coplanar_wall_idx instead - a wrap/base run abuts the wall AT ITS OWN
+                // Z, so only the coplanar-span layers are ever in its electorate;
+                // sampling the contact band above is correct for interface/ironing
+                // (which touch the surface above) but was the v2.5d root cause when it
+                // also fed base - see this block's own header comment above.
                 //
                 // v2.2 final-review I1 fix: k = 1, also set explicitly below (both
-                // role params - only fallback_extruder actually differs between
-                // them). The decision rule is "nearest wall segment wins outright, no
-                // projection" (spec C8), not a weighted vote. Leaving k at vote_params'
-                // default of 3 resurrected the v2.0-era 1/d^2-weighted knn vote even
-                // though max_dist_mm = 0 skips the v2.1-I1 electorate filter entirely:
-                // two samples of a farther wall could outvote one sample of the
-                // strictly nearest wall, and near-ties fell back to the LOWEST extruder
-                // id - exactly the mechanisms the v2.1 forensics blamed for most of its
-                // wrong pairs. With k = 1 the knn electorate is a single sample - brim_
-                // vote's score map has exactly one entry, so it returns that sample's
-                // extruder directly (score.size() == 1 path), before any tie-break logic
-                // runs. WallSampleIndex::knn's own tie order (nearest by squared
-                // distance, ties broken by ascending (extruder, object_key)) then makes
-                // an exact single-sample tie deterministic on its own, with no vote
-                // involved.
+                // role params - only fallback_extruder, and now (v2.5d) the index
+                // itself, differ between them). The decision rule is "nearest wall
+                // segment wins outright, no projection" (spec C8), not a weighted vote.
+                // Leaving k at vote_params' default of 3 resurrected the v2.0-era
+                // 1/d^2-weighted knn vote even though max_dist_mm = 0 skips the v2.1-I1
+                // electorate filter entirely: two samples of a farther wall could
+                // outvote one sample of the strictly nearest wall, and near-ties fell
+                // back to the LOWEST extruder id - exactly the mechanisms the v2.1
+                // forensics blamed for most of its wrong pairs. With k = 1 the knn
+                // electorate is a single sample - brim_vote's score map has exactly one
+                // entry, so it returns that sample's extruder directly (score.size() ==
+                // 1 path), before any tie-break logic runs. WallSampleIndex::knn's own
+                // tie order (nearest by squared distance, ties broken by ascending
+                // (extruder, object_key)) then makes an exact single-sample tie
+                // deterministic on its own, with no vote involved.
                 BrimVoteParams interface_wall_params    = vote_params;
                 interface_wall_params.k                 = 1;
                 interface_wall_params.max_dist_mm       = 0.0;
@@ -3328,22 +3412,29 @@ static void chameleon_assign_support_interfaces(Print &print)
                 base_wall_params.max_dist_mm       = 0.0;
                 base_wall_params.fallback_extruder = base_fallback_extruder;
 
-                interface_resolver = [&wall_union_idx, interface_wall_params](const Point &p) -> unsigned {
-                    return brim_vote(wall_union_idx, p, interface_wall_params);
+                interface_resolver = [&band_idx, interface_wall_params](const Point &p) -> unsigned {
+                    return brim_vote(band_idx, p, interface_wall_params);
                 };
-                base_resolver = [&wall_union_idx, base_wall_params](const Point &p) -> unsigned {
-                    return brim_vote(wall_union_idx, p, base_wall_params);
+                // v2.5d: coplanar_wall_idx, not band_idx - see this block's own header
+                // comment above for the root cause this fixes. brim_vote on an empty
+                // coplanar_wall_idx (support above the model's top walls, nothing
+                // coplanar under it) returns base_wall_params.fallback_extruder for
+                // every sample, uniformly and deterministically - no special-casing
+                // needed here, the empty-index fallback already does the right thing.
+                base_resolver = [&coplanar_wall_idx, base_wall_params](const Point &p) -> unsigned {
+                    return brim_vote(coplanar_wall_idx, p, base_wall_params);
                 };
             }
 
             if (zero_sample) {
-                // Nothing to project onto / vote on for this mode -> both roles'
-                // resolvers would trivially return their own fallback for every sample;
-                // skip the (pointless) engine calls and keep the whole layer on
-                // fallback, same as v2.0's zero-sample skip. v2.2: this `continue` is
-                // BEFORE the engine calls, so it's one of the "layers that skip
-                // partitioning" the hysteresis contract (above) leaves prev_kept
-                // unchanged for.
+                // Nothing to project onto / vote on for EITHER index (see the
+                // zero_sample assignment above for why band_idx.empty() is the only way
+                // both end up empty in practice) -> both roles' resolvers would
+                // trivially return their own fallback for every sample; skip the
+                // (pointless) engine calls and keep the whole layer on fallback, same as
+                // v2.0's zero-sample skip. v2.2: this `continue` is BEFORE the engine
+                // calls, so it's one of the "layers that skip partitioning" the
+                // hysteresis contract (above) leaves prev_kept unchanged for.
                 if (chameleon_debug_on)
                     chameleon_debug_log(chameleon_debug_line + " buckets=");
                 ++layers_zero_sample;

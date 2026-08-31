@@ -3051,3 +3051,161 @@ TEST_CASE("partition_support_entities (C5): a collection emptied by descend is r
     REQUIRE(descended.count(expected_key) == 1);
     CHECK(descended.at(expected_key) == true);
 }
+
+// --- v2.5d: role-split sampling bands (base votes coplanar-only, not the union) --
+//
+// Root cause (GUI round 5, debug-log-driven): a wrap/base support run abuts the wall
+// AT ITS OWN Z, but Print.cpp's chameleon_assign_support_interfaces built ONE
+// WallSampleIndex over the union of the coplanar layer and the 16-layer contact band
+// ABOVE it, and used that SAME union for both the interface/ironing resolver (correct
+// - an interface touches the surface above, so the contact band IS the right thing to
+// sample) and the base resolver (wrong - the claw tapers, so a higher/whiter wall's
+// samples can land XY-nearer in the flattened 2D index than the wall genuinely
+// coplanar with the base run, and k=1 picks whichever sample is nearest regardless of
+// which band it came from). The fix splits Print.cpp's single WallSampleIndex into
+// two: `coplanar_idx` (coplanar-span layers only) feeds the base resolver;
+// `band_idx` (the unchanged coplanar+contact-band union) keeps feeding interface/
+// ironing. chameleon_assign_support_interfaces itself is a Print.cpp file-local
+// static (not unit-instantiable outside a full Print/PrintObject scaffold - the same
+// constraint every other "Print.cpp orchestration" comment in this file notes), so
+// these tests exercise the reachable public engine seam the wiring fix is built out
+// of: WallSampleIndex + brim_vote + partition_support_entities, with k=1/max_dist_mm=0
+// matching Print.cpp's real interface_wall_params/base_wall_params construction. This
+// cannot be a literal pre-fix-RED/post-fix-GREEN test against Print.cpp itself (no
+// engine primitive here changes - the fix is purely which already-correct index each
+// resolver captures at the Print.cpp call site) - it instead proves the two indices
+// yield genuinely different, individually-verifiable answers for the identical query,
+// which is the failure mode the fix removes for the base role specifically.
+
+TEST_CASE("v2.5d: tapering claw - base's coplanar-only index picks the wall AT its own z, not the XY-nearer wall from the contact band above", "[chameleon]")
+{
+    const unsigned white_ext    = 3; // wall genuinely coplanar with the base run's own z
+    const unsigned teal_ext     = 5; // wall that only exists in the contact band above (taper: XY-inward, but geometrically nearer)
+    const unsigned base_fallback = 9;
+
+    // band_idx: Print.cpp's union(contact_idx, coplanar_idx) - BOTH walls present.
+    // teal sits only 1mm from the query run; white sits 3mm away - mirrors the
+    // root cause's "teal samples at/near the ring's own z are nearest" (in the
+    // flattened 2D index, XY proximity is all that matters, z-locality is lost).
+    WallSampleIndex band_idx;
+    band_idx.add_polyline(segment(0, 3, 30, 3), white_ext, 1); // coplanar wall, 3mm away
+    band_idx.add_polyline(segment(0, 1, 30, 1), teal_ext,  2); // contact-band wall, 1mm away
+
+    // coplanar_idx: ONLY the coplanar-span layers - the contact-band-only teal wall
+    // is genuinely absent here (it doesn't exist at the base run's own z).
+    WallSampleIndex coplanar_idx;
+    coplanar_idx.add_polyline(segment(0, 3, 30, 3), white_ext, 1);
+
+    BrimVoteParams params; // mirrors Print.cpp's base_wall_params: k explicitly 1 (default is 3), max_dist_mm=0 (default, uncapped)
+    params.k = 1;
+    REQUIRE(params.max_dist_mm == 0.0);
+    params.fallback_extruder = base_fallback;
+
+    auto band_resolver     = [&](const Point &pt) { return brim_vote(band_idx, pt, params); };
+    auto coplanar_resolver = [&](const Point &pt) { return brim_vote(coplanar_idx, pt, params); };
+
+    // Sanity: the two resolvers genuinely disagree at the query point (otherwise
+    // this fixture wouldn't reproduce the bug mechanism at all).
+    const Point query(scale_(15), scale_(0));
+    REQUIRE(brim_vote(band_idx, query, params) == teal_ext);
+    REQUIRE(brim_vote(coplanar_idx, query, params) == white_ext);
+
+    auto make_base_run = [] {
+        ExtrusionEntityCollection c;
+        auto *base = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+        base->polyline = Polyline({Point(scale_(0), scale_(0)), Point(scale_(30), scale_(0))});
+        c.entities.push_back(base);
+        return c;
+    };
+
+    // Simulates the PRE-v2.5d bug: base wired to the union index picks TEAL, the
+    // wrong color for a run that is genuinely coplanar with the white wall only.
+    {
+        auto fills = make_base_run();
+        std::map<unsigned, ExtrusionEntityCollection> out;
+        partition_support_entities(fills, erSupportMaterial, base_fallback, band_resolver, params, out);
+        REQUIRE(out.count(teal_ext) == 1);
+        CHECK(!out.at(teal_ext).entities.empty());
+        CHECK(out.count(white_ext) == 0);
+    }
+
+    // v2.5d fix: base wired to the coplanar-only index picks WHITE - the correct
+    // answer for a run that abuts the wall at its own z.
+    {
+        auto fills = make_base_run();
+        std::map<unsigned, ExtrusionEntityCollection> out;
+        partition_support_entities(fills, erSupportMaterial, base_fallback, coplanar_resolver, params, out);
+        REQUIRE(out.count(white_ext) == 1);
+        CHECK(!out.at(white_ext).entities.empty());
+        CHECK(out.count(teal_ext) == 0);
+    }
+}
+
+TEST_CASE("v2.5d: interface role keeps voting the union band (unchanged) - same fixture that flips base to coplanar-only", "[chameleon]")
+{
+    // Same two-wall fixture as the base test above, but exercised with role_filter =
+    // erSupportMaterialInterface against band_idx - interfaces touch the surface
+    // ABOVE them, so the contact band is deliberately still part of their
+    // electorate; this must keep picking teal (the nearer union sample), proving
+    // the v2.5d split changed ONLY the base role's wiring.
+    const unsigned white_ext = 3;
+    const unsigned teal_ext  = 5;
+    const unsigned iface_fallback = 9;
+
+    WallSampleIndex band_idx;
+    band_idx.add_polyline(segment(0, 3, 30, 3), white_ext, 1);
+    band_idx.add_polyline(segment(0, 1, 30, 1), teal_ext,  2);
+
+    BrimVoteParams params;
+    params.fallback_extruder = iface_fallback;
+    auto band_resolver = [&](const Point &pt) { return brim_vote(band_idx, pt, params); };
+
+    ExtrusionEntityCollection fills;
+    auto *iface = new ExtrusionPath(erSupportMaterialInterface, 1.0, 0.4f, 0.2f);
+    iface->polyline = Polyline({Point(scale_(0), scale_(0)), Point(scale_(30), scale_(0))});
+    fills.entities.push_back(iface);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterialInterface, iface_fallback, band_resolver, params, out);
+
+    REQUIRE(out.count(teal_ext) == 1);
+    CHECK(!out.at(teal_ext).entities.empty());
+    CHECK(out.count(white_ext) == 0);
+    for (const auto &kv : out)
+        for (const ExtrusionEntity *e : kv.second.entities)
+            CHECK(e->role() == erSupportMaterialInterface);
+}
+
+TEST_CASE("v2.5d: empty coplanar_idx (support above the model's top walls) buckets the base run to base_fallback, deterministically", "[chameleon]")
+{
+    // Print.cpp spec item 3: brim_vote against an empty WallSampleIndex returns
+    // p.fallback_extruder unconditionally (WallSampleIndex::knn on an empty index
+    // returns an empty vector - brim_vote's own empty-knn_result early-return).
+    // Post-v2.5c every resolver outcome buckets, fallback included (no more
+    // "uniform fallback stays untouched" fast path), so an entirely empty
+    // coplanar_idx - e.g. a base support column that exists above the model's own
+    // topmost wall, with nothing coplanar underneath it at all - still produces a
+    // single deterministic bucket keyed by base_fallback, not a silent no-op that
+    // leaves the run sitting untouched in support_fills.
+    const unsigned base_fallback = 7;
+    WallSampleIndex empty_coplanar_idx;
+    REQUIRE(empty_coplanar_idx.empty());
+
+    BrimVoteParams params;
+    params.fallback_extruder = base_fallback;
+    auto resolver = [&](const Point &pt) { return brim_vote(empty_coplanar_idx, pt, params); };
+
+    ExtrusionEntityCollection fills;
+    auto *base = new ExtrusionPath(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    base->polyline = Polyline({Point(scale_(0), scale_(0)), Point(scale_(30), scale_(0))});
+    ExtrusionEntity *base_ptr = base;
+    fills.entities.push_back(base);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, base_fallback, resolver, params, out);
+
+    REQUIRE(out.count(base_fallback) == 1);
+    REQUIRE(out.at(base_fallback).entities.size() == 1);
+    CHECK(out.at(base_fallback).entities.front() == base_ptr); // moved whole, pointer-stable (v2.5c)
+    CHECK(fills.entities.empty()); // nothing left behind untouched in support_fills
+}
