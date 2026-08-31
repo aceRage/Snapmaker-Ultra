@@ -473,8 +473,8 @@ struct CollectionVoteResult {
 // count is kept automatically, deterministically, with no separate tie-break branch
 // needed. An empty collection, or one whose leaves contribute zero samples (e.g. every
 // leaf's own polyline is empty), returns fallback_extruder as `.winner` (empty
-// histogram) - the caller's "leave it in support_fills untouched" path fires naturally
-// on that value, same as the leaf fast path above.
+// histogram) - the caller now whole-moves this collection into out[fallback_extruder]
+// (v2.5c+). The leaf fast path that this referenced no longer exists.
 CollectionVoteResult vote_collection_as_unit(const ExtrusionEntityCollection &collection, unsigned fallback_extruder,
                                   const std::function<unsigned(const Point &)> &resolve,
                                   const BrimVoteParams &p)

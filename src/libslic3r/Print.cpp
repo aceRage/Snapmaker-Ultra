@@ -3454,11 +3454,10 @@ static void chameleon_assign_support_interfaces(Print &print)
                 support_layer->interface_by_extruder = std::move(partitioned);
                 ++layers_partitioned;
             }
-            // else: either the uniform-fallback fast path (every entity of all three
-            // roles voted fallback uniformly - support_fills untouched, nothing to gate/trim)
-            // or every matched bucket was gated/trimmed away by apply_bucket_caps
-            // (support_fills already holds that geometry back); interface_by_extruder
-            // stays empty either way.
+            // else: partitioned can be empty only via (a) an all-degenerate layer (every
+            // entity Unchanged under the empty-chain guard) or (b) apply_bucket_caps gating/
+            // trimming everything with no-survivor merge-back (support_fills already holds
+            // that geometry back). interface_by_extruder stays empty either way.
 
             // Hysteresis (v2.3 Task 1, spec C2): this layer reached the engine calls, so
             // chameleon_update_prev_kept (BrimFilament.hpp/.cpp - see its own doc

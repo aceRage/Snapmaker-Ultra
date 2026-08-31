@@ -50,6 +50,13 @@ struct BrimVoteParams {
     // object_key -> layer-0 area (for tie-break 1); larger area wins
     std::map<size_t, double> object_area;
     unsigned fallback_extruder = 0;     // used when index empty / no candidates
+    // WARNING (v2.5c+): partition_support_leaf_entity and vote_collection_as_unit now
+    // interpret a resolver returning fallback_extruder as a real color match,
+    // indistinguishably from a genuine nearest-wall match. With max_dist_mm=0 (uncapped,
+    // Part 1 brim) this is unreachable-safe (brim_vote with non-empty index always
+    // returns a real nearest extruder). A future capped resolver (max_dist_mm > 0
+    // returning fallback beyond the cap) would silently bucket AND ToolOrdering-register
+    // unmatched geometry as the fallback COLOR, not residual support_fills.
     // 0 = uncapped (Part 1 brim path; behavior identical to pre-v2.1). > 0: if
     // the nearest knn sample is farther than this, brim_vote returns
     // fallback_extruder before scoring (v2.1 lateral-proximity rule).
@@ -451,13 +458,13 @@ size_t partition_support_interfaces(ExtrusionEntityCollection& support_fills,
 
 // v2.2 Task 1 (spec C1-C3, "cap semantics rework"): total path length (mm) of
 // `collection`'s entities. ExtrusionEntityCollection::length() throws (see its own
-// comment) - a bucket built by partition_support_entities is a flat vector of
-// ExtrusionPath* today (partition_support_leaf_entity only ever emplaces
-// ExtrusionPath), but this recurses into any nested collection too (is_collection())
-// so it stays correct if a future nested-collection vote (spec C7) ever lands a whole
-// ExtrusionEntityCollection* in a bucket. Each leaf's own length() is in SCALED units
-// (see Line::length()/MultiPoint::length()) - unscale<double> converts to mm, the same
-// way GCode.cpp/ExtrusionEntity.cpp do at every other length() call site.
+// comment) - a bucket built by partition_support_entities can hold four kinds of
+// leaves: ExtrusionPath*, original ExtrusionLoop/ExtrusionMultiPath (MovedWhole v2.5c+),
+// and whole ExtrusionEntityCollection (C7). This function recurses into any nested
+// collection (is_collection()) so it handles all types correctly. Each leaf's own
+// length() is in SCALED units (see Line::length()/MultiPoint::length()) -
+// unscale<double> converts to mm, the same way GCode.cpp/ExtrusionEntity.cpp do at
+// every other length() call site.
 double total_path_length_mm(const ExtrusionEntityCollection& collection);
 
 // v2.2 Task 1 (spec C1-C3): result of one apply_bucket_caps call.
