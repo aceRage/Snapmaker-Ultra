@@ -5707,7 +5707,14 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
 
         // Orca: update presets for the selected printer
         if (m_type == Preset::TYPE_PRINTER && wxGetApp().app_config->get_bool("remember_printer_config")) {
-            if (preset_name.find("Snapmaker U1") != std::string::npos) {
+            // Ultra: the fork preserves the current project's filament colours across a printer switch
+            // only for "Snapmaker U1"; every other target printer falls to the bare update_selections()
+            // below, which restores that printer's OWN remembered filaments and clobbers the project's
+            // colours. Extend the preservation branch to multi-nozzle machines (H2D/H2D Pro/H2C), whose
+            // edited preset carries a 2-element nozzle_diameter, so switching to them keeps project colours.
+            const ConfigOptionFloats* ultra_nd = m_preset_bundle->printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter");
+            const bool ultra_multi_nozzle = (ultra_nd && ultra_nd->values.size() > 1);
+            if (preset_name.find("Snapmaker U1") != std::string::npos || ultra_multi_nozzle) {
                 DynamicPrintConfig& projectConfig = m_preset_bundle->project_config;
                 std::vector<std::string> oldFilamentColors = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
                 std::vector<std::string> oldFilamentMultiColors;
