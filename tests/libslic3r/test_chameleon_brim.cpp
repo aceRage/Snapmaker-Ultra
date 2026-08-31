@@ -211,17 +211,127 @@ TEST_CASE("partition_support_interfaces splits by contact walls, base untouched"
     CHECK(iface_n == 0);
 }
 
-TEST_CASE("partition_support_interfaces uniform-fallback fast path keeps entities", "[chameleon]")
+TEST_CASE("partition_support_interfaces uniform-fallback vote buckets pointer-stable (v2.5c root cause fix)", "[chameleon]")
 {
+    // v2.5c root cause fix: pre-v2.5c, an entity whose every sample voted the
+    // fallback extruder took a special "stays in support_fills, untouched" fast
+    // path - this definitionally excluded a REAL painted color that happens to
+    // equal the fallback extruder from ever being bucketed/matched (the claw-wrap
+    // bug: CHAMELEON_DEBUG logging on the user's own GUI slice showed fallback=0
+    // with white wall samples plentiful (194-593/layer) yet ZERO e0 buckets across
+    // all 560 layers - white could never win because it happened to be extruder
+    // 0). This test used to be named "...fast path keeps entities" and asserted
+    // `out.empty()` / entity count unchanged; it is RE-POINTED here at the new
+    // contract - "uniform anything moves whole into its bucket" now applies to
+    // fallback too, not just non-fallback winners. The wall below genuinely votes
+    // extruder 0 (not "no candidates, so return fallback") - it just happens that
+    // 0 is also p.fallback_extruder, exactly the collision the root cause
+    // describes.
     WallSampleIndex idx;
-    idx.add_polyline(segment(0, 6, 30, 6), 0, 1);    // only fallback-extruder walls
+    idx.add_polyline(segment(0, 6, 30, 6), 0, 1);    // wall's own extruder equals fallback_extruder
     BrimVoteParams p; p.fallback_extruder = 0;
     auto fills = make_support_fills(5.0f);
-    const size_t before = fills.entities.size();
+    ExtrusionEntity *iface_a = fills.entities[1]; // make_support_fills: base, then 2 interface paths
+    ExtrusionEntity *iface_b = fills.entities[2];
     std::map<unsigned, ExtrusionEntityCollection> out;
     partition_support_interfaces(fills, 0, idx, p, out);
-    CHECK(out.empty());
-    CHECK(fills.entities.size() == before);          // untouched (off-parity)
+
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 2);
+    // Pointer-stable: the ORIGINAL entities moved (no clone, no churn) - same
+    // no-churn contract the old fast path gave only to a "stays" outcome; now the
+    // outcome is "moves", but the pointer-stability itself is preserved.
+    CHECK(std::find(out.at(0).entities.begin(), out.at(0).entities.end(), iface_a) != out.at(0).entities.end());
+    CHECK(std::find(out.at(0).entities.begin(), out.at(0).entities.end(), iface_b) != out.at(0).entities.end());
+
+    // The base path (a different role_filter) is never touched by this
+    // interface-only call; both interface originals are gone from support_fills
+    // (moved into out[0], not left behind and not duplicated).
+    size_t base_n = 0, iface_n = 0;
+    for (auto* e : fills.entities) (e->role() == erSupportMaterial ? base_n : iface_n)++;
+    CHECK(base_n == 1);
+    CHECK(iface_n == 0);
+}
+
+TEST_CASE("partition_support_entities (v2.5c): a uniform NON-fallback top-level leaf now also moves whole, pointer-stable - loop-ness preserved", "[chameleon]")
+{
+    // v2.5c unifies the top-level leaf fast path: "uniform anything moves whole
+    // into its bucket" (item 1 of the fix), not just uniform fallback. Pre-v2.5c, a
+    // uniform NON-fallback vote already left support_fills (matching the pre-C5
+    // header doc's own "non-fallback majority moves whole" wording for the
+    // COLLECTION case) but at the LEAF level it was still REBUILT into a plain new
+    // ExtrusionPath (see BrimFilament.hpp's pre-v2.5c partition_support_entities
+    // doc: "ExtrusionLoop/MultiPath-ness is not preserved, same pre-existing
+    // tradeoff"). Post-v2.5c that tradeoff is gone for the uniform case: the
+    // ORIGINAL entity pointer moves whole, so an ExtrusionLoop stays a loop instead
+    // of collapsing into a straight ExtrusionPath.
+    auto resolver = [](const Point &) -> unsigned { return 2u; }; // every sample votes extruder 2
+    BrimVoteParams p; p.fallback_extruder = 0;
+
+    Polygon sq({ Point(scale_(0), scale_(0)), Point(scale_(10), scale_(0)),
+                 Point(scale_(10), scale_(10)), Point(scale_(0), scale_(10)) });
+    ExtrusionPath src_path(erSupportMaterial, 1.0, 0.4f, 0.2f);
+    src_path.polyline = Polyline(sq.points);
+    src_path.polyline.points.push_back(sq.points.front());
+    auto *loop = new ExtrusionLoop(src_path);
+    REQUIRE(loop->is_loop());
+    REQUIRE(loop->role() == erSupportMaterial);
+
+    ExtrusionEntityCollection fills;
+    fills.entities.push_back(loop);
+
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
+
+    CHECK(fills.entities.empty());
+    REQUIRE(out.count(2) == 1);
+    REQUIRE(out.at(2).entities.size() == 1);
+    CHECK(out.at(2).entities.front() == loop); // moved WHOLE, pointer-stable - no clone, no rebuild
+    CHECK(out.at(2).entities.front()->is_loop()); // loop-ness survives (a rebuild would have lost it)
+}
+
+TEST_CASE("partition_support_entities (v2.5c root cause): a real painted color that equals the fallback extruder is no longer excluded from matching", "[chameleon]")
+{
+    // The money-shot regression test for the v2.5c fix. Diagnostic-log-proven root
+    // cause (CHAMELEON_DEBUG on the user's own GUI slice): white wall samples were
+    // plentiful (194-593/layer in the claw band), fallback_extruder resolved to 0
+    // (white, the layer-0 min external-perimeter color), and ZERO e0 buckets formed
+    // across all 560 layers even though every gate/trim/redirect mechanism kept
+    // every OTHER bucket - because partition_support_entities pre-v2.5c treated a
+    // vote == fallback_extruder as definitionally UNMATCHED, so white geometry could
+    // never become a bucket no matter how many samples voted it. This fixture
+    // reproduces that shape directly: TWO real walls exist, extruder 0 (white, which
+    // also happens to be fallback_extruder) and extruder 2 (a different color) -
+    // both must become real, separately addressable buckets; neither may fall back
+    // to support_fills or be silently absorbed into the other's bucket.
+    WallSampleIndex idx;
+    idx.add_polyline(segment(0, 6, 14, 6), 0, 1);    // left wall: extruder 0 == fallback_extruder
+    idx.add_polyline(segment(16, 6, 30, 6), 2, 2);   // right wall: extruder 2
+    BrimVoteParams p; p.fallback_extruder = 0;
+    auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
+
+    auto fills = make_support_fills(5.0f); // 1 base path @ y=-5, 2 interface paths @ y=5/6, spanning x 0->30
+    std::map<unsigned, ExtrusionEntityCollection> out;
+    partition_support_entities(fills, erSupportMaterialInterface, 0, resolver, p, out);
+
+    // Both colors bucketed - the fallback-equal color is NOT excluded.
+    REQUIRE(out.count(0) == 1);
+    CHECK(!out.at(0).entities.empty());
+    REQUIRE(out.count(2) == 1);
+    CHECK(!out.at(2).entities.empty());
+
+    // Every bucketed path still carries its true source role (never hardcoded),
+    // matching the pre-existing role-fidelity contract this fix does not touch.
+    for (auto &kv : out)
+        for (const ExtrusionEntity *e : kv.second.entities)
+            CHECK(e->role() == erSupportMaterialInterface);
+
+    // Nothing fell back to support_fills's residual/fallback path: both interface
+    // originals were matched away (into a bucket, not left/returned as residual).
+    size_t iface_n = 0;
+    for (auto *e : fills.entities)
+        if (e->role() == erSupportMaterialInterface) ++iface_n;
+    CHECK(iface_n == 0);
 }
 
 // C1: chameleon_assign_support_interfaces (Print.cpp) is not idempotent when it
@@ -233,14 +343,23 @@ TEST_CASE("partition_support_interfaces uniform-fallback fast path keeps entitie
 // see the fix-wave report for the hand-walked trace through Print.cpp). What IS
 // reachable via the public engine API is the underlying mechanism the review calls
 // out as deterministic: partition_support_interfaces mutates support_fills in place
-// (matched originals deleted, fallback-voted runs re-inserted pre-split at vote
-// boundaries with a boundary vertex borrowed from the adjacent run - see
-// split_polyline_by_vote's continuity fix). Re-running the SAME pass on that
-// already-split output re-samples each fragment from its own start: the one
-// borrowed boundary point is a single 0mm-long "run" that absorb_short_runs
-// (min_run_mm=2.0 default) always folds into its neighbour's majority vote before
-// switch_boundaries is computed - so every fragment re-splits to runs.size()==1 and
-// contributes 0 switches, even the ones that get sent to a foreign extruder's bucket.
+// (matched originals deleted, EVERY run - fallback included, v2.5c - re-inserted
+// into its own out[] bucket, pre-split at vote boundaries with a boundary vertex
+// borrowed from the adjacent run - see split_polyline_by_vote's continuity fix).
+// v2.5c update: pre-v2.5c, only the NON-fallback runs left this collection via
+// out[]; fallback runs returned to support_fills, and THIS test fed exactly those
+// fallback fragments back in to reproduce the aliasing scenario. Post-v2.5c, ALL
+// three runs (fallback included) leave via out[] on pass 1 - support_fills ends
+// pass 1 empty - so the fixture below instead feeds EVERY pass-1 bucket's geometry
+// back in (mirroring apply_bucket_caps' legacy no-survivor merge-back, which still
+// dumps a whole layer's matched geometry back into support_fills when every bucket
+// gets gated/trimmed away). Re-running the SAME pass on that already-split output
+// re-samples each fragment from its own start: the one borrowed boundary point is a
+// single 0mm-long "run" that absorb_short_runs (min_run_mm=2.0 default) always
+// folds into its neighbour's majority vote before switch_boundaries is computed -
+// so every fragment re-splits to runs.size()==1 and (v2.5c) is now itself a
+// pointer-stable MOVE into its own bucket, contributing 0 switches even for the
+// fragment that lands in the foreign extruder's bucket.
 static ExtrusionEntityCollection three_zone_interface_fill()
 {
     ExtrusionEntityCollection c;
@@ -253,27 +372,37 @@ static ExtrusionEntityCollection three_zone_interface_fill()
 TEST_CASE("partition_support_interfaces re-run on its own output undercounts switches (C1)", "[chameleon]")
 {
     WallSampleIndex idx;
-    idx.add_polyline(segment(0, 6, 10, 6), 0, 1);   // zone A: fallback extruder 0
+    idx.add_polyline(segment(0, 6, 10, 6), 0, 1);   // zone A: extruder 0 (== fallback_extruder)
     idx.add_polyline(segment(15, 6, 30, 6), 1, 2);  // zone B: foreign extruder 1 (wide -> unambiguous interior)
-    idx.add_polyline(segment(35, 6, 45, 6), 0, 3);  // zone C: fallback extruder 0
+    idx.add_polyline(segment(35, 6, 45, 6), 0, 3);  // zone C: extruder 0 (== fallback_extruder)
     BrimVoteParams p; p.fallback_extruder = 0;
 
     auto fills = three_zone_interface_fill();
     std::map<unsigned, ExtrusionEntityCollection> out1;
     const size_t switches1 = partition_support_interfaces(fills, 0, idx, p, out1);
 
-    // Pass 1: three zones -> three runs (0,1,0) -> 2 switch boundaries, and the
-    // middle (foreign) run lands in out1[1]. This is the real, correct result.
-    CHECK(switches1 > 0);
+    // Pass 1: three zones -> three runs (0,1,0) -> 2 switch boundaries. v2.5c: ALL
+    // three runs now bucket by their own vote - the middle (foreign) run lands in
+    // out1[1], and BOTH end runs (zone A, zone C - voting 0, same as
+    // fallback_extruder) land in out1[0], not back in support_fills. Nothing
+    // returns to support_fills at all.
+    CHECK(switches1 == 2);
     REQUIRE(out1.count(1) == 1);
     CHECK(!out1.at(1).entities.empty());
+    REQUIRE(out1.count(0) == 1);
+    CHECK(out1.at(0).entities.size() == 2); // zone A's run and zone C's run, as separate fragments
+    CHECK(fills.entities.empty());          // v2.5c: nothing left behind - every run bucketed
 
-    // Mirror Print.cpp's v2.2 apply_bucket_caps merge-back (BrimFilament.cpp): fold
-    // the out-of-fallback runs back into support_fills, leaving it holding all three
-    // pre-split runs as separate entities - exactly what either trigger in C1
-    // (aliased shared-object copy, or a stale posSupportMaterial re-run) hands the
-    // pass on its second visit to this layer.
-    fills.append(std::move(out1.at(1).entities));
+    // Mirror Print.cpp's apply_bucket_caps legacy no-survivor merge-back
+    // (BrimFilament.cpp: every gate/trim drop appends into merge_back_target when
+    // NOTHING survives the caps that layer) - fold EVERY pass-1 bucket's geometry
+    // back into support_fills, leaving it holding all three pre-split runs as
+    // separate entities - exactly what either trigger in C1 (aliased shared-object
+    // copy, or a stale posSupportMaterial re-run) hands the pass on its second
+    // visit to this layer.
+    for (auto &kv : out1)
+        fills.append(std::move(kv.second.entities));
+    REQUIRE(fills.entities.size() == 3);
 
     std::map<unsigned, ExtrusionEntityCollection> out2;
     const size_t switches2 = partition_support_interfaces(fills, 0, idx, p, out2);
@@ -1671,8 +1800,18 @@ TEST_CASE("partition_support_entities (C7): a role-eligible nested collection is
         CHECK(e != inner);
 }
 
-TEST_CASE("partition_support_entities (C7): a role-eligible nested collection that votes fallback stays in place, untouched", "[chameleon]")
+TEST_CASE("partition_support_entities (C7/v2.5c): a role-eligible nested collection that votes fallback now moves whole into out[fallback], pointer-stable", "[chameleon]")
 {
+    // v2.5c root cause fix: this test used to be named "...stays in place,
+    // untouched" and asserted `out.empty()` / the collection pointer left inside
+    // `fills` - the SAME fallback-exclusion collision the top-level leaf fast path
+    // had (BrimFilament.hpp's own v2.5c note), just at the whole-collection level.
+    // Re-pointed at the new contract: "uniform anything moves whole into its
+    // bucket" (item 1 of the fix) applies to a whole-collection vote too, not just
+    // leaves - a fallback-majority collection now moves, pointer-stable, into
+    // out[fallback_extruder], exactly like a non-fallback-majority collection
+    // already did pre-v2.5c (see the sibling "moved whole, never split" test
+    // above).
     WallSampleIndex idx; // empty index -> brim_vote always returns fallback_extruder
     BrimVoteParams p; p.fallback_extruder = 0;
     auto resolver = [&idx, &p](const Point &pt) { return brim_vote(idx, pt, p); };
@@ -1685,10 +1824,11 @@ TEST_CASE("partition_support_entities (C7): a role-eligible nested collection th
     std::map<unsigned, ExtrusionEntityCollection> out;
     partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
 
-    CHECK(out.empty());
-    REQUIRE(fills.entities.size() == 1);
-    CHECK(fills.entities.front() == inner); // untouched pointer, still in place
-    CHECK(static_cast<ExtrusionEntityCollection *>(fills.entities.front())->entities.size() == 2);
+    CHECK(fills.entities.empty()); // moved out of support_fills entirely
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 1);
+    CHECK(out.at(0).entities.front() == inner); // moved WHOLE - same pointer, never split or cloned
+    CHECK(static_cast<ExtrusionEntityCollection *>(out.at(0).entities.front())->entities.size() == 2);
 }
 
 TEST_CASE("partition_support_entities (C7): a mixed-role nested collection is left untouched, never voted or split", "[chameleon]")
@@ -2341,13 +2481,27 @@ TEST_CASE("partition_support_entities (C7 whole-collection vote) tie-prefers-pre
 // per-x-coordinate zone rule is simpler and fully deterministic - no knn/1/d^2 scoring
 // to reason about when the thing under test is the collection-level descend decision.
 
-TEST_CASE("partition_support_entities (C5): a mixed collection whose minority run clears the threshold DESCENDS and splits per leaf", "[chameleon]")
+TEST_CASE("partition_support_entities (C5/v2.5c): a mixed collection whose minority run clears the threshold DESCENDS; EVERY leaf re-buckets by its own uniform vote, fallback included", "[chameleon]")
 {
     // Two leaves, each internally uniform: leaf A (20mm, x in [0,20)) votes fallback (0)
     // throughout; leaf B (10mm, x in [25,35)) votes extruder 2 throughout. Whole-
     // collection histogram: ~27 fallback samples vs. ~14 extruder-2 samples (0.8mm
     // sampling over 20mm/10mm respectively) - a genuine, CONTIGUOUS minority run of
     // ~14*0.8 = 11.2mm, comfortably clearing the p.min_run_mm = 5.0 threshold set below.
+    //
+    // v2.5c root cause fix: this test used to assert leaf A's OWN uniform-fallback
+    // vote left it "in place, untouched" inside `inner` (the descend path's old
+    // per-leaf fast path only special-cased fallback), while leaf B's uniform
+    // non-fallback vote got REBUILT into a new ExtrusionPath (`!= leafB`) rather
+    // than moved. Both halves of that asymmetry are gone: "uniform anything moves
+    // whole into its bucket" (item 1 of the fix) now applies inside a descended
+    // collection exactly like it does at the top level - leaf A moves whole,
+    // pointer-stable, into out[fallback]; leaf B moves whole, pointer-stable
+    // (`== leafB`, no longer rebuilt), into out[2]. With both leaves gone, `inner`
+    // is left empty and is deleted (the same "emptied shell -> single delete" rule
+    // the pre-existing "collection emptied by descend" test already covers) -
+    // `fills` ends up empty too, since nothing stays behind to keep the (now-
+    // deleted) collection pointer alive in it.
     auto resolver = [](const Point &pt) -> unsigned {
         return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
     };
@@ -2378,21 +2532,23 @@ TEST_CASE("partition_support_entities (C5): a mixed collection whose minority ru
     DescendColumnMap descended;
     partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
 
-    // DESCENDED: the collection pointer stays (not emptied - leaf A's fallback vote
-    // left it in place), but its contents were rebuilt - leaf B is gone, moved to
-    // out[2] as a fresh split path, never as the whole collection pointer.
-    REQUIRE(fills.entities.size() == 1);
-    CHECK(fills.entities.front() == inner);
-    REQUIRE(inner->entities.size() == 1);
-    CHECK(inner->entities.front() == leafA); // untouched fast path: original pointer, in place
+    // DESCENDED, and both leaves individually re-bucketed (each votes uniformly on
+    // its own) - the now-empty collection shell is deleted, so nothing is left
+    // behind in support_fills.
+    CHECK(fills.entities.empty());
+
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 1);
+    CHECK(out.at(0).entities.front() == leafA); // moved WHOLE, pointer-stable - no rebuild
 
     REQUIRE(out.count(2) == 1);
     REQUIRE(out.at(2).entities.size() == 1);
-    CHECK(out.at(2).entities.front() != leafB); // rebuilt, not the whole original leaf
+    CHECK(out.at(2).entities.front() == leafB); // moved WHOLE, pointer-stable - no rebuild
     CHECK(out.at(2).entities.front()->role() == erSupportMaterial);
 
-    // The whole collection was never moved into any out[] bucket (that's the pre-C5
-    // whole-move path, not what happened here).
+    // The whole collection was never moved into any out[] bucket as a UNIT (that's
+    // the not-descended whole-move path, not what happened here) - it was deleted
+    // once its leaves emptied it out.
     for (const auto &kv : out)
         for (const ExtrusionEntity *e : kv.second.entities)
             CHECK(e != inner);
@@ -2401,13 +2557,21 @@ TEST_CASE("partition_support_entities (C5): a mixed collection whose minority ru
     CHECK(descended.at(expected_key) == true);
 }
 
-TEST_CASE("partition_support_entities (C5): a mixed collection whose minority run stays BELOW threshold does not descend", "[chameleon]")
+TEST_CASE("partition_support_entities (C5/v2.5c): a mixed collection whose minority run stays BELOW threshold does not descend, and its fallback-majority whole moves into out[fallback]", "[chameleon]")
 {
     // Same shape as the DESCEND test above, but leaf B is short: 2mm (x in [25,27)) ->
     // 2 + floor(2/0.8) = 4 samples -> a minority run of 4*0.8 = 3.2mm, under the SAME
-    // p.min_run_mm = 5.0 threshold this time. Must behave EXACTLY like the pre-v2.3/
-    // pre-C5 fallback-majority whole-collection case: untouched pointer, no split, no
-    // move - "current behavior (pointer-stable)" per spec C5's own wording.
+    // p.min_run_mm = 5.0 threshold this time - the collection does NOT descend (same
+    // not-genuinely-mixed classification as before, unchanged by v2.5c - see item 2 of
+    // the v2.5c fix: the descend-vs-not-descend THRESHOLD decision is untouched).
+    // v2.5c root cause fix: this test used to assert the not-descended, fallback-
+    // majority collection stayed pointer-stable IN `fills` ("current behavior
+    // (pointer-stable)" per spec C5's own wording, at the time meaning "stays"). It
+    // is re-pointed here at the new contract: "not genuinely mixed" still means
+    // "whole-move, pointer-stable, never split" - but the destination for a
+    // fallback-majority whole-move is now out[fallback], the SAME unified rule a
+    // non-fallback-majority whole-move already used (see the C7 "moved whole, never
+    // split" test above, now joined by its own C7 fallback sibling).
     auto resolver = [](const Point &pt) -> unsigned {
         return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
     };
@@ -2431,11 +2595,12 @@ TEST_CASE("partition_support_entities (C5): a mixed collection whose minority ru
     DescendColumnMap descended;
     partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
 
-    CHECK(out.empty()); // nothing split off, nothing moved
-    REQUIRE(fills.entities.size() == 1);
-    CHECK(fills.entities.front() == inner); // untouched pointer
+    CHECK(fills.entities.empty()); // moved out of support_fills entirely, not staying
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 1);
+    CHECK(out.at(0).entities.front() == inner); // moved WHOLE - same collection pointer, never split
     REQUIRE(inner->entities.size() == 2);
-    CHECK(inner->entities[0] == leafA); // both original leaf pointers intact
+    CHECK(inner->entities[0] == leafA); // both original leaf pointers intact - never split apart
     CHECK(inner->entities[1] == leafB);
     CHECK(descended.empty()); // never wrote a descend entry - it never descended
 }
@@ -2455,8 +2620,10 @@ TEST_CASE("partition_support_entities (C5/M1): a minority split across TWO leave
     // DESCEND, even though B and C are two separate, non-adjacent support leaves (they
     // don't even touch - x in [27,30) is a gap covered by neither). Post-fix, the run
     // resets at the B/C boundary: each leaf's own run is 3.2mm, neither clears 5.0mm, so
-    // the collection stays whole - EXACTLY the pre-v2.3 pointer-stable behavior, same as
-    // the single-leaf "stays BELOW threshold" test above.
+    // the collection stays whole (does not descend) - unchanged by v2.5c, which only
+    // changes what "stays whole" means for a fallback-majority winner (see the sibling
+    // "stays BELOW threshold" test's own v2.5c note above: moves into out[fallback],
+    // pointer-stable, instead of staying in `fills`).
     auto resolver = [](const Point &pt) -> unsigned {
         return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
     };
@@ -2486,9 +2653,10 @@ TEST_CASE("partition_support_entities (C5/M1): a minority split across TWO leave
     // Must FAIL pre-fix: pre-fix, B+C's concatenated 6.4mm "run" clears the 5.0mm
     // threshold, so the collection DESCENDS (out.count(2) == 1, inner shrinks to just
     // leafA, descended records the column) instead of staying whole.
-    CHECK(out.empty()); // nothing split off, nothing moved
-    REQUIRE(fills.entities.size() == 1);
-    CHECK(fills.entities.front() == inner); // untouched pointer
+    CHECK(fills.entities.empty()); // v2.5c: not-genuinely-mixed fallback winner moves whole, not stays
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 1);
+    CHECK(out.at(0).entities.front() == inner); // moved WHOLE - same collection pointer, never split
     REQUIRE(inner->entities.size() == 3);
     CHECK(inner->entities[0] == leafA); // all three original leaf pointers intact
     CHECK(inner->entities[1] == leafB);
@@ -2507,7 +2675,9 @@ TEST_CASE("partition_support_entities (C5/M2): no prior descend on this column -
     // the one honest seam that can only clear the descend threshold when the halving
     // actually applies. Here, p.descended_last_layer is empty (this column never
     // descended last layer), so the threshold stays the FULL 5.0mm - 3.2mm never clears
-    // it, and the collection stays whole (pre-v2.3 pointer-stable behavior).
+    // it, and the collection does not descend (v2.5c: its fallback-majority whole now
+    // moves into out[fallback], pointer-stable - see the "stays BELOW threshold" test's
+    // own v2.5c note above for the same not-descended/fallback-winner update).
     auto resolver = [](const Point &pt) -> unsigned {
         return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
     };
@@ -2532,9 +2702,10 @@ TEST_CASE("partition_support_entities (C5/M2): no prior descend on this column -
 
     partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
 
-    CHECK(out.empty());
-    REQUIRE(fills.entities.size() == 1);
-    CHECK(fills.entities.front() == inner);
+    CHECK(fills.entities.empty());
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 1);
+    CHECK(out.at(0).entities.front() == inner);
     REQUIRE(inner->entities.size() == 2);
     CHECK(inner->entities[0] == leafA);
     CHECK(inner->entities[1] == leafB);
@@ -2546,8 +2717,9 @@ TEST_CASE("partition_support_entities (C5/M2): column descended last layer -> HA
     // Identical fixture to the sibling test above (leaf B's 3.2mm minority run, p.min_run_mm
     // = 5.0), except p.descended_last_layer is pre-seeded with this exact collection's own
     // quantized column key - the halved threshold (2.5mm) now applies, and 3.2mm clears
-    // it: the collection DESCENDS and splits per leaf, same shape as the full-threshold
-    // DESCEND test further above.
+    // it: the collection DESCENDS, same shape as the full-threshold DESCEND test further
+    // above (v2.5c: both leaves re-bucket by their own uniform vote, fallback included -
+    // see that test's own v2.5c note for the full contract change).
     auto resolver = [](const Point &pt) -> unsigned {
         return unscale<double>(pt.x()) < 25.0 ? 0u : 2u;
     };
@@ -2578,17 +2750,20 @@ TEST_CASE("partition_support_entities (C5/M2): column descended last layer -> HA
 
     partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out, &descended);
 
-    // DESCENDED: leaf A's fallback vote leaves the collection pointer in place (not
-    // emptied), but leaf B is gone, moved to out[2] as a fresh split path.
+    // DESCENDED, and (v2.5c) both leaves individually re-bucket by their own uniform
+    // vote: leaf A (fallback) moves whole into out[0], leaf B moves whole into
+    // out[2] - both pointer-stable, no rebuild. The now-empty collection shell is
+    // deleted, so `fills` ends up empty.
     REQUIRE(out.count(2) == 1);
     REQUIRE(out.at(2).entities.size() == 1);
-    CHECK(out.at(2).entities.front() != leafB); // rebuilt, not the whole original leaf
+    CHECK(out.at(2).entities.front() == leafB); // moved WHOLE, pointer-stable - no rebuild
     CHECK(out.at(2).entities.front()->role() == erSupportMaterial);
 
-    REQUIRE(fills.entities.size() == 1);
-    CHECK(fills.entities.front() == inner);
-    REQUIRE(inner->entities.size() == 1);
-    CHECK(inner->entities.front() == leafA); // untouched fast path: original pointer, in place
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 1);
+    CHECK(out.at(0).entities.front() == leafA); // moved WHOLE, pointer-stable - no rebuild
+
+    CHECK(fills.entities.empty());
 
     REQUIRE(descended.count(expected_key) == 1);
     CHECK(descended.at(expected_key) == true);
@@ -2631,12 +2806,26 @@ TEST_CASE("partition_support_entities (C5): a uniform mixed-extruder-free collec
     CHECK(fills.entities.empty());
 }
 
-TEST_CASE("partition_support_entities (C5): descend splices a leaf's fallback-voted run back AT ITS OWN INDEX, preserving no_sort collection order", "[chameleon]")
+TEST_CASE("partition_support_entities (C5/v2.5c): descend re-buckets every leaf including fallback-voted ones - no more splice-back-in-place", "[chameleon]")
 {
     // Three leaves in one no_sort collection: leaf0 (fallback-only), leaf1 (SPANS the
     // vote boundary - part fallback, part extruder 2), leaf2 (fallback-only). p.min_run_mm
-    // = 0.0 isolates the SPLICE POSITION mechanic from the length-threshold arithmetic
-    // already covered above (any minority, however short, descends).
+    // = 0.0 isolates the mechanic under test from the length-threshold arithmetic already
+    // covered above (any minority, however short, descends).
+    //
+    // v2.5c root cause fix: this test used to be named "...splices a leaf's
+    // fallback-voted run back AT ITS OWN INDEX, preserving no_sort collection
+    // order" and asserted leaf0/leaf2 stayed untouched inside `inner` while leaf1's
+    // fallback half got spliced back in at its own index (never appended to
+    // support_fills's end) - the descend path's own mirror of the top-level leaf
+    // case's old fallback-stays fast path. Re-pointed at the new contract: EVERY
+    // leaf inside a descended collection now resolves through the SAME per-leaf
+    // rule the top-level case uses - leaf0 and leaf2 (each uniformly voting
+    // fallback) move whole, pointer-stable, into out[fallback]; leaf1 (genuinely
+    // mixed) splits, and BOTH halves - fallback included - land in out[], never
+    // spliced back into `inner`. With all three leaves gone, `inner` empties and is
+    // deleted (same "emptied shell -> single delete" rule as the top-level
+    // collection-emptied test below), and `fills` ends up empty too.
     auto resolver = [](const Point &pt) -> unsigned {
         return unscale<double>(pt.x()) < 15.0 ? 0u : 2u;
     };
@@ -2663,20 +2852,23 @@ TEST_CASE("partition_support_entities (C5): descend splices a leaf's fallback-vo
     std::map<unsigned, ExtrusionEntityCollection> out;
     partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
 
-    // DESCENDED (leaf1 alone supplies a mixed vote -> histogram.size() > 1). Original
-    // entity count (3) preserved: leaf1's ONE fallback run replaces it 1-for-1, leaf0/
-    // leaf2 stay untouched at their own indices.
-    REQUIRE(fills.entities.size() == 1);
-    CHECK(fills.entities.front() == inner);
-    REQUIRE(inner->entities.size() == 3);
+    // DESCENDED (leaf1 alone supplies a mixed vote -> histogram.size() > 1), and
+    // every leaf re-buckets: nothing left behind anywhere.
+    CHECK(fills.entities.empty());
 
-    CHECK(inner->entities[0] == leaf0);  // untouched, first position preserved
-    CHECK(inner->entities[1] != leaf0);  // a NEW path (leaf1's fallback half)...
-    CHECK(inner->entities[1] != leaf1);
-    CHECK(inner->entities[1] != leaf2);
-    CHECK(inner->entities[2] == leaf2);  // ...spliced BETWEEN leaf0 and leaf2, not after
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 3); // leaf0 (whole), leaf2 (whole), leaf1's fallback half (rebuilt)
+    CHECK(std::find(out.at(0).entities.begin(), out.at(0).entities.end(), leaf0) != out.at(0).entities.end());
+    CHECK(std::find(out.at(0).entities.begin(), out.at(0).entities.end(), leaf2) != out.at(0).entities.end());
 
-    const auto *spliced = static_cast<const ExtrusionPath *>(inner->entities[1]);
+    // The third out[0] entity is leaf1's own fallback half - a NEW rebuilt path,
+    // not any of the three original leaf pointers.
+    const ExtrusionPath *spliced = nullptr;
+    for (ExtrusionEntity *e : out.at(0).entities)
+        if (e != leaf0 && e != leaf2)
+            spliced = static_cast<const ExtrusionPath *>(e);
+    REQUIRE(spliced != nullptr);
+    CHECK(spliced != leaf1);
     REQUIRE(!spliced->polyline.points.empty());
     // Starts where leaf1 itself started (its own chain's first sample)...
     CHECK(unscale<double>(spliced->polyline.points.front().x()) == 8.0);
@@ -2696,14 +2888,21 @@ TEST_CASE("partition_support_entities (C5): descend splices a leaf's fallback-vo
     CHECK(unscale<double>(matched->polyline.points.back().x()) >= 15.0);
 }
 
-TEST_CASE("partition_support_entities (C5): can_reverse is carried onto split runs, inside a descended collection", "[chameleon]")
+TEST_CASE("partition_support_entities (C5/v2.5c): can_reverse is carried onto split runs, inside a descended collection", "[chameleon]")
 {
     // Single leaf, self-contained, whose OWN vote is mixed (spans x=15) so descend
-    // splits it into exactly two runs: one spliced back (fallback), one moved to
-    // out[2]. set_reverse() is called on the SOURCE leaf before the fixture is built -
-    // both resulting pieces must inherit can_reverse() == false, mirroring how
+    // splits it into exactly two runs: one into out[fallback], one into out[2].
+    // set_reverse() is called on the SOURCE leaf before the fixture is built - both
+    // resulting pieces must inherit can_reverse() == false, mirroring how
     // Support/SupportCommon.cpp:660-663/765-767 builds a branch anchor path with
     // reversal disabled.
+    //
+    // v2.5c root cause fix: pre-v2.5c the fallback half was spliced back into
+    // `inner` rather than bucketed; now it lands in out[fallback] like the matched
+    // half lands in out[2], and the single leaf's departure leaves `inner` empty,
+    // so it is deleted and `fills` ends up empty too (see this file's sibling
+    // splice-back-in-place test, re-pointed under the same v2.5c note, for the
+    // full contract change).
     auto resolver = [](const Point &pt) -> unsigned {
         return unscale<double>(pt.x()) < 15.0 ? 0u : 2u;
     };
@@ -2726,8 +2925,11 @@ TEST_CASE("partition_support_entities (C5): can_reverse is carried onto split ru
     std::map<unsigned, ExtrusionEntityCollection> out;
     partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
 
-    REQUIRE(inner->entities.size() == 1); // the spliced-back fallback half
-    CHECK_FALSE(inner->entities.front()->can_reverse());
+    CHECK(fills.entities.empty()); // inner emptied by the split (both halves bucketed) and deleted
+
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 1); // the fallback half
+    CHECK_FALSE(out.at(0).entities.front()->can_reverse());
 
     REQUIRE(out.count(2) == 1);
     REQUIRE(out.at(2).entities.size() == 1); // the matched half
@@ -2745,19 +2947,26 @@ TEST_CASE("partition_support_entities (C5): can_reverse is carried onto split ru
     std::map<unsigned, ExtrusionEntityCollection> out2;
     partition_support_entities(fills2, erSupportMaterial, 0, resolver, p, out2);
 
-    REQUIRE(inner2->entities.size() == 1);
-    CHECK(inner2->entities.front()->can_reverse());
+    CHECK(fills2.entities.empty());
+    REQUIRE(out2.count(0) == 1);
+    REQUIRE(out2.at(0).entities.size() == 1);
+    CHECK(out2.at(0).entities.front()->can_reverse());
     REQUIRE(out2.count(2) == 1);
     REQUIRE(out2.at(2).entities.size() == 1);
     CHECK(out2.at(2).entities.front()->can_reverse());
 }
 
-TEST_CASE("partition_support_entities (C5): can_reverse is carried for a top-level (non-collection) leaf entity too", "[chameleon]")
+TEST_CASE("partition_support_entities (C5/v2.5c): can_reverse is carried for a top-level (non-collection) leaf entity too", "[chameleon]")
 {
     // Same mechanism, exercised directly at the shared partition_support_leaf_entity
     // call site the top-level (non-nested) leaf branch already used pre-C5 - this is
     // the actual code location the can_reverse fix landed in, so it is worth proving
     // independently of the descend/collection machinery above.
+    //
+    // v2.5c root cause fix: pre-v2.5c the fallback half of this split returned to
+    // `fills` ("spliced at top level"); it now lands in out[fallback] like every
+    // other run, so `fills` ends up empty after the split (matched original
+    // deleted, both halves bucketed).
     auto resolver = [](const Point &pt) -> unsigned {
         return unscale<double>(pt.x()) < 15.0 ? 0u : 2u;
     };
@@ -2773,8 +2982,10 @@ TEST_CASE("partition_support_entities (C5): can_reverse is carried for a top-lev
     std::map<unsigned, ExtrusionEntityCollection> out;
     partition_support_entities(fills, erSupportMaterial, 0, resolver, p, out);
 
-    REQUIRE(fills.entities.size() == 1); // leaf's own fallback-voted run, spliced at top level
-    CHECK_FALSE(fills.entities.front()->can_reverse());
+    CHECK(fills.entities.empty()); // leaf's own vote is mixed -> split, deleted, both halves bucketed
+    REQUIRE(out.count(0) == 1);
+    REQUIRE(out.at(0).entities.size() == 1); // the fallback half
+    CHECK_FALSE(out.at(0).entities.front()->can_reverse());
     REQUIRE(out.count(2) == 1);
     REQUIRE(out.at(2).entities.size() == 1);
     CHECK_FALSE(out.at(2).entities.front()->can_reverse());
@@ -2791,6 +3002,13 @@ TEST_CASE("partition_support_entities (C5): a collection emptied by descend is r
     // non-existence) - this asserts the pointer appears NOWHERE reachable afterward,
     // the strongest black-box proof available; the report's ownership hand-walk covers
     // the rest (single delete, no leak, no double-free).
+    //
+    // v2.5c update: each leaf's vote here is UNIFORM (not just non-fallback), so
+    // under the new contract both now move WHOLE, pointer-stable, into their
+    // buckets (`== leafA`/`== leafB`, not rebuilt) - the pre-v2.5c "rebuilt, not
+    // the original leaf" assertions below are flipped to match. The test's own
+    // point (the collection shell itself is still deleted exactly once) is
+    // unaffected.
     auto resolver = [](const Point &pt) -> unsigned {
         return unscale<double>(pt.x()) < 15.0 ? 2u : 3u;
     };
@@ -2819,10 +3037,10 @@ TEST_CASE("partition_support_entities (C5): a collection emptied by descend is r
 
     REQUIRE(out.count(2) == 1);
     REQUIRE(out.at(2).entities.size() == 1);
-    CHECK(out.at(2).entities.front() != leafA); // rebuilt, not the original leaf
+    CHECK(out.at(2).entities.front() == leafA); // moved WHOLE, pointer-stable - no rebuild (v2.5c)
     REQUIRE(out.count(3) == 1);
     REQUIRE(out.at(3).entities.size() == 1);
-    CHECK(out.at(3).entities.front() != leafB);
+    CHECK(out.at(3).entities.front() == leafB);
 
     // The deleted collection pointer itself is not reachable anywhere: not in
     // support_fills (checked above, empty), and not smuggled into either bucket either.

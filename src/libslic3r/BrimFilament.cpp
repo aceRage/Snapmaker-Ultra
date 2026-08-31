@@ -315,16 +315,43 @@ void partition_leaf_entity(const ExtrusionEntity &entity, unsigned own_extruder,
     }
 }
 
+// v2.5c (root cause fix, diagnostic-log-proven - see BrimFilament.hpp's own
+// partition_support_entities doc comment for the full finding): outcome of voting
+// one support leaf entity. `Unchanged` is now reached ONLY by the degenerate/
+// empty-chain guard - the pre-v2.5c "uniform fallback stays untouched" fast path is
+// gone (see `MovedWhole` below), since a real painted color that happens to equal
+// fallback_extruder must not be definitionally excluded from bucketing.
+enum class SupportLeafOutcome { Unchanged, MovedWhole, Split };
+
 // Partition a single support entity (path/multipath/loop) of any role. `entity`
-// is still owned by support_fills at this point; the caller deletes it if
-// `replaced` comes back true. Fallback-voted runs are appended to
-// `new_fallback_paths` (the caller re-inserts them into support_fills once the
-// sweep over the original entities vector is finished, since it must not be
-// mutated mid-iteration); non-fallback runs land in `out[extruder]`. Emitted
-// split paths copy the source entity's role (first_path_of(entity)->role(),
-// falling back to entity.role()) rather than hardcoding one - so a base-role
-// entity's split paths stay erSupportMaterial. Returns the number of switch
-// boundaries this entity contributed.
+// is still owned by its caller's collection at this point; the caller is
+// responsible for removing/deleting the original per `outcome` (see
+// SupportLeafOutcome's own comment): `Unchanged` - leave it exactly where it is;
+// `MovedWhole` - the pointer has ALREADY been relocated into `out[]` by this
+// function, so the caller must neither delete it nor leave it behind; `Split` -
+// the original has been superseded by fresh per-run paths (also already placed
+// into `out[]`), so the caller deletes the original. Emitted split paths copy the
+// source entity's role (first_path_of(entity)->role(), falling back to
+// entity->role()) rather than hardcoding one - so a base-role entity's split paths
+// stay erSupportMaterial. Returns the number of switch boundaries this entity
+// contributed (0 for `Unchanged`/`MovedWhole` - a single-run vote crosses no
+// boundary; `runs.size() - 1` for `Split`).
+// v2.5c root cause fix (spec item 1, "fallback identity collision"): pre-v2.5c, a
+// UNIFORM vote (single run) only took this no-churn/no-clone path when it voted
+// fallback_extruder specifically - a uniform NON-fallback vote fell through to the
+// per-run rebuild loop below (losing ExtrusionLoop/MultiPath-ness even though
+// nothing about the vote was actually mixed), and a uniform FALLBACK vote was left
+// untouched in the caller's collection entirely, making a real painted color that
+// happens to equal fallback_extruder definitionally unmatchable (the claw-wrap bug:
+// CHAMELEON_DEBUG on the user's own GUI slice showed fallback=0 with white wall
+// samples plentiful every layer, yet ZERO e0 buckets ever formed across 560
+// layers). Both asymmetries are gone: ANY uniform vote (single run, any extruder E,
+// fallback included) now moves the ORIGINAL entity pointer whole into out[E] - no
+// clone, no rebuild, loop-ness/can_reverse/every other property preserved
+// automatically because it is the same object, just relocated. Only a genuinely
+// MIXED vote (>1 run) still rebuilds into per-run ExtrusionPaths, and every one of
+// those runs - fallback included - now lands in out[run.extruder] too; nothing
+// mixed-vote related returns to the caller's collection anymore.
 // v2.3 Task 3 (spec C5): every emitted split path also inherits `entity`'s OWN
 // can_reverse() (ExtrusionEntity.hpp ~111/294/347/389/461 - each concrete entity type
 // expresses "reversal disabled" its own way: ExtrusionPath via the settable
@@ -335,21 +362,22 @@ void partition_leaf_entity(const ExtrusionEntity &entity, unsigned own_extruder,
 // anchor, always print CCW") must keep that property on every rebuilt piece: every
 // new_path this function creates is a plain ExtrusionPath (never an
 // ExtrusionPathOriented), so the only way to carry a false can_reverse() forward is
-// set_reverse() - a no-op call for the (common) case where entity.can_reverse() is
+// set_reverse() - a no-op call for the (common) case where entity->can_reverse() is
 // already true, since ExtrusionPath defaults m_can_reverse to true. Losing this would
 // let GCode's chain_and_reorder flip a rebuilt piece's direction freely, breaking the
-// seam anchor into a visible blob (spec: "seam-anchor blob hazard").
-size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fallback_extruder,
+// seam anchor into a visible blob (spec: "seam-anchor blob hazard"). A MovedWhole
+// entity needs no such handling - its can_reverse() travels with it unchanged,
+// being the same object.
+size_t partition_support_leaf_entity(ExtrusionEntity *entity, unsigned fallback_extruder,
                                       const std::function<unsigned(const Point &)> &resolver,
                                       const BrimVoteParams &p,
-                                      std::vector<ExtrusionPath *> &new_fallback_paths,
                                       std::map<unsigned, ExtrusionEntityCollection> &out,
-                                      bool &replaced)
+                                      SupportLeafOutcome &outcome)
 {
-    replaced = false;
+    outcome = SupportLeafOutcome::Unchanged;
 
-    const bool     is_loop = entity.is_loop();
-    const Polyline as_pl   = entity.as_polyline();
+    const bool     is_loop = entity->is_loop();
+    const Polyline as_pl   = entity->as_polyline();
     Points         chain   = as_pl.points;
     if (is_loop && chain.size() > 1 && chain.front() == chain.back())
         chain.pop_back(); // split_polyline_core closes loops itself
@@ -359,20 +387,24 @@ size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fal
 
     std::vector<BrimRun> runs = split_polyline_core(chain, is_loop, resolver, p);
 
-    // Fast path: every sample voted for the fallback extruder -> leave the
-    // ORIGINAL entity in support_fills untouched (byte-identical geometry, no
-    // entity churn).
-    if (runs.size() == 1 && runs.front().extruder == fallback_extruder)
+    // v2.5c: a UNIFORM vote (single run, any extruder - fallback included) moves
+    // the ORIGINAL entity pointer whole into out[extruder]. No clone, no rebuild -
+    // see this function's own header comment for why this now applies to every
+    // uniform vote, not just a fallback one.
+    if (runs.size() == 1) {
+        out[runs.front().extruder].entities.push_back(entity);
+        outcome = SupportLeafOutcome::MovedWhole;
         return 0;
+    }
 
-    replaced = true;
+    outcome = SupportLeafOutcome::Split;
 
-    const ExtrusionPath *source = first_path_of(entity);
+    const ExtrusionPath *source = first_path_of(*entity);
     const double        mm3_per_mm = source ? source->mm3_per_mm : 0.0;
     const float         width      = source ? source->width      : 0.f;
     const float         height     = source ? source->height     : 0.f;
-    const ExtrusionRole  role      = source ? source->role() : entity.role();
-    const bool           source_can_reverse = entity.can_reverse(); // v2.3 Task 3 (spec C5)
+    const ExtrusionRole  role      = source ? source->role() : entity->role();
+    const bool           source_can_reverse = entity->can_reverse(); // v2.3 Task 3 (spec C5)
 
     for (const BrimRun &run : runs) {
         if (run.pts.empty())
@@ -381,10 +413,9 @@ size_t partition_support_leaf_entity(const ExtrusionEntity &entity, unsigned fal
         new_path->polyline  = Polyline(run.pts);
         if (!source_can_reverse)
             new_path->set_reverse(); // v2.3 Task 3 (spec C5): carry reversal-disable forward
-        if (run.extruder == fallback_extruder)
-            new_fallback_paths.push_back(new_path);
-        else
-            out[run.extruder].entities.push_back(new_path);
+        // v2.5c: every run buckets by its own vote, fallback included - no more
+        // "fallback runs return to the caller's collection" special case.
+        out[run.extruder].entities.push_back(new_path);
     }
 
     return runs.empty() ? 0 : runs.size() - 1;
@@ -556,17 +587,22 @@ CollectionVoteResult vote_collection_as_unit(const ExtrusionEntityCollection &co
 // collections - the only known nested-collection producer at this role,
 // SupportCommon.cpp:647-773 - are exactly one level deep, but this makes no assumption
 // of that):
-//   - a leaf whose entire vote is fallback_extruder is left in place, AT ITS OWN INDEX,
-//     inside its IMMEDIATE parent collection - untouched, no churn (mirrors
-//     partition_support_leaf_entity's own uniform-fallback fast path).
-//   - any other leaf (uniform non-fallback, or genuinely mixed) is split via
-//     partition_support_leaf_entity: fallback-voted runs become new ExtrusionPaths
-//     SPLICED IN at the original leaf's index inside its immediate parent - this is why
-//     the rebuild below appends to a fresh per-collection vector IN ITERATION ORDER
-//     rather than accumulating fallback runs globally the way the top-level leaf case's
-//     own new_fallback_paths does (no_sort order matters here, since these collections
-//     model the tree branch generator's own explicit anchor/sheath ordering); non-
-//     fallback runs go to out[extruder] (role/flow/can_reverse carried, same function).
+//   - v2.5c: a leaf whose vote is UNIFORM (single run, any extruder - fallback
+//     included) moves whole, pointer-stable, into out[extruder] - removed from its
+//     immediate parent, exactly like the top-level leaf case's own `MovedWhole`
+//     outcome (SupportLeafOutcome, above). Pre-v2.5c only a uniform FALLBACK vote
+//     stayed in place "AT ITS OWN INDEX, untouched" - that special case is gone for
+//     the same root-cause reason partition_support_leaf_entity's own header comment
+//     gives: a leaf whose real color happens to equal fallback_extruder must still
+//     be matchable.
+//   - a genuinely mixed leaf is split via partition_support_leaf_entity: EVERY run -
+//     fallback included, v2.5c - lands in out[run.extruder] (role/flow/can_reverse
+//     carried, same function). Pre-v2.5c a mixed leaf's fallback runs were spliced
+//     back in at the leaf's own index inside its immediate parent instead; that
+//     splice-back is gone too - nothing mixed-vote related returns to `collection`
+//     anymore.
+//   - only the degenerate/empty-chain guard (`Unchanged`) still leaves a leaf in
+//     place, at its own index, in `rebuilt`.
 // A nested sub-collection left FULLY EMPTY by this recursion (every one of its own
 // direct entities matched/moved out, nothing fell back into it) is itself removed from
 // its parent and deleted - the SAME "emptied shell, single delete" rule the top-level
@@ -596,19 +632,16 @@ size_t descend_collection_in_place(ExtrusionEntityCollection &collection, unsign
             continue;
         }
 
-        std::vector<ExtrusionPath *> fallback_runs;
-        bool replaced = false;
-        switch_boundaries += partition_support_leaf_entity(*child, fallback_extruder, resolver, p,
-                                                             fallback_runs, out, replaced);
-        if (!replaced) {
-            rebuilt.push_back(child); // uniform-fallback fast path: original stays, at this index
-            continue;
+        SupportLeafOutcome outcome;
+        switch_boundaries += partition_support_leaf_entity(child, fallback_extruder, resolver, p, out, outcome);
+        if (outcome == SupportLeafOutcome::Unchanged) {
+            rebuilt.push_back(child); // degenerate/empty-chain guard: original stays, at this index
+        } else if (outcome == SupportLeafOutcome::Split) {
+            delete child; // superseded by fresh per-run paths, already bucketed into out[]
         }
-        // Splice fallback runs in AT THIS LEAF'S POSITION (no_sort order preserved),
-        // then drop the now-superseded original.
-        for (ExtrusionPath *fb : fallback_runs)
-            rebuilt.push_back(fb);
-        delete child;
+        // MovedWhole: the pointer was already relocated into out[] inside
+        // partition_support_leaf_entity - nothing to push into `rebuilt`, nothing to
+        // delete here.
     }
 
     collection.entities.swap(rebuilt);
@@ -1039,13 +1072,16 @@ size_t partition_support_entities(ExtrusionEntityCollection &support_fills, Extr
                                    DescendColumnMap *descended_out)
 {
     size_t switch_boundaries = 0;
-    std::vector<ExtrusionPath *> new_fallback_paths;
 
-    // Rebuilt in place: entities whose role() != role_filter and untouched
-    // (fast-path) role_filter entities keep their original pointer and
-    // position; matched role_filter entities are deleted here and their
-    // fallback-voted runs are appended (as new entities, role copied from the
-    // source) below, once the sweep is done.
+    // Rebuilt in place: entities whose role() != role_filter, and the
+    // degenerate/empty-chain-guard role_filter entities (SupportLeafOutcome::
+    // Unchanged - see partition_support_leaf_entity's own doc comment), keep
+    // their original pointer and position. A matched role_filter entity either
+    // moves whole into `out[]` (MovedWhole) or is deleted here after its fresh
+    // per-run paths are already bucketed into `out[]` (Split) - v2.5c: neither
+    // outcome ever appends anything back into `kept` anymore, fallback included
+    // (see this function's own header comment in BrimFilament.hpp for the root
+    // cause this replaces).
     ExtrusionEntitiesPtr kept;
     kept.reserve(support_fills.entities.size());
 
@@ -1091,22 +1127,21 @@ size_t partition_support_entities(ExtrusionEntityCollection &support_fills, Extr
             }
 
             if (!genuinely_mixed) {
-                // (a) Uniform, or a real-but-too-short minority: EXACT pre-v2.3
-                // whole-move/stay behavior, pointer-stable.
-                if (vote.winner == fallback_extruder) {
-                    // Fallback majority (or no samples at all): leave the ORIGINAL
-                    // collection pointer exactly where it is - byte-identical geometry,
-                    // no entity churn, and its own no_sort flag is untouched because the
-                    // collection object itself is never touched, only re-examined.
-                    kept.push_back(entity);
-                } else {
-                    // Non-fallback majority: move the WHOLE collection pointer into
-                    // out[voted] - true ownership transfer (not append(), which clones),
-                    // same "pointer moves, no clone" contract the leaf fast path already
-                    // gives its own untouched entities. The collection's no_sort flag
-                    // travels with it unchanged (still the same object).
-                    out[vote.winner].entities.push_back(entity);
-                }
+                // (a) Uniform, or a real-but-too-short minority: whole-move,
+                // pointer-stable - true ownership transfer (not append(), which
+                // clones), same "pointer moves, no clone" contract the leaf
+                // MovedWhole outcome already gives its own untouched entities. The
+                // collection's no_sort flag travels with it unchanged (still the
+                // same object).
+                // v2.5c root cause fix: pre-v2.5c a FALLBACK winner (or the "no
+                // samples at all" default) instead left the ORIGINAL collection
+                // pointer in `support_fills`, untouched - the same fallback-
+                // exclusion collision the leaf case had (see
+                // partition_support_leaf_entity's own header comment). "Not
+                // genuinely mixed" now uniformly means "whole-move into
+                // out[vote.winner]", whatever that winner is - a real painted color
+                // that happens to equal fallback_extruder is no longer excluded.
+                out[vote.winner].entities.push_back(entity);
                 continue;
             }
 
@@ -1129,17 +1164,22 @@ size_t partition_support_entities(ExtrusionEntityCollection &support_fills, Extr
             continue;
         }
 
-        bool replaced = false;
-        switch_boundaries += partition_support_leaf_entity(*entity, fallback_extruder, resolver, p,
-                                                             new_fallback_paths, out, replaced);
-        if (replaced)
-            delete entity; // matched original removed; its runs were recorded above
-        else
-            kept.push_back(entity); // uniform-fallback fast path: original stays untouched
+        SupportLeafOutcome outcome;
+        switch_boundaries += partition_support_leaf_entity(entity, fallback_extruder, resolver, p, out, outcome);
+        switch (outcome) {
+            case SupportLeafOutcome::Unchanged:
+                kept.push_back(entity); // degenerate/empty-chain guard: original stays untouched
+                break;
+            case SupportLeafOutcome::Split:
+                delete entity; // superseded by fresh per-run paths, already bucketed into out[]
+                break;
+            case SupportLeafOutcome::MovedWhole:
+                // pointer already relocated into out[] inside
+                // partition_support_leaf_entity - nothing to push into `kept`,
+                // nothing to delete here.
+                break;
+        }
     }
-
-    for (ExtrusionPath *path : new_fallback_paths)
-        kept.push_back(path);
 
     support_fills.entities.swap(kept);
     return switch_boundaries;

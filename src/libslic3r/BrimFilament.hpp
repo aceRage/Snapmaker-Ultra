@@ -309,19 +309,46 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView>& la
                                       const Point& p,
                                       size_t& out_layer, size_t& out_region);
 
+// v2.5c (root cause fix, diagnostic-log-proven): CHAMELEON_DEBUG logging on the
+// user's own GUI slice showed white wall samples plentiful (194-593/layer in the
+// claw band), fallback_extruder resolving to 0 (white, the layer-0 min external-
+// perimeter color), and ZERO e0 buckets across all 560 layers even though every
+// gate/trim/redirect mechanism kept every OTHER bucket (559 e2, 128 e3; every
+// bucket that formed survived). Root cause: this function (and its leaf/collection
+// handling below) treated a run/entity/collection whose vote == fallback_extruder
+// as definitionally UNMATCHED - a fast path kept the original untouched (or
+// spliced/appended it back into support_fills), regardless of whether that vote
+// was a genuine "no candidate wall nearby" fallback or a REAL painted wall color
+// that simply happens to share an id with fallback_extruder (fallback is always
+// SOME real extruder - typically a layer-0 model color - so this collision is the
+// NORM on painted models, not an edge case). The v2.5a residual pin then painted
+// that never-bucketed geometry the dominant SURVIVING bucket's color instead (the
+// "teal claw wraps, khaki-heavy tree" symptom). Fixed by removing the fallback
+// special-case everywhere in this pass: a vote of fallback_extruder now buckets
+// exactly like any other vote - see each bullet below for where that changed.
+//
 // Partition the `role_filter`-role entities of `support_fills`: `resolver` is
 // called per sample point (in place of a fixed WallSampleIndex knn vote) via
 // split_polyline_by_resolver.
-// - Entities whose every vote == fallback stay in support_fills untouched (fast path).
-// - Otherwise the entity is split; runs voted fallback are appended back into
-//   support_fills as new paths (role copied from first_path_of(entity)->role(),
-//   falling back to entity->role() - so a base-role split stays erSupportMaterial,
-//   never hardcoded to erSupportMaterialInterface); other runs go to out[extruder].
+// - v2.5c: a leaf entity whose vote is UNIFORM (every sample the same extruder,
+//   fallback included) moves the ORIGINAL pointer whole into out[extruder] - no
+//   clone, no rebuild, loop-ness/can_reverse/every other property preserved
+//   automatically (SupportLeafOutcome::MovedWhole in the .cpp; this SUBSUMES the
+//   old "uniform fallback stays untouched" fast path - "uniform anything moves
+//   whole into its bucket" now, whatever that winner is). A leaf whose vote is
+//   genuinely MIXED is split into runs; EVERY run - fallback included - lands in
+//   out[run.extruder] (role copied from first_path_of(entity)->role(), falling
+//   back to entity->role() - so a base-role split stays erSupportMaterial, never
+//   hardcoded to erSupportMaterialInterface). Nothing mixed-vote related returns to
+//   support_fills anymore.
 // - Entities whose collapsed role() != role_filter are never touched (this includes
 //   a nested collection whose own contents mix roles, or match some OTHER role
 //   entirely - "collapsed" per ExtrusionEntityCollection::role(), which is already
 //   fully recursive: erNone for empty, the single common role for a uniform
-//   collection at any nesting depth, erMixed otherwise).
+//   collection at any nesting depth, erMixed otherwise). The only OTHER way an
+//   role_filter-matching entity now stays in place is the degenerate/empty-chain
+//   guard (SupportLeafOutcome::Unchanged) - an entity whose polyline collapses to
+//   nothing to sample at all.
 // - v2.2 Task 3 (spec C7, "nested collections"): a nested ExtrusionEntityCollection
 //   whose collapsed role() DOES equal role_filter (tree double-wall branch
 //   collections, layer-0 no_sort sheath collections, etc. - previously invisible to
@@ -330,45 +357,52 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView>& la
 //   0.8mm-default cadence split_polyline_core's build_chain uses (reused directly),
 //   `resolver` is called once per sample across the WHOLE collection, and the
 //   majority vote decides the outcome (ties broken to the LOWEST extruder id,
-//   deterministic - see vote_collection_as_unit's own comment in the .cpp). A
-//   non-fallback majority MOVES the original collection pointer whole into
-//   out[extruder] (no clone, no per-child split); a fallback majority (or an empty/
-//   sample-less collection) leaves it in support_fills untouched, exactly like the
-//   leaf fast path above - this is also what preserves a moved-or-left collection's
-//   own `no_sort` flag, since the collection object itself is never touched, only
-//   relocated as a whole. Matched originals (leaf OR whole collection) are deleted
-//   from support_fills's own top-level entities vector, never from inside a
-//   collection that stays behind.
+//   deterministic - see vote_collection_as_unit's own comment in the .cpp). The
+//   winning majority MOVES the original collection pointer whole into out[extruder]
+//   (no clone, no per-child split) - v2.5c: this now applies uniformly whether that
+//   winner is fallback_extruder or not (pre-v2.5c a fallback majority, or an empty/
+//   sample-less collection, instead left the pointer in support_fills untouched -
+//   the same collision this whole fix removes). This is also what preserves a
+//   moved collection's own `no_sort` flag, since the collection object itself is
+//   never touched, only relocated as a whole. Matched originals (leaf OR whole
+//   collection) are deleted from support_fills's own top-level entities vector,
+//   never from inside a collection that stays behind.
 // - v2.3 Task 3 (spec C5, root cause 5, "tree selective descent"): the whole-collection
 //   vote above (vote_collection_as_unit) now ALSO reports the raw per-extruder sample
 //   histogram and the longest contiguous run (mm) of samples that voted some extruder
 //   OTHER than the winner ("the minority's contiguous run"). A collection whose vote is
 //   UNIFORM (histogram has only one distinct extruder) or whose minority run is SHORTER
 //   than the descend threshold behaves EXACTLY as the C7 paragraph above describes -
-//   whole-move or stay, pointer-stable, no change. A collection whose minority run
-//   reaches the threshold DESCENDS instead: every LEAF entity reachable inside it
-//   (recursing into any further-nested sub-collection the same way) is individually
-//   partitioned via the SAME per-leaf logic the top-level leaf case above already uses -
-//   a leaf whose own vote is uniformly fallback is left in place untouched; a leaf whose
-//   own vote is uniformly one non-fallback extruder moves whole into out[extruder]
-//   (rebuilt as a new ExtrusionPath, per-leaf flow attrs from first_path_of(leaf) -
-//   ExtrusionLoop/MultiPath-ness is not preserved, same pre-existing tradeoff the
-//   top-level leaf case already has); a leaf with a genuinely mixed vote is split into
-//   runs, with non-fallback runs going to out[extruder] and fallback runs SPLICED BACK
-//   IN PLACE at that leaf's own index inside its IMMEDIATE parent collection (never
-//   appended to the end - `no_sort` order is preserved exactly, unlike the top-level
-//   leaf case's own new_fallback_paths, which DOES append to the end of support_fills
-//   since ordering there doesn't carry the same meaning). Every rebuilt ExtrusionPath
-//   (in either case above) inherits the SOURCE LEAF's own can_reverse() - see
-//   ExtrusionEntity::can_reverse()/ExtrusionPath::set_reverse() (ExtrusionEntity.hpp) -
-//   a branch-wall leaf built with reversal disabled (Support/SupportCommon.cpp:660-663/
+//   whole-move, pointer-stable, no change (this threshold decision itself is untouched
+//   by v2.5c - only the fallback-winner OUTCOME changed, per the C7 paragraph's own
+//   v2.5c note). A collection whose minority run reaches the threshold DESCENDS
+//   instead: every LEAF entity reachable inside it (recursing into any further-nested
+//   sub-collection the same way) is individually partitioned via the SAME per-leaf
+//   logic the top-level leaf case above already uses - v2.5c: a leaf whose own vote is
+//   UNIFORM (fallback included) moves whole into out[extruder], pointer-stable, exactly
+//   like the top-level MovedWhole case (pre-v2.5c only a uniform non-fallback vote
+//   moved, and even then it was REBUILT as a new ExtrusionPath rather than moved -
+//   ExtrusionLoop/MultiPath-ness was lost; a uniform fallback vote stayed in place
+//   untouched. Both of those are gone: the move is now pointer-stable for ANY uniform
+//   winner, no rebuild, no loop-ness loss). A leaf with a genuinely mixed vote is split
+//   into runs, and EVERY run - fallback included, v2.5c - goes to out[extruder]; no run
+//   is ever spliced back into the leaf's immediate parent collection anymore (pre-v2.5c
+//   fallback runs were SPLICED BACK IN PLACE at the leaf's own index instead). Every
+//   rebuilt ExtrusionPath (the genuinely-mixed split case only - a MovedWhole leaf needs
+//   no such handling, being the same object) inherits the SOURCE LEAF's own can_reverse()
+//   - see ExtrusionEntity::can_reverse()/ExtrusionPath::set_reverse() (ExtrusionEntity.hpp)
+//   - a branch-wall leaf built with reversal disabled (Support/SupportCommon.cpp:660-663/
 //   765-767, "always start with the anchor") must keep that property on its split
 //   pieces, or GCode's chain_and_reorder is free to flip a piece's direction and break
 //   the seam anchor (spec: "seam-anchor blob hazard"). A (possibly nested) sub-
 //   collection left fully empty by this recursion is itself removed from its parent and
 //   deleted - never left behind as a dangling empty shell - the SAME rule the top-level
 //   collection pointer follows: it stays in support_fills, still the same object,
-//   unless the descend emptied it entirely, in which case it is deleted exactly once.
+//   unless the descend emptied it entirely, in which case it is deleted exactly once
+//   (v2.5c: since a descended collection's leaves now ALL re-bucket, including any
+//   uniformly-fallback ones, a descend is more likely than before to empty the
+//   collection out entirely - this is expected, not a bug: the geometry did not
+//   disappear, it simply landed in out[fallback] instead of staying behind).
 //   The descend threshold is `p.min_run_mm` (support-pass override, spec C6: 1.6mm),
 //   HALVED for a column found in `p.descended_last_layer` (see DescendColumnMap's own
 //   comment above) - if `descended_out` is non-null, every collection this call decides
@@ -383,10 +417,22 @@ bool chameleon_pick_projection_region(const std::vector<ProjectionLayerView>& la
 //   collection's minority run happens to reach it - which, pre-C5, cannot happen at all,
 //   since vote_collection_as_unit had no minority-run concept until this task).
 // Returns switch-boundary count added (for the per-object cap accounting) - a moved
-// whole collection does not contribute to this count (it isn't split into runs); a
-// DESCENDED collection contributes the sum of its own per-leaf switch-boundary counts
-// (mirrors the top-level leaf case's own accounting, just summed across every leaf the
-// descend touched).
+// whole collection (or leaf) does not contribute to this count (it isn't split into
+// runs); a genuinely split entity/DESCENDED collection contributes `runs.size() - 1`
+// per leaf touched, summed (mirrors the top-level leaf case's own accounting).
+//
+// Knock-on effects of this fix, verified elsewhere and NOT requiring their own code
+// changes (both already generic over `map`'s/`out`'s extruder keys, with no
+// fallback_extruder special-casing to remove):
+// - apply_bucket_caps (below): the fallback-color bucket now competes in the gate/
+//   trim/redirect tiers like any other bucket - no special-casing added, deliberately
+//   (the fallback extruder is usually, but not guaranteed, strict-free at every z; the
+//   existing free/prev_kept tiers decide, same as for any other bucket).
+// - ToolOrdering.cpp's collect_extruders (~734-736): registers every non-empty
+//   out[]-derived bucket's extruder on its layer unconditionally, so out[fallback]
+//   surviving the caps now may add a toolchange on a layer where the fallback
+//   extruder wasn't otherwise present that layer - this is the intended price of
+//   printing the color the user actually painted, not a regression to guard against.
 size_t partition_support_entities(ExtrusionEntityCollection& support_fills,
                                   ExtrusionRole role_filter,
                                   unsigned fallback_extruder,
