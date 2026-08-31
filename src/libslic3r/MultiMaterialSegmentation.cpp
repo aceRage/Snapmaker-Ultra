@@ -2,6 +2,7 @@
 #include "ClipperUtils.hpp"
 #include "EdgeGrid.hpp"
 #include "Layer.hpp"
+#include "PaintDepth.hpp"
 #include "Print.hpp"
 #include "Geometry/VoronoiVisualUtils.hpp"
 #include "Geometry/VoronoiUtils.hpp"
@@ -2198,8 +2199,41 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     const size_t num_physical_filaments = print_object.print()->config().filament_colour.size();
     const size_t num_total_filaments    = print_object.print()->mixed_filament_manager().total_filaments(num_physical_filaments);
     const size_t num_facets_states      = num_total_filaments + 1;
-    const float  max_width          = float(print_object.config().mmu_segmented_region_max_width.value);
-    const float  interlocking_depth = float(print_object.config().mmu_segmented_region_interlocking_depth.value);
+
+    // Paint Depth Stage 1, plan Task 2 item 1 (docs/superpowers/plans/2026-08-31-paint-depth.md,
+    // docs/superpowers/specs/2026-08-31-paint-depth-design.md): mmu_segmented_region_max_width is
+    // now legacy-parse-only (Task 1) - the runtime clamp width is derived from paint_depth_mode
+    // via paint_depth_band_mm. We derive the flow (external-perimeter width / perimeter spacing)
+    // that feeds walls-mode the same way fuzzy_skin_segmentation_by_painting derives its clamp
+    // width below (:2237-2253 in this file - "limit the depth ... by the maximal extrusion width
+    // of external perimeters"): from every PrintRegion on the object, not only the specific
+    // region(s) that happen to carry paint. We don't have a cheap paint-facet -> PrintRegion
+    // mapping at this call site (that mapping lives in PrintObjectSlice.cpp's
+    // PrintObjectRegions::LayerRangeRegions, a different translation unit built later in the
+    // pipeline), so - mirroring that precedent exactly - every printing region's flow is a
+    // candidate. When regions differ (multiple materials/wall widths on one object), we take the
+    // MAX per-region band across all of them: a narrower region's thinner walls must never be
+    // allowed to under-clamp a wider region's paint claim, so the widest region's band wins
+    // (documented conservative choice per the plan).
+    const PaintDepthMode paint_depth_mode  = print_object.config().paint_depth_mode.value;
+    const int            paint_depth_walls = print_object.config().paint_depth_walls.value;
+    const double         paint_depth_mm    = print_object.config().paint_depth_mm.value;
+    float                max_width         = 0.f;
+    for (size_t region_idx = 0; region_idx < print_object.num_printing_regions(); ++region_idx) {
+        const PrintRegion &region               = print_object.printing_region(region_idx);
+        const float         ext_perimeter_width = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).width();
+        const float         perimeter_spacing   = region.flow(print_object, frPerimeter, print_object.config().layer_height).spacing();
+        max_width = std::max(max_width, paint_depth_band_mm(paint_depth_mode, paint_depth_walls, paint_depth_mm, ext_perimeter_width, perimeter_spacing));
+    }
+    // Beam-interlocking mutual exclusion (:2169 below) is unchanged, but the interlocking
+    // sub-band must only ever be active when depth is actually bounded (spec Stage 1, "Interlocking
+    // ... only active when depth bounded, as upstream"): mmu_segmented_region_interlocking_depth's
+    // default is now 0.3 (Task 1), so without this mode gate, pdmUnlimited would still cut a
+    // 0.3mm interlocking band via the `segmentation_interlocking_depth > 0.f` half of the OR at
+    // :2169 - breaking the "unlimited mode = legacy behavior, bit-identical" requirement. Gating
+    // it on paint_depth_mode here (rather than editing the :2169 OR itself) keeps that gate's
+    // existing shape/semantics untouched, as the plan requires.
+    const float  interlocking_depth = paint_depth_mode != pdmUnlimited ? float(print_object.config().mmu_segmented_region_interlocking_depth.value) : 0.f;
     const bool   interlocking_beam  = print_object.config().interlocking_beam.value;
 
     size_t max_painted_state = 0;
