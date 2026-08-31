@@ -29,10 +29,12 @@
 #include <limits>
 #include <unordered_set>
 #include <boost/filesystem/path.hpp>
+#include <boost/filesystem/operations.hpp>
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/regex.hpp>
 #include <boost/nowide/fstream.hpp>
+#include <boost/nowide/cstdio.hpp>
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -2338,6 +2340,147 @@ BoundingBox PrintObject::get_first_layer_bbox(float& a, float& layer_height, std
     return bbox;
 }
 
+// ============================================================================
+// CHAMELEON_DEBUG diagnostic logging (v2.5c, support-match pass instrumentation)
+// ============================================================================
+// Purpose: discriminate why a color's bucket never forms at a given support layer -
+// see docs/superpowers/sdd/2026-08-29-support-interface-match/progress.md's v2.5a
+// section and the round-4 GUI refutation this instruments for (white claw supports
+// painting teal even though the max-2 trim never fires there - so either the k=1
+// nearest-wall vote never samples a white wall at that layer, or the min-benefit gate
+// kills the (tiny) claw bucket anyway).
+//
+// GUI slicing runs on a background thread whose BOOST_LOG_TRIVIAL output does not
+// reliably land in the GUI's own log sink (Part 1's own hard-won lesson - the file sink
+// wired up by set_log_path_and_level, utils.cpp, is not guaranteed to see every
+// background-thread message on a GUI slice the way a CLI run does), so this writes
+// directly to its own file via fopen-append instead of routing through
+// BOOST_LOG_TRIVIAL - boost::nowide::fopen, the same idiom GCode.cpp/GCodeReader.cpp/
+// GCodeProcessor.cpp already use elsewhere in this codebase for exactly this "open,
+// write, close" pattern (never held open across calls, so a crash mid-slice never loses
+// buffered-but-unflushed lines).
+//
+// Gate: chameleon_debug_enabled() reads getenv("CHAMELEON_DEBUG") exactly ONCE
+// (function-local static). chameleon_assign_support_interfaces reads this ONCE per
+// pass invocation into a local bool and threads that bool through every call site
+// below it - nothing past that one getenv call runs when the env var is unset (every
+// logging/formatting call below is behind `if (chameleon_debug_on)`; WallSampleIndex::
+// add_polyline's own sample_count_out and apply_bucket_caps' own debug_out stay
+// nullptr, so their own instrumentation is a no-op pointer compare too - see each
+// function's own header comment).
+//
+// Log destination: <data_dir()>/log/chamdbg_support.log (data_dir() resolves to
+// %APPDATA%\Snapmaker_Orca on Windows - see utils.cpp's set_log_path_and_level for the
+// same log/ subfolder convention this mirrors). Appended to, never truncated - a fresh
+// run's lines simply accumulate after any earlier run's; plain text, one record per
+// line, never rotated or size-capped (diagnostic tool, not a production log stream).
+//
+// Line format - every value is a single token with no embedded whitespace, so a line
+// splits cleanly into `key=value` fields on whitespace:
+//   obj=<ordinal> print_z=<mm> height=<mm> fallback=<extruder> base_fallback=<extruder>
+//   free_windowed=<id,id,...> free_strict=<id,id,...>
+//   contact_layers=<li,li,...> coplanar_layers=<li,li,...>
+//   wall_samples=<li:e<id>=<count>,e<id>=<count>;li:...>
+//   buckets=<e<id>:before=<mm>,after=<mm>,outcome=<kept|kept_exempt|gated|trimmed>,redirect=<id|none>;...>
+// (any list-valued field is empty-after-`=` when that set/vector/map is empty - e.g.
+// "free_strict=" means no extruder is strictly free at this layer). One line per
+// support layer of a mode-active object that reaches this pass' own per-layer body
+// (i.e. every layer NOT skipped by the plate guard or the chameleon_interface_visited
+// re-run guard - see chameleon_assign_support_interfaces' own per-layer loop for both -
+// including a zero-sample layer, whose line has an empty wall_samples/buckets tail:
+// "a contact/coplanar band was selected here but nothing in it sampled at all" IS the
+// signal that discriminates mechanism (a) from a normal gate/vote outcome). A per-
+// object "SUMMARY " line (field-for-field mirror of the existing BOOST_LOG_TRIVIAL info
+// line further down this file) is appended once per object, after its last per-layer
+// line - see that BOOST_LOG_TRIVIAL call site's own comment for why this duplicate
+// exists.
+static bool chameleon_debug_enabled()
+{
+    static const bool enabled = (std::getenv("CHAMELEON_DEBUG") != nullptr);
+    return enabled;
+}
+
+static void chameleon_debug_log(const std::string &line)
+{
+    boost::filesystem::path log_dir = boost::filesystem::path(data_dir()) / "log";
+    boost::system::error_code ec;
+    if (!boost::filesystem::exists(log_dir, ec))
+        boost::filesystem::create_directories(log_dir, ec); // best-effort - the fopen below just fails (and is skipped) if this didn't work
+    boost::filesystem::path log_path = log_dir / "chamdbg_support.log";
+    FILE *f = boost::nowide::fopen(log_path.string().c_str(), "a");
+    if (f == nullptr)
+        return;
+    fputs(line.c_str(), f);
+    fputc('\n', f);
+    fclose(f);
+}
+
+static std::string chameleon_debug_format_mm(double v)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f", v);
+    return std::string(buf);
+}
+
+static std::string chameleon_debug_format_ids(const std::set<unsigned> &ids)
+{
+    std::string out;
+    for (unsigned id : ids) {
+        if (!out.empty())
+            out += ',';
+        out += std::to_string(id);
+    }
+    return out;
+}
+
+static std::string chameleon_debug_format_indices(const std::vector<size_t> &indices)
+{
+    std::string out;
+    for (size_t i : indices) {
+        if (!out.empty())
+            out += ',';
+        out += std::to_string(i);
+    }
+    return out;
+}
+
+// per_layer: (band layer index -> per-extruder inserted-sample count), one entry per
+// li visited by chameleon_assign_support_interfaces' union_layer_indices loop - see
+// that call site's own comment for how this is built.
+static std::string chameleon_debug_format_wall_samples(
+    const std::vector<std::pair<size_t, std::map<unsigned, size_t>>> &per_layer)
+{
+    std::string out;
+    for (const auto &entry : per_layer) {
+        if (!out.empty())
+            out += ';';
+        out += "li" + std::to_string(entry.first) + ":";
+        bool first = true;
+        for (const auto &kv : entry.second) {
+            if (!first)
+                out += ',';
+            out += "e" + std::to_string(kv.first) + "=" + std::to_string(kv.second);
+            first = false;
+        }
+    }
+    return out;
+}
+
+static std::string chameleon_debug_format_buckets(const std::vector<ChameleonBucketDebugEntry> &entries)
+{
+    std::string out;
+    for (const ChameleonBucketDebugEntry &e : entries) {
+        if (!out.empty())
+            out += ';';
+        out += "e" + std::to_string(e.extruder)
+             + ":before=" + chameleon_debug_format_mm(e.length_before_mm)
+             + ",after=" + chameleon_debug_format_mm(e.length_after_mm)
+             + ",outcome=" + e.outcome
+             + ",redirect=" + (e.redirected_into >= 0 ? std::to_string(e.redirected_into) : std::string("none"));
+    }
+    return out;
+}
+
 // Chameleon brim: walk one LayerRegion's perimeters (recursing into nested
 // collections and unwrapping loops/multipaths to their leaf paths), adding
 // every wall sample - shifted into plate coordinates - to wall_idx. The
@@ -2383,15 +2526,22 @@ static unsigned chameleon_region_extruder(const PrintRegion &region, bool is_ext
     return std::max(1u, region.extruder(is_external ? frExternalPerimeter : frPerimeter)) - 1;
 }
 
+// CHAMELEON_DEBUG (v2.5c diagnostic instrumentation): `sample_count_out`, when non-
+// null, is threaded straight through to every WallSampleIndex::add_polyline call below
+// (including the two recursive self-calls, so a nested collection's paths are counted
+// too) - see that function's own header comment (WallSampleIndex.hpp) for the per-
+// extruder accumulation this ultimately feeds. Default nullptr: every pre-v2.5c call
+// site is unaffected.
 static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const PrintRegion& region,
-                                            const Point& shift, size_t object_key, WallSampleIndex& wall_idx)
+                                            const Point& shift, size_t object_key, WallSampleIndex& wall_idx,
+                                            std::map<unsigned, size_t>* sample_count_out = nullptr)
 {
     if (entity == nullptr)
         return;
     if (entity->is_collection()) {
         const auto* coll = static_cast<const ExtrusionEntityCollection*>(entity);
         for (const ExtrusionEntity* child : coll->entities)
-            chameleon_collect_wall_samples(child, region, shift, object_key, wall_idx);
+            chameleon_collect_wall_samples(child, region, shift, object_key, wall_idx, sample_count_out);
         return;
     }
 
@@ -2404,7 +2554,7 @@ static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const 
         shifted.reserve(path.polyline.points.size());
         for (const Point& pt : path.polyline.points)
             shifted.push_back(pt + shift);
-        wall_idx.add_polyline(shifted, extruder, object_key);
+        wall_idx.add_polyline(shifted, extruder, object_key, /*spacing_mm=*/0.8, sample_count_out);
     };
 
     if (const auto* path = dynamic_cast<const ExtrusionPath*>(entity)) {
@@ -2789,6 +2939,13 @@ static void chameleon_assign_support_interfaces(Print &print)
     PrintObjectPtrs &objects  = print.objects_mutable();
     const Point      no_shift(0, 0); // supports and walls share object coordinates (no instance shift)
 
+    // CHAMELEON_DEBUG (v2.5c diagnostic instrumentation): checked ONCE per pass
+    // invocation, here - not per object, not per layer, not per sample - so every
+    // downstream site below gates its own extra work behind this single bool instead
+    // of re-checking getenv itself. See the CHAMELEON_DEBUG header comment above
+    // chameleon_collect_wall_samples for the log destination/line format this feeds.
+    const bool chameleon_debug_on = chameleon_debug_enabled();
+
     // v2.3 Task 1 (spec C1): once per PASS (not once per object) - every object's walls/
     // solid/sparse infill contribute to the SAME free-extruder table, since the whole
     // point is "is some extruder already printing at this z ANYWHERE on the plate".
@@ -3087,18 +3244,56 @@ static void chameleon_assign_support_interfaces(Print &print)
             std::function<unsigned(const Point &)> interface_resolver;
             std::function<unsigned(const Point &)> base_resolver;
 
+            // CHAMELEON_DEBUG: per-band-layer, per-extruder wall sample counts feeding
+            // wall_union_idx below - the (a)-vs-(b) discriminator from the round-4
+            // refutation (progress.md v2.5a section): if a claw's own extruder is ZERO
+            // here at its claw layers, the bucket dies at sampling/selection (mechanism
+            // a), not at the vote or the gate. Populated only when chameleon_debug_on
+            // (see chameleon_collect_wall_samples' own trailing parameter and
+            // WallSampleIndex::add_polyline's own comment) - an empty vector plus one
+            // pointer check per li when off.
+            std::vector<std::pair<size_t, std::map<unsigned, size_t>>> debug_wall_samples;
+
             // v2.2 Task 4 (spec C8): ONE WallSampleIndex over the UNION of the
             // contact-band layers (a) and the coplanar layers (b) - dedupe via
             // union_layer_indices (BrimFilament.hpp/.cpp) so a layer index selected
             // by both bands doesn't double-weight its walls in brim_vote's 1/d^2
             // scoring. No projection view is ever built (v2.5 upward-cast scaffolding
             // only, see this function's own header comment).
-            for (size_t li : union_layer_indices(contact_idx, coplanar_idx))
+            for (size_t li : union_layer_indices(contact_idx, coplanar_idx)) {
+                std::map<unsigned, size_t>  debug_li_counts;
+                std::map<unsigned, size_t> *debug_li_counts_ptr = chameleon_debug_on ? &debug_li_counts : nullptr;
                 for (const LayerRegion *lr : object->layers()[li]->regions())
                     chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
-                        no_shift, obj_idx, wall_union_idx);
+                        no_shift, obj_idx, wall_union_idx, debug_li_counts_ptr);
+                if (chameleon_debug_on)
+                    debug_wall_samples.emplace_back(li, std::move(debug_li_counts));
+            }
 
             zero_sample = wall_union_idx.empty();
+
+            // CHAMELEON_DEBUG: common per-layer line prefix, built once here so both the
+            // zero-sample early-exit just below and the full engine-call path further
+            // down emit the same fields - only the trailing `buckets=` segment differs
+            // (a zero-sample layer never reaches apply_bucket_caps, so it logs an empty
+            // buckets field instead of no line at all - "a contact/coplanar band was
+            // selected here but nothing sampled anywhere in it" is itself part of the
+            // (a)-mechanism signal this instrumentation exists to surface).
+            std::string chameleon_debug_line;
+            if (chameleon_debug_on) {
+                chameleon_debug_line =
+                    "obj="            + std::to_string(obj_idx) +
+                    " print_z="       + chameleon_debug_format_mm(support_layer->print_z) +
+                    " height="        + chameleon_debug_format_mm(support_layer->height) +
+                    " fallback="      + std::to_string(fallback_extruder) +
+                    " base_fallback=" + std::to_string(base_fallback_extruder) +
+                    " free_windowed=" + chameleon_debug_format_ids(free_extruders) +
+                    " free_strict="   + chameleon_debug_format_ids(free_extruders_exempt) +
+                    " contact_layers="  + chameleon_debug_format_indices(contact_idx) +
+                    " coplanar_layers=" + chameleon_debug_format_indices(coplanar_idx) +
+                    " wall_samples="    + chameleon_debug_format_wall_samples(debug_wall_samples);
+            }
+
             if (!zero_sample) {
                 // Resolver for ALL THREE roles (interface, base, and - via
                 // interface_resolver, reused verbatim, "ironing follows its interface" -
@@ -3149,6 +3344,8 @@ static void chameleon_assign_support_interfaces(Print &print)
                 // BEFORE the engine calls, so it's one of the "layers that skip
                 // partitioning" the hysteresis contract (above) leaves prev_kept
                 // unchanged for.
+                if (chameleon_debug_on)
+                    chameleon_debug_log(chameleon_debug_line + " buckets=");
                 ++layers_zero_sample;
                 support_layer->chameleon_interface_visited = true;
                 continue;
@@ -3233,14 +3430,25 @@ static void chameleon_assign_support_interfaces(Print &print)
             // chameleon_update_prev_kept below.
             const bool had_buckets_pre_gate = !partitioned.empty();
 
+            // CHAMELEON_DEBUG: per-bucket before/after/outcome accounting - see
+            // ChameleonBucketDebugEntry's own doc comment (BrimFilament.hpp) and
+            // apply_bucket_caps' own trailing parameter for what populates this.
+            // nullptr when off, matching every other debug hook in this loop.
+            std::vector<ChameleonBucketDebugEntry> chameleon_debug_bucket_entries;
+
             BucketCapResult cap_result = apply_bucket_caps(partitioned, prev_kept,
                 /*max_extruders=*/2, /*min_len_mm=*/12.0, support_layer->support_fills,
-                free_extruders, /*min_len_free_mm=*/3.0, free_extruders_exempt);
+                free_extruders, /*min_len_free_mm=*/3.0, free_extruders_exempt,
+                chameleon_debug_on ? &chameleon_debug_bucket_entries : nullptr);
             buckets_dropped_min_benefit      += cap_result.buckets_dropped_min_benefit;
             buckets_dropped_min_benefit_free += cap_result.buckets_dropped_min_benefit_free;
             buckets_trimmed_cap              += cap_result.buckets_trimmed_cap;
             buckets_redirected               += cap_result.buckets_redirected;
             buckets_exempt_kept              += cap_result.buckets_exempt_kept;
+
+            if (chameleon_debug_on)
+                chameleon_debug_log(chameleon_debug_line + " buckets=" +
+                    chameleon_debug_format_buckets(chameleon_debug_bucket_entries));
 
             if (!partitioned.empty()) {
                 support_layer->interface_by_extruder = std::move(partitioned);
@@ -3310,6 +3518,34 @@ static void chameleon_assign_support_interfaces(Print &print)
             << " interface_runs_matched=" << interface_runs_matched
             << " base_runs_matched=" << base_runs_matched
             << " ironing_runs_matched=" << ironing_runs_matched;
+
+        // CHAMELEON_DEBUG: field-for-field mirror of the BOOST_LOG_TRIVIAL summary line
+        // just above, also written to the dedicated debug file - BOOST_LOG_TRIVIAL(info)
+        // may be filtered by whatever log severity level is currently configured, and
+        // (Part 1's own hard-won lesson, see the CHAMELEON_DEBUG header comment above
+        // chameleon_collect_wall_samples) a GUI slicing background thread's
+        // BOOST_LOG_TRIVIAL output does not reliably reach the GUI's own log sink at
+        // all - so a triage session relying solely on the line above can come up empty
+        // even though the pass genuinely ran. "SUMMARY " prefix distinguishes this line
+        // from the per-layer lines above it in the same file.
+        if (chameleon_debug_on) {
+            chameleon_debug_log(
+                "SUMMARY obj=" + std::to_string(obj_idx) +
+                " mode=nearest_wall" +
+                " free_set_size=" + std::to_string(layer_filament_table.size()) +
+                " fallback=" + std::to_string(fallback_extruder) +
+                " base_fallback=" + std::to_string(base_fallback_extruder) +
+                " layers_partitioned=" + std::to_string(layers_partitioned) +
+                " layers_zero_sample=" + std::to_string(layers_zero_sample) +
+                " buckets_dropped_min_benefit=" + std::to_string(buckets_dropped_min_benefit) +
+                " buckets_dropped_min_benefit_free=" + std::to_string(buckets_dropped_min_benefit_free) +
+                " buckets_trimmed_cap=" + std::to_string(buckets_trimmed_cap) +
+                " buckets_redirected=" + std::to_string(buckets_redirected) +
+                " buckets_exempt_kept=" + std::to_string(buckets_exempt_kept) +
+                " interface_runs_matched=" + std::to_string(interface_runs_matched) +
+                " base_runs_matched=" + std::to_string(base_runs_matched) +
+                " ironing_runs_matched=" + std::to_string(ironing_runs_matched));
+        }
     }
 }
 

@@ -35,15 +35,19 @@ WallSampleIndex::WallSampleIndex(double cell_mm) : m_cell(scale_(cell_mm))
 }
 
 void WallSampleIndex::add_polyline(const Points &poly, unsigned extruder, size_t object_key,
-                                    double spacing_mm)
+                                    double spacing_mm, std::map<unsigned, size_t> *sample_count_out)
 {
     if (poly.empty())
         return;
 
-    auto insert_sample = [this, extruder, object_key](const Point &pt) {
+    auto insert_sample = [this, extruder, object_key, sample_count_out](const Point &pt) {
         std::pair<int32_t, int32_t> key = cell_of(pt, m_cell);
         m_cells[key].push_back(WallSample{ pt, extruder, object_key });
         ++m_count;
+        // CHAMELEON_DEBUG: see this function's own header comment (WallSampleIndex.hpp)
+        // - null when the caller isn't in debug mode, so this is one pointer compare.
+        if (sample_count_out)
+            ++(*sample_count_out)[extruder];
     };
 
     if (poly.size() == 1) {

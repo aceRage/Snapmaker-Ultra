@@ -1250,7 +1250,8 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
                                    ExtrusionEntityCollection &merge_back_target,
                                    const std::set<unsigned> &free_extruders,
                                    double min_len_free_mm,
-                                   const std::set<unsigned> &free_extruders_exempt)
+                                   const std::set<unsigned> &free_extruders_exempt,
+                                   std::vector<ChameleonBucketDebugEntry> *debug_out)
 {
     BucketCapResult result;
     // v2.5a: gate/trim drops land here (moved out of `map`, NOT appended anywhere
@@ -1258,6 +1259,21 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
     // at the end of this function.
     std::vector<DroppedBucket> gate_dropped;
     std::vector<DroppedBucket> trim_dropped;
+
+    // CHAMELEON_DEBUG (v2.5c): snapshot every bucket's pre-gate length and default it
+    // to "kept" - every write below only ever NARROWS a bucket's fate to gated/trimmed/
+    // kept_exempt or records a redirect target; a bucket nothing below touches stayed
+    // in `map` through both the gate and the trim, i.e. really was kept normally. Keyed
+    // by extruder id (std::map, so the final `debug_out` copy comes out pre-sorted
+    // ascending - no separate sort needed). Every write past this point is behind
+    // `if (debug_out)`, so a caller passing nullptr (every pre-v2.5c call site) pays one
+    // pointer compare per decision point and nothing else - `dbg` itself stays a single
+    // empty map, no allocation, when debug_out is null (the snapshot loop below is
+    // itself gated).
+    std::map<unsigned, ChameleonBucketDebugEntry> dbg;
+    if (debug_out)
+        for (const auto &kv : map)
+            dbg[kv.first] = ChameleonBucketDebugEntry{ kv.first, total_path_length_mm(kv.second), 0.0, "kept", -1 };
 
     // (a) C3 min-benefit gate, v2.3 Task 1 (spec C1-C2) two-tier rework: each bucket's
     // own eff_min starts at min_len_free_mm if its extruder is in `free_extruders`
@@ -1275,6 +1291,8 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
         if (prev_kept.count(it->first) != 0)
             eff_min *= 0.5;
         if (total_path_length_mm(it->second) < eff_min) {
+            if (debug_out)
+                dbg[it->first].outcome = "gated";
             gate_dropped.push_back({ it->first, std::move(it->second) });
             it = map.erase(it);
             ++result.buckets_dropped_min_benefit;
@@ -1312,6 +1330,8 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
         for (auto &kv : map) {
             if (free_extruders_exempt.count(kv.first) != 0) {
                 ++result.buckets_exempt_kept;
+                if (debug_out)
+                    dbg[kv.first].outcome = "kept_exempt";
                 continue; // exempt: never ranked, never trimmed, no slot consumed
             }
             ranked.emplace_back(kv.first, total_path_length_mm(kv.second));
@@ -1330,6 +1350,8 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
 
         for (size_t i = max_extruders; i < ranked.size(); ++i) {
             auto it = map.find(ranked[i].first);
+            if (debug_out)
+                dbg[it->first].outcome = "trimmed";
             trim_dropped.push_back({ it->first, std::move(it->second) });
             map.erase(it);
             ++result.buckets_trimmed_cap;
@@ -1357,6 +1379,16 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
             merge_back_target.append(std::move(d.geometry.entities));
         for (DroppedBucket &d : trim_dropped)
             merge_back_target.append(std::move(d.geometry.entities));
+        // CHAMELEON_DEBUG: no survivor at all this layer - every dbg entry keeps
+        // whatever outcome the gate/trim loops above already assigned it (gated or
+        // trimmed; "kept"/"kept_exempt" cannot occur here since `map` is empty), and
+        // `redirected_into` stays -1 for all of them (legacy fallback, not a redirect).
+        if (debug_out) {
+            debug_out->clear();
+            debug_out->reserve(dbg.size());
+            for (auto &kv : dbg)
+                debug_out->push_back(std::move(kv.second));
+        }
         return result;
     }
 
@@ -1402,12 +1434,26 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
         }
         map.at(best_extruder).append(std::move(dropped.geometry.entities));
         ++result.buckets_redirected;
+        if (debug_out)
+            dbg[dropped.extruder].redirected_into = int(best_extruder);
     };
 
     for (DroppedBucket &d : gate_dropped)
         redirect_one(d);
     for (DroppedBucket &d : trim_dropped)
         redirect_one(d);
+
+    // CHAMELEON_DEBUG: final pass over the surviving buckets - a kept bucket may have
+    // GROWN via the redirect loop just above, so its "after" length can only be read
+    // once every redirect_one call has finished appending into `map`.
+    if (debug_out) {
+        for (const auto &kv : map)
+            dbg[kv.first].length_after_mm = total_path_length_mm(kv.second);
+        debug_out->clear();
+        debug_out->reserve(dbg.size());
+        for (auto &kv : dbg)
+            debug_out->push_back(std::move(kv.second));
+    }
 
     return result;
 }

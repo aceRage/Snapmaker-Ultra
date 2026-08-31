@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <string>
 #include <vector>
 namespace Slic3r {
 
@@ -461,6 +462,40 @@ struct BucketCapResult {
     size_t buckets_exempt_kept = 0;
 };
 
+// CHAMELEON_DEBUG (v2.5c diagnostic instrumentation, docs/superpowers/sdd/2026-08-29-
+// support-interface-match/progress.md v2.5a section): one bucket's before/after/outcome
+// accounting for a single apply_bucket_caps call, populated only when that call's own
+// trailing `debug_out` parameter is non-null (see apply_bucket_caps' own doc comment
+// below for exactly which decision point writes which field). Print.cpp's
+// chameleon_assign_support_interfaces threads a CHAMELEON_DEBUG-gated pointer to this
+// from its once-per-pass env check; every pre-existing call site (this file's own
+// existing unit tests included) passes nullptr (the default) and is unaffected -
+// nothing here is read or written when the caller doesn't ask for it. Diagnostic-only:
+// no production code path reads this type.
+struct ChameleonBucketDebugEntry {
+    unsigned    extruder = 0;
+    // total_path_length_mm() of this bucket's geometry as it stood at apply_bucket_caps'
+    // own entry (before the gate/trim run at all).
+    double      length_before_mm = 0.0;
+    // total_path_length_mm() of this SAME extruder's bucket in `map` after the call
+    // returns - only meaningful when `outcome` is "kept"/"kept_exempt" (a bucket that
+    // survived may have GROWN if another dropped bucket's geometry was redirected into
+    // it, v2.5a); left at 0.0 for a gated/trimmed bucket, whose own geometry no longer
+    // lives under this extruder's key at all (see `redirected_into` for where it went).
+    double      length_after_mm = 0.0;
+    // One of "kept" (survived both the gate and the trim, ranked normally), "kept_exempt"
+    // (survived the trim without ever being ranked - v2.5b free_extruders_exempt),
+    // "gated" (dropped by the C3 min-benefit gate), or "trimmed" (survived the gate but
+    // ranked below max_extruders in the C1 distinct-extruder trim).
+    std::string outcome;
+    // Extruder id this bucket's geometry was redirected into (v2.5a phase 2/3), or -1
+    // when no redirect happened - either because this bucket was kept (nothing to
+    // redirect) or because it hit the legacy no-survivor fallback (map was empty going
+    // into the redirect phase - see apply_bucket_caps' own "Phase 1" comment) and merged
+    // into merge_back_target instead.
+    int         redirected_into = -1;
+};
+
 // v2.2 Task 1 (spec C1-C3, replaces the old per-layer ">3 switch-boundaries" whole-
 // layer revert and the per-object ">20 cumulative switches" escalation - both deleted
 // entirely, C2). `map` holds one support layer's matched geometry, keyed by extruder,
@@ -694,6 +729,14 @@ PrevKeptState chameleon_update_prev_kept(const PrevKeptState& state,
 // from the trim on the strength of the windowed set would therefore be wrong; the
 // gate's 3mm floor tier can still afford to be generous there (worst case: a short
 // bucket kept an extra layer or two), but the trim's exemption cannot.
+//
+// CHAMELEON_DEBUG (v2.5c): signature grows one more trailing, DEFAULTED parameter -
+// `debug_out` - so every pre-v2.5c call site (this function's own existing unit tests
+// included) compiles and behaves byte-identically unchanged: nullptr (the default)
+// means every `if (debug_out)` check below this function's own doc comment in the .cpp
+// short-circuits, so passing nothing costs one pointer compare per decision point, not
+// per sample - see ChameleonBucketDebugEntry's own doc comment above for what gets
+// recorded when a caller does pass a non-null vector.
 BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection>& map,
                                   const std::set<unsigned>& prev_kept,
                                   size_t max_extruders,
@@ -701,7 +744,8 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection>&
                                   ExtrusionEntityCollection& merge_back_target,
                                   const std::set<unsigned>& free_extruders = {},
                                   double min_len_free_mm = 0.0,
-                                  const std::set<unsigned>& free_extruders_exempt = {});
+                                  const std::set<unsigned>& free_extruders_exempt = {},
+                                  std::vector<ChameleonBucketDebugEntry>* debug_out = nullptr);
 
 // v2.5a Task 2b (spec: "mechanism B pin"): the extruder of whichever bucket in
 // `buckets` has the largest total_path_length_mm ("dominant"); ties (an exact equal
