@@ -48,6 +48,10 @@ namespace {
 // as the "brown-ring-claims-whole-layer" failure (Tests 3-4).
 const std::vector<int> PLUS_X_FACE   = {4, 5};
 const std::vector<int> ALL_SIDE_FACE = {4, 5, 6, 7, 8, 9, 10, 11};
+// Top/bottom caps, for the vertical paint-depth alignment tests further down: {2,3} is the
+// z=z cap (upward-facing, "top face"), {0,1} is the z=0 cap (downward-facing, "bottom face").
+const std::vector<int> TOP_CAP_FACE    = {2, 3};
+const std::vector<int> BOTTOM_CAP_FACE = {0, 1};
 
 // paint_infill_override defaults to true (today's behavior, matches the option's own
 // PrintConfig.cpp default) so existing callers that only pass mode/walls are unaffected.
@@ -488,4 +492,167 @@ TEST_CASE("multi_material_segmentation_by_painting: an unbounded (unlimited mode
 
     const size_t first_painted_layer = first_layer_above_z(*object, 10.0);
     CHECK_FALSE(extruder2_layer_has_solid_skin(*object, first_painted_layer));
+}
+
+// Vertical paint-depth alignment fix (.superpowers/sdd/2026-08-31-paint-depth/
+// vertical-depth-investigation.md, shell-coverage-investigation.md): segmentation_top_and_
+// bottom_layers (MultiMaterialSegmentation.cpp) claimed exactly top_shell_layers /
+// bottom_shell_layers layers deep and, pre-fix, never consulted top_shell_thickness /
+// bottom_shell_thickness - while the solid shell itself (discover_vertical_shells /
+// discover_horizontal_shells, PrintObject.cpp) is built to whichever is DEEPER of "N layers"
+// or "T millimeters" (max(layers, mm), PrintObject.cpp:1954-1967/:4141-4147). At thin layer
+// heights the solid shell ends up deeper than the painted claim, so base-colored solid shell
+// layers show through under a painted top/bottom face.
+//
+// Builds a 40x40x4mm slab, paints one whole cap (top or bottom) with Extruder2, sets
+// layer_height / top_shell_layers / top_shell_thickness / bottom_shell_layers /
+// bottom_shell_thickness explicitly, and slices via PrintObject::slice() (the same "already
+// fully applied" pattern as slice_painted_cube() above - see that function's file-level
+// note). paint_depth_mode is pinned to pdmUnlimited: the vertical projection this fixture
+// targets is a data path independent of the Stage 1 lateral clamp
+// (vertical-depth-investigation.md section 2 proves the two never touch each other's
+// inputs), and nothing here paints a SIDE facet for the lateral clamp to act on anyway, so
+// pdmUnlimited isolates the vertical mechanism from Stage 1 entirely. 4mm tall is
+// comfortably more than any shell depth exercised below (at most ~7 layers from either cap),
+// so the top and bottom shells never reach each other or the opposite (unpainted) cap.
+PrintObject *slice_capped_slab(const std::vector<int> &painted_cap_facets, double layer_height,
+                                int top_shell_layers, double top_shell_thickness,
+                                int bottom_shell_layers, double bottom_shell_thickness,
+                                Print &print)
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name        = "paint-depth-vertical.stl";
+    ModelVolume *volume  = object->add_volume(make_cube(40., 40., 4.));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : painted_cap_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    DynamicPrintConfig config = paint_depth_test_config(pdmUnlimited, 3);
+    config.option<ConfigOptionFloat>("layer_height")->value           = layer_height;
+    // Pin the first layer to the same height as every other layer. initial_layer_print_height
+    // defaults to 0.2mm independent of layer_height (PrintConfig.cpp), which would otherwise
+    // make layer 0 a different, uncontrolled height right where the bottom-face tests probe -
+    // these tests want a uniform, known layer_height throughout so the hand-derived expected
+    // claim depths (in the TEST_CASEs below) are exact.
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = layer_height;
+    config.option<ConfigOptionInt>("top_shell_layers")->value         = top_shell_layers;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value    = top_shell_thickness;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value      = bottom_shell_layers;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value = bottom_shell_thickness;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// A point at the slab's XY center, safely away from the per-layer inward taper the descent
+// loop applies near the silhouette (MultiMaterialSegmentation.cpp:1403-1407 - untouched by
+// this fix; see PLUS_X_FACE's file-level comment above for the same consideration on the
+// side-face tests). The slab's cross-section is the same 40x40 square at every layer, so any
+// layer's lslices gives the same bounding box.
+Point slab_center_point(const PrintObject &object)
+{
+    const BoundingBox bb = get_extents(object.get_layer(0)->lslices);
+    REQUIRE(bb.defined);
+    return Point((bb.min.x() + bb.max.x()) / 2, (bb.min.y() + bb.max.y()) / 2);
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: thin layers make the painted top claim reach the full (thickness-driven) shell depth", "[paintdepth]")
+{
+    // Defaults: top_shell_layers=4, top_shell_thickness=0.6mm (PrintConfig.cpp). At 0.1mm
+    // layers the thickness bound needs 6 layers (0.6/0.1), deeper than the 4-layer count
+    // bound - discover_vertical_shells already builds the solid shell 6 layers deep via
+    // max(layers, mm); pre-fix, the painted claim stopped at 4, leaving layers 5-6
+    // base-colored solid under the painted skin (the user-reported symptom).
+    Print        print;
+    PrintObject *object = slice_capped_slab(TOP_CAP_FACE, /*layer_height=*/0.1,
+                                             /*top_shell_layers=*/4, /*top_shell_thickness=*/0.6,
+                                             /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.0,
+                                             print);
+
+    const Point  probe     = slab_center_point(*object);
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 6);
+
+    // The surface layer itself, always claimed regardless of shell depth.
+    CHECK(any_contains(extruder2_claim_for_layer(*object, top_index), probe));
+    // Depths 1-5 counting down from the surface (6 layers total, the surface included):
+    // must ALL be claimed now that the claim mirrors the thickness-driven 6-layer shell.
+    // This is exactly what FAILS pre-fix (the old code stops after depth 3, i.e. 4 layers
+    // total, matching only top_shell_layers).
+    for (size_t depth = 1; depth <= 5; ++depth)
+        CHECK(any_contains(extruder2_claim_for_layer(*object, top_index - depth), probe));
+    // Depth 6 (the 7th layer down) is past the 6-layer effective shell: unclaimed, pinning
+    // that the fix computes max(layers, mm) and does not over-claim an unbounded depth.
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, top_index - 6), probe));
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: top_shell_layers=0 with nonzero top_shell_thickness still claims the painted top surface", "[paintdepth]")
+{
+    // Pre-fix, max_top_layers (MultiMaterialSegmentation.cpp:1205-1213) only ever consulted
+    // top_shell_layers, so this configuration closed the projection gate at :1225 entirely -
+    // ZERO painted claim, not even for the immediately-visible painted surface facet -
+    // despite top_shell_thickness demanding a real (3-layer, at this 0.2mm layer height)
+    // solid shell right below it.
+    Print        print;
+    PrintObject *object = slice_capped_slab(TOP_CAP_FACE, /*layer_height=*/0.2,
+                                             /*top_shell_layers=*/0, /*top_shell_thickness=*/0.6,
+                                             /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.0,
+                                             print);
+
+    const Point  probe     = slab_center_point(*object);
+    const size_t top_index = object->layer_count() - 1;
+    CHECK(any_contains(extruder2_claim_for_layer(*object, top_index), probe));
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: layer-count-driven shell depth is unchanged when it already exceeds the thickness bound", "[paintdepth]")
+{
+    // Regression guard (no over-claiming): at a normal 0.2mm layer height the stock defaults
+    // (top_shell_layers=4, top_shell_thickness=0.6mm) already have the layer count win
+    // (4 layers = 0.8mm >= 0.6mm), exactly as pre-fix - see
+    // vertical-depth-investigation.md section 3's table. The claim must stay at 4 layers,
+    // not deepen.
+    Print        print;
+    PrintObject *object = slice_capped_slab(TOP_CAP_FACE, /*layer_height=*/0.2,
+                                             /*top_shell_layers=*/4, /*top_shell_thickness=*/0.6,
+                                             /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.0,
+                                             print);
+
+    const Point  probe     = slab_center_point(*object);
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 4);
+
+    for (size_t depth = 0; depth <= 3; ++depth)
+        CHECK(any_contains(extruder2_claim_for_layer(*object, top_index - depth), probe));
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, top_index - 4), probe));
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: thin layers make the painted bottom claim reach the full (thickness-driven) shell depth", "[paintdepth]")
+{
+    // Bottom-face mirror of the top-face depth test above, using bottom_shell_layers /
+    // bottom_shell_thickness and BOTTOM_CAP_FACE. bottom_shell_thickness defaults to 0.0mm
+    // (inert - investigation table), so this pins a nonzero value explicitly to exercise the
+    // mirrored bottom_z()-based walk.
+    Print        print;
+    PrintObject *object = slice_capped_slab(BOTTOM_CAP_FACE, /*layer_height=*/0.1,
+                                             /*top_shell_layers=*/4, /*top_shell_thickness=*/0.6,
+                                             /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.6,
+                                             print);
+
+    const Point probe = slab_center_point(*object);
+
+    CHECK(any_contains(extruder2_claim_for_layer(*object, 0), probe));
+    for (size_t depth = 1; depth <= 5; ++depth)
+        CHECK(any_contains(extruder2_claim_for_layer(*object, depth), probe));
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, 6), probe));
 }

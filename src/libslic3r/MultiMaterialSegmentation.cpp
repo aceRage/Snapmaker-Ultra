@@ -1190,6 +1190,57 @@ static bool is_volume_sinking(const indexed_triangle_set &its, const Transform3d
 
 //#define MMU_SEGMENTATION_DEBUG_TOP_BOTTOM
 
+// Vertical paint-depth alignment fix (.superpowers/sdd/2026-08-31-paint-depth/
+// vertical-depth-investigation.md, shell-coverage-investigation.md): discover_vertical_shells
+// / discover_horizontal_shells (PrintObject.cpp:1954-1967, :1983-1996, :4141-4147) build the
+// solid top/bottom shell to whichever is DEEPER of "N layers" (top_shell_layers /
+// bottom_shell_layers) or "T millimeters" (top_shell_thickness / bottom_shell_thickness),
+// walked against each layer's REAL print_z / bottom_z - e.g. PrintObject.cpp:1960-1961:
+//   for (; i < int(cache_top_botom_regions.size()) &&
+//          (i < itop || m_layers[i]->print_z - print_z < region_config.top_shell_thickness - EPSILON); ++i)
+// This mirrors that exact walk (same strict "< thickness - EPSILON" boundary, same use of
+// each layer's actual print_z/height so variable layer height is handled without any
+// assumption of a constant layer height) to compute, for a specific painted surface layer,
+// how many layers its claim needs to descend to cover the same "N or T, whichever is deeper"
+// shell. Returns the count as a TOTAL layer depth (the surface layer plus however many
+// sub-layers below/above it), directly comparable to / max-able with n_layers, so callers can
+// feed the result straight into the existing count-only descent loops at :1400 (top) / :1420
+// (bottom) unchanged.
+//
+// Why max(n_layers, thickness-driven-count) is exactly equivalent to inlining the shell
+// generators' OR-condition into the descent loop, not just an approximation: both the
+// "count" half (m < n_layers) and the "thickness" half (cumulative height < thickness) of
+// that OR are monotonic in descent depth - each holds for depths 1..k and fails for every
+// depth beyond some k (print_z/bottom_z are monotonic per layer, so the cumulative height
+// gap only grows as the walk goes further) - so each is exactly the set {1..k} for its own
+// k, and the union of two such prefix sets is simply {1..max(k1,k2)}. Feeding
+// max(n_layers, thickness-driven-count) into the ORIGINAL unchanged loop bound therefore
+// reproduces the interleaved walk's result exactly, including its boundary/EPSILON handling.
+static inline int effective_shell_layers_by_thickness(const ConstLayerPtrsAdaptor &layers, size_t surface_layer_idx, bool top, int n_layers, double thickness)
+{
+    int effective = n_layers;
+    if (thickness > 0.) {
+        const size_t   num_layers = layers.size();
+        const coordf_t base       = top ? layers[surface_layer_idx]->print_z : layers[surface_layer_idx]->bottom_z();
+        int            m          = 0;
+        if (top) {
+            for (int idx = int(surface_layer_idx) - 1; idx >= 0; --idx) {
+                ++m;
+                if (base - layers[idx]->print_z >= thickness - EPSILON)
+                    break;
+            }
+        } else {
+            for (size_t idx = surface_layer_idx + 1; idx < num_layers; ++idx) {
+                ++m;
+                if (layers[idx]->bottom_z() - base >= thickness - EPSILON)
+                    break;
+            }
+        }
+        effective = std::max(effective, m);
+    }
+    return effective;
+}
+
 // Returns segmentation of top and bottom layers based on painting in segmentation gizmos.
 static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_layers(const PrintObject                                               &print_object,
                                                                                       const std::vector<ExPolygons>                                   &input_expolygons,
@@ -1202,14 +1253,42 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
     const ConstLayerPtrsAdaptor layers = print_object.layers();
 
     // Maximum number of top / bottom layers accounts for maximum overlap of one thread group into a neighbor thread group.
+    //
+    // Vertical paint-depth alignment fix: top_shell_thickness / bottom_shell_thickness can
+    // demand more layers than top_shell_layers / bottom_shell_layers alone (see the
+    // effective_shell_layers_by_thickness() comment above). max_top_layers / max_bottom_layers
+    // / granularity must account for that too - both so the projection gate right below
+    // correctly opens when layers == 0 but thickness > 0 (pre-fix this stayed 0 and the whole
+    // block was skipped, producing a ZERO painted claim despite a nonzero shell being built),
+    // and so the TBB double-buffer parity trick (layer_idx_offset, further below) keeps enough
+    // overlap margin for the deeper per-layer descent. This is a conservative *upper bound*
+    // only (sizing/gating, not the actual per-layer claim depth, which layer_color_stat()
+    // computes exactly below via effective_shell_layers_by_thickness() against each layer's
+    // real height): it uses the thinnest layer anywhere in the object, so a uniform-height
+    // estimate can only overestimate the layers a given thickness needs, never underestimate
+    // (every real layer's height is >= min_layer_height, so its real cumulative height after k
+    // layers is >= k * min_layer_height - reaching `thickness` at least as fast).
+    double min_layer_height = 0.;
+    for (const Layer *layer : layers)
+        if (layer->height > EPSILON && (min_layer_height <= 0. || layer->height < min_layer_height))
+            min_layer_height = layer->height;
+    auto layers_for_thickness = [&min_layer_height, num_layers](double thickness) -> int {
+        if (thickness <= 0.)
+            return 0;
+        if (min_layer_height <= EPSILON)
+            return int(num_layers); // Defensive fallback; real layers always have height > 0.
+        return std::min(int(num_layers), int(thickness / min_layer_height) + 1);
+    };
     int max_top_layers = 0;
     int max_bottom_layers = 0;
     int granularity = 1;
     for (size_t i = 0; i < print_object.num_printing_regions(); ++ i) {
         const PrintRegionConfig &config = print_object.printing_region(i).config();
-        max_top_layers    = std::max(max_top_layers, config.top_shell_layers.value);
-        max_bottom_layers = std::max(max_bottom_layers, config.bottom_shell_layers.value);
-        granularity       = std::max(granularity, std::max(config.top_shell_layers.value, config.bottom_shell_layers.value) - 1);
+        const int top_layers_eff    = std::max(config.top_shell_layers.value,    layers_for_thickness(config.top_shell_thickness.value));
+        const int bottom_layers_eff = std::max(config.bottom_shell_layers.value, layers_for_thickness(config.bottom_shell_thickness.value));
+        max_top_layers    = std::max(max_top_layers, top_layers_eff);
+        max_bottom_layers = std::max(max_bottom_layers, bottom_layers_eff);
+        granularity       = std::max(granularity, std::max(top_layers_eff, bottom_layers_eff) - 1);
     }
 
     // Project upwards pointing painted triangles over top surfaces,
@@ -1354,17 +1433,32 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
     auto layer_color_stat = [&layers = std::as_const(layers), &print_object](const size_t layer_idx, const size_t color_idx) -> LayerColorStat {
         LayerColorStat out;
         const Layer &layer = *layers[layer_idx];
-        for (const LayerRegion *region : layer.regions())
-            if (const PrintRegionConfig &config = region->region().config();
-                // color_idx == 0 means "don't know" extruder aka the underlying extruder.
+        for (const LayerRegion *region : layer.regions()) {
+            const PrintRegionConfig &config = region->region().config();
+            // Vertical paint-depth alignment fix, shell-coverage-investigation.md fix (2): the
+            // solid shell a painted claim must cover is whichever region reaches deepest on
+            // THIS layer, not only the region(s) that happen to carry this paint color right
+            // now - a painted patch can span regions with different shell settings (e.g. a
+            // modifier with its own top_shell_layers), and the shell the base material builds
+            // underneath does not care which color is painted above it. So these two are
+            // maxed over ALL regions on the layer, unconditionally - unlike extrusion_width /
+            // small_region_threshold / extrusion_spacing below, which stay scoped to color_idx
+            // (they size the lateral taper of THIS color's own claim, untouched by this fix).
+            // Effective count = max(configured layer count, however many layers this object's
+            // REAL layer heights need to cover the configured thickness) - see
+            // effective_shell_layers_by_thickness() above, which mirrors discover_vertical_
+            // shells / discover_horizontal_shells exactly, including variable layer height.
+            out.top_shell_layers    = std::max(out.top_shell_layers,
+                                                effective_shell_layers_by_thickness(layers, layer_idx, true,  config.top_shell_layers.value,    config.top_shell_thickness.value));
+            out.bottom_shell_layers = std::max(out.bottom_shell_layers,
+                                                effective_shell_layers_by_thickness(layers, layer_idx, false, config.bottom_shell_layers.value, config.bottom_shell_thickness.value));
+            if (// color_idx == 0 means "don't know" extruder aka the underlying extruder.
                 // As this region may split existing regions, we collect statistics over all regions for color_idx == 0.
                 color_idx == 0 || config.wall_filament == int(color_idx)) {
                 //BBS: the extrusion line width is outer wall rather than inner wall
                 const double nozzle_diameter = print_object.print()->config().nozzle_diameter.get_at(0);
                 double outer_wall_line_width = config.get_abs_value("outer_wall_line_width", nozzle_diameter);
                 out.extrusion_width     = std::max<float>(out.extrusion_width, outer_wall_line_width);
-                out.top_shell_layers    = std::max<int>(out.top_shell_layers, config.top_shell_layers);
-                out.bottom_shell_layers = std::max<int>(out.bottom_shell_layers, config.bottom_shell_layers);
                 out.small_region_threshold = config.gap_infill_speed.value > 0 ?
                                              // Gap fill enabled. Enable a single line of 1/2 extrusion width.
                                              0.5f * outer_wall_line_width :
@@ -1374,6 +1468,7 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                 out.extrusion_spacing = Flow::rounded_rectangle_extrusion_spacing(float(outer_wall_line_width), float(layer.height));
                 ++ out.num_regions;
             }
+        }
         assert(out.num_regions > 0);
         out.extrusion_width = scaled<float>(out.extrusion_width);
         out.extrusion_spacing = scaled<float>(out.extrusion_spacing);

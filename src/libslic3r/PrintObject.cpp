@@ -960,6 +960,16 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "paint_depth_walls"
             || opt_key == "paint_depth_mm"
             || opt_key == "paint_infill_override"
+            // Vertical paint-depth alignment fix (.superpowers/sdd/2026-08-31-paint-depth/
+            // vertical-depth-investigation.md section 4 "Invalidation"): segmentation_top_and_
+            // bottom_layers (MultiMaterialSegmentation.cpp) now consults top_shell_thickness /
+            // bottom_shell_thickness too (previously only discover_vertical_shells /
+            // discover_horizontal_shells at posPrepareInfill did, where these two keys were
+            // routed below). Moved here (posSlice cascades forward to posPrepareInfill and
+            // everything after it - PrintObject::invalidate_step) so editing either re-runs
+            // the MMU segmentation, not just the later shell-generation step.
+            || opt_key == "top_shell_thickness"
+            || opt_key == "bottom_shell_thickness"
             || opt_key == "raft_layers"
             || opt_key == "raft_contact_distance"
             || opt_key == "slice_closing_radius"
@@ -1097,8 +1107,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "infill_multiline"
             || opt_key == "infill_combination"
             || opt_key == "infill_combination_max_layer_height"
-            || opt_key == "bottom_shell_thickness"
-            || opt_key == "top_shell_thickness"
+            // top_shell_thickness / bottom_shell_thickness moved to the posSlice group above
+            // (vertical paint-depth alignment fix) - posSlice already cascades forward to
+            // posPrepareInfill, so they don't also need listing here.
             || opt_key == "minimum_sparse_infill_area"
             || opt_key == "sparse_infill_filament"
             || opt_key == "solid_infill_filament"
