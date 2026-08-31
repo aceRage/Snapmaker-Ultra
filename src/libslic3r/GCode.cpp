@@ -514,6 +514,11 @@ std::string WipeTowerIntegration::append_tcr(GCode& gcodegen, const WipeTower::T
         int           previous_extruder_id = gcodegen.writer().extruder() ? (int) gcodegen.writer().extruder()->id() : -1;
         config.set_key_value("previous_extruder", new ConfigOptionInt(previous_extruder_id));
         config.set_key_value("next_extruder", new ConfigOptionInt((int) new_extruder_id));
+        // Ultra: single-mapped dual-nozzle change_filament vars (filament id == extruder id; hotend -1).
+        config.set_key_value("current_filament_id", new ConfigOptionInt(std::max(0, previous_extruder_id)));
+        config.set_key_value("next_filament_id", new ConfigOptionInt((int) new_extruder_id));
+        config.set_key_value("current_hotend", new ConfigOptionInt(-1));
+        config.set_key_value("next_hotend", new ConfigOptionInt(-1));
         config.set_key_value("layer_num", new ConfigOptionInt(gcodegen.m_layer_index));
         config.set_key_value("layer_z", new ConfigOptionFloat(tcr.print_z));
         config.set_key_value("toolchange_z", new ConfigOptionFloat(z));
@@ -2808,6 +2813,56 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
             this->placeholder_parser().set("filament_tower_interface_print_temp", new ConfigOptionInt(0));
             this->placeholder_parser().set("wipe_avoid_perimeter", new ConfigOptionBool(false));
             this->placeholder_parser().set("wipe_avoid_pos_x", new ConfigOptionFloat(0.));
+        }
+
+        // Ultra: dual-nozzle machine templates (H2D/H2D Pro/H2C) reference per-nozzle-id vars that
+        // the BBS grouping engine normally computes. Single-mapped shim: everything runs on nozzle 0
+        // (filament_map all-1). Per-nozzle arrays are sized to the physical nozzle count so template
+        // index lookups (e.g. nozzle_diameter_at_nozzle_id[current_nozzle_id]) resolve. Real per-nozzle
+        // assignment is the deferred grouping-engine wiring.
+        {
+            const auto& nd = m_config.nozzle_diameter.values;
+            const size_t num_nozzles = std::max<size_t>(nd.size(), size_t(1));
+            std::vector<double> nozzle_diams(nd.begin(), nd.end());
+            if (nozzle_diams.empty()) nozzle_diams.push_back(0.4);
+            this->placeholder_parser().set("nozzle_diameter_at_nozzle_id", new ConfigOptionFloats(nozzle_diams));
+
+            std::vector<int> nozzle_vts;
+            const auto* nvt = m_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+            for (size_t i = 0; i < num_nozzles; ++i)
+                nozzle_vts.push_back((nvt && i < nvt->size()) ? nvt->get_at(int(i)) : 0);
+            this->placeholder_parser().set("nozzle_volume_types", new ConfigOptionInts(nozzle_vts));
+
+            this->placeholder_parser().set("current_nozzle_id",              new ConfigOptionInt(0));
+            this->placeholder_parser().set("next_nozzle_id",                 new ConfigOptionInt(0));
+            this->placeholder_parser().set("initial_nozzle_id",              new ConfigOptionInt(0));
+            this->placeholder_parser().set("curr_physical_extruder_id",      new ConfigOptionInt(0));
+            this->placeholder_parser().set("most_used_physical_extruder_id", new ConfigOptionInt(0));
+            this->placeholder_parser().set("new_extruder_retracted_length",  new ConfigOptionFloat(0.));
+            this->placeholder_parser().set("initial_no_support_filament_id", new ConfigOptionInt(int(initial_extruder_id)));
+            // *_hotend = the physical-nozzle id for the filament; BBS's NOZZLE_ID_FOR_GCODE returns -1
+            // when there is no dynamic nozzle map (our single-mapped case), so all hotend vars are -1.
+            this->placeholder_parser().set("initial_no_support_hotend",       new ConfigOptionInt(-1));
+            this->placeholder_parser().set("initial_hotend",                  new ConfigOptionInt(-1));
+            this->placeholder_parser().set("current_hotend",                  new ConfigOptionInt(-1));
+            this->placeholder_parser().set("next_hotend",                     new ConfigOptionInt(-1));
+
+            // Ultra: remaining single-mapped shims for dual-machine templates. Extruder-change (_ec)
+            // retraction feature off; timelapse position-picker (BBS computes per-layer) disabled;
+            // first_filaments = the initial filament on every physical extruder (single-mapped).
+            this->placeholder_parser().set("long_retraction_when_ec",          new ConfigOptionBool(false));
+            this->placeholder_parser().set("retraction_distance_when_ec",      new ConfigOptionFloat(0.));
+            this->placeholder_parser().set("farthest_point_timelapse_enabled", new ConfigOptionBool(false));
+            this->placeholder_parser().set("has_timelapse_safe_pos",           new ConfigOptionBool(false));
+            this->placeholder_parser().set("timelapse_inline_photo",           new ConfigOptionBool(false));
+            this->placeholder_parser().set("timelapse_pos_x",                  new ConfigOptionFloat(0.));
+            this->placeholder_parser().set("timelapse_pos_y",                  new ConfigOptionFloat(0.));
+            std::vector<int> first_fils(num_nozzles, int(initial_extruder_id));
+            this->placeholder_parser().set("first_filaments",             new ConfigOptionInts(first_fils));
+            this->placeholder_parser().set("first_non_support_filaments", new ConfigOptionInts(first_fils));
+            // H2C templates also reference these (single-mapped: hotend ids -1, no computed wipe-tower center).
+            this->placeholder_parser().set("first_non_support_hotend",    new ConfigOptionInts(std::vector<int>(num_nozzles, -1)));
+            this->placeholder_parser().set("wipe_tower_center_pos_valid", new ConfigOptionBool(false));
         }
     }
 
@@ -8724,6 +8779,11 @@ std::string GCode::set_extruder(unsigned int extruder_id, double print_z, bool b
     DynamicConfig dyn_config;
     dyn_config.set_key_value("previous_extruder", new ConfigOptionInt(previous_extruder_id));
     dyn_config.set_key_value("next_extruder", new ConfigOptionInt((int) extruder_id));
+    // Ultra: single-mapped dual-nozzle change_filament vars (filament id == extruder id; hotend -1).
+    dyn_config.set_key_value("current_filament_id", new ConfigOptionInt(std::max(0, previous_extruder_id)));
+    dyn_config.set_key_value("next_filament_id", new ConfigOptionInt((int) extruder_id));
+    dyn_config.set_key_value("current_hotend", new ConfigOptionInt(-1));
+    dyn_config.set_key_value("next_hotend", new ConfigOptionInt(-1));
     dyn_config.set_key_value("layer_num", new ConfigOptionInt(m_layer_index));
     dyn_config.set_key_value("layer_z", new ConfigOptionFloat(print_z));
     dyn_config.set_key_value("max_layer_z", new ConfigOptionFloat(m_max_layer_z));
