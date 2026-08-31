@@ -3922,8 +3922,16 @@ void PrintConfigDef::init_fff_params()
     def           = this->add("paint_depth_mm", coFloat);
     def->label    = L("Paint depth distance");
     def->tooltip  = L("Depth a painted claim is allowed to reach inward from the sliced boundary, "
-                    "when \"Paint depth mode\" is \"Limited by distance\".");
+                    "when \"Paint depth mode\" is \"Limited by distance\". Zero behaves the same "
+                    "as \"Paint depth mode\" = \"Unlimited\": no clamp is applied on any layer.");
     def->sidetext = "mm";	// milimeters, don't need translation
+    // Fix-wave F4: min stays 0 rather than being raised, because 0 is coherent here - see
+    // cut_segmented_layers's fix-wave F1 comment (MultiMaterialSegmentation.cpp): a zero
+    // band makes interlocking_cut_width clamp to 0 on every layer regardless of the
+    // interlocking depth setting, so the claim is left unbounded on both even and odd
+    // layers alike (matching pdmUnlimited's geometry, just without that mode's cheaper
+    // early-out at the :2170 gate). Previously (pre-F1) a zero band was incoherent: even
+    // layers still clamped to a 0.3mm sliver while odd layers were unbounded.
     def->min      = 0;
     def->category = L("Advanced");
     def->mode     = comAdvanced;
@@ -3942,9 +3950,16 @@ void PrintConfigDef::init_fff_params()
 
     def           = this->add("mmu_segmented_region_interlocking_depth", coFloat);
     def->label    = L("Interlocking depth of a segmented region");
-    def->tooltip  = L("Interlocking depth of a segmented region. It will be ignored if "
-                    "\"mmu_segmented_region_max_width\" is zero or if \"mmu_segmented_region_interlocking_depth\" "
-                    "is bigger than \"mmu_segmented_region_max_width\". Zero disables this feature.");
+    // Fix-wave F5: the old tooltip named mmu_segmented_region_max_width as the gate and as
+    // an "ignored if bigger than" bound - neither is true anymore. That key is legacy-parse-
+    // only (see its own def comment above); the real gate is "Paint depth mode" (unlimited
+    // disables interlocking entirely - see multi_material_segmentation_by_painting's mode
+    // gate, MultiMaterialSegmentation.cpp). A depth that reaches or exceeds the paint depth
+    // band is not ignored/rejected either: cut_segmented_layers clamps the even-layer cut to
+    // max(band - depth, 0), so an over-large depth simply saturates at a full-band cut on
+    // even layers rather than erroring or being skipped (see its fix-wave F1 comment).
+    def->tooltip  = L("Interlocking depth of a segmented region. Only active when \"Paint depth "
+                    "mode\" is not \"Unlimited\". Zero disables this feature.");
     def->sidetext = "mm";	// milimeters, don't need translation
     def->min      = 0;
     def->category = L("Advanced");
@@ -7899,6 +7914,15 @@ void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
         if (legacy_max_width > 0.) {
             config.set_key_value("paint_depth_mode", new ConfigOptionEnum<PaintDepthMode>(pdmMillimeters));
             config.set_key_value("paint_depth_mm", new ConfigOptionFloat(legacy_max_width));
+            // Neutralize the old key once migrated: a diff-serialized preset save only
+            // writes keys that differ from default, so if the user later switches back
+            // to paint_depth_mode=walls (the default) and saves, paint_depth_mode drops
+            // out of the diff but this stale nonzero legacy key would not - re-arming
+            // the !config.has("paint_depth_mode") guard on every future load and
+            // silently reverting the user's explicit walls choice back to millimeters
+            // forever. Zeroing it here (its own "disabled" convention) means a re-save
+            // never re-triggers this migration.
+            config.set_key_value("mmu_segmented_region_max_width", new ConfigOptionFloat(0.));
         }
     }
 }

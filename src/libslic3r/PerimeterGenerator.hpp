@@ -94,7 +94,14 @@ public:
     bool                                            has_fuzzy_skin = false;
     bool                                            has_fuzzy_hole = false;
     std::unordered_map<FuzzySkinConfig, ExPolygons> regions_by_fuzzify;
-    
+
+    // Paint Depth: mirrors PrintObject::has_bounded_paint_depth() (Print.hpp) - a
+    // painted object with a bounded (non-unlimited) claim treats its own paint-region
+    // boundary as an interface, same as object_config->interface_shells does, for the
+    // top-surface/one-wall-top detection below. Set by the caller (LayerRegion.cpp),
+    // since PerimeterGenerator itself has no PrintObject pointer to query.
+    bool                                            has_bounded_paint_depth = false;
+
     PerimeterGenerator(
         // Input:
         const SurfaceCollection*    slices,

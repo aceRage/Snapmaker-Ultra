@@ -1150,12 +1150,23 @@ static void cut_segmented_layers(const std::vector<ExPolygons>        &input_exp
                                  const std::function<void()>          &throw_on_cancel_callback)
 {
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - cutting segmented layers in parallel - begin";
+    // Fix-wave F1: interlocking_cut_width (cut_width minus the interlock sub-band, clamped
+    // to 0) is the Prusa-style even-layer cut width - it carves the interlock "tooth" at the
+    // INNER boundary of the clamped claim, not a full replacement of cut_width by the tiny
+    // interlocking_depth value. Gating on interlocking_cut_width > 0.f (rather than
+    // interlocking_depth != 0.f) rather than std::max()-ing at the interlock value directly
+    // also gives fix-wave F4 for free: when cut_width == 0 (e.g. paint_depth_mm == 0 in
+    // millimeters mode), interlocking_cut_width == max(0 - interlocking_depth, 0) == 0
+    // regardless of interlocking_depth's magnitude, so region_cut_width falls through to
+    // cut_width == 0 on EVERY layer (even and odd alike) - the whole-layer skip below then
+    // leaves segmented_regions untouched, i.e. unlimited, coherently on both parities. No
+    // separate zero-band special case is needed at the call site.
     const float interlocking_cut_width = interlocking_depth > 0.f ? std::max(cut_width - interlocking_depth, 0.f) : 0.f;
     tbb::parallel_for(tbb::blocked_range<size_t>(0, segmented_regions.size()),
-    [&segmented_regions, &input_expolygons, &cut_width, &interlocking_depth, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
+    [&segmented_regions, &input_expolygons, &cut_width, &interlocking_cut_width, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
         for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
             throw_on_cancel_callback();
-            const float  region_cut_width       = ((layer_idx % 2 == 0) && (interlocking_depth != 0.f)) ? interlocking_depth : cut_width;
+            const float  region_cut_width       = ((layer_idx % 2 == 0) && (interlocking_cut_width > 0.f)) ? interlocking_cut_width : cut_width;
             const size_t num_extruders_plus_one = segmented_regions[layer_idx].size();
             if (region_cut_width > 0.f) {
                 std::vector<ExPolygons> segmented_regions_cuts(num_extruders_plus_one); // Indexed by extruder_id

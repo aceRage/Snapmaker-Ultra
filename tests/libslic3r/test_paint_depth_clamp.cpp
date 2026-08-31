@@ -1,5 +1,7 @@
 #include <catch2/catch.hpp>
 
+#include <algorithm>
+
 #include "libslic3r/Model.hpp"
 #include "libslic3r/MultiMaterialSegmentation.hpp"
 #include "libslic3r/PaintDepth.hpp"
@@ -295,6 +297,84 @@ TEST_CASE("multi_material_segmentation_by_painting: unlimited mode leaves the sa
     // pins that mmu_segmented_region_interlocking_depth's new 0.3mm default (Task 1) does
     // NOT leak a clamp into unlimited mode (Task 2 item 3's interlocking gate).
     CHECK(any_contains(extruder2_claim, deep_but_still_nearest_to_face));
+}
+
+// Fix-wave F1/F8 (docs/superpowers/sdd/2026-08-31-paint-depth/final-review.md): the review
+// flagged that no committed test pinned the walls-mode band WIDTH or the interlocking
+// sub-band's per-layer alternation, so the pre-fix bug (cut_segmented_layers used the raw
+// interlocking_depth as a REPLACEMENT band on even layers, clamping them to a ~0.3mm sliver
+// instead of the full wall band) was invisible to the suite. This test pins both: every
+// layer's claim reaches (at least) band - interlock deep regardless of parity - i.e. no
+// layer is ever reduced to a bare sliver - and the interlock "tooth" (the sub-band between
+// band-interlock and band) is claimed on odd layers but carved away on even layers, per
+// Prusa-style semantics (see cut_segmented_layers's fix-wave F1 comment,
+// MultiMaterialSegmentation.cpp).
+TEST_CASE("multi_material_segmentation_by_painting: walls-mode band width is pinned and the interlock sub-band alternates only at the inner edge", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_cube(PLUS_X_FACE, pdmWalls, 3, print);
+
+    // Expected band, computed with the exact formula/inputs multi_material_segmentation_by_
+    // painting itself uses (paint_depth_band_mm, max across the object's real printing
+    // regions) - read off the already-sliced object so this test tracks the production
+    // formula rather than hardcoding a value that would silently drift from it.
+    float band_mm = 0.f;
+    for (size_t region_idx = 0; region_idx < object->num_printing_regions(); ++region_idx) {
+        const PrintRegion &region               = object->printing_region(region_idx);
+        const float         ext_perimeter_width = region.flow(*object, frExternalPerimeter, object->config().layer_height).width();
+        const float         perimeter_spacing   = region.flow(*object, frPerimeter, object->config().layer_height).spacing();
+        band_mm = std::max(band_mm, paint_depth_band_mm(pdmWalls, 3, 0.0, ext_perimeter_width, perimeter_spacing));
+    }
+    REQUIRE(band_mm > 0.f);
+
+    const double interlock_mm = object->config().mmu_segmented_region_interlocking_depth.value;
+    // Test assumption (true of today's defaults - mmu_segmented_region_interlocking_depth
+    // default 0.3, walls=3 band well over 1mm): fails loudly, not silently, if that ever
+    // stops holding.
+    REQUIRE(interlock_mm > 0.);
+    REQUIRE(interlock_mm < band_mm);
+
+    // Two adjacent layers of known parity, away from the top/bottom shell-layer projection
+    // merge (mandatory check #2: top/bottom projections merge in AFTER the cut, un-clamped,
+    // so a probe too close to either cap could see that unclamped merge instead of the cut
+    // this test targets).
+    REQUIRE(object->layer_count() >= 10);
+    const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+    const size_t odd_layer  = even_layer + 1;
+    REQUIRE(even_layer % 2 == 0);
+    REQUIRE(odd_layer % 2 == 1);
+
+    const BoundingBox bb = get_extents(object->get_layer(int(even_layer))->lslices);
+    REQUIRE(bb.defined);
+    const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+
+    auto probe_at_depth = [&](size_t layer_idx, double depth_mm) -> bool {
+        const Point pt(coord_t(bb.max.x() - scale_(depth_mm)), mid_y);
+        return any_contains(extruder2_claim_for_layer(*object, layer_idx), pt);
+    };
+
+    // Well inside BOTH the full band and the interlock-shrunk band: must be claimed on
+    // EVERY layer regardless of parity - this is exactly what pre-fix F1 broke (even
+    // layers' claim depth was interlocking_depth alone, ~0.3mm, not the band).
+    const double well_inside_both_mm = band_mm - interlock_mm - 0.05;
+    REQUIRE(well_inside_both_mm > 0.05);
+    CHECK(probe_at_depth(even_layer, well_inside_both_mm));
+    CHECK(probe_at_depth(odd_layer, well_inside_both_mm));
+
+    // Inside the interlock "tooth" itself (between band-interlock and band): claimed on
+    // the odd (full-band) layer, NOT claimed on the even (interlock-notched) layer. This
+    // is the alternating sub-band Prusa semantics F1 restores - carved at the INNER
+    // boundary of the claim, not a wholesale replacement of the band.
+    const double interlock_notch_mm = band_mm - interlock_mm / 2.0;
+    REQUIRE(interlock_notch_mm > well_inside_both_mm);
+    REQUIRE(interlock_notch_mm < band_mm);
+    CHECK(probe_at_depth(odd_layer, interlock_notch_mm));
+    CHECK_FALSE(probe_at_depth(even_layer, interlock_notch_mm));
+
+    // Past the full band on both parities: unclaimed everywhere.
+    const double past_band_mm = band_mm + 0.2;
+    CHECK_FALSE(probe_at_depth(even_layer, past_band_mm));
+    CHECK_FALSE(probe_at_depth(odd_layer, past_band_mm));
 }
 
 TEST_CASE("multi_material_segmentation_by_painting: a fully-painted boundary still clamps to the band (whole-layer short-circuit)", "[paintdepth]")
