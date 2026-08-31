@@ -1670,6 +1670,29 @@ TEST_CASE("apply_bucket_caps: free-tier gate admits a bucket the normal 12mm flo
     CHECK(result.buckets_dropped_min_benefit == 1);
 }
 
+TEST_CASE("apply_bucket_caps (v2.4 spec C): buckets_dropped_min_benefit_free counts only the FREE-tier subset of the total drops", "[chameleon]")
+{
+    // Three buckets: #1 (5mm, NOT free) drops under the normal 12mm floor; #2 (2mm,
+    // free) drops under the free-tier 3mm floor; #3 (20mm, free) survives both floors.
+    // Total drops = 2 (buckets_dropped_min_benefit), but only ONE of those two was a
+    // free-tier drop (buckets_dropped_min_benefit_free) - the split must not conflate
+    // "dropped" with "dropped because it was free".
+    std::map<unsigned, ExtrusionEntityCollection> map;
+    map[1] = bucket_of_length(5.0);  // NOT free -> dropped, normal tier
+    map[2] = bucket_of_length(2.0);  // free -> dropped, free tier
+    map[3] = bucket_of_length(20.0); // free -> survives
+    std::set<unsigned> prev_kept;
+    std::set<unsigned> free_extruders{2, 3};
+    ExtrusionEntityCollection merge_back;
+
+    BucketCapResult result = apply_bucket_caps(map, prev_kept, 2, /*min_len_mm=*/12.0, merge_back,
+                                                free_extruders, /*min_len_free_mm=*/3.0);
+
+    CHECK(result.buckets_dropped_min_benefit == 2);
+    CHECK(result.buckets_dropped_min_benefit_free == 1);
+    CHECK(result.kept == std::set<unsigned>{3});
+}
+
 TEST_CASE("apply_bucket_caps: default call (no free_extruders passed) behaves exactly like the pre-v2.3 flat gate", "[chameleon]")
 {
     // Same 5mm bucket as above, but via the trailing-defaulted call signature (no
@@ -1817,6 +1840,70 @@ TEST_CASE("chameleon_layer_free_extruders: a z with no coincident entry returns 
 TEST_CASE("chameleon_layer_free_extruders: empty table returns empty regardless of query_z", "[chameleon]")
 {
     CHECK(chameleon_layer_free_extruders({}, 42.0).empty());
+}
+
+// --- v2.4 Task B (spec B, the claw fix): windowed query --------------------
+
+TEST_CASE("chameleon_layer_free_extruders: default (no down_mm/up_mm passed) is byte-identical to the pre-v2.4 exact query", "[chameleon]")
+{
+    // Same fixtures as the four exact-coincidence tests directly above, but calling
+    // the 2-argument overload explicitly alongside the 4-argument one with 0.0/0.0 -
+    // proves the new defaulted parameters don't perturb a single existing caller
+    // (this test IS one of those callers, unmodified) and that omitting the trailing
+    // args is truly equivalent to passing them as 0.0 explicitly.
+    LayerFilamentTable table = build_layer_filament_table({ {1.0, 0}, {3.0, 1} });
+    CHECK(chameleon_layer_free_extruders(table, 3.0) == std::set<unsigned>{1});
+    CHECK(chameleon_layer_free_extruders(table, 3.0, 0.0, 0.0) == std::set<unsigned>{1});
+
+    LayerFilamentTable table2 = build_layer_filament_table({ {1.0, 0}, {50.0, 1} });
+    CHECK(chameleon_layer_free_extruders(table2, 25.0).empty());
+    CHECK(chameleon_layer_free_extruders(table2, 25.0, 0.0, 0.0).empty());
+}
+
+TEST_CASE("chameleon_layer_free_extruders: down_mm rescues an entry BELOW query_z that a zero-window query misses", "[chameleon]")
+{
+    // Entry at z=10.0; querying at z=11.5 (1.5mm above, well outside a zero-window's
+    // EPSILON) misses under the default window, but a down_mm=2.0 window
+    // ([11.5 - 2.0 - EPS, 11.5 + EPS] = [9.5-EPS, 11.5+EPS]) covers 10.0 - this is the
+    // claw fix's own down_mm = support_layer->height usage (Print.cpp call site).
+    LayerFilamentTable table = build_layer_filament_table({ {10.0, 2} });
+    CHECK(chameleon_layer_free_extruders(table, 11.5).empty());                    // RED without the window
+    CHECK(chameleon_layer_free_extruders(table, 11.5, 2.0, 0.0) == std::set<unsigned>{2});
+
+    // down_mm too small to reach: 1.0mm window from 11.5 only covers down to 10.5,
+    // still missing the entry at 10.0 - proves the window's SIZE is respected, not
+    // just its presence.
+    CHECK(chameleon_layer_free_extruders(table, 11.5, 1.0, 0.0).empty());
+}
+
+TEST_CASE("chameleon_layer_free_extruders: up_mm rescues an entry ABOVE query_z that a zero-window query misses", "[chameleon]")
+{
+    // Entry at z=10.0; querying at z=8.0 (2.0mm below) misses under the default
+    // window, but an up_mm=2.5 window ([8.0-EPS, 8.0+2.5+EPS] = [8.0-EPS, 10.5+EPS])
+    // covers 10.0 - this is the claw fix's own up_mm = kContactBandMm usage.
+    LayerFilamentTable table = build_layer_filament_table({ {10.0, 5} });
+    CHECK(chameleon_layer_free_extruders(table, 8.0).empty());                     // RED without the window
+    CHECK(chameleon_layer_free_extruders(table, 8.0, 0.0, 2.5) == std::set<unsigned>{5});
+
+    // up_mm too small to reach: 1.0mm window from 8.0 only covers up to 9.0, still
+    // missing the entry at 10.0.
+    CHECK(chameleon_layer_free_extruders(table, 8.0, 0.0, 1.0).empty());
+}
+
+TEST_CASE("chameleon_layer_free_extruders: down_mm and up_mm combine into ONE asymmetric window and union every entry inside it", "[chameleon]")
+{
+    // Three entries at 8.0/10.0/13.0; querying at z=10.0 with down_mm=1.5, up_mm=2.5
+    // covers [8.5-EPS, 12.5+EPS] - includes 10.0 (exact) and... not 8.0 (0.5mm short
+    // of the down edge) and not 13.0 (0.5mm past the up edge) - proves down/up bound
+    // their own sides independently, not a symmetric radius.
+    LayerFilamentTable table = build_layer_filament_table({ {8.0, 0}, {10.0, 1}, {13.0, 2} });
+    CHECK(chameleon_layer_free_extruders(table, 10.0, 1.5, 2.5) == std::set<unsigned>{1});
+
+    // Widen both sides just enough to catch all three - result is the UNION of every
+    // covered entry's set, mirroring the exact-coincidence query's own merge-boundary
+    // union behavior (see the EPSILON-merge-boundary test above), just over a wider
+    // window instead of a merge artifact.
+    CHECK(chameleon_layer_free_extruders(table, 10.0, 2.5, 3.5) == (std::set<unsigned>{0, 1, 2}));
 }
 
 TEST_CASE("brim_vote tie-prefers-prev_kept (C3): flips the min-id tie-break outcome", "[chameleon]")

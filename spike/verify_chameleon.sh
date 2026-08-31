@@ -9,13 +9,19 @@
 #      nearest_wall slices.
 #   3. (Part 2) Support Interface Auto-Match on the tshape.stl fixture:
 #      manual-mode support-region identity vs p2_baseline.gcode (tower off/on),
-#      nearest_surface-mode sanity (exit 0, bounded M620 growth, feature-tag
-#      presence; tower off/on), and a nearest_surface determinism repeat.
-#   4. (Part 2, v2.2 Task 4, spec C8) nearest_wall-mode sanity — same shape as
-#      3's nearest_surface checks (exit 0, bounded M620 growth, feature-tag
-#      presence; tower off/on) plus a determinism repeat. Checks are prefixed
-#      "p2-wall-" to avoid colliding with section 2's unrelated
-#      "nearestwall-*" (Part 1 brim_filament_source=nearest_wall) checks.
+#      and (v2.4 spec A/D) a LEGACY-ALIAS check: spike_p2_overrides.json still
+#      literally sets support_interface_filament_source = "nearest_surface" -
+#      the enum value v2.4 removed - proving PrintConfigDef::handle_legacy's
+#      new alias (PrintConfig.cpp, mirrors the draft_shield "limited" value-
+#      remap precedent) migrates it to "nearest_wall" instead of silently
+#      substituting the default (manual). Retargeted from this section's
+#      pre-v2.4 "nearest_surface-mode sanity" checks - see the section's own
+#      comment below for exactly what's asserted and why.
+#   4. (Part 2, v2.2 Task 4, spec C8) nearest_wall-mode sanity (exit 0,
+#      bounded M620 growth, feature-tag presence; tower off/on) plus a
+#      determinism repeat. Checks are prefixed "p2-wall-" to avoid colliding
+#      with section 2's unrelated "nearestwall-*" (Part 1
+#      brim_filament_source=nearest_wall) checks.
 #
 # Run from anywhere; the script cd's into its own directory (spike/) first so
 # all the relative harness paths below resolve the same way regardless of the
@@ -54,18 +60,23 @@ M620_MAX=10
 # ---------------------------------------------------------------------------
 TSHAPE="tshape.stl"
 P2_MANUAL_OVERRIDES="spike_support_overrides.json"    # support_interface_filament_source = manual (default)
-P2_NEAREST_OVERRIDES="spike_p2_overrides.json"        # + support_interface_filament_source = nearest_surface
-# v2.2 Task 4 (spec C8): support_interface_filament_source = nearest_wall - the new
-# user-directed A/B comparison mode. Same fixture/shape as P2_NEAREST_OVERRIDES, just
-# the third enum value.
+# v2.4 (spec A/D): this fixture's value is DELIBERATELY left as the literal string
+# "nearest_surface" - the enum value v2.4 removed - so it now serves as the
+# legacy-alias check's own fixture (section 3 below) instead of the pre-v2.4
+# "nearest_surface-mode sanity" checks it used to drive. Do NOT edit its content to
+# "nearest_wall": the whole point of the section 3 checks is proving the OLD string
+# still slices correctly via PrintConfigDef::handle_legacy's new alias.
+P2_NEAREST_OVERRIDES="spike_p2_overrides.json"
+# v2.2 Task 4 (spec C8): support_interface_filament_source = nearest_wall - the
+# surviving mode (v2.4 dropped nearest_surface). Same fixture/shape as
+# P2_NEAREST_OVERRIDES, just the current enum value spelled directly.
 P2_WALL_OVERRIDES="spike_p2_wall_overrides.json"
 P2_BASELINE="out/p2_baseline.gcode"                   # recorded pre-Task-4 (HEAD a157ac6cf8): manual mode, tower off, single PLA filament
 
 OUT_P2_MAN_OFF="out/p2_manual_off.gcode"
 OUT_P2_MAN_ON="out/p2_manual_on.gcode"
-OUT_P2_NS_OFF_1="out/p2_nearest_off_1.gcode"
-OUT_P2_NS_OFF_2="out/p2_nearest_off_2.gcode"
-OUT_P2_NS_ON="out/p2_nearest_on.gcode"
+OUT_P2_LEGACY_OFF_1="out/p2_legacy_off_1.gcode"
+OUT_P2_LEGACY_OFF_2="out/p2_legacy_off_2.gcode"
 OUT_P2_WALL_OFF_1="out/p2_wall_off_1.gcode"
 OUT_P2_WALL_OFF_2="out/p2_wall_off_2.gcode"
 OUT_P2_WALL_ON="out/p2_wall_on.gcode"
@@ -361,14 +372,43 @@ fi
 # how many filaments are --load-filaments'd. Print::extruders() (Print.cpp)
 # reflects real per-object usage, not the loaded-filament-profile count, so
 # chameleon_assign_support_interfaces' own top-level guard
-# (print.extruders().size() <= 1) returns before doing any work — even in
-# nearest_surface mode on this fixture, interface_by_extruder stays empty
-# for every support layer, so the new GCode.cpp emission block never finds a
-# match to emit. The nearest_surface checks below therefore validate
-# no-crash / well-formed output and correct feature/M620 presence, not real
-# cross-extruder matching — that requires the user's multi-filament GUI
-# fixture (see report for the definitive per-run evidence of whether the
-# emission block fired).
+# (print.extruders().size() <= 1) returns before doing any work — no per-
+# object "Chameleon support match: ..." BOOST_LOG line is ever emitted on
+# THIS fixture, in EITHER mode, regardless of whether an alias/migration
+# worked correctly. The checks below therefore CANNOT use that log line as
+# migration evidence (unlike a real multi-filament GUI plate) - see 3c's own
+# comment for what they use instead.
+#
+# 3c (v2.4 spec A/D): LEGACY-ALIAS check. spike_p2_overrides.json still
+# literally sets support_interface_filament_source = "nearest_surface" - the
+# enum value v2.4 removed (PrintConfig.hpp/.cpp) - so slicing with it
+# exercises PrintConfigDef::handle_legacy's new alias (mirrors the
+# draft_shield "limited" value-remap precedent) end to end. Without that
+# alias, ConfigOptionEnum<T>::from_string would fail to find "nearest_surface"
+# in s_keys_map_SupportInterfaceFilamentSource and Config.cpp's
+# set_deserialize_raw would silently substitute the option's DEFAULT
+# (manual) instead - so "it still slices" alone is NOT sufficient proof the
+# alias worked (a silent-manual substitution also slices without error).
+# Three independent, config-level signals distinguish the two outcomes
+# (chosen specifically because the CLI LIMITATION above rules out the
+# per-object BOOST_LOG line as evidence on this fixture):
+#   1. exit 0 (baseline: didn't crash/error).
+#   2. The load_config_file log line for this fixture reads "no substitutions
+#      performed from file spike_p2_overrides.json" - PROVES handle_legacy
+#      consumed "nearest_surface" and rewrote it to a value the enum DOES
+#      recognize BEFORE deserialize ever ran, so the later substitution-
+#      logging path (Config.cpp set_deserialize_raw, which WOULD log "Found
+#      legacy configuration values, substituted...") never triggers. A
+#      substitution-logged run means the alias did NOT fire and the value
+#      silently fell back to manual.
+#   3. The output gcode's CONFIG_BLOCK dump contains the literal line
+#      "; support_interface_filament_source = nearest_wall" (GCode.cpp
+#      append_full_config, "; <key> = <value>") - the RESOLVED value after
+#      migration. "= manual" here would mean the alias silently lost the
+#      user's intent even if signal 2 above somehow still passed.
+# Bounded M620 growth + feature-tag presence (the same sanity bar the pre-
+# v2.4 nearest_surface checks used) round out the group as cheap defense-in-
+# depth, plus a determinism repeat.
 # ---------------------------------------------------------------------------
 
 # --- 3a. Manual mode, tower OFF: identity (support-scoped) vs the frozen
@@ -413,92 +453,97 @@ else
     record "p2-manual-on-vs-baseline" FAIL "skipped: slice did not complete"
 fi
 
-# --- 3c. nearest_surface mode, tower OFF: no-crash + bounded M620 growth +
-#         feature-tag presence. PLA+PETG loaded (2 filaments) so the pass's
-#         own extruders()>1 gate has the best available chance to engage on
-#         this CLI fixture; see the CLI LIMITATION note above for why it
-#         still won't exercise real per-region matching here.
-run_slice_p2 "$P2_NEAREST_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_NS_OFF_1" "out/p2_nearest_off_1.log"
-p2ns_off1_rc=$?
-if [ $p2ns_off1_rc -eq 0 ]; then record "p2-nearest-off-exit0" PASS "exit 0"
-else record "p2-nearest-off-exit0" FAIL "exit $p2ns_off1_rc — see out/p2_nearest_off_1.log"; fi
+# --- 3c. LEGACY-ALIAS check (v2.4 spec A/D): P2_NEAREST_OVERRIDES still says
+#         "nearest_surface" literally. exit 0 + no-substitution-notice +
+#         resolved-value-is-nearest_wall (NOT manual) + the same bounded-M620/
+#         feature-tag sanity bar the pre-v2.4 checks used - see this
+#         section's own header comment above for why these three signals
+#         (not the per-object BOOST_LOG line) are the evidence used here.
+#         --debug=3 (PrintConfig.cpp "debug" option, 3 = info level):
+#         Utils.cpp's set_logging_level defaults the CLI to level 2
+#         ("warning") - EVERY BOOST_LOG_TRIVIAL(info) line, including both
+#         "no substitutions performed from file ..." (Snapmaker_Orca.cpp
+#         load_config_file) and chameleon_assign_support_interfaces' own
+#         per-object "Chameleon support match: ..." line, is filtered out of
+#         the log at the default level. Without --debug=3 the substitution-
+#         notice check below would silently see an EMPTY log and could pass
+#         for the wrong reason (grep -q on missing text is indistinguishable
+#         from grep -q on filtered-out text) - bump to info explicitly so the
+#         check actually exercises the log line it claims to.
+run_slice_p2 "$P2_NEAREST_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_LEGACY_OFF_1" "out/p2_legacy_off_1.log" --debug=3
+p2legacy_off1_rc=$?
+if [ $p2legacy_off1_rc -eq 0 ]; then record "p2-legacy-off-exit0" PASS "exit 0"
+else record "p2-legacy-off-exit0" FAIL "exit $p2legacy_off1_rc — see out/p2_legacy_off_1.log"; fi
 
-if [ $p2ns_off1_rc -eq 0 ]; then
-    total_layers=$(total_layers_of "$OUT_P2_NS_OFF_1")
+if [ $p2legacy_off1_rc -eq 0 ]; then
+    # Signal 2: handle_legacy consumed "nearest_surface" cleanly - no
+    # deserialize-failure substitution was ever logged for this file. Anchor
+    # on the filename (not just the generic phrase) so this doesn't
+    # accidentally match a DIFFERENT file's "no substitutions" line further
+    # up the same log (machine/filament profiles are loaded first).
+    if grep -qE "no substitutions performed from file .*spike_p2_overrides\.json" "out/p2_legacy_off_1.log"; then
+        record "p2-legacy-no-substitution-notice" PASS "handle_legacy alias fired silently (no Config.cpp fallback substitution logged)"
+    else
+        record "p2-legacy-no-substitution-notice" FAIL "expected 'no substitutions performed from file ...spike_p2_overrides.json' in out/p2_legacy_off_1.log — see log manually"
+    fi
+
+    # Signal 3: the RESOLVED config value in the output gcode's CONFIG_BLOCK
+    # is nearest_wall, not manual - proves the alias migrated the value
+    # rather than a substitution silently defaulting it.
+    if grep -qE "^; support_interface_filament_source = nearest_wall" "$OUT_P2_LEGACY_OFF_1"; then
+        record "p2-legacy-resolved-nearest-wall" PASS "CONFIG_BLOCK shows support_interface_filament_source = nearest_wall"
+    else
+        record "p2-legacy-resolved-nearest-wall" FAIL "'; support_interface_filament_source = nearest_wall' not found in $OUT_P2_LEGACY_OFF_1"
+    fi
+
+    total_layers=$(total_layers_of "$OUT_P2_LEGACY_OFF_1")
     [ -z "$total_layers" ] && total_layers=0
     m620_max=$((2 + 2 * 3 * total_layers))
-    m620_count=$(m620_count_of "$OUT_P2_NS_OFF_1")
+    m620_count=$(m620_count_of "$OUT_P2_LEGACY_OFF_1")
     if [ "$m620_count" -ge 2 ] && [ "$m620_count" -le "$m620_max" ]; then
-        record "p2-nearest-off-m620-bounds" PASS "M620 count = $m620_count (bound [2,$m620_max], total_layers=$total_layers)"
+        record "p2-legacy-m620-bounds" PASS "M620 count = $m620_count (bound [2,$m620_max], total_layers=$total_layers)"
     else
-        record "p2-nearest-off-m620-bounds" FAIL "M620 count = $m620_count, outside bound [2,$m620_max]"
+        record "p2-legacy-m620-bounds" FAIL "M620 count = $m620_count, outside bound [2,$m620_max]"
     fi
 
-    feature_count=$(grep -c "; FEATURE: Support interface" "$OUT_P2_NS_OFF_1")
+    feature_count=$(grep -c "; FEATURE: Support interface" "$OUT_P2_LEGACY_OFF_1")
     if [ "$feature_count" -ge 1 ]; then
-        record "p2-nearest-off-feature-present" PASS "'; FEATURE: Support interface' occurs $feature_count time(s)"
+        record "p2-legacy-feature-present" PASS "'; FEATURE: Support interface' occurs $feature_count time(s)"
     else
-        record "p2-nearest-off-feature-present" FAIL "'; FEATURE: Support interface' not found"
+        record "p2-legacy-feature-present" FAIL "'; FEATURE: Support interface' not found"
     fi
 else
-    record "p2-nearest-off-m620-bounds" FAIL "skipped: run did not slice"
-    record "p2-nearest-off-feature-present" FAIL "skipped: run did not slice"
+    record "p2-legacy-no-substitution-notice" FAIL "skipped: run did not slice"
+    record "p2-legacy-resolved-nearest-wall" FAIL "skipped: run did not slice"
+    record "p2-legacy-m620-bounds" FAIL "skipped: run did not slice"
+    record "p2-legacy-feature-present" FAIL "skipped: run did not slice"
 fi
 
-# --- 3d. nearest_surface mode, tower ON: same sanity bar, tower override
-#         applied (see 3b's note — it collapses to tower-off here too).
-run_slice_p2 "$P2_NEAREST_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_NS_ON" "out/p2_nearest_on.log" --enable-prime-tower=1
-p2ns_on_rc=$?
-if [ $p2ns_on_rc -eq 0 ]; then record "p2-nearest-on-exit0" PASS "exit 0"
-else record "p2-nearest-on-exit0" FAIL "exit $p2ns_on_rc — see out/p2_nearest_on.log"; fi
+# --- 3d. Determinism repeat: legacy-alias fixture, tower OFF, two
+#         consecutive slices, support-scoped compare (per the CAVEAT above).
+run_slice_p2 "$P2_NEAREST_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_LEGACY_OFF_2" "out/p2_legacy_off_2.log" --debug=3
+p2legacy_off2_rc=$?
+if [ $p2legacy_off2_rc -eq 0 ]; then record "p2-legacy-determinism-run2-exit0" PASS "exit 0"
+else record "p2-legacy-determinism-run2-exit0" FAIL "exit $p2legacy_off2_rc — see out/p2_legacy_off_2.log"; fi
 
-if [ $p2ns_on_rc -eq 0 ]; then
-    total_layers=$(total_layers_of "$OUT_P2_NS_ON")
-    [ -z "$total_layers" ] && total_layers=0
-    m620_max=$((2 + 2 * 3 * total_layers))
-    m620_count=$(m620_count_of "$OUT_P2_NS_ON")
-    if [ "$m620_count" -ge 2 ] && [ "$m620_count" -le "$m620_max" ]; then
-        record "p2-nearest-on-m620-bounds" PASS "M620 count = $m620_count (bound [2,$m620_max], total_layers=$total_layers)"
+if [ $p2legacy_off1_rc -eq 0 ] && [ $p2legacy_off2_rc -eq 0 ]; then
+    if support_identical "$OUT_P2_LEGACY_OFF_1" "$OUT_P2_LEGACY_OFF_2"; then
+        record "p2-legacy-determinism" PASS "run1 == run2, support-region + toolchange (normalized)"
     else
-        record "p2-nearest-on-m620-bounds" FAIL "M620 count = $m620_count, outside bound [2,$m620_max]"
-    fi
-
-    feature_count=$(grep -c "; FEATURE: Support interface" "$OUT_P2_NS_ON")
-    if [ "$feature_count" -ge 1 ]; then
-        record "p2-nearest-on-feature-present" PASS "'; FEATURE: Support interface' occurs $feature_count time(s)"
-    else
-        record "p2-nearest-on-feature-present" FAIL "'; FEATURE: Support interface' not found"
+        record "p2-legacy-determinism" FAIL "run1 != run2, support-region + toolchange (normalized)"
     fi
 else
-    record "p2-nearest-on-m620-bounds" FAIL "skipped: run did not slice"
-    record "p2-nearest-on-feature-present" FAIL "skipped: run did not slice"
-fi
-
-# --- 3e. Determinism repeat: nearest_surface, tower OFF, two consecutive
-#         slices, support-scoped compare (per the CAVEAT above).
-run_slice_p2 "$P2_NEAREST_OVERRIDES" "${FIL_PLA};${FIL_PETG}" "$OUT_P2_NS_OFF_2" "out/p2_nearest_off_2.log"
-p2ns_off2_rc=$?
-if [ $p2ns_off2_rc -eq 0 ]; then record "p2-nearest-determinism-run2-exit0" PASS "exit 0"
-else record "p2-nearest-determinism-run2-exit0" FAIL "exit $p2ns_off2_rc — see out/p2_nearest_off_2.log"; fi
-
-if [ $p2ns_off1_rc -eq 0 ] && [ $p2ns_off2_rc -eq 0 ]; then
-    if support_identical "$OUT_P2_NS_OFF_1" "$OUT_P2_NS_OFF_2"; then
-        record "p2-nearest-determinism" PASS "run1 == run2, support-region + toolchange (normalized)"
-    else
-        record "p2-nearest-determinism" FAIL "run1 != run2, support-region + toolchange (normalized)"
-    fi
-else
-    record "p2-nearest-determinism" FAIL "skipped: one or both runs did not slice"
+    record "p2-legacy-determinism" FAIL "skipped: one or both runs did not slice"
 fi
 
 # ---------------------------------------------------------------------------
 # 4. Support Interface Auto-Match (Part 2) — nearest_wall mode (v2.2 Task 4,
-#    spec C8). Same tshape.stl fixture and the same CLI LIMITATION/CAVEAT notes
-#    as section 3's nearest_surface checks above apply here verbatim (single
-#    used extruder on this CLI fixture, so this validates no-crash / well-formed
-#    output / feature-tag presence / determinism, not real cross-extruder
-#    matching — see section 3's own comment block for the full rationale).
-#    Checks are prefixed "p2-wall-" (NOT "nearestwall-", which section 2 above
+#    spec C8; v2.4 spec A the sole surviving mode). Same tshape.stl fixture
+#    and the same CLI LIMITATION/CAVEAT notes as section 3 above apply here
+#    verbatim (single used extruder on this CLI fixture, so this validates
+#    no-crash / well-formed output / feature-tag presence / determinism, not
+#    real cross-extruder matching — see section 3's own comment block for the
+#    full rationale). Checks are prefixed "p2-wall-" (NOT "nearestwall-", which section 2 above
 #    already uses for the unrelated Part 1 brim_filament_source=nearest_wall
 #    checks) so the two features' checks never collide in the results table.
 # ---------------------------------------------------------------------------

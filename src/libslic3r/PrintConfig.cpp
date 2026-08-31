@@ -357,7 +357,6 @@ CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(BrimFilamentSource)
 
 static t_config_enum_values s_keys_map_SupportInterfaceFilamentSource {
     { "manual",          int(SupportInterfaceFilamentSource::sifsManual) },
-    { "nearest_surface", int(SupportInterfaceFilamentSource::sifsNearestSurface) },
     { "nearest_wall",    int(SupportInterfaceFilamentSource::sifsNearestWall) }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(SupportInterfaceFilamentSource)
@@ -5468,16 +5467,13 @@ void PrintConfigDef::init_fff_params()
     def = this->add("support_interface_filament_source", coEnum);
     def->label = L("Support interface filament source");
     def->category = L("Support");
-    def->tooltip = L("Default: use the configured support interface filament. Nearest surface: "
-                     "each interface region uses the filament of the model surface it touches. "
-                     "Nearest wall: every support extrusion matches the nearest model wall, no "
-                     "distance limit - comparison mode.");
+    def->tooltip = L("Default: use the configured support interface filament. Nearest wall: "
+                     "every support extrusion matches the nearest model wall filament, no "
+                     "distance limit.");
     def->enum_keys_map = &ConfigOptionEnum<SupportInterfaceFilamentSource>::get_enum_values();
     def->enum_values.emplace_back("manual");
-    def->enum_values.emplace_back("nearest_surface");
     def->enum_values.emplace_back("nearest_wall");
     def->enum_labels.emplace_back(L("Default"));
-    def->enum_labels.emplace_back(L("Nearest surface"));
     def->enum_labels.emplace_back(L("Nearest wall"));
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<SupportInterfaceFilamentSource>(sifsManual));
@@ -7401,6 +7397,18 @@ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &va
         opt_key = "counterbore_hole_bridging";
     } else if (opt_key == "draft_shield" && value == "limited") {
         value = "disabled";
+    } else if (opt_key == "support_interface_filament_source" && value == "nearest_surface") {
+        // v2.4 (spec A): nearest_surface was removed from the enum (USER: GUI A/B round
+        // 2 verdict - see PrintConfig.hpp's SupportInterfaceFilamentSource comment).
+        // Value-remap precedent: draft_shield "limited" -> "disabled" directly above.
+        // Without this, ConfigOptionEnum<T>::from_string("nearest_surface") fails (the
+        // string is no longer in s_keys_map_SupportInterfaceFilamentSource) and
+        // Config.cpp's set_deserialize_raw silently substitutes the option's DEFAULT
+        // (sifsManual) instead - an old project that opted into cross-extruder matching
+        // would silently become manual-mode with no warning. nearest_wall is the
+        // user-directed migration target (nearest_surface's own upward-cast for ironing/
+        // top interfaces is deferred to v2.5, to land inside nearest_wall).
+        value = "nearest_wall";
     } else if ((opt_key == "sparse_infill_pattern"         ||
                 opt_key == "top_surface_pattern"           ||
                 opt_key == "undertop_surface_pattern"      ||

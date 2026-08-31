@@ -1193,22 +1193,27 @@ LayerFilamentTable build_layer_filament_table(std::vector<std::pair<double, unsi
     return table;
 }
 
-std::set<unsigned> chameleon_layer_free_extruders(const LayerFilamentTable &table, double query_z)
+std::set<unsigned> chameleon_layer_free_extruders(const LayerFilamentTable &table, double query_z,
+                                                   double down_mm, double up_mm)
 {
-    // Binary search (table is ascending by z, build_layer_filament_table's own
-    // contract) for the first entry whose z is >= query_z - EPSILON - by definition of
-    // lower_bound, every entry before it has z < query_z - EPSILON and so is wholly out
-    // of range, meaning that first qualifying entry is also the LEFTMOST one that could
-    // possibly fall within EPSILON of query_z (no separate backward scan needed). Widen
-    // forward from there while entries remain <= query_z + EPSILON - more than one
-    // table entry can qualify when a merge boundary in the table leaves two adjacent
-    // entries each individually within EPSILON of a query z that sits between them,
-    // even though the two entries themselves are more than EPSILON apart from EACH
-    // OTHER (EPSILON-merging is anchored per-run, not a transitive equivalence).
+    // v2.4 Task B (spec B): windowed coincidence - [query_z - down_mm - EPSILON,
+    // query_z + up_mm + EPSILON] - generalizing the old exact-z query (down_mm=up_mm=0
+    // collapses this to the same [query_z - EPSILON, query_z + EPSILON] window the
+    // pre-v2.4 version used). Binary search (table is ascending by z,
+    // build_layer_filament_table's own contract) for the first entry whose z is >=
+    // query_z - down_mm - EPSILON - by definition of lower_bound, every entry before it
+    // has z < that bound and so is wholly out of range, meaning that first qualifying
+    // entry is also the LEFTMOST one the window could possibly include (no separate
+    // backward scan needed). Widen forward from there while entries remain <= query_z +
+    // up_mm + EPSILON - more than one table entry can qualify even with a zero-width
+    // window, when a merge boundary in the table leaves two adjacent entries each
+    // individually within EPSILON of a query z that sits between them, even though the
+    // two entries themselves are more than EPSILON apart from EACH OTHER (EPSILON-
+    // merging is anchored per-run, not a transitive equivalence).
     std::set<unsigned> result;
-    auto it = std::lower_bound(table.begin(), table.end(), query_z - EPSILON,
+    auto it = std::lower_bound(table.begin(), table.end(), query_z - down_mm - EPSILON,
         [](const std::pair<double, std::set<unsigned>> &entry, double z) { return entry.first < z; });
-    for (; it != table.end() && it->first <= query_z + EPSILON; ++it)
+    for (; it != table.end() && it->first <= query_z + up_mm + EPSILON; ++it)
         result.insert(it->second.begin(), it->second.end());
     return result;
 }
@@ -1254,6 +1259,10 @@ BucketCapResult apply_bucket_caps(std::map<unsigned, ExtrusionEntityCollection> 
             merge_back_target.append(std::move(it->second.entities));
             it = map.erase(it);
             ++result.buckets_dropped_min_benefit;
+            // v2.4 Task C (spec C): `is_free` is already computed above for this same
+            // bucket - free-tier subset split, see BucketCapResult's own comment.
+            if (is_free)
+                ++result.buckets_dropped_min_benefit_free;
         } else {
             ++it;
         }

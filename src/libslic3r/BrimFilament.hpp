@@ -130,6 +130,15 @@ void partition_brim_by_wall(const ExtrusionEntityCollection& brim,
                             ExtrusionEntityCollection& kept,
                             std::map<unsigned, ExtrusionEntityCollection>& out);
 
+// v2.4 Task B (spec B): the contact-band width, hoisted out of a hardcoded literal so
+// select_contact_layers' own default AND chameleon_layer_free_extruders' windowed query
+// (its up_mm side, see below) share exactly one number - the claw fix (spec root cause:
+// free-eligibility used strict z-coincidence, so a wall that only exists in the contact
+// band above its support column was never "free" there) depends on the free-extruder
+// window covering PRECISELY the same band select_contact_layers already selects for
+// voting; two independently-tuned constants could silently drift apart.
+constexpr double kContactBandMm = 2.0;
+
 // Indices of object layers whose TOP z lies in (lo_z, hi_z].
 // print_zs = ascending layer TOP z values; layer i spans (print_zs[i-1], print_zs[i]].
 std::vector<size_t> select_layers_in_band(const std::vector<double>& print_zs,
@@ -139,7 +148,7 @@ std::vector<size_t> select_layers_in_band(const std::vector<double>& print_zs,
 // Thin call onto select_layers_in_band(print_zs, support_top_z, support_top_z + gap_mm).
 // Requires gap_mm > max layer height, else the direct contact layer itself is dropped.
 std::vector<size_t> select_contact_layers(const std::vector<double>& print_zs,
-                                          double support_top_z, double gap_mm = 2.0);
+                                          double support_top_z, double gap_mm = kContactBandMm);
 
 // v2.1 final-review I2 fix: select_layers_in_band's sibling for bands that are only
 // ONE layer tall (e.g. the coplanar lateral band, sized to a support layer's own
@@ -414,8 +423,18 @@ struct BucketCapResult {
     // it, even to empty; only a layer whose caller skips calling apply_bucket_caps
     // entirely - no engine call ran - leaves the caller's prev_kept unchanged).
     std::set<unsigned> kept;
-    // Buckets merged back by the C3 min-benefit gate (total length < min_len_mm).
+    // Buckets merged back by the C3 min-benefit gate (total length < its tier floor -
+    // min_len_mm for a normal bucket, min_len_free_mm for one in free_extruders).
     size_t buckets_dropped_min_benefit = 0;
+    // v2.4 Task C (spec C): free-tier SUBSET of buckets_dropped_min_benefit above - how
+    // many of the total drops were a bucket whose extruder was already in
+    // free_extruders (so it was gated against min_len_free_mm, not min_len_mm). Cheap
+    // to track since the gate loop already computes `is_free` per bucket; lets a triage
+    // reader tell apart "the claw fix's free-tier window still isn't rescuing enough
+    // length" from "12mm normal-tier churn dominates" without re-deriving it from raw
+    // per-layer free_extruders sets. Always <= buckets_dropped_min_benefit; the normal-
+    // tier count is the difference, not tracked as its own field.
+    size_t buckets_dropped_min_benefit_free = 0;
     // Buckets merged back by the C1 distinct-extruder trim (survived the gate, but
     // ranked below the top max_extruders by (prev_kept membership, then length)).
     size_t buckets_trimmed_cap = 0;
@@ -477,16 +496,32 @@ using LayerFilamentTable = std::vector<std::pair<double, std::set<unsigned>>>;
 LayerFilamentTable build_layer_filament_table(std::vector<std::pair<double, unsigned>> raw);
 
 // Pure query side of LayerFilamentTable: the union of every entry's set whose z lies
-// within EPSILON of `query_z` (a support layer's own print_z) - COINCIDENCE, not
-// nearest-neighbor: a query z with no matching entry (no object anywhere on the plate
-// has a layer at that height) returns an empty set - "not free" - rather than falling
-// back to the closest entry, since a support layer between two object layers isn't
-// actually sharing a toolchange with either one. `table` must already be ascending by
-// z (build_layer_filament_table's own contract) - this does a binary search (multiple
-// adjacent entries can each fall within EPSILON of query_z at a merge boundary, so the
-// search widens outward from the found index in both directions rather than trusting a
-// single lower_bound hit).
-std::set<unsigned> chameleon_layer_free_extruders(const LayerFilamentTable& table, double query_z);
+// within [query_z - down_mm - EPSILON, query_z + up_mm + EPSILON] - a WINDOWED
+// coincidence query, not nearest-neighbor: a query whose window contains no entry (no
+// object anywhere on the plate has a layer in that z range) returns an empty set - "not
+// free" - rather than falling back to the closest entry, since a support layer between
+// two object layers isn't actually sharing a toolchange with either one.
+//
+// v2.4 Task B (spec B, root cause): defaults (down_mm=0, up_mm=0) collapse the window
+// back to [query_z - EPSILON, query_z + EPSILON] - EXACT coincidence, byte-identical to
+// the pre-v2.4 unwindowed query - so every pre-v2.4 call site (this function's own
+// existing unit tests included) compiles and behaves unchanged. The claw fix (spec root
+// cause: free-eligibility used strict z-COINCIDENCE, so a white claw wall that exists
+// only in the contact band ABOVE its support column was never "free" at the support
+// layer's own z, even though the vote itself samples that same band) is entirely the
+// caller passing non-zero down_mm/up_mm - see Print.cpp's chameleon_assign_support_
+// interfaces call site (down_mm = the support layer's own height, an interval-overlap
+// correction for unsynced support/object layer grids; up_mm = kContactBandMm, the SAME
+// constant select_contact_layers' band uses, so free-eligibility covers precisely the
+// band the vote samples - "a color the sampler can vote is a color the gate must not
+// floor at the normal-tier length").
+//
+// `table` must already be ascending by z (build_layer_filament_table's own contract) -
+// this does a binary search (multiple adjacent entries can each fall within the window
+// at a merge boundary, so the scan widens outward from the found index rather than
+// trusting a single lower_bound hit).
+std::set<unsigned> chameleon_layer_free_extruders(const LayerFilamentTable& table, double query_z,
+                                                   double down_mm = 0.0, double up_mm = 0.0);
 
 // v2.3 Task 1 (spec C2): per-object hysteresis state threaded through
 // chameleon_assign_support_interfaces' per-support-layer loop (Print.cpp) - `prev_kept`

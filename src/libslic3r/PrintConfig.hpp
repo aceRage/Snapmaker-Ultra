@@ -250,10 +250,25 @@ enum BrimType {
 enum BrimFilamentSource { bfsObject = 0, bfsNearestWall };
 
 // Chameleon support interface: which filament a support-interface extrusion is printed with.
-// v2.2 Task 4 (spec C8): sifsNearestWall appended (never inserted) - serialized configs
-// key this enum by its integer value (CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS), so an
-// existing "nearest_surface" (1) save must keep resolving to sifsNearestSurface.
-enum SupportInterfaceFilamentSource { sifsManual = 0, sifsNearestSurface, sifsNearestWall };
+// v2.4 (spec A, GUI A/B round 2 verdict): nearest_surface REMOVED - it kept mixing
+// layers even in large single-color areas, so the user chose nearest_wall as the sole
+// keeper (nearest_wall's own claw-symptom root cause is fixed separately, spec B). A
+// saved config still holding the old "nearest_surface" string is migrated to
+// "nearest_wall" by PrintConfigDef::handle_legacy (PrintConfig.cpp, mirroring the
+// draft_shield "limited" value-remap precedent there) - required because without it,
+// ConfigOptionEnum<T>::from_string fails to find "nearest_surface" in
+// s_keys_map_SupportInterfaceFilamentSource below, and Config.cpp's set_deserialize_raw
+// then silently substitutes the option's DEFAULT (sifsManual) instead - turning an old
+// nearest_wall-equivalent project into a silently-manual one.
+//
+// sifsNearestWall's raw integer value CHANGES here (was 2, now 1) since
+// sifsNearestSurface (1) is deleted from the middle of the enum, not appended at the
+// end. Safe only because the wire format (save files, 3MF) is keyed by STRING name via
+// s_keys_map_SupportInterfaceFilamentSource (PrintConfig.cpp), never by this raw int -
+// verified: the GUI (Tab.cpp/ConfigManipulation.cpp) reads/writes this option only by
+// its string key "support_interface_filament_source", never by enum value name, so no
+// UI code needs updating for this shrink.
+enum SupportInterfaceFilamentSource { sifsManual = 0, sifsNearestWall };
 
 enum TimelapseType : int {
     tlTraditional = 0,

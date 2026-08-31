@@ -804,10 +804,10 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             // undo that - the stale partitions survive on the still-valid SupportLayers
             // and keep flowing into ToolOrdering + GCode emission even though the gate
             // says the feature should be off. Force posSupportMaterial to re-run (in
-            // either direction) for any object opted into EITHER matching mode
-            // (nearest_surface or, v2.2 Task 4, nearest_wall - the gate below is
-            // `!= sifsManual`, so this check mirrors it), so fresh layers are generated
-            // and the gate's decision actually takes effect. Only objects that opted in
+            // either direction) for any object opted into cross-extruder matching
+            // (v2.4: sifsNearestWall is the only non-manual value left - the gate below
+            // is `!= sifsManual`, so this check mirrors it), so fresh layers are
+            // generated and the gate's decision actually takes effect. Only objects that opted in
             // are checked; other objects on mixed plates are over-invalidated as a result
             // (osteps applies to all objects below), which is accepted rather than
             // threading a per-object condition through the loop.
@@ -2446,7 +2446,19 @@ static void chameleon_collect_wall_samples(const ExtrusionEntity* entity, const 
 // own_extruder_0based last-resort fallback (reached only if BOTH read <= 0) was also
 // unreachable dead code. Both issues are fixed by routing through the one canonical
 // PrintRegion::extruder() call instead of re-deriving its logic by hand.
-static unsigned chameleon_projection_region_extruder(const PrintRegion &region)
+// v2.4 (spec A): v2.5 UPWARD-CAST SCAFFOLDING - kept, currently UNUSED. This function
+// and the two below it (chameleon_build_projection_views, chameleon_projection_extruder_
+// from_view) were nearest_surface's own vertical-projection resolver glue; v2.4 deleted
+// nearest_surface's only caller (chameleon_assign_support_interfaces' else-arm) but
+// deliberately did NOT delete these - the plan is to upward-cast this same "surface
+// directly above a sample wins" logic into nearest_wall for IRONING + TOP INTERFACES in
+// v2.5 (see docs/superpowers/specs/2026-08-30-support-match-v24-design.md's "E. Non-
+// changes" section). [[maybe_unused]] silences the unreferenced-static-function warning
+// a stricter warning level than this codebase currently builds with would otherwise
+// raise; ProjectionLayerView (BrimFilament.hpp), chameleon_pick_projection_region
+// (BrimFilament.hpp/.cpp), and their existing unit tests are kept unchanged for the same
+// reason.
+[[maybe_unused]] static unsigned chameleon_projection_region_extruder(const PrintRegion &region)
 {
     // v2.3 final-review M5 fix: same defensive underflow clamp as
     // chameleon_region_extruder above, and for the same reason - solid_infill_filament/
@@ -2493,7 +2505,9 @@ static constexpr double CHAMELEON_PROJECTION_MARGIN_MM = 1.2;
 // Support/SupportMaterial.cpp:1395's xy_expansion, added to the same margin). Unlike
 // lslices/region_slice_polys above, expanded_lslices IS a copy (offset_ex produces new
 // geometry, not aliased storage), so this is the one part of the view that isn't free.
-static void chameleon_build_projection_views(const PrintObject &object,
+// v2.5 upward-cast scaffolding - kept, currently unused; see
+// chameleon_projection_region_extruder's own banner comment above.
+[[maybe_unused]] static void chameleon_build_projection_views(const PrintObject &object,
                                               const std::vector<size_t> &band_layer_indices,
                                               std::vector<ProjectionLayerView> &out_view,
                                               std::vector<const Layer *> &out_view_layers)
@@ -2572,7 +2586,9 @@ static void chameleon_build_projection_views(const PrintObject &object,
 // layers x regions x islands) per call before M1). Layer::lslices_bboxes is precomputed
 // once at slicing time (PrintObjectSlice.cpp), long before this pass runs, so the AABB
 // gate inside chameleon_pick_projection_region is free.
-static bool chameleon_projection_extruder_from_view(const std::vector<ProjectionLayerView> &view,
+// v2.5 upward-cast scaffolding - kept, currently unused; see
+// chameleon_projection_region_extruder's own banner comment above.
+[[maybe_unused]] static bool chameleon_projection_extruder_from_view(const std::vector<ProjectionLayerView> &view,
                                                       const std::vector<const Layer *> &view_layers,
                                                       const Point &p,
                                                       unsigned &out_extruder)
@@ -2718,30 +2734,38 @@ static LayerFilamentTable chameleon_collect_layer_filaments(const Print &print)
 
 // Chameleon P2.1: support match pass (renamed from "interface partition pass" - v2.1
 // resolves BOTH support roles now, see docs/superpowers/specs/2026-08-30-support-match-
-// v2-design.md's "Decision rules" section, the binding contract). For every object opted
-// into support_interface_filament_source == sifsNearestSurface, per support layer:
-// interface entities (erSupportMaterialInterface) are resolved by vertical projection
-// (the model surface directly above a sample wins) with a lateral-proximity fallback when
-// projection misses ("SURFACE ABOVE WINS", user-approved); base entities
-// (erSupportMaterial) are resolved by lateral proximity only (v2.1's "any support within
-// 1mm of a wall at its own layer matches that wall" anti-contamination rule). v2.2 Task 3
-// (spec C6) adds a THIRD role: ironing (erIroning) follows the INTERFACE resolver/
-// fallback verbatim - "ironing follows its interface" - since erIroning entities are the
-// ironed top surface of matched interface tops, not a role with its own independent
-// vertical/lateral rule. All three roles are partitioned via three calls to the SAME
-// partition_support_entities engine (T1/v2.2 Task 3) - interface first (role_filter =
-// erSupportMaterialInterface), then base (role_filter = erSupportMaterial), then ironing
-// (role_filter = erIroning, reusing interface_resolver/fallback_extruder/vote_params
-// verbatim) - sharing ONE SupportLayer::interface_by_extruder map (T1 storage), which
-// v2.2 Task 1 then gates/trims as a whole via ONE apply_bucket_caps call per layer (spec
-// C1-C3: length-ranked distinct-extruder cap with hysteresis, NOT a switch-count budget -
-// see apply_bucket_caps' own doc comment in BrimFilament.hpp for the full rationale;
-// order among the three partition_support_entities calls only matters for log/counter
-// bookkeeping, not correctness: each call only ever touches entities whose role() matches
-// its own role_filter). v2.2 Task 3 (spec C7) also makes each of these three calls vote
-// any role-eligible NESTED collection (collapsed role() == that call's role_filter) as
-// one whole unit instead of leaving it invisible to the matcher entirely (spec root cause
-// 6) - see partition_support_entities' own doc comment in BrimFilament.hpp.
+// v2-design.md's "Decision rules" section for the original binding contract; v2.4 (spec
+// A, docs/superpowers/specs/2026-08-30-support-match-v24-design.md) simplified the
+// per-layer resolution rule itself to a single mode - see below). For every object opted
+// into support_interface_filament_source != sifsManual (v2.4: the only surviving
+// non-manual value is sifsNearestWall - nearest_surface's vertical-projection-primary/
+// lateral-fallback rule was REMOVED outright, GUI A/B round 2 verdict: it still mixed
+// layers even in large single-color areas even after v2.2/v2.3's fixes. Its machinery -
+// ProjectionLayerView, chameleon_build_projection_views, chameleon_projection_extruder_
+// from_view below, chameleon_pick_projection_region/gap_aware_lateral_cap_mm in
+// BrimFilament - is KEPT, currently unused, as v2.5 upward-cast scaffolding for ironing/
+// top interfaces inside nearest_wall, not deleted; see each symbol's own comment), per
+// support layer: all three roles - interface (erSupportMaterialInterface), base
+// (erSupportMaterial), and ironing (erIroning, "ironing follows its interface": erIroning
+// entities are the ironed top surface of a matched interface run, not a role with its own
+// independent rule) - are resolved by the SAME nearest-wall vote: brim_vote, k=1,
+// UNCAPPED (max_dist_mm=0), against ONE WallSampleIndex built from the union of the
+// contact-band and coplanar-span layers (see the per-layer loop below) - "the nearest
+// wall segment wins outright, no distance limit, no projection". All three roles are
+// partitioned via three calls to the SAME partition_support_entities engine (T1/v2.2 Task
+// 3) - interface first (role_filter = erSupportMaterialInterface), then base (role_filter
+// = erSupportMaterial), then ironing (role_filter = erIroning, reusing interface_resolver/
+// fallback_extruder/vote_params verbatim) - sharing ONE SupportLayer::interface_by_extruder
+// map (T1 storage), which v2.2 Task 1 then gates/trims as a whole via ONE
+// apply_bucket_caps call per layer (spec C1-C3: length-ranked distinct-extruder cap with
+// hysteresis, NOT a switch-count budget - see apply_bucket_caps' own doc comment in
+// BrimFilament.hpp for the full rationale; order among the three partition_support_entities
+// calls only matters for log/counter bookkeeping, not correctness: each call only ever
+// touches entities whose role() matches its own role_filter). v2.2 Task 3 (spec C7) also
+// makes each of these three calls vote any role-eligible NESTED collection (collapsed
+// role() == that call's role_filter) as one whole unit instead of leaving it invisible to
+// the matcher entirely (spec root cause 6) - see partition_support_entities' own doc
+// comment in BrimFilament.hpp.
 //
 // Must run after generate_support_material has completed for every object - fresh or
 // copied from a shared/cached object - and before ToolOrdering/psWipeTower construction,
@@ -2753,7 +2777,10 @@ static LayerFilamentTable chameleon_collect_layer_filaments(const Print &print)
 //
 // Off (manual mode / single extruder / ByObject sequence): this function returns
 // immediately without touching support_fills or interface_by_extruder on ANY object -
-// byte-identical gcode is a hard requirement (spec's off-mode purity).
+// byte-identical gcode is a hard requirement (spec's off-mode purity). The `!= sifsManual`
+// gate (below) is the WHOLE opt-in - v2.4 deleted the second per-object mode branch that
+// gate used to feed (the old `nearest_wall_mode` local and its else-arm), so every object
+// that opts in takes the identical path below, no per-object branching left.
 static void chameleon_assign_support_interfaces(Print &print)
 {
     if (print.extruders().size() <= 1 || print.config().print_sequence == PrintSequence::ByObject)
@@ -2771,11 +2798,11 @@ static void chameleon_assign_support_interfaces(Print &print)
         PrintObject *object = objects[obj_idx];
         if (object == nullptr)
             continue;
-        // v2.2 Task 4 (spec C8): the gate now admits EITHER matching mode - manual
-        // (sifsManual) is the only value that opts an object out. `nearest_wall_mode`
-        // (below) then picks which per-layer resolver strategy this object uses; every
-        // guard/step below this point (shared-object skip, plate guard, visited flag,
-        // apply_bucket_caps, storage, emission, logging) is identical regardless of mode.
+        // v2.4 (spec A): `!= sifsManual` is the WHOLE opt-in now that nearest_surface is
+        // gone - sifsNearestWall is the only other value the enum can hold, so there is
+        // no longer a second mode to pick between below. Every guard/step below this
+        // point (shared-object skip, plate guard, visited flag, apply_bucket_caps,
+        // storage, emission, logging) applies uniformly to every opted-in object.
         if (object->config().support_interface_filament_source.value == sifsManual)
             continue;
         if (object->layers().empty() || object->support_layers().empty())
@@ -2791,15 +2818,6 @@ static void chameleon_assign_support_interfaces(Print &print)
         // per-layer chameleon_interface_visited guard below on each one.
         if (object->get_shared_object() != nullptr)
             continue;
-
-        // v2.2 Task 4 (spec C8): per-object mode switch. nearest_surface keeps today's
-        // projection-primary/lateral-fallback behavior (interface+ironing) and gap-
-        // capped lateral (base) - unchanged below. nearest_wall is a pure nearest-wall
-        // vote for ALL THREE roles, uncapped, over a single WallSampleIndex built from
-        // the union of the contact-band and coplanar layers - no projection views are
-        // ever built in this mode. Purpose (spec): user-directed A/B comparison against
-        // nearest_surface, not a replacement default.
-        const bool nearest_wall_mode = object->config().support_interface_filament_source.value == sifsNearestWall;
 
         const unsigned object_default_extruder = chameleon_object_default_extruder(print, *object);
         // Spec-mandated fallback: the object's resolved interface extruder, mirroring
@@ -2864,61 +2882,18 @@ static void chameleon_assign_support_interfaces(Print &print)
         // brim behavior stays byte-identical" contract the merge previously violated.
         vote_params.merge_ring_seam = true;
 
-        // v2.2 Task 2 (spec C4, root cause 1): gap-aware lateral cap, replacing the
-        // hardcoded 1.0mm max_dist_mm below (BrimVoteParams.max_dist_mm, Task 1). The
-        // cap is CENTERLINE-to-centerline (both wall samples and support line paths are
-        // centerlines), so the physical minimum distance it must admit between a wall
-        // and an adjacent support skin is the surface-to-surface gap the support
-        // generator itself holds (support_object_xy_distance) plus half the outer
-        // wall's own width (its centerline sits that far inside the wall's true outer
-        // surface) plus half the support line's own width (same, on the support side).
-        // 1.0mm was frequently LESS than gap_xy + half-widths alone at common profiles
-        // (e.g. 0.2mm gap + 0.4mm outer wall + 0.4mm support line = 0.6mm of that
-        // minimum already, before the arithmetic's own slack) - "nearly unsatisfiable"
-        // (spec root cause 1), so nearly every base/lateral vote silently fell back to
-        // khaki even when a wall genuinely faced the support skin (the khaki-along-
-        // teal-wall GUI bug). gap_aware_lateral_cap_mm (BrimFilament.hpp/.cpp) is the
-        // pure arithmetic (+0.35mm slack, spec C4), unit-tested there; this is just the
-        // width resolution glue, computed once per object like vote_params above.
+        // v2.4 (spec A): the gap-aware lateral cap (outer_wall_width_mm/
+        // support_nozzle_diameter_mm/support_line_width_mm/lateral_cap_mm, formerly
+        // computed here) was v2.2 Task 2's fix for nearest_surface's OWN lateral/base
+        // resolver, which capped how far a support skin could reach for a coplanar wall
+        // (BrimVoteParams.max_dist_mm). nearest_wall's resolver has never used a
+        // distance cap (max_dist_mm stays 0 = uncapped, spec C8) - "nearest wall wins
+        // outright, no distance limit" - so this glue has no caller left now that
+        // nearest_surface's else-arm is gone. gap_aware_lateral_cap_mm itself
+        // (BrimFilament.hpp/.cpp) is NOT deleted - pure function, unit-tested there,
+        // kept for the same v2.5 upward-cast reason as the projection machinery (see
+        // this function's own header comment above).
         //
-        // Widths resolved the SAME WAY the support generator resolves them for this
-        // exact purpose (mirrored, not shared - SupportParameters is built fresh inside
-        // generate_support_material, long before this post-pass runs, so there's no
-        // live SupportParameters instance available here to read from):
-        //  - outer wall width: max over every printing region of PrintRegion::flow(
-        //    *object, frExternalPerimeter, layer_height).width() - Support/
-        //    SupportParameters.hpp:70-76's own external_perimeter_width loop, verbatim.
-        //    PrintRegion::flow() (PrintRegion.cpp:59-60) already folds a 0mm ("auto")
-        //    outer_wall_line_width to object.config().line_width internally, so the
-        //    "support_line_width may be 0 = auto" handling below has no counterpart
-        //    needed here - flow() already resolved it.
-        //  - support line width: object_config.support_line_width.get_abs_value(...),
-        //    falling back to object_config.line_width.get_abs_value(...) when 0 (auto) -
-        //    Support/SupportParameters.hpp:165-168's support_extrusion_width resolution,
-        //    verbatim, including its support_interface_filament-1 nozzle index (filament
-        //    value 0 underflows to size_t(-1), which ConfigOptionVector::get_at treats
-        //    as "the 0th/current nozzle" by design, not UB - see Slicing.cpp:71-74's own
-        //    comment, and Support/SupportMaterial.cpp:2152's identical expression for
-        //    this same fallback). First-layer width variants are deliberately ignored
-        //    here, same as v2.1's flat 1.0mm cap was - this is a lateral/coplanar rule,
-        //    not a first-layer-specific one.
-        double outer_wall_width_mm = 0.0;
-        for (size_t region_id = 0; region_id < object->num_printing_regions(); ++region_id) {
-            const PrintRegion &region = object->printing_region(region_id);
-            outer_wall_width_mm = std::max(outer_wall_width_mm,
-                double(region.flow(*object, frExternalPerimeter, object->slicing_parameters().layer_height).width()));
-        }
-        const double support_nozzle_diameter_mm = print.config().nozzle_diameter.get_at(
-            object->config().support_interface_filament.value - 1);
-        const double support_line_width_default_mm =
-            object->config().line_width.get_abs_value(support_nozzle_diameter_mm);
-        double support_line_width_mm =
-            object->config().support_line_width.get_abs_value(support_nozzle_diameter_mm);
-        support_line_width_mm = support_line_width_mm > 0.0 ? support_line_width_mm : support_line_width_default_mm;
-
-        const double lateral_cap_mm = gap_aware_lateral_cap_mm(
-            object->config().support_object_xy_distance.value, outer_wall_width_mm, support_line_width_mm);
-
         // v2.2 Task 1 (spec C1-C3): this object's hysteresis state - the extruder set
         // apply_bucket_caps committed on the PREVIOUS support layer that reached the
         // engine calls. Empty at object start. Threaded through every iteration of the
@@ -2949,8 +2924,16 @@ static void chameleon_assign_support_interfaces(Print &print)
         // counters (deleted with the >3 whole-layer revert and >20 per-object
         // escalation, C1-C2 - a switch-boundary tally never measured the real per-layer
         // cost). These count actual apply_bucket_caps outcomes instead.
-        size_t buckets_dropped_min_benefit = 0; // C3 gate: bucket total length < its tier floor (v2.3 Task 1: 12mm normal / 3mm free)
-        size_t buckets_trimmed_cap         = 0; // C1 trim: bucket ranked below the top 2
+        size_t buckets_dropped_min_benefit      = 0; // C3 gate: bucket total length < its tier floor (v2.3 Task 1: 12mm normal / 3mm free)
+        // v2.4 Task C (spec C): free-tier SUBSET of buckets_dropped_min_benefit above -
+        // cheap to split out (apply_bucket_caps' gate loop already computes `is_free`
+        // per bucket, BrimFilament.cpp) and answers a triage question the combined total
+        // can't: "did the claw fix's free-tier window still fail to rescue enough
+        // length, or is 12mm-normal-tier churn the dominant drop cause?" Normal-tier
+        // drops are buckets_dropped_min_benefit - buckets_dropped_min_benefit_free, not
+        // tracked as its own field since it's one subtraction away.
+        size_t buckets_dropped_min_benefit_free = 0;
+        size_t buckets_trimmed_cap              = 0; // C1 trim: bucket ranked below the top 2
         // Raw matched-run counts (NOT switch-boundary/cap accounting - purely
         // informational, mirrors partition_support_entities' own return value) per
         // role, summed across every layer that reached the engine calls.
@@ -2991,9 +2974,8 @@ static void chameleon_assign_support_interfaces(Print &print)
                 continue;
 
             // v2.3 Task 1 (spec C3): sync vote_params.prev_kept to THIS layer's current
-            // hysteresis state BEFORE any of the mode-branch resolvers below copy
-            // vote_params by value (interface_wall_params/base_wall_params/
-            // interface_lateral_params/base_lateral_params, all `= vote_params`) - those
+            // hysteresis state BEFORE the resolvers below copy vote_params by value
+            // (interface_wall_params/base_wall_params, both `= vote_params`) - those
             // copies are taken fresh every iteration of this loop, but `vote_params`
             // itself is constructed ONCE per OBJECT, above this loop, so without this
             // line every layer's resolvers would see whatever prev_kept happened to be
@@ -3011,36 +2993,45 @@ static void chameleon_assign_support_interfaces(Print &print)
             vote_params.descended_last_layer = descended_last_layer;
 
             // v2.3 Task 1 (spec C1): this layer's free-extruder set - the once-per-pass
-            // z-table's coincidence lookup at this support layer's own print_z. Resolved
+            // z-table's WINDOWED lookup at this support layer's own print_z. Resolved
             // once per layer (not per bucket) since it depends only on z, feeds the
             // apply_bucket_caps call at the tail of this iteration.
-            const std::set<unsigned> free_extruders =
-                chameleon_layer_free_extruders(layer_filament_table, support_layer->print_z);
+            //
+            // v2.4 Task B (spec B, the claw fix): down_mm/up_mm replace the old exact-z
+            // query - a white claw wall that exists only in the contact band ABOVE its
+            // support column (z, z + kContactBandMm] was never "free" at the support
+            // layer's OWN z under strict coincidence, even though the vote above (a)/(b)
+            // samples that same band; every short white bucket then faced the 12mm
+            // normal-tier floor and merged back to fallback. down_mm = support_layer->
+            // height (interval-overlap correction, mirroring coplanar_idx's own
+            // rationale above, for unsynced support/object layer grids); up_mm =
+            // kContactBandMm - the SAME constant contact_idx's own select_contact_layers
+            // call uses (hoisted, BrimFilament.hpp) - so free-eligibility covers exactly
+            // the band the vote can actually match against, no more and no less.
+            const std::set<unsigned> free_extruders = chameleon_layer_free_extruders(
+                layer_filament_table, support_layer->print_z,
+                /*down_mm=*/support_layer->height, /*up_mm=*/kContactBandMm);
 
             // (a) Contact-band layers: v2.0-style band (support_top_z, support_top_z +
-            // 2.0]). nearest_surface (below) feeds this by index list directly into
-            // chameleon_build_projection_views/chameleon_projection_extruder_from_view
-            // (Task 2, M1-hoisted). nearest_wall (v2.2 Task 4, spec C8) instead unions
-            // this list with the coplanar band below into ONE wall-sample index - see
-            // the mode branch below; no WallSampleIndex is built from this list alone.
-            std::vector<size_t> contact_idx = select_contact_layers(layer_print_zs, support_layer->print_z, 2.0);
+            // kContactBandMm]) - unioned below with the coplanar band (b) into ONE
+            // wall-sample index (v2.2 Task 4, spec C8; v2.4 spec A made this the only
+            // path, deleting nearest_surface's separate use of this list for a
+            // projection view - see this function's own header comment).
+            std::vector<size_t> contact_idx = select_contact_layers(layer_print_zs, support_layer->print_z, kContactBandMm);
 
             // (b) Coplanar lateral band: object layers whose z-INTERVAL OVERLAPS this
             // support layer's OWN span (print_z - height, print_z] - v2.1's "any support
             // within 1mm of a wall at its own layer matches that wall" rule (spec's
-            // Decision rules, "Lateral rule - all roles"). This REPLACES the old
-            // contact-band WallSampleIndex that v2.0 used for interface lateral voting -
-            // projection (a) now owns the contact band, and the lateral rule uses this
-            // separate, layer-local band instead.
+            // Decision rules, "Lateral rule - all roles").
             //
             // v2.1 final-review I2 fix: select_layers_overlapping_span, not
             // select_layers_in_band - this band is only ONE support-layer tall, so a
             // pure top-z-in-band test can miss an object layer whose walls flank the
             // band even though its own top overshoots hi_z (unsynced support/object
-            // layer grids, variable layer height). The projection band above
-            // (contact_idx, select_contact_layers -> select_layers_in_band) is
-            // deliberately left as-is: its 2.0mm width is wider than any single layer,
-            // so the top-z deviation the v2.0 review accepted for it still holds.
+            // layer grids, variable layer height). The contact band above (contact_idx,
+            // select_contact_layers -> select_layers_in_band) is deliberately left
+            // as-is: its kContactBandMm width is wider than any single layer, so the
+            // top-z deviation the v2.0 review accepted for it still holds.
             std::vector<size_t> coplanar_idx = select_layers_overlapping_span(
                 layer_print_zs, support_layer->print_z - support_layer->height, support_layer->print_z,
                 // Raft-aware first-layer bottom (re-review N2): with a raft the object's
@@ -3048,143 +3039,72 @@ static void chameleon_assign_support_interfaces(Print &print)
                 // must not coplanar-match layer 0's walls.
                 object->layers().front()->print_z - object->layers().front()->height);
 
-            // v2.2 Task 4 (spec C8): locals populated by exactly ONE of the two mode
-            // branches just below. interface_resolver/base_resolver are declared as
-            // std::function (rather than `auto`) precisely so both branches can assign
-            // into the SAME two variables, which the three-engine-call tail further down
-            // - unchanged, shared regardless of mode - then calls without caring which
-            // branch built them. Any BrimVoteParams a resolver needs is captured BY
-            // VALUE (cheap, immutable after construction) so it never dangles once the
-            // branch's own inner scope exits; coplanar_wall_idx/wall_union_idx/
-            // projection_view(_layers) are captured BY REFERENCE and so are declared
-            // here, at the per-layer scope that outlives both the branch below and the
-            // engine calls that use the resolvers.
-            WallSampleIndex                        coplanar_wall_idx; // nearest_surface: lateral fallback index
-            WallSampleIndex                        wall_union_idx;    // nearest_wall (C8): the ONE uncapped index
-            std::vector<ProjectionLayerView>       projection_view;   // nearest_surface only - stays empty in C8 mode
-            std::vector<const Layer *>             projection_view_layers;
+            // v2.4 (spec A): un-nested from the old per-object mode branch - nearest_wall
+            // is the only path left, so wall_union_idx/interface_resolver/base_resolver
+            // are populated unconditionally below instead of by one of two branches.
+            // interface_resolver/base_resolver stay std::function (not `auto`) since the
+            // three-engine-call tail further down just calls them, agnostic to how they
+            // were built. BrimVoteParams is captured BY VALUE (cheap, immutable after
+            // construction) so it never dangles; wall_union_idx is captured BY REFERENCE
+            // and so is declared here, at the per-layer scope that outlives both the
+            // construction below and the engine calls that use the resolvers.
+            WallSampleIndex                        wall_union_idx;
             bool                                    zero_sample = false;
             std::function<unsigned(const Point &)> interface_resolver;
             std::function<unsigned(const Point &)> base_resolver;
 
-            if (nearest_wall_mode) {
-                // v2.2 Task 4 (spec C8): ONE WallSampleIndex over the UNION of the
-                // contact-band layers (a) and the coplanar layers (b) - dedupe via
-                // union_layer_indices (BrimFilament.hpp/.cpp) so a layer index selected
-                // by both bands doesn't double-weight its walls in brim_vote's 1/d^2
-                // scoring. No projection view is ever built in this mode.
-                for (size_t li : union_layer_indices(contact_idx, coplanar_idx))
-                    for (const LayerRegion *lr : object->layers()[li]->regions())
-                        chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
-                            no_shift, obj_idx, wall_union_idx);
+            // v2.2 Task 4 (spec C8): ONE WallSampleIndex over the UNION of the
+            // contact-band layers (a) and the coplanar layers (b) - dedupe via
+            // union_layer_indices (BrimFilament.hpp/.cpp) so a layer index selected
+            // by both bands doesn't double-weight its walls in brim_vote's 1/d^2
+            // scoring. No projection view is ever built (v2.5 upward-cast scaffolding
+            // only, see this function's own header comment).
+            for (size_t li : union_layer_indices(contact_idx, coplanar_idx))
+                for (const LayerRegion *lr : object->layers()[li]->regions())
+                    chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
+                        no_shift, obj_idx, wall_union_idx);
 
-                zero_sample = wall_union_idx.empty();
-                if (!zero_sample) {
-                    // Resolver for ALL THREE roles (interface, base, and - via
-                    // interface_resolver, reused verbatim same as nearest_surface's own
-                    // "ironing follows its interface" - erIroning) = brim_vote against
-                    // wall_union_idx, UNCAPPED: max_dist_mm explicitly left at 0 (brim_
-                    // vote's own "0 = uncapped" convention, BrimVoteParams' default) -
-                    // the nearest wall wins outright, no distance limit, "comparison
-                    // mode" per spec C8.
-                    //
-                    // v2.2 final-review I1 fix: k = 1, also set explicitly below (both
-                    // role params - only fallback_extruder actually differs between
-                    // them). The mode's decision rule is "nearest wall segment wins
-                    // outright, no projection" (spec C8), not a weighted vote. Leaving k
-                    // at vote_params' default of 3 resurrected the v2.0-era 1/d^2-
-                    // weighted knn vote even though max_dist_mm = 0 skips the v2.1-I1
-                    // electorate filter entirely: two samples of a farther wall could
-                    // outvote one sample of the strictly nearest wall, and near-ties fell
-                    // back to the LOWEST extruder id - exactly the mechanisms the v2.1
-                    // forensics blamed for most of its wrong pairs, now contaminating
-                    // this mode's sole purpose (A/B attribution of nearest_surface's
-                    // color decisions). With k = 1 the knn electorate is a single sample
-                    // - brim_vote's score map has exactly one entry, so it returns that
-                    // sample's extruder directly (score.size() == 1 path), before any
-                    // tie-break logic runs. WallSampleIndex::knn's own tie order (nearest
-                    // by squared distance, ties broken by ascending (extruder,
-                    // object_key)) then makes an exact single-sample tie deterministic on
-                    // its own, with no vote involved.
-                    BrimVoteParams interface_wall_params    = vote_params;
-                    interface_wall_params.k                 = 1;
-                    interface_wall_params.max_dist_mm       = 0.0;
-                    interface_wall_params.fallback_extruder = fallback_extruder;
+            zero_sample = wall_union_idx.empty();
+            if (!zero_sample) {
+                // Resolver for ALL THREE roles (interface, base, and - via
+                // interface_resolver, reused verbatim, "ironing follows its interface" -
+                // erIroning) = brim_vote against wall_union_idx, UNCAPPED: max_dist_mm
+                // explicitly left at 0 (brim_vote's own "0 = uncapped" convention,
+                // BrimVoteParams' default) - the nearest wall wins outright, no distance
+                // limit.
+                //
+                // v2.2 final-review I1 fix: k = 1, also set explicitly below (both
+                // role params - only fallback_extruder actually differs between
+                // them). The decision rule is "nearest wall segment wins outright, no
+                // projection" (spec C8), not a weighted vote. Leaving k at vote_params'
+                // default of 3 resurrected the v2.0-era 1/d^2-weighted knn vote even
+                // though max_dist_mm = 0 skips the v2.1-I1 electorate filter entirely:
+                // two samples of a farther wall could outvote one sample of the
+                // strictly nearest wall, and near-ties fell back to the LOWEST extruder
+                // id - exactly the mechanisms the v2.1 forensics blamed for most of its
+                // wrong pairs. With k = 1 the knn electorate is a single sample - brim_
+                // vote's score map has exactly one entry, so it returns that sample's
+                // extruder directly (score.size() == 1 path), before any tie-break logic
+                // runs. WallSampleIndex::knn's own tie order (nearest by squared
+                // distance, ties broken by ascending (extruder, object_key)) then makes
+                // an exact single-sample tie deterministic on its own, with no vote
+                // involved.
+                BrimVoteParams interface_wall_params    = vote_params;
+                interface_wall_params.k                 = 1;
+                interface_wall_params.max_dist_mm       = 0.0;
+                interface_wall_params.fallback_extruder = fallback_extruder;
 
-                    BrimVoteParams base_wall_params    = vote_params;
-                    base_wall_params.k                 = 1;
-                    base_wall_params.max_dist_mm       = 0.0;
-                    base_wall_params.fallback_extruder = base_fallback_extruder;
+                BrimVoteParams base_wall_params    = vote_params;
+                base_wall_params.k                 = 1;
+                base_wall_params.max_dist_mm       = 0.0;
+                base_wall_params.fallback_extruder = base_fallback_extruder;
 
-                    interface_resolver = [&wall_union_idx, interface_wall_params](const Point &p) -> unsigned {
-                        return brim_vote(wall_union_idx, p, interface_wall_params);
-                    };
-                    base_resolver = [&wall_union_idx, base_wall_params](const Point &p) -> unsigned {
-                        return brim_vote(wall_union_idx, p, base_wall_params);
-                    };
-                }
-            } else {
-                // nearest_surface: exactly today's (pre-Task-4) behavior, unchanged.
-                for (size_t li : coplanar_idx)
-                    for (const LayerRegion *lr : object->layers()[li]->regions())
-                        chameleon_collect_wall_samples(&lr->perimeters, lr->region(),
-                            no_shift, obj_idx, coplanar_wall_idx);
-
-                zero_sample = contact_idx.empty() && coplanar_wall_idx.empty();
-                if (!zero_sample) {
-                    // v2.2 Task 2 (spec C4): gap-aware lateral_cap_mm (computed once per
-                    // object above), replacing v2.1's flat 1.0mm cap, layered on top of
-                    // this object's shared run-building tunables (sample_mm/min_run_mm/
-                    // max_runs/k, from vote_params above). fallback_extruder differs per
-                    // role, so each role gets its own copy; both otherwise vote against
-                    // the SAME coplanar_wall_idx.
-                    BrimVoteParams interface_lateral_params    = vote_params;
-                    interface_lateral_params.max_dist_mm       = lateral_cap_mm;
-                    interface_lateral_params.fallback_extruder = fallback_extruder;
-
-                    BrimVoteParams base_lateral_params    = vote_params;
-                    base_lateral_params.max_dist_mm       = lateral_cap_mm;
-                    base_lateral_params.fallback_extruder = base_fallback_extruder;
-
-                    // v2.1 final-review M1 fix: build the projection band's
-                    // ProjectionLayerView list ONCE per support layer, not once per
-                    // 0.8mm sample point. Previously this was rebuilt (2 vector
-                    // allocations per region per band layer) inside every
-                    // interface_resolver call below - see
-                    // chameleon_build_projection_views' own comment. interface_resolver
-                    // captures these two by reference and reuses them across every
-                    // sample point this support layer resolves.
-                    chameleon_build_projection_views(*object, contact_idx, projection_view, projection_view_layers);
-
-                    // Interface resolver: projection (the model surface directly above a
-                    // sample) wins whenever it hits; lateral (coplanar walls, gap-aware
-                    // cap) is the fallback when projection misses. "SURFACE ABOVE WINS"
-                    // is the user-approved priority (spec's Decision rules). FENCED
-                    // future option (NOT built - only this priority is approved): the
-                    // opposite priority (lateral wins, projection only as its own
-                    // fallback) is a one-branch change - swap which of the two
-                    // self-contained expressions below is tried first and which becomes
-                    // the "else" branch; no other code needs to move, since both are
-                    // already independent (p) -> unsigned expressions with no shared
-                    // mutable state.
-                    interface_resolver = [&projection_view, &projection_view_layers,
-                                           &coplanar_wall_idx, interface_lateral_params](const Point &p) -> unsigned {
-                        unsigned proj_extruder = 0;
-                        if (chameleon_projection_extruder_from_view(projection_view, projection_view_layers, p,
-                                                                      proj_extruder))
-                            return proj_extruder;
-                        return brim_vote(coplanar_wall_idx, p, interface_lateral_params);
-                    };
-
-                    // Base resolver: lateral only. Spec: "ALL base/erSupportMaterial
-                    // points" use the lateral rule - vertical projection is an
-                    // interface-only concept (base support doesn't sit directly under a
-                    // model surface the way an interface layer does), so there is no
-                    // projection branch here at all.
-                    base_resolver = [&coplanar_wall_idx, base_lateral_params](const Point &p) -> unsigned {
-                        return brim_vote(coplanar_wall_idx, p, base_lateral_params);
-                    };
-                }
+                interface_resolver = [&wall_union_idx, interface_wall_params](const Point &p) -> unsigned {
+                    return brim_vote(wall_union_idx, p, interface_wall_params);
+                };
+                base_resolver = [&wall_union_idx, base_wall_params](const Point &p) -> unsigned {
+                    return brim_vote(wall_union_idx, p, base_wall_params);
+                };
             }
 
             if (zero_sample) {
@@ -3281,8 +3201,9 @@ static void chameleon_assign_support_interfaces(Print &print)
             BucketCapResult cap_result = apply_bucket_caps(partitioned, prev_kept,
                 /*max_extruders=*/2, /*min_len_mm=*/12.0, support_layer->support_fills,
                 free_extruders, /*min_len_free_mm=*/3.0);
-            buckets_dropped_min_benefit += cap_result.buckets_dropped_min_benefit;
-            buckets_trimmed_cap         += cap_result.buckets_trimmed_cap;
+            buckets_dropped_min_benefit      += cap_result.buckets_dropped_min_benefit;
+            buckets_dropped_min_benefit_free += cap_result.buckets_dropped_min_benefit_free;
+            buckets_trimmed_cap              += cap_result.buckets_trimmed_cap;
 
             if (!partitioned.empty()) {
                 support_layer->interface_by_extruder = std::move(partitioned);
@@ -3312,8 +3233,16 @@ static void chameleon_assign_support_interfaces(Print &print)
             support_layer->chameleon_interface_visited = true;
         }
 
+        // v2.4 (spec A): "mode=nearest_wall" is now a constant, not a per-object
+        // ternary - sifsNearestWall is the only value that ever reaches this line
+        // (sifsManual objects `continue`d out above the loop entirely, and
+        // sifsNearestSurface no longer exists) - kept as a literal string, not removed,
+        // so the line stays a stable grep target and a triage/verify script can still
+        // assert "the pass ran for this object" (mode= present) vs. "the object was
+        // gated out as manual" (no line at all for that ordinal) - see the legacy-alias
+        // verify check (spike/verify_chameleon.sh) for exactly that assertion.
         BOOST_LOG_TRIVIAL(info) << "Chameleon support match: object ordinal " << obj_idx
-            << " mode=" << (nearest_wall_mode ? "nearest_wall" : "nearest_surface")
+            << " mode=nearest_wall"
             // v2.3 Task 4 (spec C9): free_set_size is the once-per-PASS
             // layer_filament_table's entry count (z-coincidence rows, not extruders per
             // row) - same value on every object's line since the table is built once
@@ -3324,9 +3253,17 @@ static void chameleon_assign_support_interfaces(Print &print)
             // tier in/out of a gate-count anomaly from this one field before digging into
             // per-layer free_extruders.
             << " free_set_size=" << layer_filament_table.size()
+            // v2.4 Task C (spec C): resolved fallback ids, so a triage reader can tell
+            // "this object's whole layer degraded to fallback" apart from "the gate
+            // dropped a genuinely-matched bucket back to fallback" (same symptom, gcode-
+            // side - a run of the fallback color - but different root cause) without
+            // re-deriving these from object config by hand.
+            << " fallback=" << fallback_extruder
+            << " base_fallback=" << base_fallback_extruder
             << " layers_partitioned=" << layers_partitioned
             << " layers_zero_sample=" << layers_zero_sample
             << " buckets_dropped_min_benefit=" << buckets_dropped_min_benefit
+            << " buckets_dropped_min_benefit_free=" << buckets_dropped_min_benefit_free
             << " buckets_trimmed_cap=" << buckets_trimmed_cap
             << " interface_runs_matched=" << interface_runs_matched
             << " base_runs_matched=" << base_runs_matched
