@@ -5810,6 +5810,12 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection* presets /*= nullptr
 
     UnsavedChangesDialog dlg(m_type, presets, new_printer_name, no_transfer);
 
+    // Ultra: if there are no actionable diff rows (phantom dirtiness — e.g. switching
+    // printers where the 3mf/profile changed only non-displayable settings), don't show an
+    // empty "Transfer or discard changes" dialog; silently discard and proceed.
+    if (dlg.getUpdateItemCount() == 0)
+        return true;
+
     if (dlg.ShowModal() == wxID_CANCEL)
         return false;
 

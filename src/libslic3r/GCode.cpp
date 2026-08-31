@@ -592,6 +592,26 @@ std::string WipeTowerIntegration::append_tcr(GCode& gcodegen, const WipeTower::T
                 config.set_key_value(key_value, new ConfigOptionFloat(0.f));
             }
         }
+        // Ultra: per-filament flush vectors for BBS 2.x change_filament templates (single-nozzle).
+        {
+            const ConfigBase& cfg = gcodegen.config();
+            const auto* ft_opt = cfg.option<ConfigOptionInts>("filament_flush_temp");
+            const auto* vs_opt = cfg.option<ConfigOptionFloats>("filament_flush_volumetric_speed");
+            const auto* mv_opt = cfg.option<ConfigOptionFloats>("filament_max_volumetric_speed");
+            const auto* rh_opt = cfg.option<ConfigOptionInts>("nozzle_temperature_range_high");
+            const size_t nf = mv_opt ? mv_opt->size() : 0;
+            std::vector<int> fts; std::vector<double> vss;
+            for (size_t i = 0; i < nf; ++i) {
+                double vs = (vs_opt && i < vs_opt->size()) ? vs_opt->get_at(int(i)) : 0.;
+                if (vs == 0.) vs = mv_opt->get_at(int(i));
+                vss.push_back(vs);
+                int ft = (ft_opt && i < ft_opt->size()) ? ft_opt->get_at(int(i)) : 0;
+                if (ft == 0 && rh_opt) ft = rh_opt->get_at(int(i));
+                fts.push_back(ft);
+            }
+            config.set_key_value("flush_volumetric_speeds", new ConfigOptionFloats(vss));
+            config.set_key_value("flush_temperatures", new ConfigOptionInts(fts));
+        }
         toolchange_gcode_str = gcodegen.placeholder_parser_process("change_filament_gcode", change_filament_gcode, new_extruder_id, &config);
         check_add_eol(toolchange_gcode_str);
 
@@ -2735,6 +2755,60 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
             }
         }
         this->placeholder_parser().set("chamber_cooling_mode", new ConfigOptionInt(chamber_cooling_mode));
+    }
+
+    // Ultra: publish BambuStudio 2.x placeholder vars used by newer machine gcode templates
+    // (machine_start / change_filament). Single-nozzle: filament order == array index, no
+    // per-nozzle remap (dual-nozzle grouping is a separate, deferred port).
+    {
+        int min_vitrification = std::numeric_limits<int>::max();
+        for (unsigned int extruder : tool_ordering.all_extruders())
+            min_vitrification = std::min(min_vitrification, m_config.temperature_vitrification.get_at(extruder));
+        if (min_vitrification == std::numeric_limits<int>::max())
+            min_vitrification = 0;
+        this->placeholder_parser().set("min_vitrification_temperature", new ConfigOptionInt(min_vitrification));
+
+        const auto* flush_temp_opt = m_config.option<ConfigOptionInts>("filament_flush_temp");
+        const auto* flush_vspd_opt = m_config.option<ConfigOptionFloats>("filament_flush_volumetric_speed");
+        const size_t num_filaments = m_config.filament_max_volumetric_speed.size();
+        std::vector<int>    flush_temps;   flush_temps.reserve(num_filaments);
+        std::vector<double> flush_vspeeds; flush_vspeeds.reserve(num_filaments);
+        for (size_t i = 0; i < num_filaments; ++i) {
+            double vs = (flush_vspd_opt && i < flush_vspd_opt->size()) ? flush_vspd_opt->get_at(int(i)) : 0.;
+            if (vs == 0.) vs = m_config.filament_max_volumetric_speed.get_at(int(i));
+            flush_vspeeds.push_back(vs);
+            int ft = (flush_temp_opt && i < flush_temp_opt->size()) ? flush_temp_opt->get_at(int(i)) : 0;
+            if (ft == 0) ft = m_config.nozzle_temperature_range_high.get_at(int(i));
+            flush_temps.push_back(ft);
+        }
+        this->placeholder_parser().set("flush_volumetric_speeds", new ConfigOptionFloats(flush_vspeeds));
+        this->placeholder_parser().set("flush_temperatures", new ConfigOptionInts(flush_temps));
+        // Ultra: A2L time_lapse_gcode reads clear_to_x0 (BBS computes it per-layer via a
+        // timelapse position-picker the fork lacks). Single-nozzle shim = always clear.
+        this->placeholder_parser().set("clear_to_x0", new ConfigOptionBool(true));
+
+        // Ultra: single-nozzle shims for other BBS 2.x machine/change_filament template vars the
+        // fork's (single-nozzle) engine doesn't compute. filament_map = all-on-extruder-1 (correct
+        // for one nozzle); optional features (prime-tower interface, wipe-avoid, tall-bed obstacle
+        // detect) safely disabled. These are set globally so change_filament sees them too.
+        {
+            std::vector<int> fmap(num_filaments > 0 ? num_filaments : 1, 1);
+            this->placeholder_parser().set("filament_map", new ConfigOptionInts(fmap));
+            bool all_bbl = true;
+            const auto* vend = m_config.option<ConfigOptionStrings>("filament_vendor");
+            if (vend)
+                for (unsigned int e : tool_ordering.all_extruders())
+                    if (int(e) < int(vend->size()) && vend->get_at(int(e)).find("Bambu") == std::string::npos) { all_bbl = false; break; }
+            this->placeholder_parser().set("is_all_bbl_filament", new ConfigOptionBool(all_bbl));
+            this->placeholder_parser().set("has_tpu_in_first_layer", new ConfigOptionBool(false));
+            this->placeholder_parser().set("cooling_filter_enabled", new ConfigOptionBool(false));
+            this->placeholder_parser().set("max_print_z", new ConfigOptionFloat(0.));
+            this->placeholder_parser().set("is_prime_tower_interface", new ConfigOptionBool(false));
+            this->placeholder_parser().set("filament_tower_interface_purge_volume", new ConfigOptionFloat(0.));
+            this->placeholder_parser().set("filament_tower_interface_print_temp", new ConfigOptionInt(0));
+            this->placeholder_parser().set("wipe_avoid_perimeter", new ConfigOptionBool(false));
+            this->placeholder_parser().set("wipe_avoid_pos_x", new ConfigOptionFloat(0.));
+        }
     }
 
     std::string machine_start_gcode = this->placeholder_parser_process("machine_start_gcode", print.config().machine_start_gcode.value,
@@ -8705,6 +8779,24 @@ std::string GCode::set_extruder(unsigned int extruder_id, double print_z, bool b
     // Orca: Ignore change_filament_gcode if is the first call for a tool change and manual_filament_change is enabled
     if (!change_filament_gcode.empty() && !(m_config.manual_filament_change.value && m_toolchange_count == 1)) {
         dyn_config.set_key_value("toolchange_z", new ConfigOptionFloat(print_z));
+
+        // Ultra: per-filament flush vectors for BBS 2.x change_filament templates (single-nozzle).
+        {
+            const auto* ft_opt = m_config.option<ConfigOptionInts>("filament_flush_temp");
+            const auto* vs_opt = m_config.option<ConfigOptionFloats>("filament_flush_volumetric_speed");
+            const size_t nf = m_config.filament_max_volumetric_speed.size();
+            std::vector<int> fts; std::vector<double> vss;
+            for (size_t i = 0; i < nf; ++i) {
+                double vs = (vs_opt && i < vs_opt->size()) ? vs_opt->get_at(int(i)) : 0.;
+                if (vs == 0.) vs = m_config.filament_max_volumetric_speed.get_at(int(i));
+                vss.push_back(vs);
+                int ft = (ft_opt && i < ft_opt->size()) ? ft_opt->get_at(int(i)) : 0;
+                if (ft == 0) ft = m_config.nozzle_temperature_range_high.get_at(int(i));
+                fts.push_back(ft);
+            }
+            dyn_config.set_key_value("flush_volumetric_speeds", new ConfigOptionFloats(vss));
+            dyn_config.set_key_value("flush_temperatures", new ConfigOptionInts(fts));
+        }
 
         toolchange_gcode_parsed = placeholder_parser_process("change_filament_gcode", change_filament_gcode, extruder_id, &dyn_config);
         check_add_eol(toolchange_gcode_parsed);

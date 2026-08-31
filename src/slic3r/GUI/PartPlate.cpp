@@ -3585,7 +3585,7 @@ void PartPlateList::set_default_wipe_tower_pos_for_plate(int plate_idx)
 }
 
 //this may be happened after machine changed
-void PartPlateList::reset_size(int width, int depth, int height, bool reload_objects, bool update_shapes)
+void PartPlateList::reset_size(int width, int depth, int height, bool reload_objects, bool update_shapes, bool move_instances)
 {
 	Vec3d origin1, origin2;
 
@@ -3596,7 +3596,10 @@ void PartPlateList::reset_size(int width, int depth, int height, bool reload_obj
 		m_plate_width = width;
 		m_plate_depth = depth;
 		m_plate_height = height;
-		update_all_plates_pos_and_size(false, false, true);
+		// Ultra: when move_instances is set (printer/bed-size switch), translate each instance
+		// by its plate origin delta + half the size delta (existing math in set_pos_and_size)
+		// so objects keep their position relative to the plate center instead of jumping.
+		update_all_plates_pos_and_size(move_instances, move_instances, true);
 		if (update_shapes) {
 			set_shapes(m_shape, m_exclude_areas, m_logo_texture_filename, m_height_to_lid, m_height_to_rod);
 		}
@@ -4583,11 +4586,31 @@ int PartPlateList::reload_all_objects(bool except_locked, int plate_index)
 				}
 			}
 
-			if ((k == m_plate_list.size()) && (unprintable_plate.intersect_instance(i, j, &boundingbox)))
+			if (k == m_plate_list.size())
 			{
-				//found in unprintable plate, add it to plate
-				unprintable_plate.add_instance(i, j, false, &boundingbox);
-				BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": found in unprintable plate, obj_id %1%, instance_id %2%") % i % j;
+				if (unprintable_plate.intersect_instance(i, j, &boundingbox))
+				{
+					//found in unprintable plate, add it to plate
+					unprintable_plate.add_instance(i, j, false, &boundingbox);
+					BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": found in unprintable plate, obj_id %1%, instance_id %2%") % i % j;
+				}
+				else if (!m_plate_list.empty())
+				{
+					// Ultra: the instance matched no printable plate and isn't on the unprintable
+					// plate. Keep it assigned to the nearest plate (add_instance flags it outside /
+					// unprintable) instead of stranding it off-plate ("ejecting" it) on a bed change.
+					Vec3d ic = boundingbox.center();
+					unsigned int best = 0; double bestd = 1e300;
+					for (unsigned int p = 0; p < (unsigned int)m_plate_list.size(); ++p)
+					{
+						Vec3d pc = m_plate_list[p]->get_center_origin();
+						double dx = ic.x() - pc.x(), dy = ic.y() - pc.y();
+						double d = dx * dx + dy * dy;
+						if (d < bestd) { bestd = d; best = p; }
+					}
+					m_plate_list[best]->add_instance(i, j, false, &boundingbox);
+					BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": kept off-bed instance on nearest plate %1%, obj_id %2%, instance_id %3%") % best % i % j;
+				}
 			}
 		}
 

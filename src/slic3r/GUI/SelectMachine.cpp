@@ -894,19 +894,26 @@ wxWindow *SelectMachineDialog::create_item_checkbox(wxString title, wxWindow *pa
 
 void SelectMachineDialog::update_select_layout(MachineObject *obj)
 {
-    if (obj && obj->is_support_auto_flow_calibration) {
+    // Ultra: the capability flags come from the device report (jj.contains checks in
+    // DeviceManager); newer machines (H2S/A2L/P2S/H2D) don't always populate them over the
+    // cloud path, so fall back to showing these options for any Bambu machine. All modern
+    // Bambu printers support bed leveling / flow calibration / timelapse. (See the cap-report
+    // research for the real report-parse fix.)
+    const bool bbl_caps_fallback = obj && !obj->printer_type.empty();
+
+    if (obj && (obj->is_support_auto_flow_calibration || bbl_caps_fallback)) {
         select_flow->Show();
     } else {
         select_flow->Hide();
     }
 
-    if (obj && obj->is_support_auto_leveling) {
+    if (obj && (obj->is_support_auto_leveling || bbl_caps_fallback)) {
         select_bed->Show();
     } else {
         select_bed->Hide();
     }
 
-    if (obj && obj->is_support_timelapse && is_show_timelapse()) {
+    if (obj && (obj->is_support_timelapse || bbl_caps_fallback) && is_show_timelapse()) {
         select_timelapse->Show();
         update_timelapse_enable_status();
     } else {

@@ -30,24 +30,27 @@ APP_NAME="Snapmaker_Orca"
 APP_NAME_EX="Snapmaker Orca"
 DMG_NAME="Snapmaker_Orca_${ARCH}.dmg"
 
-# 证书配置
-CERTIFICATE_ID="Developer ID Application: Shenzhen Snapmaker Technologies Co., Ltd. (5NGD3B3V37)"
+# 证书配置 — read from the environment (public repo; do not hard-code a signing identity).
+# Set SIGN_CERTIFICATE_ID to your own "Developer ID Application: <Name> (<TEAMID>)".
+CERTIFICATE_ID="${SIGN_CERTIFICATE_ID:-Developer ID Application: __PLEASE_SET_SIGN_CERTIFICATE_ID__}"
 ENTITLEMENTS="$PROJECT_DIR/scripts/disable_validation.entitlements"
 
 # ============================================
-# 公证凭据配置（已设置）
+# Notary credentials: read from the environment / CI secrets. NEVER hard-code them here
+# (this is a public repo). Set NOTARY_APPLE_ID, NOTARY_TEAM_ID, NOTARY_PASSWORD (an Apple
+# app-specific password) as env vars, or use a notarytool keychain profile.
 # ============================================
-NOTARY_APPLE_ID="snapmaker-app@snapmaker.com"
-NOTARY_TEAM_ID="5NGD3B3V37"
+NOTARY_APPLE_ID="${NOTARY_APPLE_ID:-__PLEASE_SET_NOTARY_APPLE_ID__}"
+NOTARY_TEAM_ID="${NOTARY_TEAM_ID:-}"
 #NOTARY_KEYCHAIN_PROFILE="snapmaker"
-NOTARY_PASSWORD="guhi-nuxy-mgnh-cbqs"
+NOTARY_PASSWORD="${NOTARY_PASSWORD:-__PLEASE_ENTER_PASSWORD__}"
 
 echo "=========================================="
 echo "macOS 应用签名、打包、公证完整流程"
 echo "=========================================="
 echo "架构: $ARCH"
 echo "证书: $CERTIFICATE_ID"
-echo "TEAM_ID: 5NGD3B3V37"
+echo "TEAM_ID: $NOTARY_TEAM_ID"
 echo "项目目录: $PROJECT_DIR"
 echo
 
@@ -457,7 +460,7 @@ echo "架构: $ARCH"
 echo "应用: $FINAL_APP"
 echo "DMG: $FINAL_DMG_PATH"
 echo "证书: $CERTIFICATE_ID"
-echo "TEAM_ID: 5NGD3B3V37"
+echo "TEAM_ID: $NOTARY_TEAM_ID"
 echo ""
 echo "使用方法:"
 echo "  1. 打开 DMG: open $FINAL_DMG_PATH"

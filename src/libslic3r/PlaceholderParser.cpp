@@ -386,6 +386,40 @@ namespace client
             return expr();
         }
 
+        // Ultra: BambuStudio 2.x change_filament templates use ceil()/floor()
+        // (e.g. "ceil(flush_length / 80) * 5"); mirror round() but toward +/-inf.
+        expr ceil(const Iterator start_pos) const
+        {
+            switch (this->type()) {
+            case TYPE_EMPTY:
+                return expr();
+            case TYPE_INT:
+                return expr(this->i(), start_pos, this->it_range.end());
+            case TYPE_DOUBLE:
+                return expr(static_cast<int>(std::ceil(this->d())), start_pos, this->it_range.end());
+            default:
+                this->throw_exception("Cannot ceil a non-numeric value.");
+            }
+            assert(false);
+            return expr();
+        }
+
+        expr floor(const Iterator start_pos) const
+        {
+            switch (this->type()) {
+            case TYPE_EMPTY:
+                return expr();
+            case TYPE_INT:
+                return expr(this->i(), start_pos, this->it_range.end());
+            case TYPE_DOUBLE:
+                return expr(static_cast<int>(std::floor(this->d())), start_pos, this->it_range.end());
+            default:
+                this->throw_exception("Cannot floor a non-numeric value.");
+            }
+            assert(false);
+            return expr();
+        }
+
         expr unary_not(const Iterator start_pos) const
         { 
             switch (this->type()) {
@@ -1056,8 +1090,11 @@ namespace client
                 return;
 
             assert(opt.opt->is_vector());
+            // Ultra: BambuStudio 2.x machine gcode references per-extruder vectors as scalars
+            // (e.g. "nozzle_diameter == 0.2"). Match BBS: a bare per-extruder vector in scalar
+            // context resolves to the current extruder's element instead of throwing.
             if (! opt.has_index())
-                ctx->throw_exception("Referencing a vector variable when scalar is expected", opt.it_range);
+                opt.index = int(ctx->current_extruder_id);
             const ConfigOptionVectorBase* vec = static_cast<const ConfigOptionVectorBase*>(opt.opt);
             if (vec->empty())
                 ctx->throw_exception("Indexing an empty vector variable", opt.it_range);
@@ -1913,6 +1950,10 @@ namespace client
                 { out = value.unary_integer(out.it_range.begin()); }
         static void round(expr &value, expr &out)
                 { out = value.round(out.it_range.begin()); }
+        static void ceil(expr &value, expr &out)
+                { out = value.ceil(out.it_range.begin()); }
+        static void floor(expr &value, expr &out)
+                { out = value.floor(out.it_range.begin()); }
         // For indicating "no optional parameter".
         static void noexpr(expr &out) { out.reset(); }
     };
@@ -2162,6 +2203,8 @@ namespace client
                                                                     [ px::bind(&expr::digits<true>, _val, _2, _3) ]
                 |   (kw["int"]   > '(' > conditional_expression(_r1) > ')') [ px::bind(&FactorActions::to_int,  _1, _val) ]
                 |   (kw["round"] > '(' > conditional_expression(_r1) > ')') [ px::bind(&FactorActions::round,   _1, _val) ]
+                |   (kw["ceil"]  > '(' > conditional_expression(_r1) > ')') [ px::bind(&FactorActions::ceil,    _1, _val) ]
+                |   (kw["floor"] > '(' > conditional_expression(_r1) > ')') [ px::bind(&FactorActions::floor,   _1, _val) ]
                 |   (kw["is_nil"] > '(' > variable_reference(_r1) > ')') [px::bind(&MyContext::is_nil_test, _r1, _1, _val)]
                 |   (kw["one_of"] > '(' > one_of(_r1) > ')')        [ _val = _1 ]
                 |   (kw["empty"] > '(' > variable_reference(_r1) > ')') [px::bind(&MyContext::is_vector_empty, _r1, _1, _val)]
@@ -2241,6 +2284,8 @@ namespace client
                 ("random")
                 ("repeat")
                 ("round")
+                ("ceil")
+                ("floor")
                 ("not")
                 ("one_of")
                 ("or")

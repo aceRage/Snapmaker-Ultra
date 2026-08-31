@@ -2142,6 +2142,35 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloats { 2. });
 
+    // Ultra: BambuStudio 2.x flush tuning, consumed by GCode.cpp to publish
+    // flush_temperatures / flush_volumetric_speeds for newer change_filament templates.
+    def = this->add("filament_flush_temp", coInts);
+    def->label = L("Flush temperature");
+    def->tooltip = L("Temperature when flushing filament. 0 indicates the upper bound of the recommended nozzle temperature range.");
+    def->sidetext = "°C";
+    def->min = 0;
+    def->max = max_temp;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInts { 0 });
+
+    def = this->add("filament_flush_volumetric_speed", coFloats);
+    def->label = L("Flush volumetric speed");
+    def->tooltip = L("Volumetric speed when flushing filament. 0 indicates the max volumetric speed.");
+    def->sidetext = u8"mm³/s";
+    def->min = 0;
+    def->max = 200;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloats { 0. });
+
+    // Ultra: BBS 2.x change_filament templates reference filament_cooling_before_tower[extruder].
+    def = this->add("filament_cooling_before_tower", coFloats);
+    def->label = L("Cooling before tower");
+    def->tooltip = L("Temperature drop applied before entering the prime tower when changing filament.");
+    def->sidetext = "°C";
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloats { 0. });
+
     def = this->add("machine_load_filament_time", coFloat);
     def->label = L("Filament load time");
     def->tooltip = L("Time to load new filament when switch filament. It's usually applicable for single-extruder multi-material machines. "

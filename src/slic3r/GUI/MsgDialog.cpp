@@ -312,6 +312,20 @@ ErrorDialog::ErrorDialog(wxWindow *parent, const wxString &msg, bool monospaced_
 
     SetMaxSize(wxSize(-1, CONTENT_MAX_HEIGHT*wxGetApp().em_unit()));
 
+    // Ultra: the error text renders in a wxHtmlWindow (not selectable), so add a Copy
+    // button that puts the raw message on the clipboard without closing the dialog.
+    {
+        Button* copy_btn = new Button(this, _L("Copy"), "", 0, 0, wxID_COPY);
+        copy_btn->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+        copy_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+            if (wxTheClipboard->Open()) {
+                wxTheClipboard->SetData(new wxTextDataObject(this->msg));
+                wxTheClipboard->Close();
+            }
+        });
+        btn_sizer->Add(copy_btn, 0, wxLEFT, FromDIP(5));
+    }
+
     finalize();
 }
 

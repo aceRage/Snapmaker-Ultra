@@ -5577,6 +5577,20 @@ void MachineObject::parse_new_info(json print)
 
         is_220V_voltage  = get_flag_bits(fun, 3) == 0?false:true;
         is_support_flow_calibration = get_flag_bits(fun, 6);
+        // NP capability-flag fix (Ultra fork): the SelectMachine send-dialog gates key on
+        // is_support_auto_flow_calibration (DeviceManager.hpp:847), NOT is_support_flow_calibration
+        // (846), and that member was never populated in this new-gen (NP) parse path. Mirror the one
+        // fully-confirmed cap: fun bit 6 agrees across the fork decode and two independent public
+        // BambuStudio reads. Pure alias of an already-decoded value, so it cannot enable an
+        // unsupported toggle. See memory: NP-PRINTER CAPABILITY-FLAG PARSING (w2yp5n5g0/wf4e0sbkj).
+        is_support_auto_flow_calibration = is_support_flow_calibration;
+        // NOTE(NP-caps): no confirmed NP bit exists for is_support_auto_leveling — is_support_bed_leveling
+        // comes from the legacy JSON 'support_bed_leveling' int, and fun bit 40 is only the umbrella
+        // new-auto-cali flag. Likewise no NP bit maps to is_support_timelapse (fun bit 28 is the distinct
+        // is_support_internal_timelapse sub-feature; upstream shows the timelapse toggle unconditionally).
+        // Both are intentionally left unset here — the SelectMachine bbl_caps_fallback (non-empty
+        // printer_type) is the correct visibility mechanism for them, matching upstream behaviour.
+        // Do NOT wire a guessed bit to either; a wrong bit would show an unsupported feature.
         is_support_pa_calibration = get_flag_bits(fun, 7);
         is_support_prompt_sound = get_flag_bits(fun, 8);
         is_support_filament_tangle_detect = get_flag_bits(fun, 9);

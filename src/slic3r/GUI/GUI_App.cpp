@@ -3377,6 +3377,10 @@ __retry:
             m_agent->set_country_code(country_code);
             m_agent->start();
             profiler.mark("m_agent->start");
+            // Ultra: the plugin's start() restores a persisted Bambu session (auto-relogin).
+            // If we're logged in without a UI login, pull the cloud device list now.
+            if (m_agent->is_user_login())
+                kick_user_device_refresh();
         }
     }
     else {
@@ -4826,15 +4830,13 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
 
 void GUI_App::enable_user_preset_folder(bool enable)
 {
-    if (enable) {
-        std::string user_id = m_agent->get_user_id();
-        app_config->set("preset_folder", user_id);
-        GUI::wxGetApp().preset_bundle->update_user_presets_directory(user_id);
-    } else {
-        BOOST_LOG_TRIVIAL(info) << "preset_folder: set to empty";
-        app_config->set("preset_folder", "");
-        GUI::wxGetApp().preset_bundle->update_user_presets_directory(DEFAULT_USER_FOLDER_NAME);
-    }
+    // Ultra: keep the user's preset library in the shared "default" folder regardless of
+    // Bambu login. Upstream switches to a per-account folder on login, which hides every
+    // preset the user made while logged out (printer/process/filament) and reads as data
+    // loss. Login should affect cloud devices only, not the local preset library.
+    (void) enable;
+    app_config->set("preset_folder", "");
+    GUI::wxGetApp().preset_bundle->update_user_presets_directory(DEFAULT_USER_FOLDER_NAME);
 }
 
 void GUI_App::check_track_enable()
