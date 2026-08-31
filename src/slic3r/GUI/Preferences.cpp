@@ -1342,9 +1342,6 @@ wxWindow* PreferencesDialog::create_general_page()
 
     std::vector<wxString> Units         = {_L("Metric") + " (mm, g)", _L("Imperial") + " (in, oz)"};
     auto item_currency = create_item_combobox(_L("Units"), page, _L("Units"), "use_inches", Units);
-    // Ultra: mirror the logged-in Bambu Studio user's custom print/filament presets into this slicer.
-    auto item_sync_bambu_presets = create_item_checkbox(_L("Import Bambu Studio user presets"), page,
-        _L("At startup, mirror your custom Bambu Studio print & filament presets into Snapmaker Orca so they are usable here too. One-way (Bambu Studio stays the source); your own presets and deletions are preserved. Takes effect after restart."), 50, "sync_bambu_user_presets");
     auto item_single_instance = create_item_checkbox(_L("Allow only one Snapmaker Orca instance"), page,
     #if __APPLE__
             _L("On OSX there is always only one instance of app running by default. However it is allowed to run multiple instances "
@@ -1478,7 +1475,6 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_language, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_region, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_currency, 0, wxTOP, FromDIP(3));
-    sizer_page->Add(item_sync_bambu_presets, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_default_page, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_camera_navigation_style, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_single_instance, 0, wxTOP, FromDIP(3));
@@ -1589,6 +1585,8 @@ wxWindow* PreferencesDialog::create_ultra_page()
         _L("When a project's print profile is not available, pick the profile you last used at the same layer height instead of the first compatible one."), 50, "prefer_last_print_profile");
     auto item_auto_shadow = create_item_checkbox(_L("Seamless System Filament Edits"), page,
         _L("Saving a modified system preset silently saves and selects \"<name> - Custom\" instead of asking for a new name every time."), 50, "auto_shadow_system_presets");
+    auto item_sync_bambu_presets = create_item_checkbox(_L("Import Bambu Studio user presets"), page,
+        _L("At startup, mirror your custom Bambu Studio print & filament presets into Snapmaker Orca so they are usable here too. One-way (Bambu Studio stays the source); your own presets and deletions are preserved. Takes effect after restart."), 50, "sync_bambu_user_presets");
 
     auto title_bambu = create_item_title(_L("Bambu Network"), page, _L("Bambu Network"));
     auto item_bambu_plugin = create_item_checkbox(_L("Enable Bambu network plugin"), page,
@@ -1616,6 +1614,7 @@ wxWindow* PreferencesDialog::create_ultra_page()
     sizer_page->Add(title_presets, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_prefer_last_print, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_auto_shadow, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_sync_bambu_presets, 0, wxTOP, FromDIP(3));
     sizer_page->Add(title_bambu, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_bambu_plugin, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_bambu_stealth, 0, wxTOP, FromDIP(3));

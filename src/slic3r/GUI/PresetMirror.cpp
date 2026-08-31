@@ -187,8 +187,9 @@ void mirror_bambu_user_presets(const std::string& logged_in_uid)
             else if (s == "error") ++errors;
         };
 
-        // Only print + filament (exclude machine). base\ first so inherits resolve.
-        const char* types[] = { "filament", "process" };
+        // print + filament + machine (Stage 2). base\ first so inherits resolve; a machine preset
+        // whose inherits/base is a printer this fork lacks is dropped non-fatally by the loader.
+        const char* types[] = { "filament", "process", "machine" };
         for (const char* typ : types) {
             bfs::path sdir = src_uid / typ;
             if (!bfs::is_directory(sdir, ec)) continue;
