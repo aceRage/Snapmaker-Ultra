@@ -2421,6 +2421,18 @@ std::vector<std::vector<float>> WipeTower2::extract_wipe_volumes(const PrintConf
         for (unsigned int j = 0; j < number_of_extruders; ++j)
             wipe_volumes[i][j] = std::max<float>(wipe_volumes[i][j] * scale, config.filament_minimal_purge_on_wipe_tower.get_at(j));
 
+    // Ultra (Phase 7, tower geometry half): a change between filaments on DIFFERENT physical nozzles is a
+    // nozzle switch, not a color purge (the gcode-side gate at GCode.cpp already emits zero flush for it).
+    // Zero those pairs here too so the prime tower is not SIZED for purges that never happen. Same predicate
+    // as the emit-time gate; guarded on filament_map so classic single-nozzle towers are unchanged.
+    const std::vector<int>& fm = config.filament_map.values;
+    if (!fm.empty()) {
+        for (unsigned int i = 0; i < number_of_extruders; ++i)
+            for (unsigned int j = 0; j < number_of_extruders; ++j)
+                if (i < fm.size() && j < fm.size() && fm[i] != fm[j])
+                    wipe_volumes[i][j] = 0.f;
+    }
+
     return wipe_volumes;
 }
 
