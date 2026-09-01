@@ -15142,6 +15142,20 @@ void Plater::priv::on_slicing_completed(wxCommandEvent & evt)
         return;
     }
 
+    // Ultra (Phase 8): mirror the sliced Print's computed filament->nozzle map (dual-nozzle grouping) into
+    // the project config, so it is serialized into a saved 3mf (the exporter uses full_config_secure(),
+    // which reads project_config, not the transient Print config). No-op for classic single-nozzle machines
+    // whose filament_map stays all-1.
+    if (this->printer_technology == ptFFF) {
+        if (Slic3r::Print* print = background_process.fff_print()) {
+            const std::vector<int>& fm = print->config().filament_map.values;
+            if (!fm.empty()) {
+                auto* opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionInts>("filament_map", true);
+                if (opt) opt->values = fm;
+            }
+        }
+    }
+
     if (view3D->is_dragging()) // updating scene now would interfere with the gizmo dragging
         delayed_scene_refresh = true;
     else {

@@ -7723,8 +7723,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 // filament map override global settings only when group mode overrides the global settings
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << FILAMENT_MAP_ATTR << "\" " << VALUE_ATTR << "=\"";
                 const size_t filaments_count = dynamic_cast<const ConfigOptionStrings*>(config.option("filament_colour"))->values.size();
+                // Ultra (Phase 8): write the real per-filament nozzle map (1-based) when present, so a saved
+                // project keeps the dual-nozzle grouping. Falls back to 1 (single nozzle) per filament when
+                // filament_map is absent/short (classic machines, or not yet grouped).
+                const auto* fmap_opt = dynamic_cast<const ConfigOptionInts*>(config.option("filament_map"));
                 for (int i = 0; i < filaments_count; ++i) {
-                    stream << "1"; // Orca hack: for now, all filaments are mapped to extruder 1
+                    int v = (fmap_opt && i < (int)fmap_opt->values.size() && fmap_opt->values[i] >= 1) ? fmap_opt->values[i] : 1;
+                    stream << v;
                     if (i != (filaments_count - 1))
                         stream << " ";
                 }
@@ -7911,8 +7916,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 // TODO: Orca: hack
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << FILAMENT_MAP_ATTR << "\" " << VALUE_ATTR << "=\"";
                 const size_t filaments_count = dynamic_cast<const ConfigOptionStrings*>(config.option("filament_colour"))->values.size();
+                // Ultra (Phase 8): write the real per-filament nozzle map (1-based) when present, so a saved
+                // project keeps the dual-nozzle grouping. Falls back to 1 (single nozzle) per filament when
+                // filament_map is absent/short (classic machines, or not yet grouped).
+                const auto* fmap_opt = dynamic_cast<const ConfigOptionInts*>(config.option("filament_map"));
                 for (int i = 0; i < filaments_count; ++i) {
-                    stream << "1"; // Orca hack: for now, all filaments are mapped to extruder 1
+                    int v = (fmap_opt && i < (int)fmap_opt->values.size() && fmap_opt->values[i] >= 1) ? fmap_opt->values[i] : 1;
+                    stream << v;
                     if (i != (filaments_count - 1))
                         stream << " ";
                 }
