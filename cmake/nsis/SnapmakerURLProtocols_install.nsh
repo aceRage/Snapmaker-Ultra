@@ -3,12 +3,10 @@
 ; On 64-bit Windows, 32-bit NSIS must use the 64-bit registry view so the 64-bit app sees these keys.
 SetRegView 64
 
-WriteRegStr HKLM "Software\Classes\snapmaker-orca" "" "URL:Snapmaker Orca"
-WriteRegStr HKLM "Software\Classes\snapmaker-orca" "URL Protocol" ""
-WriteRegStr HKLM "Software\Classes\snapmaker-orca\shell\open\command" "" '"$INSTDIR\snapmaker-orca.exe" "%1"'
-
-WriteRegStr HKLM "Software\Classes\Snapmaker_Orca" "" "URL:Snapmaker Orca"
-WriteRegStr HKLM "Software\Classes\Snapmaker_Orca" "URL Protocol" ""
-WriteRegStr HKLM "Software\Classes\Snapmaker_Orca\shell\open\command" "" '"$INSTDIR\snapmaker-orca.exe" "%1"'
+; Ultra: register ONLY an Ultra-specific scheme so a side-by-side official Snapmaker Orca keeps
+; its own snapmaker-orca:// / Snapmaker_Orca:// handlers (and our uninstall never removes them).
+WriteRegStr HKLM "Software\Classes\snapmaker-ultra" "" "URL:Snapmaker-Ultra"
+WriteRegStr HKLM "Software\Classes\snapmaker-ultra" "URL Protocol" ""
+WriteRegStr HKLM "Software\Classes\snapmaker-ultra\shell\open\command" "" '"$INSTDIR\snapmaker-orca.exe" "%1"'
 
 SetRegView 32

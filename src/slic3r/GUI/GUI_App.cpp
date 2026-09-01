@@ -593,7 +593,7 @@ private:
         {
             title    = "Snapmaker Orca";
             version  = std::string("V") + Snapmaker_VERSION;
-            betaText = _L("Beta version");
+            betaText = _L("Ultra version"); // Ultra: tells the official and Ultra builds apart at launch
 
             titleFont   = Label::sysFont(20, false);
             versionFont = Label::Body_13;
