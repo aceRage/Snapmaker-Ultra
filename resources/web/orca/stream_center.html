@@ -10,27 +10,32 @@ html, body { width: 100%; height: 100%; background: #2b2b2b; font-family: 'Segoe
 #topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 12px; background: #1f1f1f; }
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 16px; background: #4a4a4a; color: #fff; font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }
 .chip.active { background: #0a9e50; }
+.chip.over { outline: 2px solid #5fd08a; }
 .chip .icon { opacity: 0.7; font-size: 12px; padding: 0 2px; }
 .chip .icon:hover { opacity: 1; }
 #addchip { background: #3a3a3a; border: 1px dashed #777; }
 #spacer { flex: 1; }
 select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+#layoutbox { display: inline-flex; align-items: center; gap: 4px; color: #aaa; font-size: 12px; }
 #grid { position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; display: grid; gap: 4px; padding: 4px; background: #2b2b2b; }
 .cell { position: relative; background: #000; border-radius: 4px; overflow: hidden; }
 .cell iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
-.cell .label { position: absolute; left: 8px; top: 6px; z-index: 2; padding: 2px 8px; border-radius: 10px; background: rgba(0,0,0,0.55); color: #fff; font-size: 12px; pointer-events: none; }
+.cell .label { position: absolute; left: 8px; top: 6px; z-index: 2; padding: 2px 8px; border-radius: 10px; background: rgba(0,0,0,0.55); color: #fff; font-size: 12px; cursor: grab; user-select: none; }
 .cell.empty { border: 1px dashed #555; background: #262626; }
+.cell.over { outline: 2px solid #5fd08a; outline-offset: -2px; }
+body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #note { color: #999; font-size: 12px; }
 #modal-bg { display: none; position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; }
-#modal { background: #333; border-radius: 8px; padding: 18px; min-width: 320px; color: #fff; box-shadow: 0 6px 24px rgba(0,0,0,0.5); }
+#modal { background: #333; border-radius: 8px; padding: 18px; min-width: 360px; max-width: 480px; max-height: 92vh; overflow-y: auto; color: #fff; box-shadow: 0 6px 24px rgba(0,0,0,0.5); }
 #modal h3 { font-size: 15px; margin-bottom: 12px; font-weight: 600; }
 #modal .field { margin-bottom: 10px; }
 #modal .field label { display: block; font-size: 12px; color: #aaa; margin-bottom: 4px; }
-#modal input { width: 100%; background: #222; color: #fff; border: 1px solid #555; border-radius: 5px; padding: 7px 9px; font-size: 13px; }
+#modal .field .info { font-size: 12px; color: #bbb; line-height: 1.4; background: #2a2a2a; border-radius: 5px; padding: 7px 9px; }
+#modal .field .status { font-size: 12px; color: #999; margin-top: 4px; }
+#modal input, #modal select { width: 100%; background: #222; color: #fff; border: 1px solid #555; border-radius: 5px; padding: 7px 9px; font-size: 13px; }
 #modal .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
-#modal .buttons span { padding: 7px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; user-select: none; }
-#modal .ok { background: #0a9e50; }
-#modal .cancel { background: #555; }
+#modal .buttons span, #modal .field .btn { display: inline-block; padding: 7px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; user-select: none; background: #555; }
+#modal .ok { background: #0a9e50 !important; }
 </style>
 </head>
 <body>
@@ -39,24 +44,20 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
   <span class="chip" id="addchip">+ Add</span>
   <span id="spacer"></span>
   <span id="note"></span>
-  <select id="layout" title="Grid layout">
-    <option value="1x1">1 stream</option>
-    <option value="2x1">2 side by side</option>
-    <option value="1x2">2 stacked</option>
-    <option value="2x2">2 x 2</option>
-    <option value="3x2">3 x 2</option>
-    <option value="3x3">3 x 3</option>
-    <option value="4x3">4 x 3</option>
-    <option value="4x4">4 x 4</option>
-  </select>
+  <span id="layoutbox" title="Grid layout: columns x rows (drag a name to reorder)">
+    <select id="cols"></select><span>&times;</span><select id="rows"></select>
+  </span>
 </div>
 <div id="grid"></div>
 <div id="modal-bg"><div id="modal"></div></div>
 <script>
 (function() {
     var KEY = 'snorca_streams_v1';
+    var MAX_DIM = 9;
+    // hosts: [{id, ip, alias, kind, code, user, pass, profile, name}]; active: [id] in display order.
     var state = { hosts: [], active: [], layout: '1x1' };
 
+    function newId() { return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
     function load() {
         try {
             var s = JSON.parse(localStorage.getItem(KEY));
@@ -64,22 +65,33 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         } catch (e) {}
         if (!Array.isArray(state.active)) state.active = [];
         if (!state.layout) state.layout = '1x1';
+        // Older versions keyed everything by IP: adopt the IP as the id so stored lists keep working.
+        state.hosts.forEach(function(h) { if (!h.id) h.id = h.ip; });
         // Merge hosts handed over by the slicer (?seed=ip1,ip2)
         try {
             var seed = new URLSearchParams(location.search).get('seed');
             if (seed) seed.split(',').forEach(function(ip) {
                 ip = ip.trim();
                 if (ip && !state.hosts.some(function(h) { return h.ip === ip; }))
-                    state.hosts.push({ ip: ip, alias: '' });
+                    state.hosts.push({ id: ip, ip: ip, alias: '' });
             });
         } catch (e) {}
+        var ids = {};
+        state.hosts.forEach(function(h) { ids[h.id] = true; });
+        state.active = state.active.filter(function(id, i, a) { return ids[id] && a.indexOf(id) === i; });
     }
     function save() {
         try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
     }
+    function hostById(id) { return state.hosts.filter(function(x) { return x.id === id; })[0]; }
     function validHost(ip) {
-        // bare host, or a full stream URL used verbatim (http(s) pages, or rtsp(s) fed through go2rtc)
-        return /^(https?|rtsps?):\/\/\S+$/i.test(ip) || /^[A-Za-z0-9.:\-_]+$/.test(ip);
+        // bare host, or a full stream URL used verbatim (http(s) pages; rtsp(s)/onvif fed through go2rtc)
+        return /^(https?|rtsps?|onvif):\/\/\S+$/i.test(ip) || /^[A-Za-z0-9.:\-_]+$/.test(ip);
+    }
+    function hashStr(s) {
+        var h = 0x811c9dc5;
+        for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+        return h.toString(16);
     }
     // The slicer's webview injects the app-wide "wx" script channel; the panel
     // listens for our messages on it. ("snorca" was never injected on Edge.)
@@ -90,9 +102,8 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
     var relayPort = 0;
     try { relayPort = parseInt(new URLSearchParams(location.search).get('relay')) || 0; } catch (e) {}
     function kindOf(h) {
-        if (h.kind === 'rtsps') return 'rtsps';
-        if (/^rtsps?:\/\//i.test(h.ip)) return 'rtsp-url'; // a pasted rtsp:// URL wins over the picked type
-        if (h.kind === 'flashforge') return 'flashforge';
+        if (/^(rtsps?|onvif):\/\//i.test(h.ip)) return 'rtsp-url'; // a pasted stream URL wins over the picked type
+        if (h.kind === 'rtsps' || h.kind === 'flashforge' || h.kind === 'ipcam' || h.kind === 'wyze') return h.kind;
         if (h.kind === 'p1' || (h.code && h.kind !== 'auto-url')) return 'p1';
         return 'url';
     }
@@ -102,8 +113,23 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             return 'http://127.0.0.1:' + relayPort + '/bambu?ip=' + encodeURIComponent(h.ip) + '&code=' + encodeURIComponent(h.code);
         return /^https?:\/\//i.test(h.ip) ? h.ip : 'http://' + h.ip + '/webcam/webrtc';
     }
+    function userInfo(h) {
+        return h.user ? encodeURIComponent(h.user) + ':' + encodeURIComponent(h.pass || '') + '@' : '';
+    }
+    function withPort(host, port) { return /:\d+$/.test(host) ? host : host + ':' + port; }
+    // Generic IP camera: go2rtc asks the camera over ONVIF for its stream URL
+    // (subtype 0 = main profile, 1 = sub stream), then pulls RTSP.
+    function onvifSrc(h) {
+        return 'onvif://' + userInfo(h) + withPort(h.ip, 80) + '?subtype=' + (h.profile === 'sub' ? '1' : '0');
+    }
+    // Wyze: no open protocol. Either docker-wyze-bridge (host + camera name, RTSP on 8554)
+    // or Wyze's RTSP firmware (camera IP, stream at /live).
+    function wyzeSrc(h) {
+        if (h.name) return 'rtsp://' + userInfo(h) + withPort(h.ip, 8554) + '/' + encodeURIComponent(h.name);
+        return 'rtsp://' + userInfo(h) + h.ip + '/live';
+    }
 
-    // go2rtc relay for RTSPS printers (X1/H2 family): started by the slicer on request.
+    // go2rtc relay (RTSP/ONVIF sources): started by the slicer on request.
     var go2rtcPort = 0, go2rtcRequested = false, go2rtcFailed = false, go2rtcStreams = {};
     window.__go2rtcReady = function(p) {
         go2rtcPort = p || 0;
@@ -115,9 +141,8 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         go2rtcRequested = true;
         postToSlicer('start_go2rtc');
     }
-    function go2rtcCell(h, cell, srcOverride) {
-        var name = h.ip.replace(/[^A-Za-z0-9]/g, '_');
-        var src  = srcOverride || ('rtspx://bblp:' + encodeURIComponent(h.code) + '@' + h.ip + ':322/streaming/live/1');
+    function go2rtcCell(cell, src) {
+        var name = 's' + hashStr(src);
         if (!go2rtcStreams[name]) {
             go2rtcStreams[name] = true;
             fetch('http://127.0.0.1:' + go2rtcPort + '/api/streams?name=' + name + '&src=' + encodeURIComponent(src), { method: 'PUT' })
@@ -127,6 +152,39 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         f.allow = 'autoplay';
         f.src = 'http://127.0.0.1:' + go2rtcPort + '/stream.html?src=' + name + '&mode=mse';
         cell.appendChild(f);
+    }
+    function relayWaitCell(cell) {
+        ensureGo2rtc();
+        var wait = document.createElement('div');
+        wait.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:' + (go2rtcFailed ? '#c66' : '#888') + ';font-size:13px;text-align:center;padding:8px;';
+        wait.textContent = go2rtcFailed ? 'Stream relay failed to start - restart the app and check the log for Go2RtcLauncher errors.' : 'Starting stream relay…';
+        cell.appendChild(wait);
+        cell.dataset.id = ''; // rebuild this cell once the relay reports in
+    }
+    // ONVIF WS-Discovery on the LAN, answered by go2rtc: cb(list | null, errorText)
+    function discoverOnvif(cb) {
+        ensureGo2rtc();
+        var tries = 0;
+        (function wait() {
+            if (go2rtcPort) return doFetch();
+            if (go2rtcFailed || ++tries > 60) return cb(null, 'Stream relay is not available');
+            setTimeout(wait, 250);
+        })();
+        function doFetch() {
+            fetch('http://127.0.0.1:' + go2rtcPort + '/api/onvif')
+                .then(function(r) { return r.text().then(function(t) { return { ok: r.ok, text: t }; }); })
+                .then(function(res) {
+                    if (!res.ok) return cb([], /no sources/i.test(res.text) ? '' : res.text.trim());
+                    var list = [];
+                    try { var j = JSON.parse(res.text); list = (j && j.sources) || (Array.isArray(j) ? j : []); } catch (e) {}
+                    cb(list.map(function(s) {
+                        var url = s.url || '';
+                        var m = /^[a-z]+:\/\/(?:[^@\/]*@)?([^\/?#]+)/i.exec(url);
+                        return { name: s.name || url, host: m ? m[1] : url };
+                    }), '');
+                })
+                .catch(function(e) { cb(null, String(e)); });
+        }
     }
 
     // Flashforge (Creator 5 / Adventurer 5M family): the printer reports its own
@@ -156,15 +214,7 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             return;
         }
         if (/^rtsps?:\/\//i.test(url)) {
-            if (go2rtcPort) { go2rtcCell(h, cell, url); }
-            else {
-                ensureGo2rtc();
-                var wait2 = document.createElement('div');
-                wait2.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:' + (go2rtcFailed ? '#c66' : '#888') + ';font-size:13px;text-align:center;padding:8px;';
-                wait2.textContent = go2rtcFailed ? 'Stream relay failed to start - restart the app and check the log for Go2RtcLauncher errors.' : 'Starting stream relay…';
-                cell.appendChild(wait2);
-                cell.dataset.ip = '';
-            }
+            if (go2rtcPort) go2rtcCell(cell, url); else relayWaitCell(cell);
         } else if (/action=stream/i.test(url)) {
             var im = document.createElement('img');
             im.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
@@ -178,7 +228,8 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         }
     }
     // In-page modal: the embedded WebView does not service prompt()/confirm() dialogs.
-    // opts = { title, message, fields: [{key,label,value,placeholder}] }; cb(null | {key:value})
+    // opts = { title, message, fields: [{key, label, type, value, placeholder, options, showIf(values), onClick(ctx)}] }
+    // types: text (default), password, select, button, info. cb(null | {key: value})
     function showModal(opts, cb) {
         var bg = document.getElementById('modal-bg');
         var modal = document.getElementById('modal');
@@ -192,30 +243,78 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             msg.textContent = opts.message;
             modal.appendChild(msg);
         }
-        var inputs = {};
-        (opts.fields || []).forEach(function(f) {
+        var inputs = {}, wraps = {}, statuses = {}, fields = opts.fields || [];
+        function values() {
+            var v = {};
+            for (var k in inputs) v[k] = (inputs[k].value || '').trim();
+            return v;
+        }
+        function fillOptions(sel, options) {
+            sel.innerHTML = '';
+            (options || []).forEach(function(o) {
+                var opt = document.createElement('option');
+                opt.value = o.value;
+                opt.textContent = o.label;
+                sel.appendChild(opt);
+            });
+        }
+        function refresh() {
+            var v = values();
+            fields.forEach(function(f) {
+                var show = !f.showIf || f.showIf(v, inputs);
+                wraps[f.key].style.display = show ? '' : 'none';
+            });
+        }
+        var ctx = {
+            get: function(k) { return inputs[k] ? inputs[k].value : ''; },
+            set: function(k, val) { if (inputs[k]) inputs[k].value = val; refresh(); },
+            setOptions: function(k, options) { if (inputs[k]) fillOptions(inputs[k], options); refresh(); },
+            setStatus: function(k, text) { if (statuses[k]) statuses[k].textContent = text; }
+        };
+        fields.forEach(function(f) {
             var wrap = document.createElement('div');
             wrap.className = 'field';
-            var lab = document.createElement('label');
-            lab.textContent = f.label;
-            wrap.appendChild(lab);
+            wraps[f.key] = wrap;
+            if (f.type !== 'button' && f.type !== 'info') {
+                var lab = document.createElement('label');
+                lab.textContent = f.label;
+                wrap.appendChild(lab);
+            }
             var inp;
             if (f.type === 'select') {
                 inp = document.createElement('select');
-                inp.style.cssText = 'width:100%;background:#222;color:#fff;border:1px solid #555;border-radius:5px;padding:7px 9px;font-size:13px;';
-                (f.options || []).forEach(function(o) {
-                    var opt = document.createElement('option');
-                    opt.value = o.value;
-                    opt.textContent = o.label;
-                    inp.appendChild(opt);
-                });
+                fillOptions(inp, f.options);
                 if (f.value) inp.value = f.value;
+                inp.addEventListener('change', function() { refresh(); if (f.onChange) f.onChange(ctx); });
+            } else if (f.type === 'button') {
+                inp = document.createElement('span');
+                inp.className = 'btn';
+                inp.textContent = f.label;
+                inp.onclick = function() { if (f.onClick) f.onClick(ctx); };
+                inp.value = '';
+            } else if (f.type === 'info') {
+                inp = document.createElement('div');
+                inp.className = 'info';
+                inp.textContent = typeof f.text === 'function' ? '' : (f.text || '');
+                inp.value = '';
+                if (typeof f.text === 'function') {
+                    var textFn = f.text;
+                    var origRefresh = refresh;
+                    refresh = function() { inp.textContent = textFn(values()); origRefresh(); };
+                }
             } else {
                 inp = document.createElement('input');
+                if (f.type === 'password') inp.type = 'password';
                 inp.value = f.value || '';
                 inp.placeholder = f.placeholder || '';
             }
             wrap.appendChild(inp);
+            if (f.type === 'button') {
+                var st = document.createElement('div');
+                st.className = 'status';
+                wrap.appendChild(st);
+                statuses[f.key] = st;
+            }
             modal.appendChild(wrap);
             inputs[f.key] = inp;
         });
@@ -234,70 +333,159 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         var ok = document.createElement('span');
         ok.className = 'ok';
         ok.textContent = 'OK';
-        ok.onclick = function() {
-            var values = {};
-            for (var k in inputs) values[k] = inputs[k].value.trim();
-            close(values);
-        };
+        ok.onclick = function() { close(values()); };
         buttons.appendChild(ok);
         modal.appendChild(buttons);
         bg.style.display = 'flex';
         modal.onkeydown = function(e) {
-            if (e.key === 'Enter') ok.onclick();
+            if (e.key === 'Enter' && e.target.tagName !== 'SELECT') ok.onclick();
             if (e.key === 'Escape') close(null);
         };
+        refresh();
         var first = modal.querySelector('input');
         if (first) first.focus();
     }
+    var KIND_OPTIONS = [
+        { value: 'auto',       label: 'Snapmaker / direct stream URL' },
+        { value: 'p1',         label: 'Bambu P1 / A1 (needs access code)' },
+        { value: 'rtsps',      label: 'Bambu X1 / H2 (needs access code + LAN Liveview on)' },
+        { value: 'flashforge', label: 'Flashforge (Creator 5 / Adventurer 5M family)' },
+        { value: 'ipcam',      label: 'IP camera (RTSP / ONVIF: Reolink, Amcrest, Hikvision, Tapo, …)' },
+        { value: 'wyze',       label: 'Wyze (RTSP firmware or wyze-bridge)' }
+    ];
+    var KIND_INFO = {
+        ipcam: 'The camera is pulled through the bundled go2rtc relay: it asks the camera over ONVIF for its stream and plays it here. ' +
+               'ONVIF must be enabled on the camera (most brands: on by default, some need a separate ONVIF user). ' +
+               'Use an H.264 stream — H.265 only plays if Windows has the HEVC video extension. ' +
+               'If you already know the rtsp:// URL, paste it in the address field instead.',
+        wyze:  'Wyze cameras have no open stream. Either run docker-wyze-bridge on a PC/NAS and enter the bridge host plus the camera name ' +
+               'shown in the bridge (RTSP port 8554, works with every current model), or flash Wyze\'s RTSP firmware (V2 / Pan / V3 only) ' +
+               'and enter the camera IP with the RTSP user/password you set in the Wyze app, leaving the camera name empty.'
+    };
+    function isCam(v) { return v.kind === 'ipcam' || v.kind === 'wyze'; }
+    // Add / Edit dialog shared by the chips and the + Add button. cb(values | null)
+    function hostDialog(title, h, cb) {
+        showModal({
+            title: title,
+            fields: [
+                { key: 'kind', label: 'Type', type: 'select', value: h.kind || 'auto', options: KIND_OPTIONS },
+                { key: 'info', type: 'info', text: function(v) { return KIND_INFO[v.kind] || ''; }, showIf: isCam },
+                { key: 'find', type: 'button', label: 'Find ONVIF cameras on this network', showIf: function(v) { return v.kind === 'ipcam'; },
+                  onClick: function(ctx) {
+                      ctx.setStatus('find', 'Searching (a few seconds)…');
+                      discoverOnvif(function(list, err) {
+                          if (list === null) { ctx.setStatus('find', 'Search failed: ' + err); return; }
+                          if (list.length === 0) { ctx.setStatus('find', err || 'No ONVIF cameras answered. Check that ONVIF is enabled, then enter the address by hand.'); return; }
+                          ctx.setStatus('find', list.length + ' found — pick one below');
+                          ctx.setOptions('found', [{ value: '', label: '(choose a camera)' }].concat(list.map(function(c) {
+                              return { value: c.host, label: c.name === c.host ? c.host : c.name + ' — ' + c.host };
+                          })));
+                      });
+                  } },
+                { key: 'found', label: 'Found cameras', type: 'select', options: [],
+                  showIf: function(v, inputs) { return v.kind === 'ipcam' && inputs.found.options.length > 0; },
+                  onChange: function(ctx) { if (ctx.get('found')) ctx.set('ip', ctx.get('found')); } },
+                { key: 'ip', label: 'IP address, hostname, or full stream URL (http/rtsp)', value: h.ip || '', placeholder: 'e.g. 10.0.0.106' },
+                { key: 'name', label: 'Camera name in wyze-bridge (leave empty for RTSP firmware)', value: h.name || '', placeholder: 'e.g. garage-cam',
+                  showIf: function(v) { return v.kind === 'wyze'; } },
+                { key: 'user', label: 'Camera user name', value: h.user || '', placeholder: 'e.g. admin', showIf: isCam },
+                { key: 'pass', label: 'Camera password', type: 'password', value: h.pass || '', showIf: isCam },
+                { key: 'profile', label: 'Stream', type: 'select', value: h.profile || 'main', showIf: function(v) { return v.kind === 'ipcam'; }, options: [
+                    { value: 'main', label: 'Main stream (full resolution)' },
+                    { value: 'sub',  label: 'Sub stream (lower resolution — better for big grids)' }
+                ] },
+                { key: 'alias', label: 'Alias (optional)', value: h.alias || '', placeholder: 'e.g. U1 Left' },
+                { key: 'code', label: 'LAN access code', value: h.code || '', showIf: function(v) { return v.kind === 'p1' || v.kind === 'rtsps'; } }
+            ]
+        }, function(r) {
+            if (r === null || !r.ip || !validHost(r.ip)) return cb(null);
+            if ((r.kind === 'p1' || r.kind === 'rtsps') && !r.code) return cb(null);
+            cb(r);
+        });
+    }
+    function applyDialog(h, r) {
+        h.ip = r.ip; h.alias = r.alias; h.kind = r.kind; h.code = r.code;
+        h.user = r.user; h.pass = r.pass; h.profile = r.profile; h.name = r.name;
+    }
+    function sameCamera(a, b) {
+        return a.ip === b.ip && (a.kind || 'auto') === (b.kind || 'auto') && (a.name || '') === (b.name || '') && (a.profile || 'main') === (b.profile || 'main');
+    }
+
+    // Drag to reorder: chips reorder the list (and the grid), grid labels swap cells.
+    var dragId = null, dragFrom = null;
+    function startDrag(e, id, from) {
+        dragId = id; dragFrom = from;
+        try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', id); } catch (x) {}
+        document.body.classList.add('dragging');
+    }
+    function endDrag() {
+        dragId = null; dragFrom = null;
+        document.body.classList.remove('dragging');
+        document.querySelectorAll('.over').forEach(function(el) { el.classList.remove('over'); });
+    }
+    function moveInList(list, id, beforeId) {
+        var i = list.indexOf(id);
+        if (i !== -1) list.splice(i, 1);
+        var j = beforeId ? list.indexOf(beforeId) : -1;
+        if (j === -1) list.push(id); else list.splice(j, 0, id);
+    }
+    function moveHostBefore(id, beforeId) {
+        var ids = state.hosts.map(function(h) { return h.id; });
+        moveInList(ids, id, beforeId);
+        state.hosts.sort(function(a, b) { return ids.indexOf(a.id) - ids.indexOf(b.id); });
+        if (state.active.indexOf(id) !== -1)
+            moveInList(state.active, id, state.active.indexOf(beforeId) !== -1 ? beforeId : null);
+        save(); render();
+    }
+    function dropOnCell(index) {
+        if (!dragId) return;
+        var a = state.active, from = a.indexOf(dragId);
+        if (dragFrom === 'cell' && from !== -1) {
+            if (index < a.length) { var t = a[index]; a[index] = dragId; a[from] = t; }
+            else { a.splice(from, 1); a.push(dragId); }
+        } else { // a chip dropped onto the grid: show it in that cell
+            if (from !== -1) a.splice(from, 1);
+            a.splice(Math.min(index, a.length), 0, dragId);
+        }
+        save(); render();
+    }
+
     function cellCount(layout) {
         var p = layout.split('x');
-        return { cols: +p[0], rows: +p[1], n: (+p[0]) * (+p[1]) };
+        var cols = Math.min(MAX_DIM, Math.max(1, +p[0] || 1)), rows = Math.min(MAX_DIM, Math.max(1, +p[1] || 1));
+        return { cols: cols, rows: rows, n: cols * rows };
     }
     function render() {
         var chips = document.getElementById('chips');
         chips.innerHTML = '';
         state.hosts.forEach(function(h) {
             var c = document.createElement('span');
-            c.className = 'chip' + (state.active.indexOf(h.ip) !== -1 ? ' active' : '');
+            c.className = 'chip' + (state.active.indexOf(h.id) !== -1 ? ' active' : '');
+            c.draggable = true;
+            c.addEventListener('dragstart', function(e) { startDrag(e, h.id, 'chip'); });
+            c.addEventListener('dragend', endDrag);
+            c.addEventListener('dragover', function(e) { if (dragFrom === 'chip' && dragId !== h.id) { e.preventDefault(); c.classList.add('over'); } });
+            c.addEventListener('dragleave', function() { c.classList.remove('over'); });
+            c.addEventListener('drop', function(e) { e.preventDefault(); if (dragFrom === 'chip' && dragId && dragId !== h.id) moveHostBefore(dragId, h.id); endDrag(); });
             var name = document.createElement('span');
             name.textContent = h.alias || h.ip;
-            name.title = h.alias ? h.ip : 'Click to show/hide this stream';
+            name.title = (h.alias ? h.ip + ' — ' : '') + 'Click to show/hide, drag to reorder';
             c.appendChild(name);
             var edit = document.createElement('span');
             edit.className = 'icon';
             edit.textContent = '✎';
-            edit.title = 'Edit printer';
+            edit.title = 'Edit';
             edit.onclick = function(e) {
                 e.stopPropagation();
-                showModal({
-                    title: 'Edit ' + (h.alias || h.ip),
-                    fields: [
-                        { key: 'ip', label: 'IP address, hostname, or full stream URL (http/rtsp)', value: h.ip },
-                        { key: 'alias', label: 'Alias (empty to clear)', value: h.alias || '' },
-                        { key: 'kind', label: 'Printer type', type: 'select', value: h.kind || 'auto', options: [
-                            { value: 'auto',  label: 'Snapmaker / direct stream URL' },
-                            { value: 'p1',    label: 'Bambu P1 / A1 (needs access code)' },
-                            { value: 'rtsps', label: 'Bambu X1 / H2 (needs access code + LAN Liveview on)' },
-                            { value: 'flashforge', label: 'Flashforge (Creator 5 / Adventurer 5M family)' }
-                        ] },
-                        { key: 'code', label: 'LAN access code (Bambu printers only)', value: h.code || '' }
-                    ]
-                }, function(r) {
-                    if (r === null || !r.ip || !validHost(r.ip)) return;
-                    if (r.ip !== h.ip && state.hosts.some(function(x) { return x.ip === r.ip; })) return;
-                    if ((r.kind === 'p1' || r.kind === 'rtsps') && !r.code) return;
+                hostDialog('Edit ' + (h.alias || h.ip), h, function(r) {
+                    if (r === null) return;
+                    if (state.hosts.some(function(x) { return x !== h && sameCamera(x, r); })) return;
                     var oldIp = h.ip;
-                    h.ip = r.ip; h.alias = r.alias; h.kind = r.kind; h.code = r.code;
-                    if (oldIp !== h.ip) {
-                        var ai = state.active.indexOf(oldIp);
-                        if (ai !== -1) state.active[ai] = h.ip;
-                    }
-                    // Drop cached probe/relay state and the live cell so the new settings take effect.
+                    applyDialog(h, r);
+                    // Drop cached probe state and the live cell so the new settings take effect.
                     delete ffUrls[oldIp]; delete ffUrls[h.ip];
-                    delete go2rtcStreams[oldIp.replace(/[^A-Za-z0-9]/g, '_')];
-                    delete go2rtcStreams[h.ip.replace(/[^A-Za-z0-9]/g, '_')];
                     document.querySelectorAll('#grid .cell').forEach(function(cell) {
-                        if (cell.dataset.ip === oldIp || cell.dataset.ip === h.ip) cell.remove();
+                        if (cell.dataset.id === h.id) cell.remove();
                     });
                     save(); render();
                 });
@@ -309,24 +497,25 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
             del.title = 'Remove';
             del.onclick = function(e) {
                 e.stopPropagation();
-                showModal({ title: 'Remove printer', message: 'Remove ' + (h.alias ? h.alias + ' (' + h.ip + ')' : h.ip) + ' from the list?' }, function(r) {
+                showModal({ title: 'Remove camera', message: 'Remove ' + (h.alias ? h.alias + ' (' + h.ip + ')' : h.ip) + ' from the list?' }, function(r) {
                     if (r === null) return;
-                    state.hosts = state.hosts.filter(function(x) { return x.ip !== h.ip; });
-                    state.active = state.active.filter(function(x) { return x !== h.ip; });
+                    state.hosts = state.hosts.filter(function(x) { return x.id !== h.id; });
+                    state.active = state.active.filter(function(x) { return x !== h.id; });
                     save(); render();
                 });
             };
             c.appendChild(del);
             c.onclick = function() {
-                var i = state.active.indexOf(h.ip);
-                if (i === -1) state.active.push(h.ip); else state.active.splice(i, 1);
+                var i = state.active.indexOf(h.id);
+                if (i === -1) state.active.push(h.id); else state.active.splice(i, 1);
                 save(); render();
             };
             chips.appendChild(c);
         });
-        document.getElementById('layout').value = state.layout;
 
         var lay = cellCount(state.layout);
+        document.getElementById('cols').value = lay.cols;
+        document.getElementById('rows').value = lay.rows;
         var grid = document.getElementById('grid');
         var barH = document.getElementById('topbar').offsetHeight;
         grid.style.setProperty('--bar-h', barH + 'px');
@@ -338,37 +527,37 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
         var note = document.getElementById('note');
         note.textContent = state.active.length > lay.n
             ? (state.active.length - lay.n) + ' selected stream(s) hidden by layout'
-            : (state.hosts.length === 0 ? 'Add a printer IP to start' : '');
+            : (state.hosts.length === 0 ? 'Add a printer or camera to start' : '');
 
-        // Reuse existing iframes where the host has not changed to avoid reconnecting.
+        // Reuse existing cells where the camera has not changed to avoid reconnecting.
         var existing = {};
         Array.prototype.slice.call(grid.children).forEach(function(cell) {
-            if (cell.dataset.ip) existing[cell.dataset.ip] = cell;
+            if (cell.dataset.id) existing[cell.dataset.id] = cell;
         });
         grid.innerHTML = '';
         for (var i = 0; i < lay.n; i++) {
-            var ip = shown[i];
-            if (ip) {
-                var h = state.hosts.filter(function(x) { return x.ip === ip; })[0];
-                var cell = existing[ip];
+            var id = shown[i];
+            var cell;
+            if (id) {
+                var h = hostById(id);
+                cell = existing[id];
                 if (!cell) {
                     cell = document.createElement('div');
                     cell.className = 'cell';
-                    cell.dataset.ip = ip;
-                    var hh   = h || { ip: ip };
+                    cell.dataset.id = id;
+                    var hh   = h || { id: id, ip: id };
                     var kind = kindOf(hh);
                     if (kind === 'flashforge') {
                         ffCell(hh, cell);
-                    } else if (kind === 'rtsp-url' || kind === 'rtsps') {
+                    } else if (kind === 'rtsp-url' || kind === 'rtsps' || kind === 'ipcam' || kind === 'wyze') {
                         if (go2rtcPort) {
-                            go2rtcCell(hh, cell, kind === 'rtsp-url' ? hh.ip : null);
+                            var src = kind === 'rtsp-url' ? hh.ip
+                                    : kind === 'ipcam'    ? onvifSrc(hh)
+                                    : kind === 'wyze'     ? wyzeSrc(hh)
+                                    : 'rtspx://bblp:' + encodeURIComponent(hh.code) + '@' + hh.ip + ':322/streaming/live/1';
+                            go2rtcCell(cell, src);
                         } else {
-                            ensureGo2rtc();
-                            var wait = document.createElement('div');
-                            wait.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:' + (go2rtcFailed ? '#c66' : '#888') + ';font-size:13px;text-align:center;padding:8px;';
-                            wait.textContent = go2rtcFailed ? 'Stream relay failed to start - restart the app and check the log for Go2RtcLauncher errors.' : 'Starting stream relay…';
-                            cell.appendChild(wait);
-                            cell.dataset.ip = ''; // rebuild this cell once the relay reports in
+                            relayWaitCell(cell);
                         }
                     } else if (kind === 'p1') {
                         // The relay serves MJPEG, which renders in a plain <img>.
@@ -384,49 +573,61 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
                     }
                     var lab = document.createElement('span');
                     lab.className = 'label';
+                    lab.title = 'Drag to another cell to reorder';
+                    lab.draggable = true;
+                    (function(cid) {
+                        lab.addEventListener('dragstart', function(e) { startDrag(e, cid, 'cell'); });
+                        lab.addEventListener('dragend', endDrag);
+                    })(id);
                     cell.appendChild(lab);
                 }
-                cell.querySelector('.label').textContent = (h && h.alias) ? h.alias : ip;
-                grid.appendChild(cell);
+                cell.querySelector('.label').textContent = (h && h.alias) ? h.alias : (h ? h.ip : id);
             } else {
-                var empty = document.createElement('div');
-                empty.className = 'cell empty';
-                grid.appendChild(empty);
+                cell = document.createElement('div');
+                cell.className = 'cell empty';
             }
+            // Cells are reused across renders, so bind the drop handlers once and read
+            // the cell's current position at drop time.
+            if (!cell.dataset.droppable) {
+                cell.dataset.droppable = '1';
+                (function(el) {
+                    el.addEventListener('dragover', function(e) { if (dragId) { e.preventDefault(); el.classList.add('over'); } });
+                    el.addEventListener('dragleave', function() { el.classList.remove('over'); });
+                    el.addEventListener('drop', function(e) { e.preventDefault(); dropOnCell(+el.dataset.index); endDrag(); });
+                })(cell);
+            }
+            cell.dataset.index = i;
+            grid.appendChild(cell);
         }
     }
     document.getElementById('addchip').onclick = function() {
-        showModal({
-            title: 'Add printer',
-            fields: [
-                { key: 'ip', label: 'IP address, hostname, or full stream URL (http/rtsp)', placeholder: 'e.g. 10.0.0.106' },
-                { key: 'alias', label: 'Alias (optional)', placeholder: 'e.g. U1 Left' },
-                { key: 'kind', label: 'Printer type', type: 'select', options: [
-                    { value: 'auto',  label: 'Snapmaker / direct stream URL' },
-                    { value: 'p1',    label: 'Bambu P1 / A1 (needs access code)' },
-                    { value: 'rtsps', label: 'Bambu X1 / H2 (needs access code + LAN Liveview on)' },
-                    { value: 'flashforge', label: 'Flashforge (Creator 5 / Adventurer 5M family)' }
-                ] },
-                { key: 'code', label: 'LAN access code (Bambu printers only)', placeholder: 'leave empty for Snapmaker / URLs' }
-            ]
-        }, function(r) {
-            if (r === null || !r.ip) return;
-            if (!validHost(r.ip) || state.hosts.some(function(h) { return h.ip === r.ip; })) return;
-            if ((r.kind === 'p1' || r.kind === 'rtsps') && !r.code) return;
-            state.hosts.push({ ip: r.ip, alias: r.alias || '', code: r.code || '', kind: r.kind || 'auto' });
-            state.active.push(r.ip);
+        hostDialog('Add printer or camera', {}, function(r) {
+            if (r === null) return;
+            if (state.hosts.some(function(h) { return sameCamera(h, r); })) return;
+            var h = { id: newId() };
+            applyDialog(h, r);
+            state.hosts.push(h);
+            state.active.push(h.id);
             save(); render();
         });
     };
-    document.getElementById('layout').onchange = function() {
-        state.layout = this.value;
-        save(); render();
-    };
+    ['cols', 'rows'].forEach(function(id) {
+        var sel = document.getElementById(id);
+        for (var i = 1; i <= MAX_DIM; i++) {
+            var opt = document.createElement('option');
+            opt.value = i; opt.textContent = i;
+            sel.appendChild(opt);
+        }
+        sel.onchange = function() {
+            state.layout = document.getElementById('cols').value + 'x' + document.getElementById('rows').value;
+            save(); render();
+        };
+    });
     window.addEventListener('resize', function() { render(); });
 
     load();
     // Default: first host active in the default single-stream layout.
-    if (state.active.length === 0 && state.hosts.length > 0) state.active = [state.hosts[0].ip];
+    if (state.active.length === 0 && state.hosts.length > 0) state.active = [state.hosts[0].id];
     save();
     render();
 })();
