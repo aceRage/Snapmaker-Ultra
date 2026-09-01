@@ -74,3 +74,22 @@ body) sliced unlimited vs walls:3 — claimed region area shrinks to the band, i
 reverts to base filament in walls AND infill; thin-feature fixture for #6892. GUI:
 user paints a dark spot on a light body, checks preview cross-section shows ≤3 dark
 walls + base-color interior; then bleed check on a real print.
+
+## Cost note (added post-Wave-B, wave-b-review.md Important 3)
+
+Stage 2's later "Option N" extension (curved-gap-design.md, `.superpowers/sdd/2026-08-31-paint-
+depth/wave-b-report.md`) made the painted top/bottom claim a constant-thickness shell rather than
+a fixed layer count. Both of that wave's own reports originally stated the resulting change was
+"none wasted... total extrusion unchanged" — that is false and was corrected in a fix wave
+(`.superpowers/sdd/2026-08-31-paint-depth/wave-b-fixwave-report.md`). The accurate statement,
+recorded here since this is the doc future changes to the feature should be checked against:
+
+- The claim *volume* is a re-colouring at constant infill density, not extra solid — that part of
+  the "none wasted" intuition is correct.
+- The job's total extrusion still goes UP relative to the pre-Option-N shell-count claim: a
+  painted flat cap gains extra tool changes (9 more at stock defaults, 6 → 15 layers) each with
+  its own purge (≈2.5 cm³ at the stock 280 mm³ flush default), plus the wall loops the new colour
+  boundary adds on every newly split sparse-infill layer.
+- Positive, and provable independent of slope purity: the painted claim is a strict superset of
+  the pre-Option-N claim at every slope, so nothing the feature already delivered is degraded
+  anywhere by the deepened shell.

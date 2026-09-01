@@ -293,9 +293,31 @@ added here.
 
 ## 6. Cost, stated plainly
 
-**Material: none wasted.** The claim is exactly the set of material within `D` of the painted
-surface — the minimum volume that delivers `D` of opacity. Filament shifts from base to painted
-colour; total extrusion is unchanged.
+**Fix-wave correction (wave-b-review.md Important 3):** the paragraph below originally read
+"Material: none wasted... total extrusion is unchanged" — false, and self-contradicted by the
+very next paragraph, which correctly says each newly painted layer costs a tool change and a
+purge. Corrected headline: **the claim volume is a re-colouring, not extra solid — but the job's
+total extrusion goes UP**, by two independent mechanisms neither of which is a shift:
+
+1. **Purge / prime tower.** 6 → 15 painted layers on a flat cap is **9 extra tool changes**.
+   `flush_volumes_matrix`'s default in this tree is **280 mm³ per change** (`PrintConfig.cpp:6519`),
+   so ≈ **2520 mm³ ≈ 2.5 cm³ ≈ ~3 g of PLA** of purged filament added per painted flat cap, at
+   stock defaults — on a small painted part that can exceed the object's own volume. Purge is
+   extruded material, not a shift.
+2. **Colour-boundary wall loops.** Every newly split layer (the 9 extra layers between the old
+   6-layer solid shell and the new 15-layer normal-thickness claim, which are sparse-infill
+   layers at stock `top_shell_layers`/`top_shell_thickness`) gains a full set of wall loops around
+   the new colour boundary — dense extrusion replacing ~15%-density infill. Net material up.
+
+The "none wasted" intuition is true, but only of the object's own solid volume at constant
+infill density (`paint_infill_override` defaults to `true`, so the painted claim's sparse infill
+stays sparse and merely changes colour) — a strictly narrower statement than the one originally
+made here. See curved-gap-design.md §7 for the same correction at its source.
+
+**Positive result, stronger than this report's own "byte-identical" framing elsewhere (review's
+Minor 1):** on the painted path, Wave B's claim is a strict SUPERSET of the legacy claim at every
+slope, so nothing anywhere is degraded — provable independent of slope purity, unlike "24°+ is
+byte-identical" which needs a pure slope to hold.
 
 **Tool changes / purge — the real cost, and the user has accepted it per the standing fidelity
 ruling.** On a painted **flat top** the number of layers carrying a painted region goes from the

@@ -2986,3 +2986,196 @@ TEST_CASE("ToolOrdering::collect_extruders does not add the base filament to a l
     // nothing on this layer emits with it.
     CHECK_FALSE(has_base_extruder);
 }
+
+// ===========================================================================================
+// WAVE B REVIEW FIX WAVE (.superpowers/sdd/2026-08-31-paint-depth/wave-b-review.md). Important
+// 1, Important 2. Important 3 is a documentation-only correction (design/report cost claims) -
+// no test. The Wave A fix wave above landed FIRST and shifted this review's own line numbers;
+// every anchor below was re-read against the current file, not trusted from the review text.
+// ===========================================================================================
+
+// Important 2 fixture: same construction as slice_painted_box() above, but with a THIRD
+// physical extruder and TWO painted facet groups, each its own colour - the painted-cap-over-
+// painted-stripe interaction Wave B left unmentioned and untested. A new helper rather than
+// extending slice_painted_box() / paint_depth_test_config(), which stay untouched: every other
+// fixture in this file paints exactly one colour, so generalizing either of those shared helpers
+// for this one two-colour case would be a bigger, riskier change than adding beside them.
+PrintObject *slice_two_painted_colours(double x, double y, double z,
+                                        const std::vector<int> &cap_facets, const std::vector<int> &side_facets,
+                                        PaintDepthMode mode, int walls, double layer_height, Print &print)
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name        = "paint-depth-two-colour.stl";
+    ModelVolume *volume  = object->add_volume(make_cube(x, y, z));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : cap_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    for (int facet_idx : side_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder3);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    // Base config from paint_depth_test_config(), then widened from 2 to 3 physical filaments -
+    // see that function's own comment on why every per-extruder width-driving option needs
+    // pinning explicitly rather than trusting the resize.
+    DynamicPrintConfig config = paint_depth_test_config(mode, walls);
+    config.set_num_extruders(3);
+    config.set_num_filaments(3);
+    config.option<ConfigOptionFloats>("filament_diameter")->values = {1.75, 1.75, 1.75};
+    config.option<ConfigOptionStrings>("filament_colour")->values  = {"#FFFFFF", "#804020", "#2040A0"};
+    config.option<ConfigOptionFloats>("nozzle_diameter")->values   = {0.4, 0.4, 0.4};
+    config.option<ConfigOptionFloat>("layer_height")->value                     = layer_height;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value       = layer_height;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
+    // Matches slice_bounded_frustum()'s pinning: top_shell_layers = 4 / top_shell_thickness =
+    // 0.6 at 0.1mm layers is a 6-layer effective legacy shell, so the review's own "6 -> 15
+    // layers at stock defaults" numbers apply verbatim.
+    config.option<ConfigOptionInt>("top_shell_layers")->value    = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value = 0.6;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// Generalization of extruder2_claim_for_layer() (above) to an arbitrary physical filament id -
+// needed once a fixture paints more than one colour. Identical body, parameterized.
+ExPolygons claim_for_layer(const PrintObject &object, size_t layer_idx, int extruder_id)
+{
+    ExPolygons   result;
+    const Layer *layer = object.get_layer(int(layer_idx));
+    for (size_t region_idx = 0; region_idx < object.num_printing_regions(); ++region_idx) {
+        const PrintRegion &region = object.printing_region(region_idx);
+        if (region.config().wall_filament.value != extruder_id)
+            continue;
+        const int local_id = region.print_object_region_id();
+        if (local_id < 0 || local_id >= layer->region_count())
+            continue;
+        const LayerRegion *layerm = layer->get_region(local_id);
+        if (layerm == nullptr)
+            continue;
+        for (const Surface &s : layerm->slices.surfaces)
+            result.emplace_back(s.expolygon);
+    }
+    return result;
+}
+
+// Important 1: the review's own worked scenario, re-derived against the CURRENT code. Wave A's
+// own I-1 fix (immediately above - paint_depth_classic_notch_cap_mm, landed AFTER this review
+// was written) turns out to already close this finding, not merely narrow it. Re-derivation:
+//
+//   effective_even_layer_band = max_width - interlocking_depth'
+//                              = max_width - min(interlocking_depth, max(0, max_width - max_wall_stack))
+//                              = max(max_width - interlocking_depth, max_wall_stack)
+//
+// (algebra: let a = interlocking_depth, s = max(0, max_width - max_wall_stack). The per-region
+// classic floor guarantees max_width >= max_wall_stack term-by-term - see
+// paint_depth_band_classic_floor_mm - so max() of the larger sequence is >= max() of the smaller
+// one, i.e. s = max_width - max_wall_stack exactly, never clamped to 0. interlocking_depth' =
+// min(a, s), so max_width - interlocking_depth' = max_width - min(a, s) = max(max_width - a,
+// max_width - s) = max(max_width - a, max_wall_stack).) The right-hand max() means the
+// even-layer band can never fall below max_wall_stack, for ANY D on the classic generator - not
+// only at the walls = 1 boundary the review's own numbers use. And the D >= wall_stack gate
+// (out.normal_shell, MultiMaterialSegmentation.cpp) is itself only ever open on the classic
+// generator BECAUSE that same per-region floor guarantees max_width (== D ==
+// paint_depth_normal_mm) >= every region's own wall_stack. So wherever the gate is open on the
+// classic generator, max_wall_stack >= wall_stack, and the "ring" (wall_stack -
+// effective_even_layer_band) is <= 0: Wave A's I-1 fix closes Important 1 as a side effect of
+// closing its own, differently-framed finding - the same notch narrowing the same band below the
+// same wall_stack, observed from the classic-floor side rather than the descent-gate side. This
+// case pins it as a REGRESSION, not a fresh RED: classic, walls = 1 (the review's own
+// configuration, where the floor gives ZERO slack and the notch is capped to exactly 0), probing
+// the review's own disputed inset window [0.7785, 0.8785]mm on BOTH parities. Reused fixture
+// from the "D >= wall_stack gate" case above.
+//
+// Stock flow at 0.1mm layers / 0.45mm lines: ext_w = 0.45, ext_s = 0.428540, wall_stack =
+// 0.878540.
+TEST_CASE("multi_material_segmentation_by_painting: the classic floor's notch cap already closes the D >= wall_stack gate's sandwiched ring, on BOTH parities, at walls = 1 (Important 1)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_bounded_frustum(40.392, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                 pdmWalls, /*walls=*/1, /*layer_height=*/0.1, print,
+                                                 PerimeterGeneratorType::Classic);
+    REQUIRE(object->layer_count() >= 27);
+
+    // wall_stack - 0.05 = 0.828540mm: inside the review's disputed [0.7785, 0.8785]mm window,
+    // matching the I-1 test's own `wall_stack +/- 0.05mm` probing convention. Without the notch
+    // cap this would be claimed on the odd layer (band reaches 0.878540mm untouched) but NOT on
+    // the even layer (band narrowed to 0.778540mm by the uncapped 0.1mm notch) - the review's own
+    // "sandwiched ring" defect. Both parities pass here because the notch is capped to 0 at
+    // walls = 1 (the floored band has zero slack above wall_stack), so the even-layer band
+    // reaches wall_stack too, exactly like the odd one - a true regression pin, not a fresh RED.
+    const double probe_inset = 0.828540;
+    for (size_t probe_layer : {size_t(12), size_t(13)}) {
+        CAPTURE(probe_layer);
+        const ExPolygons claim = extruder2_claim_for_layer(*object, probe_layer);
+        CHECK(any_contains(claim, layer_edge_probe(*object, probe_layer, probe_inset)));
+    }
+}
+
+// Important 2: merge_segmented_layers trims EVERY extruder's lateral claim by EVERY extruder's
+// top/bottom claim, keyed purely on extruder identity - not on whether the trimmer is the base
+// colour or another painted one. segmentation_top_and_bottom_layers's own "PAINTED COLOURS ONLY"
+// comment is careful to explain why deepening is safe against the BASE colour (color_idx 0 never
+// deepens) and silent about painted-vs-painted. Before this fix, a painted cap's DEEPENED
+// top/bottom claim (up to 15 layers at stock defaults) ate just as deep into a NEIGHBOURING
+// PAINTED colour's lateral band as it does into the base colour's - 2.5x deeper than the
+// pre-Wave-B legacy shell (6 layers), unmentioned and untested in Wave B.
+//
+// New helpers below (slice_two_painted_colours / claim_for_layer) rather than extending
+// slice_painted_box() / paint_depth_test_config() / extruder2_claim_for_layer(), which stay
+// untouched - this is the only fixture in the file with two independently painted colours.
+//
+// 40x40x6mm box: TOP_CAP_FACE painted Extruder2 (colour A, the cap), the full-height +X wall
+// painted Extruder3 (colour B, the side stripe, painted right up to the shared top edge) -
+// exactly the review's failure scenario ("colour B painted on a side wall right up to the top
+// edge, colour A painted on the flat top"). Stock-shaped defaults at 0.1mm layers:
+// top_shell_layers = 4 / top_shell_thickness = 0.6 -> 6-layer legacy shell; walls = 3 -> D =
+// 1.435675mm -> M = ceil(1.435675/0.1) = 15 -> 15-layer deepened descent. Probe inset 1.1mm is
+// inside colour B's own lateral band (>= 1.335675mm on this fixture at either parity) AND past
+// colour A's F1 wall_stack clearance (0.878540mm) from the +X contour, so it is exactly the
+// overlap zone the excess-vs-other-painted-laterals clip is about: depth 3 is within colour A's
+// LEGACY shell (colour A legitimately owns it, unchanged by this fix - a non-regression sanity
+// check); depth 10 is within colour A's DEEPENED reach only (colour B must keep it, exactly as
+// it did before Wave B - the regression this case pins).
+TEST_CASE("multi_material_segmentation_by_painting: a painted cap does not eat a neighbouring painted colour's lateral band deeper than its legacy shell (Important 2)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_two_painted_colours(/*x=*/40., /*y=*/40., /*z=*/6.,
+                                                      TOP_CAP_FACE, PLUS_X_FACE,
+                                                      pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 20);
+
+    // Depth 3: within colour A's legacy shell (<= 6 layers) - both the pre- and post-fix claim
+    // agree here, so this is a sanity check that the fixture behaves as designed, not the
+    // regression itself.
+    {
+        const size_t probe_layer = top_index - 3;
+        const Point  probe       = layer_edge_probe(*object, probe_layer, 1.1);
+        CHECK(any_contains(claim_for_layer(*object, probe_layer, /*Extruder2, colour A*/ 2), probe));
+        CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder3, colour B*/ 3), probe));
+    }
+
+    // Depth 10: within colour A's DEEPENED reach (15 layers) but past its LEGACY shell (6
+    // layers). RED pre-fix: colour A's cap claims this too (2.5x deeper than its legacy shell).
+    // GREEN post-fix: colour B's stripe keeps it, exactly as it did before Wave B - and colour A
+    // does NOT also claim it, which the CHECK_FALSE below pins directly (bounding the trim alone,
+    // without also clipping colour A's own excess against colour B's lateral claim, would leave
+    // this a genuine geometric overlap rather than a clean hand-back).
+    {
+        const size_t probe_layer = top_index - 10;
+        const Point  probe       = layer_edge_probe(*object, probe_layer, 1.1);
+        CHECK(any_contains(claim_for_layer(*object, probe_layer, /*Extruder3, colour B*/ 3), probe));
+        CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder2, colour A*/ 2), probe));
+    }
+}

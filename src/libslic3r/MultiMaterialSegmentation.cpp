@@ -1543,11 +1543,21 @@ static inline ExPolygons exposed_surface_part(const ExPolygons              &pro
 // sliver guard, which the design deliberately did not propose.
 //
 // Returns segmentation of top and bottom layers based on painting in segmentation gizmos.
+// Fix-wave (wave-b-review.md Important 2): legacy_top_and_bottom_layers_out is filled with the
+// SAME per-colour top/bottom claims, but each one stopped at top_shell_layers/bottom_shell_layers
+// (the pre-Wave-B solid-shell depth) instead of the possibly-deepened top_descent_layers/
+// bottom_descent_layers. merge_segmented_layers uses it to stop a painted colour's DEEPENED reach
+// from silently annexing a neighbouring painted colour's own lateral claim any deeper than it did
+// before Wave B, while leaving the deepened reach fully intact against the base colour (Wave B's
+// own fix) and for a colour's own claim. Always sized [num_facets_states][num_layers] whenever
+// the main return value is (i.e. whenever this function does any work at all) so the two stay
+// index-compatible; left empty (default-constructed) by any early return.
 static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_layers(const PrintObject                                               &print_object,
                                                                                       const std::vector<ExPolygons>                                   &input_expolygons,
                                                                                       const std::function<ModelVolumeFacetsInfo(const ModelVolume &)> &extract_facets_info,
                                                                                       const size_t                                                     num_facets_states,
                                                                                       const float                                                      paint_depth_normal_mm,
+                                                                                      std::vector<std::vector<ExPolygons>>                            &legacy_top_and_bottom_layers_out,
                                                                                       const std::function<void()>                                     &throw_on_cancel_callback)
 {
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - Segmentation of top and bottom layers in parallel - Begin";
@@ -1745,6 +1755,17 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
     shell_triangles_by_color_bottom.assign(num_facets_states, std::vector<ExPolygons>(num_layers * 2));
     shell_triangles_by_color_top.assign(num_facets_states, std::vector<ExPolygons>(num_layers * 2));
 
+    // Fix-wave (wave-b-review.md Important 2): shadow of shell_triangles_by_color_top/bottom,
+    // holding only the descent steps within top_shell_layers/bottom_shell_layers of the surface -
+    // i.e. exactly what this same walk would deposit with paint_depth_normal_mm forced to 0. Same
+    // double-buffer sizing/parity as the arrays above, since it is written at the identical
+    // [color_idx][last_idx + layer_idx_offset] slots, just conditionally (a subset of the same
+    // writes) - so the §C race-freedom argument for the arrays above extends to these unchanged.
+    std::vector<std::vector<ExPolygons>> legacy_shell_triangles_by_color_bottom(num_facets_states);
+    std::vector<std::vector<ExPolygons>> legacy_shell_triangles_by_color_top(num_facets_states);
+    legacy_shell_triangles_by_color_bottom.assign(num_facets_states, std::vector<ExPolygons>(num_layers * 2));
+    legacy_shell_triangles_by_color_top.assign(num_facets_states, std::vector<ExPolygons>(num_layers * 2));
+
     struct LayerColorStat {
         // Number of regions for a queried color.
         int     num_regions             { 0 };
@@ -1911,7 +1932,8 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
     const size_t num_groups = (num_layers + size_t(granularity) - 1) / size_t(granularity);
     tbb::parallel_for(size_t(0), num_groups, [&granularity, &num_layers, &num_facets_states, &layer_color_stat, &top_raw, &triangles_by_color_top,
                                               &throw_on_cancel_callback, &input_expolygons, &bottom_raw, &triangles_by_color_bottom,
-                                              &shell_triangles_by_color_top, &shell_triangles_by_color_bottom](const size_t group_idx) {
+                                              &shell_triangles_by_color_top, &shell_triangles_by_color_bottom,
+                                              &legacy_shell_triangles_by_color_top, &legacy_shell_triangles_by_color_bottom](const size_t group_idx) {
         size_t layer_idx_offset = (group_idx & 1) * num_layers;
         const size_t group_end  = std::min(num_layers, (group_idx + 1) * size_t(granularity));
         for (size_t layer_idx = group_idx * size_t(granularity); layer_idx < group_end; ++ layer_idx) {
@@ -2061,6 +2083,12 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                     break;
                                 }
                                 deposited = true;
+                                // Fix-wave (wave-b-review.md Important 2): this step is also within
+                                // the LEGACY (pre-Wave-B) shell depth whenever it is fewer than
+                                // top_shell_layers steps from the surface - copy it (not move; the
+                                // move below still needs it) into the legacy shadow before it goes.
+                                if (int(layer_idx) - last_idx < stat.top_shell_layers)
+                                    append(legacy_shell_triangles_by_color_top[color_idx][last_idx + layer_idx_offset], last);
                                 append(shell_triangles_by_color_top[color_idx][last_idx + layer_idx_offset], std::move(last));
                             }
                         }
@@ -2122,6 +2150,10 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                     break;
                                 }
                                 deposited = true;
+                                // Fix-wave (wave-b-review.md Important 2), mirrored - see the top
+                                // loop's comment above.
+                                if (last_idx - layer_idx < size_t(stat.bottom_shell_layers))
+                                    append(legacy_shell_triangles_by_color_bottom[color_idx][last_idx + layer_idx_offset], last);
                                 append(shell_triangles_by_color_bottom[color_idx][last_idx + layer_idx_offset], std::move(last));
                             }
                         }
@@ -2132,10 +2164,34 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
 
     std::vector<std::vector<ExPolygons>> triangles_by_color_merged(num_facets_states);
     triangles_by_color_merged.assign(num_facets_states, std::vector<ExPolygons>(num_layers));
+    // Fix-wave (wave-b-review.md Important 2): sized identically to triangles_by_color_merged, and
+    // filled below from the SAME per-colour arrays, just before the moves that consume the surface
+    // ones - see the function header comment.
+    legacy_top_and_bottom_layers_out.assign(num_facets_states, std::vector<ExPolygons>(num_layers));
     tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&triangles_by_color_merged, &triangles_by_color_bottom, &triangles_by_color_top, &num_layers, &throw_on_cancel_callback,
-                                                                  &shell_triangles_by_color_top, &shell_triangles_by_color_bottom](const tbb::blocked_range<size_t> &range) {
+                                                                  &shell_triangles_by_color_top, &shell_triangles_by_color_bottom,
+                                                                  &legacy_shell_triangles_by_color_top, &legacy_shell_triangles_by_color_bottom,
+                                                                  &legacy_top_and_bottom_layers_out](const tbb::blocked_range<size_t> &range) {
         for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
             throw_on_cancel_callback();
+            // Fix-wave (wave-b-review.md Important 2): capture the legacy-bounded reach BEFORE the
+            // moves below consume triangles_by_color_top/bottom (the surface-layer contributions,
+            // shared identically between legacy and full - see the function header comment). Not
+            // yet trimmed against other colours: merge_segmented_layers intersects/diffs it against
+            // the fully-resolved claim itself, so no priority resolution needs to be repeated here.
+            for (size_t color_idx = 0; color_idx < legacy_top_and_bottom_layers_out.size(); ++color_idx) {
+                ExPolygons &reach = legacy_top_and_bottom_layers_out[color_idx][layer_idx];
+                append(reach, triangles_by_color_top[color_idx][layer_idx]);
+                append(reach, triangles_by_color_top[color_idx][layer_idx + num_layers]);
+                append(reach, triangles_by_color_bottom[color_idx][layer_idx]);
+                append(reach, triangles_by_color_bottom[color_idx][layer_idx + num_layers]);
+                append(reach, legacy_shell_triangles_by_color_top[color_idx][layer_idx]);
+                append(reach, legacy_shell_triangles_by_color_top[color_idx][layer_idx + num_layers]);
+                append(reach, legacy_shell_triangles_by_color_bottom[color_idx][layer_idx]);
+                append(reach, legacy_shell_triangles_by_color_bottom[color_idx][layer_idx + num_layers]);
+                if (! reach.empty())
+                    reach = union_ex(reach);
+            }
             ExPolygons painted_exploys;
             for (size_t color_idx = 0; color_idx < triangles_by_color_merged.size(); ++color_idx) {
                 auto &self = triangles_by_color_merged[color_idx][layer_idx];
@@ -2534,6 +2590,7 @@ static void remove_multiple_edges_in_vertices(MMU_Graph &graph, const std::vecto
 
 static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::vector<std::vector<ExPolygons>> &segmented_regions,
                                                                    std::vector<std::vector<ExPolygons>>      &&top_and_bottom_layers,
+                                                                   std::vector<std::vector<ExPolygons>>      &&legacy_top_and_bottom_layers,
                                                                    const size_t                                num_facets_states,
                                                                    const std::function<void()>                &throw_on_cancel_callback)
 {
@@ -2541,6 +2598,49 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
     std::vector<std::vector<ExPolygons>> segmented_regions_merged(num_layers);
     segmented_regions_merged.assign(num_layers, std::vector<ExPolygons>(num_facets_states));
     assert(!top_and_bottom_layers.size() || num_facets_states == top_and_bottom_layers.size());
+    assert(!legacy_top_and_bottom_layers.size() || num_facets_states == legacy_top_and_bottom_layers.size());
+
+    // Fix-wave (wave-b-review.md Important 2): a painted colour's DEEPENED (beyond-legacy-shell)
+    // top/bottom reach must not silently annex a NEIGHBOURING PAINTED colour's own lateral claim -
+    // merge_segmented_layers's own §2.2 fix already stops a base (color_idx 0) claim from doing
+    // this to a painted lateral band, but nothing stops one PAINTED colour's claim from doing the
+    // same to another's, and Wave B deepened that reach 2.5x (6 -> 15 layers at stock defaults).
+    // Bounding the trim loop below to the legacy reach alone is NOT enough by itself: this
+    // colour's own excess is still appended into ITS OWN region unconditionally further down, so
+    // skipping the trim would leave the SAME area double-claimed - a real overlap, not merely an
+    // unfixed asymmetry. So clip the excess itself here, against every OTHER painted colour's own
+    // (raw, pre-trim) lateral claim, and rebuild this colour's top_and_bottom claim as
+    // legacy U clipped-excess before the merge loop ever sees it - one self-consistent claim that
+    // the trim loop AND the append-back both keep using completely unmodified below. Base colour
+    // (color_idx 0) never deepens (segmentation_top_and_bottom_layers's own "PAINTED COLOURS ONLY"
+    // gate: color_idx 0's top_descent_layers == top_shell_layers always), so its excess is empty
+    // by construction and this loop starting at color_idx 1 is correct, not an oversight.
+    if (!top_and_bottom_layers.empty() && !legacy_top_and_bottom_layers.empty()) {
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&segmented_regions, &top_and_bottom_layers, &legacy_top_and_bottom_layers, &num_facets_states, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
+            for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
+                throw_on_cancel_callback();
+                for (size_t color_idx = 1; color_idx < num_facets_states; ++color_idx) {
+                    ExPolygons &full = top_and_bottom_layers[color_idx][layer_idx];
+                    if (full.empty())
+                        continue;
+                    const ExPolygons &legacy = legacy_top_and_bottom_layers[color_idx][layer_idx];
+                    ExPolygons        excess = legacy.empty() ? full : diff_ex(full, legacy);
+                    if (excess.empty())
+                        continue;
+                    ExPolygons other_painted_laterals;
+                    for (size_t other_idx = 1; other_idx < num_facets_states; ++other_idx)
+                        if (other_idx != color_idx && !segmented_regions[layer_idx][other_idx].empty())
+                            append(other_painted_laterals, segmented_regions[layer_idx][other_idx]);
+                    if (other_painted_laterals.empty())
+                        continue;
+                    ExPolygons excess_clipped = diff_ex(excess, other_painted_laterals);
+                    ExPolygons combined       = legacy;
+                    append(combined, std::move(excess_clipped));
+                    full = std::move(combined);
+                }
+            }
+        });
+    }
 
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - Merging segmented layers in parallel - Begin";
     tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&segmented_regions, &top_and_bottom_layers, &segmented_regions_merged, &num_facets_states, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
@@ -2885,12 +2985,15 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
 
     // The first index is extruder number (includes default extruder), and the second one is layer number
     std::vector<std::vector<ExPolygons>> top_and_bottom_layers;
+    // Fix-wave (wave-b-review.md Important 2): the legacy-depth shadow of top_and_bottom_layers -
+    // see segmentation_top_and_bottom_layers's header comment and merge_segmented_layers.
+    std::vector<std::vector<ExPolygons>> legacy_top_and_bottom_layers;
     if (include_top_and_bottom_layers == IncludeTopAndBottomLayers::Yes) {
-        top_and_bottom_layers = segmentation_top_and_bottom_layers(print_object, input_expolygons, extract_facets_info, num_facets_states, segmentation_normal_depth, throw_on_cancel_callback);
+        top_and_bottom_layers = segmentation_top_and_bottom_layers(print_object, input_expolygons, extract_facets_info, num_facets_states, segmentation_normal_depth, legacy_top_and_bottom_layers, throw_on_cancel_callback);
         throw_on_cancel_callback();
     }
 
-    std::vector<std::vector<ExPolygons>> segmented_regions_merged = merge_segmented_layers(segmented_regions, std::move(top_and_bottom_layers), num_facets_states, throw_on_cancel_callback);
+    std::vector<std::vector<ExPolygons>> segmented_regions_merged = merge_segmented_layers(segmented_regions, std::move(top_and_bottom_layers), std::move(legacy_top_and_bottom_layers), num_facets_states, throw_on_cancel_callback);
     throw_on_cancel_callback();
 
 #ifdef MM_SEGMENTATION_DEBUG_REGIONS

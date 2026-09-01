@@ -407,9 +407,26 @@ narrower than a wall stack on layers below the painted extent. Not recommended.)
 
 ## 7. Costs
 
+**Fix-wave correction (wave-b-review.md Important 3): this "total extrusion is unchanged" claim
+below is wrong and was contradicted two paragraphs later even in the original text.** The claim
+*volume* is a re-colouring at constant infill density (true, and the reason the intuition below
+felt right), but the job's total extrusion goes UP: ~9 extra tool changes per painted flat cap at
+stock defaults (6 → 15 layers), each with its own purge (≈ 2.5 cm³ at the stock 280 mm³ flush
+default — see PrintConfig.cpp's `flush_volumes_matrix`), plus the wall loops the new colour
+boundary adds on every newly split sparse-infill layer. See wave-b-report.md §6 for the full
+corrected accounting. Original text, kept for context:
 **Material: none wasted; it is exactly the shell volume.** The claim is the set of material
 within `D` of the painted surface — the minimum volume that can deliver `D` of opacity.
-Filament shifts from base to painted colour; total extrusion is unchanged.
+Filament shifts from base to painted colour; total extrusion is unchanged **for the object's own
+solid volume only, not for the job as a whole** (see the correction above).
+
+**Positive result, stronger than "byte-identical" (review's Minor 1, worth recording here too):**
+on the painted path, Wave B's claim is a strict SUPERSET of the legacy claim at every slope, so
+nothing anywhere is degraded — N1 replaces a subset of `top_ex` with `top_ex` itself (a
+superset), N2 only raises the loop bound, N3 only removes break opportunities, and the one added
+break only fires where the legacy term was already empty. This is provable independent of slope
+purity and is the claim to rely on, not "24°+ is byte-identical" (which needs a pure slope to
+hold).
 
 **Lateral footprint grows a lot on shallow slopes** — `D/tan θ` = 8.14 mm at 10°, 5.36 mm at
 15°, 3.94 mm at 20°. That is correct (normal thickness is still 1.4 mm) but it is visually
