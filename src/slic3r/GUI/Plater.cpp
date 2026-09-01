@@ -13750,6 +13750,46 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
     return return_state;
 }
 
+// Ultra (Phase 10): per-nozzle loaded-filament info + AMS slot budget from the connected multi-nozzle
+// printer's AMS. Splits AMS banks by Ams::nozzle. Empty if the layout is not multi-nozzle.
+static std::vector<std::vector<DynamicPrintConfig>> ultra_build_extruder_filament_info_from_ams(MachineObject* obj, std::vector<std::string>* out_ams_count = nullptr)
+{
+    std::vector<std::vector<DynamicPrintConfig>> infos;
+    if (!obj) return infos;
+    int nozzles = 0;
+    for (auto& kv : obj->amsList)
+        if (kv.second) nozzles = std::max(nozzles, kv.second->nozzle + 1);
+    if (nozzles < 2) return infos;
+    infos.resize(nozzles);
+    std::vector<std::map<int, int>> cap_per_noz(nozzles); // map<bank_slot_count, num_banks>
+    for (auto& kv : obj->amsList) {
+        Ams* a = kv.second;
+        if (!a) continue;
+        int nz = a->nozzle;
+        if (nz < 0 || nz >= nozzles) continue;
+        int cap = (int) a->trayList.size();
+        if (cap > 0) cap_per_noz[nz][cap] += 1;
+        for (auto& tv : a->trayList) {
+            AmsTray* t = tv.second;
+            if (!t || !t->is_tray_info_ready()) continue;
+            DynamicPrintConfig cfg;
+            cfg.set_key_value("filament_type",   new ConfigOptionStrings{ t->get_filament_type() });
+            cfg.set_key_value("filament_colour", new ConfigOptionStrings{ into_u8(wxColour("#" + t->color).GetAsString(wxC2S_HTML_SYNTAX)) });
+            cfg.set_key_value("filament_id",     new ConfigOptionStrings{ t->setting_id });
+            infos[nz].push_back(std::move(cfg));
+        }
+    }
+    if (out_ams_count) {
+        out_ams_count->assign(nozzles, "");
+        for (int n = 0; n < nozzles; ++n) {
+            std::string s;
+            for (auto& c : cap_per_noz[n]) { if (!s.empty()) s += "|"; s += std::to_string(c.first) + "#" + std::to_string(c.second); }
+            (*out_ams_count)[n] = s;
+        }
+    }
+    return infos;
+}
+
 // Restart background processing thread based on a bitmask of UpdateBackgroundProcessReturnState.
 bool Plater::priv::restart_background_process(unsigned int state)
 {
@@ -13757,6 +13797,39 @@ bool Plater::priv::restart_background_process(unsigned int state)
         // Avoid a race condition
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", Line %1%: ui jobs running, return false")%__LINE__;
         return false;
+    }
+
+    // Ultra (Phase 10): AMS-aware grouping via Print MEMBERS ONLY (never the print/project config, which the
+    // fragile web device view reads and nulls out on). When a Bambu dual-nozzle profile is loaded AND a
+    // matching multi-nozzle printer is selected, carry the live AMS filaments + slot budget + a force-match
+    // flag on the Print; the grouping reads them. Any other case clears the flag so a re-slice reverts to
+    // flush. The gcode filament_map write (Phase 6, proven safe) still happens.
+    if (this->printer_technology == ptFFF && !this->background_process.empty()) {
+        if (Slic3r::Print* print = this->background_process.fff_print()) {
+            print->set_ultra_force_match_mode(false);
+            print->set_ultra_ams_count({});
+            DeviceManager* dev = wxGetApp().getDeviceManager();
+            MachineObject* obj = dev ? dev->get_selected_machine() : nullptr;
+            if (obj && obj->is_multi_extruders() && print->is_BBL_printer()) {
+                int ec = 0;
+                bool dual_nozzle_profile = const_cast<DynamicPrintConfig&>(print->full_print_config()).support_different_extruders(ec);
+                std::vector<std::string> ams_count;
+                auto infos = ultra_build_extruder_filament_info_from_ams(obj, &ams_count);
+                const size_t profile_nozzles = print->config().nozzle_diameter.values.size();
+                if (dual_nozzle_profile && !infos.empty() && infos.size() == profile_nozzles) {
+                    print->set_extruder_filament_info(infos);
+                    print->set_ultra_ams_count(ams_count);
+                    print->set_ultra_force_match_mode(true);
+                    int total = 0; for (auto& v : infos) total += (int)v.size();
+                    std::string acs; for (auto& s : ams_count) acs += "[" + s + "]";
+                    BOOST_LOG_TRIVIAL(warning) << "[Ultra P10] AMS-aware slice (config-bypass): match mode, " << infos.size()
+                                               << " nozzles, " << total << " loaded filaments, ams_count=" << acs;
+                } else if (dual_nozzle_profile && !infos.empty()) {
+                    BOOST_LOG_TRIVIAL(warning) << "[Ultra P10] AMS-aware slice SKIPPED: device nozzles=" << infos.size()
+                                               << " != profile nozzles=" << profile_nozzles << " (wrong device type for this profile)";
+                }
+            }
+        }
     }
 
     if ( ! this->background_process.empty() &&

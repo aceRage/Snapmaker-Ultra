@@ -1290,7 +1290,11 @@ FilamentGroupContext build_filament_group_context(
     collect_unprintable_limits(physical_unprintables, geometric_unprintables, ext_unprintable_filaments);
 
     bool ignore_ext_filament = false;
-    std::vector<std::string> extruder_ams_count_str = print_config.extruder_ams_count.values;
+    // Ultra (Phase 10): the AMS slot budget comes ONLY from the Print member (set from the live AMS). We
+    // deliberately never write extruder_ams_count in this fork (the web device UI reads it), so the config
+    // key is only ever empty or a stale imported-3mf value — do NOT fall back to it, or that stale value
+    // could silently drive grouping. Empty member -> empty -> calc_max_group_size default (flush path).
+    const std::vector<std::string>& extruder_ams_count_str = print->get_ultra_ams_count();
     auto extruder_ams_counts = get_extruder_ams_count(extruder_ams_count_str);
     std::vector<int> group_size = calc_max_group_size(extruder_ams_counts, ignore_ext_filament);
 
@@ -1497,8 +1501,13 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume()
         bool is_sequential = (print_config->print_sequence == PrintSequence::ByObject) && (m_print->objects().size() > 1);
         if (!is_sequential && const_cast<DynamicPrintConfig*>(m_print_full_config)->support_different_extruders(extruder_count)) {
             LayerData layer_data = collect_layer_and_unprintable_data();
+            // Ultra (Phase 10): force match mode from the Print flag (set when a live AMS is available) rather
+            // than the config key, which we do NOT overwrite (the web device UI reads filament_map_mode).
+            FilamentMapMode group_mode = m_print->get_ultra_force_match_mode()
+                                         ? FilamentMapMode::fmmAutoForMatch
+                                         : print_config->filament_map_mode.value;
             auto grouping = ToolOrdering::get_recommended_filament_maps(
-                m_print, layer_data.layer_filaments, print_config->filament_map_mode.value,
+                m_print, layer_data.layer_filaments, group_mode,
                 layer_data.physical_unprintables, layer_data.geometric_unprintables, layer_data.filament_unprintable_volumes);
             m_print->set_nozzle_group_result(std::make_shared<MultiNozzleUtils::LayeredNozzleGroupResult>(grouping));
             // Ultra (Phase 6): write the 1-based filament->extruder map into the live config so process (wipe

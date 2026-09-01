@@ -949,6 +949,17 @@ public:
     std::vector<std::set<int>> get_physical_unprintable_filaments(const std::vector<unsigned int>& used_filaments) const;
     std::map<int, std::set<NozzleVolumeType>> get_filament_unprintable_flow(const std::vector<unsigned int>& used_filaments) const;
 
+    // Ultra (Phase 10): AMS-aware grouping inputs carried OUTSIDE the print config. The per-nozzle AMS slot
+    // budget (extruder_ams_count "cap#numBanks" per nozzle) and the "force match mode" flag are set from the
+    // connected printer's AMS before slicing. Kept as Print members (not config keys) because
+    // extruder_ams_count / filament_map_mode are config the fragile Bambu web device view reads, and writing
+    // grouping values into them nulls its connected machine (breaks the print menu). The grouping reads these
+    // members instead. Empty/false -> grouping uses its config default (flush).
+    const std::vector<std::string>& get_ultra_ams_count() const { return m_ultra_ams_count; }
+    void set_ultra_ams_count(const std::vector<std::string>& v) { m_ultra_ams_count = v; }
+    bool get_ultra_force_match_mode() const { return m_ultra_force_match_mode; }
+    void set_ultra_force_match_mode(bool v) { m_ultra_force_match_mode = v; }
+
     // methods for handling state
     bool                is_step_done(PrintStep step) const { return Inherited::is_step_done(step); }
     // Returns true if an object step is done on all objects and there's at least one object.
@@ -1138,6 +1149,9 @@ private:
     std::vector<std::vector<DynamicPrintConfig>>            m_extruder_filament_info;
     std::unordered_map<int, std::unordered_map<int, double>> m_filament_print_time;
     std::vector<std::set<int>>                             m_geometric_unprintable_filaments;
+    // Ultra (Phase 10): AMS-aware grouping inputs kept out of the print config (see accessors).
+    std::vector<std::string>                              m_ultra_ams_count;
+    bool                                                  m_ultra_force_match_mode = false;
 
     //SoftFever
     bool m_isBBLPrinter;
