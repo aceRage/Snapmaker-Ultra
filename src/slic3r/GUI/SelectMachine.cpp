@@ -1060,8 +1060,31 @@ bool SelectMachineDialog::do_ams_mapping(MachineObject *obj_)
 {
     if (!obj_) return false;
     obj_->get_ams_colors(m_cur_colors_in_thumbnail);
+
+    // Ultra (Phase 10 diagnostics): dump the connected printer's AMS layout, each bank's nozzle_id, and the
+    // dual-nozzle grouping (project_config.filament_map). Warning-level so it beats the fork's log floor.
+    // This shows the real H2D AMS topology needed to route each filament to its assigned nozzle's bank.
+    {
+        std::string fm_str;
+        if (auto* fm = wxGetApp().preset_bundle->project_config.option<ConfigOptionInts>("filament_map"))
+            for (int v : fm->values) fm_str += std::to_string(v) + " ";
+        BOOST_LOG_TRIVIAL(warning) << "[Ultra P10] filament_map(1based nozzle per filament)= " << fm_str
+                                   << " | filaments=" << m_filaments.size();
+        for (auto it = obj_->amsList.begin(); it != obj_->amsList.end(); ++it) {
+            Ams* a = it->second;
+            std::string trays;
+            if (a) for (auto t = a->trayList.begin(); t != a->trayList.end(); ++t)
+                trays += "[slot " + t->first + " " + (t->second ? t->second->color : "?") + " " + (t->second ? t->second->get_filament_type() : "?") + "]";
+            BOOST_LOG_TRIVIAL(warning) << "[Ultra P10] AMS id=" << it->first
+                                       << " nozzle=" << (a ? a->nozzle : -99) << " trays=" << trays;
+        }
+    }
+
     // try color and type mapping
     int result = obj_->ams_filament_mapping(m_filaments, m_ams_mapping_result);
+    for (const auto& r : m_ams_mapping_result)
+        BOOST_LOG_TRIVIAL(warning) << "[Ultra P10] map F(" << (r.id+1) << ") -> tray " << (r.tray_id+1)
+                                   << " ams_id=" << r.ams_id << " slot_id=" << r.slot_id;
     if (result == 0) {
         print_ams_mapping_result(m_ams_mapping_result);
         std::string ams_array;
