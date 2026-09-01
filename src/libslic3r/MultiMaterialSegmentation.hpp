@@ -64,6 +64,14 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               // absorb as its F1 guard. 0.f (paired with segmentation_normal_depth
                                                               // == 0.f) disables the absorb entirely.
                                                               float                                                            segmentation_wall_stack,
+                                                              // ITEM 2 (interclaim-sliver-investigation.md loose end 3, shell-
+                                                              // setting-and-gapfill-report.md): the WIDER kill width the #7104
+                                                              // thin-projection filter uses when gap_infill_speed == 0 for at
+                                                              // least one of the object's regions (mm, max across such regions,
+                                                              // 0.f if none), plumbed through to the absorb so its own kill width
+                                                              // can track the wider sliver population that configuration
+                                                              // produces instead of silently under-covering it. See the .cpp.
+                                                              float                                                            segmentation_claim_width_gapfill_off,
                                                               bool                                                             segmentation_interlocking_beam,
                                                               IncludeTopAndBottomLayers                                        include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback);

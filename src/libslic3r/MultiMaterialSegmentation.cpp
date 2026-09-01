@@ -2691,9 +2691,19 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
                                                                    // whether depth is bounded at all (segmentation_normal_depth > 0.f at
                                                                    // the call site - the SAME condition the rest of the feature gates on,
                                                                    // so paint_depth_mode == unlimited stays byte-identical: the entire
-                                                                   // absorb stage is skipped, not merely a no-op inside it).
+                                                                   // absorb stage is skipped, not merely a no-op inside it). ITEM 2
+                                                                   // plumbing added below: min_claim_width_gapfill_off.
                                                                    const std::vector<ExPolygons>              &input_expolygons,
                                                                    const float                                  min_claim_width,
+                                                                   // ITEM 2 (interclaim-sliver-investigation.md loose end 3):
+                                                                   // the wider gap-fill-disabled kill width (mm, 0.f if no
+                                                                   // region has gap fill off), MAX'd against min_claim_width
+                                                                   // at the point of use below rather than folded into
+                                                                   // min_claim_width itself - min_claim_width is ALSO the
+                                                                   // degradation ladder's floor (paint_depth_clamp_keep_core,
+                                                                   // cut_segmented_layers) and widening that floor is a
+                                                                   // different, unrelated change this fix does not make.
+                                                                   const float                                  min_claim_width_gapfill_off,
                                                                    const float                                  wall_stack,
                                                                    const bool                                   bounded_mode,
                                                                    const std::function<void()>                &throw_on_cancel_callback)
@@ -2807,7 +2817,20 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
         //     neighbouring colours' claims are eroded independently and the miter-join corner
         //     truncation adds to the gap. A t of small_region_threshold (kill width 0.225mm)
         //     would leave every one of them behind; t = min_claim_width / 2 catches them.
-        const float t                 = scaled<float>(min_claim_width * 0.5f);
+        //
+        // ITEM 2 (interclaim-sliver-investigation.md loose end 3, corrected the same way as the
+        // above): min_claim_width alone stops covering the sliver population once gap fill is
+        // disabled for at least one region. With gap_infill_speed == 0, small_region_threshold's
+        // OWN kill width triples to ~0.75mm at stock flows (the OTHER arm of the same ternary
+        // this comment's first bullet already reasons about) - wider than min_claim_width's
+        // 0.45mm - so a sliver in that wider range has a "printable core" under a t = min_claim_
+        // width/2 opening and is (wrongly) left as genuine base. min_claim_width_gapfill_off
+        // carries that wider quantity (0.f, hence inert, unless a region actually has gap fill
+        // off - see the call-site comment, multi_material_segmentation_by_painting); MAX against
+        // min_claim_width so an object with gap fill enabled everywhere is byte-identical to
+        // before this fix.
+        const float effective_claim_width = std::max(min_claim_width, min_claim_width_gapfill_off);
+        const float t                 = scaled<float>(effective_claim_width * 0.5f);
         const float wall_stack_scaled = scaled<float>(wall_stack);
         // eps = 2*SCALED_EPSILON (the investigation's own choice): just enough to make a
         // zero-area touch (shared boundary only) register as an overlap for
@@ -2978,6 +3001,17 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               // skin caller's value) disables the absorb, matching its 0.f
                                                               // segmentation_normal_depth.
                                                               const float                                                      segmentation_wall_stack,
+                                                              // ITEM 2 (interclaim-sliver-investigation.md loose end 3 / shell-
+                                                              // setting-and-gapfill-report.md): the WIDER kill width the #7104
+                                                              // thin-projection filter uses when gap_infill_speed == 0 for at
+                                                              // least one of the object's regions (mm, max across such regions,
+                                                              // 0.f if none), plumbed through to merge_segmented_layers's
+                                                              // interior inter-claim absorb so its own kill width can track it
+                                                              // instead of silently under-covering the wider sliver population
+                                                              // that configuration produces. 0.f (the fuzzy skin caller's value,
+                                                              // paired with segmentation_wall_stack == 0.f) is inert - the
+                                                              // absorb never runs on that path regardless.
+                                                              const float                                                      segmentation_claim_width_gapfill_off,
                                                               const bool                                                       segmentation_interlocking_beam,
                                                               const IncludeTopAndBottomLayers                                  include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback)
@@ -3204,7 +3238,7 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
     }
 
     std::vector<std::vector<ExPolygons>> segmented_regions_merged = merge_segmented_layers(segmented_regions, std::move(top_and_bottom_layers), std::move(legacy_top_and_bottom_layers), num_facets_states,
-                                                                                            input_expolygons, segmentation_min_claim_width, segmentation_wall_stack, segmentation_normal_depth > 0.f, throw_on_cancel_callback);
+                                                                                            input_expolygons, segmentation_min_claim_width, segmentation_claim_width_gapfill_off, segmentation_wall_stack, segmentation_normal_depth > 0.f, throw_on_cancel_callback);
     throw_on_cancel_callback();
 
 #ifdef MM_SEGMENTATION_DEBUG_REGIONS
@@ -3275,6 +3309,26 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // MORE, so it can only make the absorb LESS willing to touch a component near the contour,
     // never more.
     float                max_wall_stack_absorb = 0.f;
+    // ITEM 2 (interclaim-sliver-investigation.md loose end 3 / interclaim-absorb-report.md
+    // "still open", shell-setting-and-gapfill-report.md): when gap_infill_speed == 0,
+    // layer_color_stat's small_region_threshold (below) takes its "gap fill disabled" arm -
+    // ext_perimeter_width + 0.7 * that region's extrusion spacing, instead of half the width -
+    // which widens the #7104 thin-projection filter's kill width from 0.225mm to ~0.75mm at
+    // stock flows (interclaim-sliver-investigation.md section 2 "Config sensitivity"). That
+    // widens the population of inter-claim base slivers past the absorb's own kill width
+    // (min_claim_width, 0.45mm - see the absorb's threshold comment in merge_segmented_layers),
+    // so a sliver in that gap survives the absorb and prints body-coloured. Track the SAME
+    // quantity here so the absorb can be told about it: MAX across regions where gap fill is
+    // actually disabled (0.f if none, so an object with gap fill enabled everywhere - today's
+    // default - is byte-identical: the absorb then falls back to min_claim_width exactly as
+    // before this fix). Deliberately UNCONDITIONAL on wall_generator (unlike max_wall_stack
+    // above, which is classic-only) - the sliver is created by segmentation, upstream of and
+    // identical for both perimeter generators; only whether it PRINTS differs (Classic starts
+    // emitting an external loop once a strip clears roughly one bead; Arachne widens ANY strip
+    // past min_feature_size, 0.1mm, into a min_bead_width, 0.34mm, bead) - at ~0.75mm both
+    // generators clear their own threshold and print it, so both are affected by the defect
+    // this is fixing.
+    float                max_claim_width_absorb_gapfill_off = 0.f;
     for (size_t region_idx = 0; region_idx < print_object.num_printing_regions(); ++region_idx) {
         const PrintRegion &region                 = print_object.printing_region(region_idx);
         const float         ext_perimeter_width   = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).width();
@@ -3290,6 +3344,9 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
         max_ext_perimeter_width = std::max(max_ext_perimeter_width, ext_perimeter_width);
         if (perimeter_spacing > 0.f)
             min_perimeter_spacing = min_perimeter_spacing > 0.f ? std::min(min_perimeter_spacing, perimeter_spacing) : perimeter_spacing;
+        if (region.config().gap_infill_speed.value <= 0.f)
+            max_claim_width_absorb_gapfill_off = std::max(max_claim_width_absorb_gapfill_off,
+                ext_perimeter_width + 0.7f * Flow::rounded_rectangle_extrusion_spacing(ext_perimeter_width, float(print_object.config().layer_height.value)));
     }
     // Beam-interlocking mutual exclusion (:2169 below) is unchanged, but the interlocking
     // sub-band must only ever be active when depth is actually bounded (spec Stage 1, "Interlocking
@@ -3371,7 +3428,7 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // which is a contract worth reading at the call site rather than deriving.
     const float paint_depth_normal_mm = paint_depth_mode != pdmUnlimited ? max_width : 0.f;
 
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, max_ext_perimeter_width, paint_depth_normal_mm, max_wall_stack_absorb, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, max_ext_perimeter_width, paint_depth_normal_mm, max_wall_stack_absorb, max_claim_width_absorb_gapfill_off, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
 }
 
 // Returns fuzzy skin segmentation based on painting in fuzzy skin segmentation gizmo
@@ -3399,7 +3456,9 @@ std::vector<std::vector<ExPolygons>> fuzzy_skin_segmentation_by_painting(const P
     // just above, this keeps merge_segmented_layers's bounded_mode gate false, so the interior
     // inter-claim absorb never runs on the fuzzy skin path (which has no notion of "painted
     // colour claims" for it to absorb between in the first place).
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, max_external_perimeter_width, 0.f, 0.f, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
+    // ITEM 2: 0.f for segmentation_claim_width_gapfill_off too, for the same reason - the
+    // absorb never runs on this path regardless, so there is no threshold for it to widen.
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, max_external_perimeter_width, 0.f, 0.f, 0.f, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
 }
 
 } // namespace Slic3r

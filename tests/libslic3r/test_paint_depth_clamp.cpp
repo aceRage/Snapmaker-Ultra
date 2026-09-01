@@ -3262,10 +3262,14 @@ TEST_CASE("interclaim_absorb_winner: largest shared area wins, and a genuine tie
 // paint_depth_test_config() only ever paint a single colour. New helper rather than extending
 // either of those (which stay untouched), matching this file's established precedent - see
 // slice_two_painted_colours's own comment above.
+// ITEM 2 (loose end 3, shell-setting-and-gapfill-report.md): trailing gap_infill_speed
+// parameter, same < 0 "leave at the registry default" sentinel slice_painted_box already uses
+// for interlocking_depth, so every existing caller (which omits it) is unaffected.
 PrintObject *slice_bounded_frustum_two_colours(double bottom, double top, double height,
                                                 const std::vector<int> &colour_a_facets, const std::vector<int> &colour_b_facets,
                                                 PaintDepthMode mode, int walls, double layer_height, Print &print,
-                                                PerimeterGeneratorType wall_generator = PerimeterGeneratorType::Arachne)
+                                                PerimeterGeneratorType wall_generator = PerimeterGeneratorType::Arachne,
+                                                double gap_infill_speed = -1.0)
 {
     Model        model;
     ModelObject *object = model.add_object();
@@ -3296,6 +3300,8 @@ PrintObject *slice_bounded_frustum_two_colours(double bottom, double top, double
     config.option<ConfigOptionInt>("bottom_shell_layers")->value                = 3;
     config.option<ConfigOptionFloat>("bottom_shell_thickness")->value           = 0.0;
     config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = wall_generator;
+    if (gap_infill_speed >= 0.0)
+        config.option<ConfigOptionFloat>("gap_infill_speed")->value = gap_infill_speed;
 
     print.set_status_silent();
     print.apply(model, config);
@@ -3315,16 +3321,23 @@ const std::vector<int> FRUSTUM_WALL_POS_Y = {8, 9};
 
 // ITEM 1 regression pin - the investigation's own suggested assertion (interclaim-sliver-
 // investigation.md section 5, Option 1, "Testability"): true if ANY layer of `object` has a
-// base-coloured component that is simultaneously (a) narrower than 2*small_region_threshold
-// (0.225mm at stock flows) - i.e. it has no printable core of its own, exactly what each
-// colour's private opening_ex deletes - and (b) entirely clear of the F1 wall-stack band at the
-// contour - i.e. NOT F1's own territory. Such a component can only be a base sliver trapped
-// between painted claims: genuine base always either touches the contour (F1's territory) or is
-// wide enough to have a printable core, so a THIN, INTERIOR base component has nothing but
-// painted neighbours around it.
-bool has_interclaim_sliver(const PrintObject &object, double wall_stack_mm = 0.878540)
+// base-coloured component that is simultaneously (a) narrower than kill_width_mm - i.e. it has
+// no printable core of its own under an opening by half that width - and (b) entirely clear of
+// the F1 wall-stack band at the contour - i.e. NOT F1's own territory. Such a component can only
+// be a base sliver trapped between painted claims: genuine base always either touches the
+// contour (F1's territory) or is wide enough to have a printable core, so a THIN, INTERIOR base
+// component has nothing but painted neighbours around it.
+// kill_width_mm defaults to 0.45 (= min_claim_width at stock flows, the absorb's OWN kill width
+// - merge_segmented_layers's "t = min_claim_width / 2" - not 2*small_region_threshold, which is
+// a narrower, different quantity; see interclaim-absorb-report.md section 1's threshold
+// correction), so every ITEM 1 caller that omits the parameter is unaffected. ITEM 2 (loose end
+// 3, shell-setting-and-gapfill-report.md) passes the WIDER gap-fill-disabled kill width (0.75mm
+// at stock flows) explicitly, so this probe can actually see the wider sliver population that
+// configuration produces - the default 0.45mm probe would find nothing even when the underlying
+// defect is present, since a ~0.6-0.75mm component has a printable core under a 0.225mm opening.
+bool has_interclaim_sliver(const PrintObject &object, double wall_stack_mm = 0.878540, double kill_width_mm = 0.45)
 {
-    const float t          = float(scale_(0.225));
+    const float t          = float(scale_(kill_width_mm / 2.0));
     const float wall_stack = float(scale_(wall_stack_mm));
     for (size_t layer_idx = 0; layer_idx < object.layer_count(); ++layer_idx) {
         const Layer *layer = object.get_layer(int(layer_idx));
@@ -3527,24 +3540,17 @@ TEST_CASE("multi_material_segmentation_by_painting: Item 2 (band-level opening) 
     }
 }
 
-// ITEM 1, second (curved) fixture. The frustum-based test above turns out NOT to reproduce the
-// defect: every originating layer's own top_ex has the SAME ring width r on a FLAT facet, so the
-// per-colour opening is an all-or-nothing gate per colour (either the whole wall survives it or
-// the whole wall does not) - never a locally varying one, so there is nothing for a neighbouring
-// colour to inherit. The investigation's own mechanism needs r to vary from originating layer to
-// originating layer, so that SOME descent-step contributions survive their own opening_ex while
-// adjacent ones (from a nearby, slightly steeper originating layer) do not - which needs genuine
-// surface CURVATURE, not a flat facet.
-//
-// A sphere gives exactly that: local slope-from-horizontal at polar angle beta from the equator
-// is (90-beta) degrees, continuously varying, so painting two colours split at beta=66deg (slope
-// 24deg, the #7104 ceiling) puts the transition interclaim-sliver-investigation.md analyses right
-// at the colour boundary, with genuine curvature on both sides of it - much closer to the
-// reported defect (a curved painted face) than any flat-faceted primitive in this file.
-TEST_CASE("multi_material_segmentation_by_painting: two adjacent painted claims on a curved (sphere) surface leave NO base-coloured sliver at their shared boundary (Item 1)", "[paintdepth]")
+// ITEM 2 (loose end 3, shell-setting-and-gapfill-report.md): same sphere construction as the
+// Item 1 curved two-colour fixture below, extracted into a helper so it can be built twice -
+// once at the registry's own gap_infill_speed default (today's gap-fill-ON behavior, unchanged)
+// and once with it forced to 0 (gap fill disabled - the configuration loose end 3 identified as
+// widening the absorb's own sliver population past its kill width). gap_infill_speed < 0 (the
+// same sentinel slice_bounded_frustum_two_colours/slice_painted_box already use) means "leave it
+// at whatever paint_depth_test_config's own registry default resolves to".
+PrintObject *slice_bounded_sphere_two_colours(double radius, PaintDepthMode mode, int walls, Print &print,
+                                               double gap_infill_speed = -1.0)
 {
-    constexpr double kPi    = 3.14159265358979323846;
-    const double     radius = 8.0;
+    constexpr double kPi = 3.14159265358979323846;
 
     Model        model;
     ModelObject *object = model.add_object();
@@ -3575,7 +3581,7 @@ TEST_CASE("multi_material_segmentation_by_painting: two adjacent painted claims 
     object->add_instance();
     object->ensure_on_bed();
 
-    DynamicPrintConfig config = paint_depth_test_config(pdmWalls, 3);
+    DynamicPrintConfig config = paint_depth_test_config(mode, walls);
     config.set_num_extruders(3);
     config.set_num_filaments(3);
     config.option<ConfigOptionFloats>("filament_diameter")->values = {1.75, 1.75, 1.75};
@@ -3589,14 +3595,36 @@ TEST_CASE("multi_material_segmentation_by_painting: two adjacent painted claims 
     config.option<ConfigOptionFloat>("top_shell_thickness")->value              = 0.6;
     config.option<ConfigOptionInt>("bottom_shell_layers")->value                = 3;
     config.option<ConfigOptionFloat>("bottom_shell_thickness")->value           = 0.0;
+    if (gap_infill_speed >= 0.0)
+        config.option<ConfigOptionFloat>("gap_infill_speed")->value = gap_infill_speed;
 
-    Print print;
     print.set_status_silent();
     print.apply(model, config);
     REQUIRE(print.objects().size() == 1);
     PrintObject *out_object = print.objects_mutable().front();
     out_object->slice();
     REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// ITEM 1, second (curved) fixture. The frustum-based test above turns out NOT to reproduce the
+// defect: every originating layer's own top_ex has the SAME ring width r on a FLAT facet, so the
+// per-colour opening is an all-or-nothing gate per colour (either the whole wall survives it or
+// the whole wall does not) - never a locally varying one, so there is nothing for a neighbouring
+// colour to inherit. The investigation's own mechanism needs r to vary from originating layer to
+// originating layer, so that SOME descent-step contributions survive their own opening_ex while
+// adjacent ones (from a nearby, slightly steeper originating layer) do not - which needs genuine
+// surface CURVATURE, not a flat facet.
+//
+// A sphere gives exactly that: local slope-from-horizontal at polar angle beta from the equator
+// is (90-beta) degrees, continuously varying, so painting two colours split at beta=66deg (slope
+// 24deg, the #7104 ceiling) puts the transition interclaim-sliver-investigation.md analyses right
+// at the colour boundary, with genuine curvature on both sides of it - much closer to the
+// reported defect (a curved painted face) than any flat-faceted primitive in this file.
+TEST_CASE("multi_material_segmentation_by_painting: two adjacent painted claims on a curved (sphere) surface leave NO base-coloured sliver at their shared boundary (Item 1)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *out_object = slice_bounded_sphere_two_colours(8.0, pdmWalls, 3, print);
 
     // RED/GREEN, measured on this exact fixture with the absorb toggled off and on
     // (interclaim-absorb-report.md "Diagnosis"): with the absorb OFF, has_interclaim_sliver
@@ -3608,4 +3636,77 @@ TEST_CASE("multi_material_segmentation_by_painting: two adjacent painted claims 
     // go with them. This assertion is therefore NOT satisfied by an area floor - it holds
     // exactly, which is why none is used.
     CHECK_FALSE(has_interclaim_sliver(*out_object));
+}
+
+// ITEM 2 (loose end 3, .superpowers/sdd/2026-08-31-paint-depth/interclaim-sliver-
+// investigation.md section 2 "Config sensitivity" / interclaim-absorb-report.md "still open" /
+// shell-setting-and-gapfill-report.md): with gap_infill_speed == 0, layer_color_stat's
+// small_region_threshold (MultiMaterialSegmentation.cpp) takes its "gap fill disabled" arm -
+// ext_perimeter_width + 0.7 * that region's extrusion spacing - instead of half the width,
+// which widens the #7104 thin-projection filter's kill width from 0.225mm to ~0.75mm at stock
+// flows. That is PAST the absorb's own (unfixed) kill width, min_claim_width = 0.45mm, so an
+// inter-claim sliver up to ~0.75mm wide survives the absorb and prints body-coloured - on the
+// SAME curved sphere fixture Item 1 already fixed for the gap-fill-ON case. This is item 2's
+// regression pin: it must FAIL on HEAD before the fix (the absorb's threshold does not yet
+// track the wider gap-off population) and pass once it does.
+TEST_CASE("multi_material_segmentation_by_painting: gap_infill_speed=0 no longer leaves a base-coloured sliver at a curved colour boundary (Item 2)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_bounded_sphere_two_colours(8.0, pdmWalls, 3, print, /*gap_infill_speed=*/0.0);
+
+    // The WIDER kill width gap_infill_speed=0 actually produces, computed from the object's
+    // own real per-region flow via the EXACT SAME formula layer_color_stat's "gap fill
+    // disabled" arm uses (MultiMaterialSegmentation.cpp) - tracks the production formula
+    // instead of hardcoding a value that could silently drift from it.
+    float ext_perimeter_width = 0.f;
+    for (size_t region_idx = 0; region_idx < object->num_printing_regions(); ++region_idx) {
+        const PrintRegion &region = object->printing_region(region_idx);
+        ext_perimeter_width = std::max(ext_perimeter_width,
+            region.flow(*object, frExternalPerimeter, object->config().layer_height).width());
+    }
+    REQUIRE(ext_perimeter_width > 0.f);
+    const float kill_width_mm = ext_perimeter_width +
+        0.7f * Flow::rounded_rectangle_extrusion_spacing(ext_perimeter_width, float(object->config().layer_height.value));
+    CAPTURE(kill_width_mm);
+
+    CHECK_FALSE(has_interclaim_sliver(*object, /*wall_stack_mm=*/0.878540, double(kill_width_mm)));
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: gap_infill_speed=0 leaves the gap-fill-on sphere fixture's own result unchanged (Item 2)", "[paintdepth]")
+{
+    // Same fixture and probe as the Item 1 sphere test above, sliced with the registry's own
+    // (nonzero) gap_infill_speed default - i.e. gap fill ON, today's behavior, explicitly
+    // pinned unaffected by item 2's fix (which is conditional on gap fill being OFF for at
+    // least one region; an object with gap fill on everywhere must see byte-for-byte the same
+    // absorb threshold as before this fix).
+    Print        print;
+    PrintObject *object = slice_bounded_sphere_two_colours(8.0, pdmWalls, 3, print);
+
+    CHECK_FALSE(has_interclaim_sliver(*object));
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: a genuine base region wider than the gap-fill-off threshold between two painted claims stays base (Item 2 does not over-absorb)", "[paintdepth]")
+{
+    // Same OPPOSITE-walls fixture as the Item 1 "does not over-absorb" test above, but with
+    // gap_infill_speed=0 so item 2's WIDER (gap-fill-disabled) kill width is the one actually
+    // active for this object. The genuine base region here is many mm wide - nowhere close to
+    // either the 0.45mm (gap-on) or ~0.75mm (gap-off) kill width - so if item 2's fix ever
+    // widened the absorb's threshold UNCONDITIONALLY rather than tracking the real gap-fill-off
+    // quantity, or widened it too far, this is exactly the kind of region it would put at risk.
+    // It must stay base.
+    Print        print;
+    PrintObject *object = slice_bounded_frustum_two_colours(40.392, 18., 3., FRUSTUM_WALL_NEG_Y, FRUSTUM_WALL_POS_Y,
+                                                             pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print,
+                                                             PerimeterGeneratorType::Arachne, /*gap_infill_speed=*/0.0);
+    REQUIRE(object->layer_count() >= 27);
+
+    const size_t       probe_layer = 12;
+    const BoundingBox bb = get_extents(object->get_layer(int(probe_layer))->lslices);
+    REQUIRE(bb.defined);
+    // Dead centre of the +X side, far (multiple mm) from both painted walls and from the
+    // frustum's own contour - unambiguously genuine base at any plausible claim width.
+    const Point centre_probe(coord_t(bb.max.x() - scale_(1.0)), (bb.min.y() + bb.max.y()) / 2);
+
+    CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder2*/ 2), centre_probe));
+    CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder3*/ 3), centre_probe));
 }
