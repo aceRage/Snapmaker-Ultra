@@ -1218,23 +1218,48 @@ static bool is_volume_sinking(const indexed_triangle_set &its, const Transform3d
 // reproduces the interleaved walk's result exactly, including its boundary/EPSILON handling.
 static inline int effective_shell_layers_by_thickness(const ConstLayerPtrsAdaptor &layers, size_t surface_layer_idx, bool top, int n_layers, double thickness)
 {
+    // Fix-wave C1 (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-fix-review.md):
+    // a zero layer count is not "no minimum, thickness still applies" - it is "no shell at
+    // all", exactly mirroring PrintObject.cpp:1965 (`if (n_top_layers > 0)`), :1994 (bottom
+    // counterpart) and :4124 (`if (num_solid_layers == 0) continue;`), which gate their entire
+    // gather/scatter blocks on a nonzero count and never reach the thickness term when it's 0.
+    // LayerRegion.cpp:1025-1036 goes further and demotes the surface itself (stTop/stBottom ->
+    // stInternal/stInternalVoid) in that case, so there is no solid skin to paint a color onto,
+    // let alone a shell beneath it. Returning early here (before the thickness walk below can
+    // raise `effective` above 0) keeps this helper's zero-shell case matching that reality.
+    if (n_layers <= 0)
+        return n_layers;
     int effective = n_layers;
     if (thickness > 0.) {
         const size_t   num_layers = layers.size();
         const coordf_t base       = top ? layers[surface_layer_idx]->print_z : layers[surface_layer_idx]->bottom_z();
         int            m          = 0;
+        // Fix-wave I1: `++m` must count the surface layer itself, in addition to every layer
+        // strictly below/above it that the walk visits. When the loop breaks, the layer that
+        // triggered the break is already included by that same iteration's `++m`, so `m` is
+        // already the correct total depth. When the loop instead runs off the end of the
+        // object (idx < 0 for top, idx == num_layers for bottom) every visited layer was inside
+        // `thickness` and none of them ever triggered a break - `m` as left by the loop counts
+        // only the layers below/above the surface, one short of the total depth including the
+        // surface layer itself, so it needs one more increment here.
         if (top) {
-            for (int idx = int(surface_layer_idx) - 1; idx >= 0; --idx) {
+            int idx = int(surface_layer_idx) - 1;
+            for (; idx >= 0; --idx) {
                 ++m;
                 if (base - layers[idx]->print_z >= thickness - EPSILON)
                     break;
             }
+            if (idx < 0)
+                ++m;
         } else {
-            for (size_t idx = surface_layer_idx + 1; idx < num_layers; ++idx) {
+            size_t idx = surface_layer_idx + 1;
+            for (; idx < num_layers; ++idx) {
                 ++m;
                 if (layers[idx]->bottom_z() - base >= thickness - EPSILON)
                     break;
             }
+            if (idx >= num_layers)
+                ++m;
         }
         effective = std::max(effective, m);
     }
@@ -1256,12 +1281,16 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
     //
     // Vertical paint-depth alignment fix: top_shell_thickness / bottom_shell_thickness can
     // demand more layers than top_shell_layers / bottom_shell_layers alone (see the
-    // effective_shell_layers_by_thickness() comment above). max_top_layers / max_bottom_layers
-    // / granularity must account for that too - both so the projection gate right below
-    // correctly opens when layers == 0 but thickness > 0 (pre-fix this stayed 0 and the whole
-    // block was skipped, producing a ZERO painted claim despite a nonzero shell being built),
-    // and so the TBB double-buffer parity trick (layer_idx_offset, further below) keeps enough
-    // overlap margin for the deeper per-layer descent. This is a conservative *upper bound*
+    // effective_shell_layers_by_thickness() comment above) - but ONLY when the corresponding
+    // layer count is itself nonzero (fix-wave C1: a zero count means no shell at all, and
+    // thickness is dead config in that case - see effective_shell_layers_by_thickness()'s early
+    // return and PrintObject.cpp:1965/:1994/:4124). top_layers_eff / bottom_layers_eff below
+    // gate on the configured count being > 0 before consulting thickness, matching that helper
+    // exactly. max_top_layers / max_bottom_layers / granularity must still account for the
+    // thickness-driven deepening in the nonzero case, both so the projection gate right below
+    // opens whenever there is a real (count- or thickness-driven) shell to claim, and so the
+    // TBB double-buffer parity trick (layer_idx_offset, further below) keeps enough overlap
+    // margin for the deeper per-layer descent. This is a conservative *upper bound*
     // only (sizing/gating, not the actual per-layer claim depth, which layer_color_stat()
     // computes exactly below via effective_shell_layers_by_thickness() against each layer's
     // real height): it uses the thinnest layer anywhere in the object, so a uniform-height
@@ -1284,8 +1313,13 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
     int granularity = 1;
     for (size_t i = 0; i < print_object.num_printing_regions(); ++ i) {
         const PrintRegionConfig &config = print_object.printing_region(i).config();
-        const int top_layers_eff    = std::max(config.top_shell_layers.value,    layers_for_thickness(config.top_shell_thickness.value));
-        const int bottom_layers_eff = std::max(config.bottom_shell_layers.value, layers_for_thickness(config.bottom_shell_thickness.value));
+        // Fix-wave C1: gate on the configured count being nonzero before consulting thickness -
+        // a zero count means the generators never build that shell at all (see above), so
+        // thickness must not resurrect it here either.
+        const int top_layers_eff    = config.top_shell_layers.value > 0
+            ? std::max(config.top_shell_layers.value, layers_for_thickness(config.top_shell_thickness.value)) : 0;
+        const int bottom_layers_eff = config.bottom_shell_layers.value > 0
+            ? std::max(config.bottom_shell_layers.value, layers_for_thickness(config.bottom_shell_thickness.value)) : 0;
         max_top_layers    = std::max(max_top_layers, top_layers_eff);
         max_bottom_layers = std::max(max_bottom_layers, bottom_layers_eff);
         granularity       = std::max(granularity, std::max(top_layers_eff, bottom_layers_eff) - 1);
@@ -1434,6 +1468,16 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
         LayerColorStat out;
         const Layer &layer = *layers[layer_idx];
         for (const LayerRegion *region : layer.regions()) {
+            // Fix-wave I2 (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-fix-review.md):
+            // PrintObjectSlice.cpp:5199-5208 gives every layer a LayerRegion for EVERY
+            // PrintRegion on the object, whether or not that region has any geometry on this
+            // particular layer. Without this guard, a region confined to another part of the
+            // object (a modifier, or a Z-stacked volume) still contributes its shell settings
+            // to the max below, inflating the claim depth on layers it never actually touches.
+            // region->slices is populated per-layer at PrintObjectSlice.cpp:5229-5235, before
+            // segmentation runs at :5267, so this is valid and free.
+            if (region->slices.empty())
+                continue;
             const PrintRegionConfig &config = region->region().config();
             // Vertical paint-depth alignment fix, shell-coverage-investigation.md fix (2): the
             // solid shell a painted claim must cover is whichever region reaches deepest on
