@@ -988,6 +988,7 @@ static std::vector<std::string> s_Preset_printer_options {
     // Ultra (dual-nozzle): per-extruder machine descriptors + variant matrix.
     "extruder_type", "default_nozzle_volume_type", "extruder_nozzle_volume_type", "extruder_variant_list",
     "extruder_ams_count", "extruder_nozzle_count", "extruder_max_nozzle_count", "printer_extruder_id",
+    "extruder_nozzle_stats", "machine_switch_extruder_time", "group_algo_with_time", // Ultra (dual-nozzle) grouping inputs
     "printer_extruder_variant", "master_extruder_id", "physical_extruder_map", "extruder_printable_area",
     "extruder_printable_height", "grab_length", "hotend_cooling_rate", "hotend_heating_rate", "nozzle_flush_dataset",
     "printer_technology",

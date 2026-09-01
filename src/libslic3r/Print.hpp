@@ -12,6 +12,7 @@
 #include "Slicing.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "GCode/ToolOrdering.hpp"
+#include "MultiNozzleUtils.hpp" // Ultra (dual-nozzle): NozzleGroupResult held on Print
 #include "GCode/WipeTower.hpp"
 #include "GCode/WipeTower2.hpp"
 #include "GCode/ThumbnailData.hpp"
@@ -923,6 +924,31 @@ public:
     int                 export_cached_data(const std::string& dir_path, bool with_space=false);
     int                 load_cached_data(const std::string& directory);
 
+    // Ultra (dual-nozzle): the filament->nozzle grouping result, computed externally (GUI/CLI) before
+    // process() for AMS-multi-nozzle machines (H2D/H2C/X2D). Null for classic single-/multi-extruder
+    // machines (e.g. Snapmaker U1 toolchanger), which keep the existing per-extruder pipeline.
+    void set_nozzle_group_result(const std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase> result) { m_nozzle_group_result = result; }
+    const std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase> get_nozzle_group_result() const { return m_nozzle_group_result; }
+    std::shared_ptr<MultiNozzleUtils::LayeredNozzleGroupResult> get_layered_nozzle_group_result() const {
+        return std::dynamic_pointer_cast<MultiNozzleUtils::LayeredNozzleGroupResult>(m_nozzle_group_result);
+    }
+
+    // Ultra (dual-nozzle): inputs to the filament->nozzle grouping compute. In BBS these are populated by
+    // GUI slice-prep; this fork does not populate them yet (stubbed-input grouping), so the getters return
+    // empty and the grouper treats every filament as reachable on every nozzle. Setters exist so a later
+    // input-population pass can fill them without touching the grouping code.
+    const std::vector<std::vector<DynamicPrintConfig>>& get_extruder_filament_info() const { return m_extruder_filament_info; }
+    void set_extruder_filament_info(const std::vector<std::vector<DynamicPrintConfig>>& v) { m_extruder_filament_info = v; }
+    std::unordered_map<int, std::unordered_map<int, double>> get_filament_print_time() const { return m_filament_print_time; }
+    void set_filament_print_time(const std::unordered_map<int, std::unordered_map<int, double>>& v) { m_filament_print_time = v; }
+    const std::vector<std::set<int>>& get_geometric_unprintable_filaments() const { return m_geometric_unprintable_filaments; }
+    void set_geometric_unprintable_filaments(const std::vector<std::set<int>>& v) { m_geometric_unprintable_filaments = v; }
+    // Computed on demand: usage type is config-derived (real); physical/flow unprintables are stubbed empty
+    // (the config subsystem they need is not ported).
+    std::vector<FilamentUsageType> get_filament_usage_type() const;
+    std::vector<std::set<int>> get_physical_unprintable_filaments(const std::vector<unsigned int>& used_filaments) const;
+    std::map<int, std::set<NozzleVolumeType>> get_filament_unprintable_flow(const std::vector<unsigned int>& used_filaments) const;
+
     // methods for handling state
     bool                is_step_done(PrintStep step) const { return Inherited::is_step_done(step); }
     // Returns true if an object step is done on all objects and there's at least one object.
@@ -1105,7 +1131,14 @@ private:
     MixedFilamentManager                    m_mixed_filament_mgr;
     PrintObjectPtrs                         m_objects;
     PrintRegionPtrs                         m_print_regions;
-    
+    // Ultra (dual-nozzle): filament->nozzle grouping result set externally before process(); null on
+    // classic machines. Reset in clear().
+    std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase> m_nozzle_group_result;
+    // Ultra (dual-nozzle): grouping inputs (see getters). Empty until an input-population pass fills them.
+    std::vector<std::vector<DynamicPrintConfig>>            m_extruder_filament_info;
+    std::unordered_map<int, std::unordered_map<int, double>> m_filament_print_time;
+    std::vector<std::set<int>>                             m_geometric_unprintable_filaments;
+
     //SoftFever
     bool m_isBBLPrinter;
 

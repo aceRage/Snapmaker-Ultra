@@ -5,8 +5,11 @@
 
 #include "../libslic3r.h"
 #include "../MixedFilament.hpp"
+#include "../MultiNozzleUtils.hpp" // Ultra (dual-nozzle): grouping result types
 
 #include <utility>
+#include <set>
+#include <map>
 
 #include <boost/container/small_vector.hpp>
 
@@ -219,6 +222,26 @@ private:
     void 				collect_extruder_statistics(bool prime_multi_material);
     void                reorder_extruders_for_minimum_flush_volume();
 
+    // Ultra (dual-nozzle): per-slice grouping inputs, and the compute entry that turns them into a
+    // filament->nozzle grouping result. Only invoked for grouping-model machines (H2D/H2C/X2D); classic
+    // machines skip this path entirely. See reorder_extruders_for_minimum_flush_volume().
+    struct LayerData {
+        std::vector<std::vector<unsigned int>>       layer_filaments;
+        std::vector<unsigned int>                    used_filaments;
+        std::vector<std::set<int>>                   physical_unprintables;
+        std::vector<std::set<int>>                   geometric_unprintables;
+        std::map<int, std::set<NozzleVolumeType>>    filament_unprintable_volumes;
+    };
+    LayerData collect_layer_and_unprintable_data();
+    static MultiNozzleUtils::LayeredNozzleGroupResult get_recommended_filament_maps(
+        Print*                                            print,
+        const std::vector<std::vector<unsigned int>>&     layer_filaments,
+        const FilamentMapMode                             mode,
+        const std::vector<std::set<int>>&                 physical_unprintables,
+        const std::vector<std::set<int>>&                 geometric_unprintables,
+        const std::map<int, std::set<NozzleVolumeType>>&  unprintable_volumes,
+        const std::unordered_map<int, int>&               nozzle_status = {});
+
     // BBS
     std::vector<unsigned int> generate_first_layer_tool_order(const Print& print);
     std::vector<unsigned int> generate_first_layer_tool_order(const PrintObject& object);
@@ -244,6 +267,10 @@ private:
     const DynamicPrintConfig*  m_print_full_config = nullptr;
     const PrintConfig*         m_print_config_ptr = nullptr;
     const PrintObject*         m_print_object_ptr = nullptr;
+    // Ultra (dual-nozzle): non-const handle to the owning Print, set in the Print constructor so the
+    // grouping compute can store its result. Null in the ByObject/PrintObject path (grouping is skipped
+    // there anyway). See reorder_extruders_for_minimum_flush_volume().
+    Print*                     m_print = nullptr;
     bool                       m_is_BBL_printer = false;
     // Mixed filament support: pointer to manager (owned by Print) and
     // number of physical extruders.

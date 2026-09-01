@@ -5,6 +5,10 @@
 #include "ClipperUtils.hpp"
 #include "ParameterUtils.hpp"
 #include "../BrimFilament.hpp"
+// Ultra (dual-nozzle): filament->nozzle grouping compute.
+#include "../FilamentGroup.hpp"
+#include "../FilamentGroupUtils.hpp"
+#include "ToolOrderUtils.hpp"
 
 // #define SLIC3R_DEBUG
 
@@ -423,6 +427,9 @@ ToolOrdering::ToolOrdering(const Print &print, unsigned int first_extruder, bool
     m_is_BBL_printer = print.is_BBL_printer();
     m_print_full_config = &print.full_print_config();
     m_print_config_ptr = &print.config();
+    // Ultra (dual-nozzle): non-const handle so reorder_extruders_for_minimum_flush_volume can store the
+    // grouping result. Safe: ToolOrdering runs inside the owning Print's process().
+    m_print = const_cast<Print*>(&print);
     // Mixed filament support.
     m_mixed_mgr   = &print.mixed_filament_manager();
     m_num_physical = print.config().filament_diameter.size();
@@ -1164,6 +1171,307 @@ void ToolOrdering::collect_extruder_statistics(bool prime_multi_material)
     }
 }
 
+// ============================================================================================
+// Ultra (dual-nozzle): filament->nozzle grouping compute. Ported from Bambu Studio, scoped to
+// grouping-model machines (H2D/H2C/X2D) via DynamicPrintConfig::support_different_extruders(). The
+// classic single-/multi-extruder pipeline (incl. Snapmaker U1) never enters this path. Grouping inputs
+// that BBS derives from geometry pre-slicing (geometric/flow unprintables, print time) are stubbed
+// empty in this fork; grouping is therefore flush/color driven only. See Print::get_*_unprintable_*.
+// ============================================================================================
+namespace GroupReorder {
+
+std::function<bool(int, std::vector<int>&)> create_custom_seq_function(
+    const PrintConfig& print_config,
+    bool include_first_layer,
+    const std::vector<unsigned int>& first_layer_filaments = {})
+{
+    std::vector<LayerPrintSequence> other_layers_seqs = get_other_layers_print_sequence(
+        print_config.other_layers_print_sequence_nums.value,
+        print_config.other_layers_print_sequence.values);
+
+    return [other_layers_seqs, include_first_layer, first_layer_filaments](int layer_idx, std::vector<int>& out_seq) -> bool {
+        if (include_first_layer && layer_idx == 0 && !first_layer_filaments.empty()) {
+            out_seq.resize(first_layer_filaments.size());
+            std::transform(first_layer_filaments.begin(), first_layer_filaments.end(), out_seq.begin(), [](int v) { return v + 1; });
+            return true;
+        }
+        for (size_t idx = other_layers_seqs.size() - 1; idx != size_t(-1); --idx) {
+            const auto& other_layers_seq = other_layers_seqs[idx];
+            if (layer_idx + 1 >= other_layers_seq.first.first && layer_idx + 1 <= other_layers_seq.first.second) {
+                out_seq = other_layers_seq.second;
+                return true;
+            }
+        }
+        return false;
+    };
+}
+
+std::vector<MultiNozzleUtils::NozzleGroupInfo> build_nozzle_groups(const PrintConfig& print_config, size_t extruder_nums)
+{
+    std::vector<MultiNozzleUtils::NozzleGroupInfo> nozzle_groups;
+    auto extruder_nozzle_counts = get_extruder_nozzle_stats(print_config.extruder_nozzle_stats.values);
+    auto nozzle_volume_types = print_config.nozzle_volume_type.values;
+    for (size_t idx = 0; idx < extruder_nums; ++idx) {
+        if (idx >= extruder_nozzle_counts.size() || extruder_nozzle_counts[idx].empty()) {
+            nozzle_groups.emplace_back(format_diameter_to_str(print_config.nozzle_diameter.values[idx]), NozzleVolumeType(print_config.nozzle_volume_type.values[idx]), idx,
+                                       print_config.extruder_max_nozzle_count.values[idx]);
+        } else {
+            NozzleVolumeType type = NozzleVolumeType(nozzle_volume_types[idx]);
+            if (type == nvtHybrid) {
+                for (auto [volume_type, count] : extruder_nozzle_counts[idx])
+                    nozzle_groups.emplace_back(format_diameter_to_str(print_config.nozzle_diameter.values[idx]), volume_type, idx, count);
+            } else
+                nozzle_groups.emplace_back(format_diameter_to_str(print_config.nozzle_diameter.values[idx]), type, idx, extruder_nozzle_counts[idx][type]);
+        }
+    }
+    return nozzle_groups;
+}
+
+std::vector<MultiNozzleUtils::NozzleInfo> build_default_nozzle_list(const PrintConfig& print_config, size_t extruder_nums)
+{
+    using namespace MultiNozzleUtils;
+    std::vector<NozzleInfo> nozzle_list;
+    for (size_t idx = 0; idx < extruder_nums; ++idx) {
+        NozzleInfo tmp;
+        tmp.diameter = format_diameter_to_str(print_config.nozzle_diameter.values[idx]);
+        tmp.group_id = idx;
+        tmp.extruder_id = idx;
+        tmp.volume_type = NozzleVolumeType(print_config.nozzle_volume_type.values[idx]);
+        nozzle_list.emplace_back(std::move(tmp));
+    }
+    return nozzle_list;
+}
+
+std::vector<FlushMatrix> prepare_flush_matrices(const PrintConfig& print_config)
+{
+    size_t extruder_nums = print_config.nozzle_diameter.values.size();
+    size_t filament_nums = print_config.filament_colour.values.size();
+    std::vector<FlushMatrix> nozzle_flush_mtx;
+    for (size_t nozzle_id = 0; nozzle_id < extruder_nums; ++nozzle_id) {
+        std::vector<float> flush_matrix(cast<float>(get_flush_volumes_matrix(print_config.flush_volumes_matrix.values, nozzle_id, extruder_nums)));
+        std::vector<std::vector<float>> wipe_volumes;
+        for (unsigned int i = 0; i < filament_nums; ++i)
+            wipe_volumes.push_back(std::vector<float>(flush_matrix.begin() + i * filament_nums, flush_matrix.begin() + (i + 1) * filament_nums));
+        nozzle_flush_mtx.emplace_back(wipe_volumes);
+    }
+    auto flush_multiplies = (print_config.prime_volume_mode == PrimeVolumeMode::pvmFast) ? print_config.flush_multiplier_fast.values : std::vector<double>{};
+    flush_multiplies.resize(extruder_nums, print_config.flush_multiplier.value);
+    for (size_t nozzle_id = 0; nozzle_id < extruder_nums; ++nozzle_id)
+        for (auto& vec : nozzle_flush_mtx[nozzle_id])
+            for (auto& v : vec)
+                v *= flush_multiplies[nozzle_id];
+    return nozzle_flush_mtx;
+}
+
+FilamentGroupContext build_filament_group_context(
+    Print* print,
+    const std::vector<std::vector<unsigned int>>& layer_filaments,
+    const std::vector<std::set<int>>& physical_unprintables,
+    const std::vector<std::set<int>>& geometric_unprintables,
+    const std::map<int, std::set<NozzleVolumeType>>& unprintable_volumes,
+    FilamentMapMode mode,
+    const std::unordered_map<int, int>& nozzle_status)
+{
+    using namespace MultiNozzleUtils;
+    using namespace FilamentGroupUtils;
+
+    FilamentGroupContext context;
+
+    const auto& print_config = print->config();
+    const size_t filament_nums = print_config.filament_colour.values.size();
+    const size_t extruder_nums = print_config.nozzle_diameter.values.size();
+    bool has_multiple_nozzle = std::any_of(print_config.extruder_max_nozzle_count.values.begin(), print_config.extruder_max_nozzle_count.values.end(),
+                                           [](int v) { return v > 1; });
+
+    auto nozzle_flush_mtx = prepare_flush_matrices(print_config);
+    auto nozzle_groups = build_nozzle_groups(print_config, extruder_nums);
+
+    std::vector<std::set<int>> ext_unprintable_filaments(2);
+    collect_unprintable_limits(physical_unprintables, geometric_unprintables, ext_unprintable_filaments);
+
+    bool ignore_ext_filament = false;
+    std::vector<std::string> extruder_ams_count_str = print_config.extruder_ams_count.values;
+    auto extruder_ams_counts = get_extruder_ams_count(extruder_ams_count_str);
+    std::vector<int> group_size = calc_max_group_size(extruder_ams_counts, ignore_ext_filament);
+
+    if (print_config.has_filament_switcher) {
+        int total_filaments = (int)filament_nums;
+        for (auto& s : group_size)
+            s = std::max(s, total_filaments);
+    }
+
+    std::vector<bool> prefer_non_model_filament(extruder_nums);
+    for (size_t idx = 0; idx < extruder_nums; ++idx)
+        prefer_non_model_filament[idx] = (print_config.extruder_type.values[idx] == ExtruderType::etBowden);
+
+    auto machine_filament_info = build_machine_filaments(print->get_extruder_filament_info(), extruder_ams_counts, ignore_ext_filament);
+
+    std::vector<std::string> filament_types = print_config.filament_type.values;
+    std::vector<std::string> filament_colours = print_config.filament_colour.values;
+    std::vector<unsigned char> filament_is_support = print_config.filament_is_support.values;
+    std::vector<std::string> filament_ids = print_config.filament_ids.values;
+    // filament_ids is not normalized per-filament in this fork (see PrintConfig/Preset notes); size it to the
+    // filament count so downstream indexing is safe. Empty ids just mean no identity hint for grouping.
+    if (filament_ids.size() < filament_nums) filament_ids.resize(filament_nums);
+    std::vector<FilamentUsageType> filament_usage_types = print->get_filament_usage_type();
+
+    FGMode fg_mode = mode == FilamentMapMode::fmmAutoForMatch ? FGMode::MatchMode : FGMode::FlushMode;
+    context.model_info.flush_matrix = std::move(nozzle_flush_mtx);
+    context.model_info.unprintable_filaments = ext_unprintable_filaments;
+    context.model_info.layer_filaments = layer_filaments;
+    context.model_info.filament_ids = filament_ids;
+    context.model_info.unprintable_volumes = unprintable_volumes;
+
+    for (size_t idx = 0; idx < filament_types.size(); ++idx) {
+        FilamentGroupUtils::FilamentInfo info;
+        info.color = filament_colours[idx];
+        info.type = filament_types[idx];
+        info.is_support = filament_is_support[idx];
+        info.usage_type = filament_usage_types[idx];
+        context.model_info.filament_info.emplace_back(std::move(info));
+    }
+
+    context.speed_info.filament_print_time = print->get_filament_print_time();
+    context.speed_info.group_with_time = print->config().group_algo_with_time;
+    context.speed_info.filament_change_time = print->config().machine_load_filament_time + print->config().machine_unload_filament_time;
+    context.speed_info.extruder_change_time = print->config().machine_switch_extruder_time;
+    {
+        double load_time = print->config().machine_load_filament_time;
+        double unload_time = print->config().machine_unload_filament_time;
+        context.speed_info.change_time_params.standard_load_time = static_cast<float>(load_time);
+        context.speed_info.change_time_params.standard_unload_time = static_cast<float>(unload_time);
+        context.speed_info.change_time_params.selector_load_time = static_cast<float>(load_time / 2);
+        context.speed_info.change_time_params.selector_unload_time = static_cast<float>(unload_time / 2);
+    }
+
+    context.machine_info.machine_filament_info = machine_filament_info;
+    context.machine_info.max_group_size = std::move(group_size);
+    context.machine_info.master_extruder_id = print_config.master_extruder_id.value - 1;
+    context.machine_info.prefer_non_model_filament = prefer_non_model_filament;
+
+    context.group_info.total_filament_num = (int)(filament_nums);
+    context.group_info.max_gap_threshold = 0.01;
+    context.group_info.strategy = FGStrategy::BestCost;
+    context.group_info.mode = fg_mode;
+    context.group_info.ignore_ext_filament = ignore_ext_filament;
+    context.group_info.has_filament_switcher = print_config.has_filament_switcher.value;
+
+    if (mode == FilamentMapMode::fmmManual)
+        context.group_info.filament_volume_map = print_config.filament_volume_map.values;
+    else
+        context.group_info.filament_volume_map = std::vector<int>(filament_nums, (int)(NozzleVolumeType::nvtHybrid));
+
+    context.nozzle_info.nozzle_list = build_nozzle_list(nozzle_groups);
+    context.nozzle_info.extruder_nozzle_list = build_extruder_nozzle_list(context.nozzle_info.nozzle_list);
+
+    if (context.nozzle_info.nozzle_list.empty())
+        throw Slic3r::RuntimeError(std::string("No valid nozzle found. Please check nozzle count."));
+
+    if (!nozzle_status.empty())
+        context.nozzle_info.nozzle_status = nozzle_status;
+
+    auto used_filaments = collect_sorted_used_filaments(layer_filaments);
+
+    // add_volume_type_limits, only for single-nozzle-per-extruder dual machines
+    if (!has_multiple_nozzle) {
+        std::vector<std::set<int>> ext_unprintable_filaments_with_volume = ext_unprintable_filaments;
+        for (auto& nozzle : context.nozzle_info.nozzle_list) {
+            for (auto fil_id : used_filaments) {
+                auto uv = context.model_info.unprintable_volumes[fil_id];
+                if (uv.count(nozzle.volume_type))
+                    ext_unprintable_filaments_with_volume[nozzle.extruder_id].insert(fil_id);
+            }
+        }
+        for (auto fil_id : used_filaments) {
+            if (ext_unprintable_filaments_with_volume[0].count(fil_id) && ext_unprintable_filaments_with_volume[1].count(fil_id)) {
+                ext_unprintable_filaments_with_volume[0].erase(fil_id);
+                ext_unprintable_filaments_with_volume[1].erase(fil_id);
+            }
+        }
+        context.model_info.unprintable_filaments = ext_unprintable_filaments_with_volume;
+    }
+
+    return context;
+}
+
+} // namespace GroupReorder
+
+MultiNozzleUtils::LayeredNozzleGroupResult ToolOrdering::get_recommended_filament_maps(
+    Print*                                            print,
+    const std::vector<std::vector<unsigned int>>&     layer_filaments,
+    const FilamentMapMode                             mode,
+    const std::vector<std::set<int>>&                 physical_unprintables,
+    const std::vector<std::set<int>>&                 geometric_unprintables,
+    const std::map<int, std::set<NozzleVolumeType>>&  unprintable_volumes,
+    const std::unordered_map<int, int>&               nozzle_status)
+{
+    using namespace FilamentGroupUtils;
+    using namespace MultiNozzleUtils;
+    using namespace GroupReorder;
+
+    if (!print || layer_filaments.empty())
+        return LayeredNozzleGroupResult();
+
+    const auto& print_config = print->config();
+    size_t filament_nums = print_config.filament_colour.values.size();
+    size_t extruder_nums = print_config.nozzle_diameter.values.size();
+    auto used_filaments = collect_sorted_used_filaments(layer_filaments);
+    bool has_multiple_nozzle = std::any_of(print_config.extruder_max_nozzle_count.values.begin(), print_config.extruder_max_nozzle_count.values.end(),
+                                           [](int v) { return v > 1; });
+    bool has_multiple_extruder = extruder_nums > 1;
+
+    auto nozzle_list = build_default_nozzle_list(print_config, extruder_nums);
+
+    if (mode == FilamentMapMode::fmmManual && !has_multiple_nozzle) {
+        auto manual_filament_map = print_config.filament_map.values;
+        std::transform(manual_filament_map.begin(), manual_filament_map.end(), manual_filament_map.begin(), [](int v) { return v - 1; });
+        auto result = LayeredNozzleGroupResult::create(manual_filament_map, nozzle_list, used_filaments);
+        return result ? *result : LayeredNozzleGroupResult();
+    }
+
+    int master_extruder_id = print_config.master_extruder_id.value - 1;
+    std::vector<int> ret(filament_nums, master_extruder_id);
+
+    if (has_multiple_extruder || has_multiple_nozzle) {
+        auto context = build_filament_group_context(print, layer_filaments, physical_unprintables, geometric_unprintables, unprintable_volumes, mode, nozzle_status);
+
+        if (has_multiple_nozzle && mode == FilamentMapMode::fmmManual) {
+            auto manual_filament_map = print_config.filament_map.values;
+            std::transform(manual_filament_map.begin(), manual_filament_map.end(), manual_filament_map.begin(), [](int v) { return v - 1; });
+            ret = calc_filament_group_for_manual_multi_nozzle(manual_filament_map, context);
+        } else if (has_multiple_nozzle && mode == FilamentMapMode::fmmAutoForMatch) {
+            ret = calc_filament_group_for_match_multi_nozzle(context);
+        } else {
+            FilamentGroup fg(context);
+            if (!has_multiple_nozzle)
+                fg.get_custom_seq = create_custom_seq_function(print_config, false);
+            ret = fg.calc_filament_group();
+        }
+
+        if (has_multiple_nozzle) {
+            auto result_opt = LayeredNozzleGroupResult::create(ret, context.nozzle_info.nozzle_list, used_filaments);
+            if (!result_opt) return LayeredNozzleGroupResult();
+            return *result_opt;
+        }
+    }
+
+    auto result_opt = LayeredNozzleGroupResult::create(ret, nozzle_list, used_filaments);
+    return result_opt ? *result_opt : LayeredNozzleGroupResult();
+}
+
+ToolOrdering::LayerData ToolOrdering::collect_layer_and_unprintable_data()
+{
+    LayerData data;
+    for (auto& lt : m_layer_tools)
+        data.layer_filaments.emplace_back(lt.extruders);
+    data.used_filaments = collect_sorted_used_filaments(data.layer_filaments);
+    // Ultra: geometric unprintables and mixed-filament expansion are not populated in this fork (stubbed).
+    data.geometric_unprintables = m_print ? m_print->get_geometric_unprintable_filaments() : std::vector<std::set<int>>{};
+    data.physical_unprintables = m_print ? m_print->get_physical_unprintable_filaments(data.used_filaments) : std::vector<std::set<int>>{};
+    data.filament_unprintable_volumes = m_print ? m_print->get_filament_unprintable_flow(data.used_filaments) : std::map<int, std::set<NozzleVolumeType>>{};
+    return data;
+}
+
 void ToolOrdering::reorder_extruders_for_minimum_flush_volume()
 {
     const PrintConfig *print_config = m_print_config_ptr;
@@ -1173,6 +1481,55 @@ void ToolOrdering::reorder_extruders_for_minimum_flush_volume()
 
     if (!print_config || m_layer_tools.empty())
         return;
+
+    // Ultra (dual-nozzle): for grouping-model machines (H2D/H2C/X2D), compute the filament->nozzle grouping
+    // and store it on the Print for downstream GCode per-layer nozzle queries. Gated on
+    // support_different_extruders() (distinct extruder variants) so classic single-nozzle machines and the
+    // U1 toolchanger (identical variants) never enter this path. Non-sequential prints only. The classic
+    // flush-reorder body below runs unchanged in all cases.
+    // reorder_extruders_for_minimum_flush_volume runs more than once per slice (BBS's filament-savings
+    // estimate pass + the real pass). Each call recomputes and rewrites the stored result, filament_map
+    // header, and placeholder together, so the LAST call wins and the grouping-dependent outputs stay
+    // mutually consistent. (Do NOT guard on the already-stored result: it persists across slices and would
+    // leave a re-slice single-mapped.) The grouping is non-deterministic, so the map may vary per slice.
+    if (m_print && m_print_full_config) {
+        int extruder_count = 0;
+        bool is_sequential = (print_config->print_sequence == PrintSequence::ByObject) && (m_print->objects().size() > 1);
+        if (!is_sequential && const_cast<DynamicPrintConfig*>(m_print_full_config)->support_different_extruders(extruder_count)) {
+            LayerData layer_data = collect_layer_and_unprintable_data();
+            auto grouping = ToolOrdering::get_recommended_filament_maps(
+                m_print, layer_data.layer_filaments, print_config->filament_map_mode.value,
+                layer_data.physical_unprintables, layer_data.geometric_unprintables, layer_data.filament_unprintable_volumes);
+            m_print->set_nozzle_group_result(std::make_shared<MultiNozzleUtils::LayeredNozzleGroupResult>(grouping));
+            // Ultra (Phase 6): write the 1-based filament->extruder map into the live config so process (wipe
+            // tower), the config block, and gcode all route filaments to their assigned nozzle. This is the
+            // simple half of BBS's update_filament_maps_to_config; the per-nozzle filament-variant config
+            // cascade is deferred (identical-variant H2D nozzles make it a near-no-op).
+            {
+                std::vector<int> em = grouping.get_extruder_map(false); // 1-based, per filament index
+                if (!em.empty()) {
+                    // em is sized to the filament count and is the authoritative per-filament map; write it
+                    // unconditionally. (A >= size guard silently skipped the write when full_print_config's
+                    // preset filament_map had a different length, leaving a stale header.)
+                    const_cast<PrintConfig&>(m_print->config()).filament_map.values = em;
+                    // Also write full_print_config: the "; filament_map = " gcode header (append_full_config)
+                    // reads THIS, and the Bambu printer routes filaments to nozzles from that header.
+                    if (m_print_full_config) {
+                        auto* opt = const_cast<DynamicPrintConfig*>(m_print_full_config)->option<ConfigOptionInts>("filament_map", true);
+                        if (opt) opt->values = em;
+                    }
+                }
+            }
+            // Ultra (dual-nozzle): warning-level so it survives the fork's default log filter; lets a slice
+            // log confirm grouping fired and show the filament->extruder assignment.
+            {
+                std::string map_str;
+                for (int e : grouping.get_extruder_map(true)) map_str += std::to_string(e) + " ";
+                BOOST_LOG_TRIVIAL(warning) << "[Ultra] nozzle grouping computed: extruders=" << extruder_count
+                                           << " filament->extruder(0-based): " << map_str;
+            }
+        }
+    }
 
     // Get wiping matrix to get number of extruders and convert vector<double> to vector<float>:
     std::vector<float> flush_matrix(cast<float>(print_config->flush_volumes_matrix.values));

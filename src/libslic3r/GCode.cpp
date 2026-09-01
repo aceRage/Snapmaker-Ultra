@@ -2798,7 +2798,15 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
         // for one nozzle); optional features (prime-tower interface, wipe-avoid, tall-bed obstacle
         // detect) safely disabled. These are set globally so change_filament sees them too.
         {
+            // Ultra (Phase 6): drive per-filament nozzle routing from the stored grouping result (H2D/H2C/X2D).
+            // filament_map is 1-based extruder per filament; the change_filament template + printer firmware
+            // route each filament to its nozzle from this. Null result (classic machines) -> all-1 (single nozzle).
             std::vector<int> fmap(num_filaments > 0 ? num_filaments : 1, 1);
+            if (auto gr = print.get_layered_nozzle_group_result()) {
+                auto em = gr->get_extruder_map(false); // 1-based, per filament index
+                for (size_t i = 0; i < fmap.size() && i < em.size(); ++i)
+                    if (em[i] >= 1) fmap[i] = em[i];
+            }
             this->placeholder_parser().set("filament_map", new ConfigOptionInts(fmap));
             bool all_bbl = true;
             const auto* vend = m_config.option<ConfigOptionStrings>("filament_vendor");

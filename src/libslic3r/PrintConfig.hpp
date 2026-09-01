@@ -645,9 +645,31 @@ public:
     std::string get_filament_type(std::string &displayed_filament_type, int id = 0);
 
     bool is_custom_defined();
+
+    // Ultra (dual-nozzle): returns true when the printer's extruders carry more than one distinct
+    // extruder variant (H2D/H2C/X2D), i.e. it is a multi-nozzle grouping machine. extruder_count is
+    // filled with the nozzle count. Single-nozzle machines and same-variant toolchangers (U1) → false.
+    bool support_different_extruders(int& extruder_count);
 };
 
 void handle_legacy_sla(DynamicPrintConfig &config);
+
+// Ultra (dual-nozzle): parse the per-extruder AMS-count / nozzle-stat encodings from their string
+// configs (see get_recommended_filament_maps / build_nozzle_groups).
+extern std::vector<std::map<int, int>>              get_extruder_ams_count(const std::vector<std::string> &strs);
+extern std::vector<std::map<NozzleVolumeType, int>> get_extruder_nozzle_stats(const std::vector<std::string> &strs);
+
+// Ultra (dual-nozzle): slice one nozzle's sub-matrix out of a packed multi-nozzle flush matrix.
+// extruder_id == size_t(-1) (or nozzle_nums == 1) returns the whole (single-nozzle) matrix unchanged.
+template<class T>
+static std::vector<T> get_flush_volumes_matrix(const std::vector<T> &fv_matrix, size_t extruder_id = size_t(-1), size_t nozzle_nums = 1)
+{
+    if (extruder_id != size_t(-1) && nozzle_nums != 1) {
+        return std::vector<T>(fv_matrix.begin() + size_t(fv_matrix.size() / nozzle_nums * extruder_id + EPSILON),
+                              fv_matrix.begin() + size_t(fv_matrix.size() / nozzle_nums * (extruder_id + 1) + EPSILON));
+    }
+    return fv_matrix;
+}
 
 class StaticPrintConfig : public StaticConfig
 {
@@ -1239,6 +1261,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloats,              filament_diameter))
     ((ConfigOptionFloats,              filament_density))
     ((ConfigOptionStrings,             filament_type))
+    ((ConfigOptionStrings,             filament_ids))
     ((ConfigOptionBools,               filament_soluble))
     ((ConfigOptionBools,               filament_is_support))
     ((ConfigOptionFloats,              filament_cost))
@@ -1324,6 +1347,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,               parking_pos_retraction))
     ((ConfigOptionFloat,               extra_loading_move))
     ((ConfigOptionFloat,               machine_load_filament_time))
+    ((ConfigOptionFloat,               machine_switch_extruder_time))
+    ((ConfigOptionBool,                group_algo_with_time))
     ((ConfigOptionFloat,               machine_tool_change_time))
     // Ultra: fixed startup/prepare seconds added to the print time estimate
     ((ConfigOptionFloat,               machine_prepare_time))
@@ -1367,6 +1392,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionEnumsGeneric,        extruder_nozzle_volume_type))
     ((ConfigOptionStrings,             extruder_variant_list))
     ((ConfigOptionStrings,             extruder_ams_count))
+    ((ConfigOptionStrings,             extruder_nozzle_stats))
     ((ConfigOptionInts,                extruder_nozzle_count))
     ((ConfigOptionInts,                extruder_max_nozzle_count))
     ((ConfigOptionInts,                printer_extruder_id))
@@ -1548,6 +1574,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     // BBS: wipe tower is only used for priming
     ((ConfigOptionFloat,              prime_volume))
     ((ConfigOptionFloat,              flush_multiplier))
+    ((ConfigOptionFloats,             flush_multiplier_fast))
     ((ConfigOptionFloat,              z_offset))
     // BBS: project filaments
     ((ConfigOptionFloats,             filament_colour_new))

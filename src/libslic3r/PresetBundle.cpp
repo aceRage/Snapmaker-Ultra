@@ -192,6 +192,7 @@ static std::vector<std::string> s_project_options {
     "wipe_tower_rotation_angle",
     "curr_bed_type",
     "flush_multiplier",
+    "flush_multiplier_fast", // Ultra (dual-nozzle) grouping input
     // Ultra: nozzle flow variant declared to the printer (metadata only; auto-matched at send)
     "nozzle_volume_type",
     // Ultra (dual-nozzle): plate-level filament grouping state.

@@ -492,6 +492,76 @@ std::string format_diameter_to_str(double diameter)
     return s;
 }
 
+// Parse the per-extruder AMS-count encoding "amsIdx#count|amsIdx#count|..." into a map per extruder.
+std::vector<std::map<int, int>> get_extruder_ams_count(const std::vector<std::string>& strs)
+{
+    std::vector<std::map<int, int>> extruder_ams_counts;
+    for (const std::string& str : strs) {
+        std::map<int, int> ams_count_info;
+        if (str.empty()) { extruder_ams_counts.emplace_back(ams_count_info); continue; }
+        std::vector<std::string> ams_infos;
+        boost::algorithm::split(ams_infos, str, boost::algorithm::is_any_of("|"));
+        for (const std::string& ams_info : ams_infos) {
+            std::vector<std::string> numbers;
+            boost::algorithm::split(numbers, ams_info, boost::algorithm::is_any_of("#"));
+            if (numbers.size() != 2) continue;
+            ams_count_info.insert(std::make_pair(std::atoi(numbers[0].c_str()), std::atoi(numbers[1].c_str())));
+        }
+        extruder_ams_counts.emplace_back(ams_count_info);
+    }
+    return extruder_ams_counts;
+}
+
+// Parse the per-extruder nozzle-stat encoding "VolumeType#count|VolumeType#count|..." into a map per extruder.
+std::vector<std::map<NozzleVolumeType, int>> get_extruder_nozzle_stats(const std::vector<std::string>& strs)
+{
+    std::vector<std::map<NozzleVolumeType, int>> extruder_nozzle_counts;
+    for (const std::string& str : strs) {
+        std::map<NozzleVolumeType, int> nozzle_count_map;
+        if (str.empty()) { extruder_nozzle_counts.emplace_back(nozzle_count_map); continue; }
+        std::vector<std::string> nozzle_infos;
+        boost::algorithm::split(nozzle_infos, str, boost::is_any_of("|"));
+        for (auto& nozzle_info : nozzle_infos) {
+            std::vector<std::string> attr;
+            boost::algorithm::split(attr, nozzle_info, boost::is_any_of("#"));
+            if (attr.size() < 2) continue;
+            NozzleVolumeType volume_type = nvtStandard;
+            auto type_iter = s_keys_map_NozzleVolumeType.find(attr[0]);
+            if (type_iter != s_keys_map_NozzleVolumeType.end())
+                volume_type = NozzleVolumeType(type_iter->second);
+            int nozzle_count = std::atoi(attr[1].c_str());
+            nozzle_count_map[volume_type] += nozzle_count;
+        }
+        extruder_nozzle_counts.emplace_back(nozzle_count_map);
+    }
+    return extruder_nozzle_counts;
+}
+
+// True when the printer's extruders carry more than one distinct extruder variant (dual-nozzle grouping
+// machine: H2D/H2C/X2D). Same-variant toolchangers (U1) and single-nozzle machines return false.
+bool DynamicPrintConfig::support_different_extruders(int& extruder_count)
+{
+    extruder_count = 0;
+    std::set<std::string> variant_set;
+    // nozzle_diameter may be a plain or nullable float vector across configs; read the count via the
+    // vector base so the gate works regardless (BBS assumed nullable; this fork stores coFloats).
+    if (auto* nd_vec = dynamic_cast<const ConfigOptionVectorBase*>(this->option("nozzle_diameter")))
+        extruder_count = (int)nd_vec->size();
+    auto extruder_variant_opt = dynamic_cast<const ConfigOptionStrings*>(this->option("extruder_variant_list"));
+    if (extruder_variant_opt != nullptr) {
+        int variant_n = (int)extruder_variant_opt->values.size();
+        int n = std::min(extruder_count, variant_n);
+        for (int index = 0; index < n; index++) {
+            std::string variant = extruder_variant_opt->get_at(index);
+            std::vector<std::string> variants_list;
+            boost::split(variants_list, variant, boost::is_any_of(","), boost::token_compress_on);
+            if (!variants_list.empty())
+                variant_set.insert(variants_list.begin(), variants_list.end());
+        }
+    }
+    return (variant_set.size() > 1);
+}
+
 static t_config_enum_values s_keys_map_PrinterStructure {
     {"undefine",        int(PrinterStructure::psUndefine)},
     {"corexy",          int(PrinterStructure::psCoreXY)},
@@ -6384,6 +6454,29 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("The actual flushing volumes is equal to the flush multiplier multiplied by the flushing volumes in the table.");
     //def->sidetext = "";
     def->set_default_value(new ConfigOptionFloat(0.3));
+
+    // Ultra (dual-nozzle): keys consumed by the filament->nozzle grouping compute (get_recommended_filament_maps).
+    def = this->add("flush_multiplier_fast", coFloats);
+    def->label = L("Flush multiplier (Fast mode)");
+    def->tooltip = L("The flush multiplier used in fast purge mode.");
+    def->set_default_value(new ConfigOptionFloats{1.2});
+
+    def = this->add("group_algo_with_time", coBool);
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("machine_switch_extruder_time", coFloat);
+    def->label = L("Extruder switch time");
+    def->tooltip = L("Time to switch extruder. For statistics only");
+    def->min = 0;
+    def->sidetext = L("s");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(5));
+
+    // NOTE: filament_ids already has an option def earlier in this file; do NOT re-add it here (a second
+    // this->add would just be a redundant registration). Only the struct member (PrintConfig.hpp) was missing.
+
+    def = this->add("extruder_nozzle_stats", coStrings);
+    def->set_default_value(new ConfigOptionStrings{});
 
     // BBS
     def = this->add("prime_volume", coFloat);

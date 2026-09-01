@@ -520,6 +520,48 @@ void Print::clear()
 	m_objects.clear();
     m_print_regions.clear();
     m_model.clear_objects();
+    // Ultra (dual-nozzle): drop any stale grouping result so a re-sliced job recomputes it.
+    m_nozzle_group_result.reset();
+}
+
+// Ultra (dual-nozzle): classify each filament as model-only / support-only / hybrid from object extruder
+// usage and support-filament assignments. Config-derived, cheap; feeds the grouping context.
+std::vector<FilamentUsageType> Print::get_filament_usage_type() const
+{
+    std::vector<FilamentUsageType> filament_usage_types;
+    std::set<int> model_filaments, support_filaments; // 0-based
+    for (auto* obj : m_objects) {
+        auto obj_filaments = obj->object_extruders();
+        model_filaments.insert(obj_filaments.begin(), obj_filaments.end());
+        int support_fil           = obj->config().support_filament - 1;
+        int support_interface_fil = obj->config().support_interface_filament - 1;
+        if (support_fil >= 0) support_filaments.insert(support_fil);
+        if (support_interface_fil >= 0) support_filaments.insert(support_interface_fil);
+    }
+    for (int idx = 0; idx < m_config.filament_type.size(); ++idx) {
+        bool is_model   = model_filaments.count(idx) > 0;
+        bool is_support = support_filaments.count(idx) > 0;
+        if (is_model && is_support)
+            filament_usage_types.emplace_back(FilamentUsageType::Hybrid);
+        else if (is_support)
+            filament_usage_types.emplace_back(FilamentUsageType::SupportOnly);
+        else
+            filament_usage_types.emplace_back(FilamentUsageType::ModelOnly);
+    }
+    return filament_usage_types;
+}
+
+// Ultra (dual-nozzle): stubbed empty. The BBS versions derive per-nozzle physical/flow reachability from
+// the filament_printable bitmask and the filament/extruder variant subsystem, neither of which is ported.
+// Empty means the grouper imposes no hardware reachability constraint (color grouping still applies).
+std::vector<std::set<int>> Print::get_physical_unprintable_filaments(const std::vector<unsigned int>& /*used_filaments*/) const
+{
+    return std::vector<std::set<int>>(m_config.nozzle_diameter.size());
+}
+
+std::map<int, std::set<NozzleVolumeType>> Print::get_filament_unprintable_flow(const std::vector<unsigned int>& /*used_filaments*/) const
+{
+    return {};
 }
 
 // Called by Print::apply().
