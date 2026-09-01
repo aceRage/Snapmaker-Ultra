@@ -935,6 +935,9 @@ set (CPACK_PACKAGE_VENDOR "Snapmaker")
 set (CPACK_PACKAGE_VERSION_MAJOR "${ORCA_VERSION_MAJOR}")
 set (CPACK_PACKAGE_VERSION_MINOR "${ORCA_VERSION_MINOR}")
 set (CPACK_PACKAGE_VERSION_PATCH "${ORCA_VERSION_PATCH}")
+# Ultra: keep the 4th version component (2.3.6.x) in Add/Remove Programs; the MAJOR/MINOR/PATCH
+# triple above drops it, which made consecutive patch releases indistinguishable there.
+set (CPACK_PACKAGE_VERSION "${Snapmaker_VERSION}")
 set (CPACK_PACKAGE_FILE_NAME "Snapmaker_Orca_Windows_Installer_V${Snapmaker_VERSION}")
 set (CPACK_PACKAGE_DESCRIPTION_SUMMARY "Snapmaker Orca is an open source slicer for FDM printers")
 set (CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/Snapmaker/OrcaSlicer")
