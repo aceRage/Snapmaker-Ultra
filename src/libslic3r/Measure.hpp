@@ -18,7 +18,12 @@ enum class SurfaceFeatureType : int {
     Point  = 1 << 0,
     Edge   = 1 << 1,
     Circle = 1 << 2,
-    Plane  = 1 << 3
+    Plane  = 1 << 3,
+    // Ultra: assembly-only pick kinds. Both carry the Plane layout (m_pt1 = normal, m_pt2 = centroid) so
+    // the direction/point mate machinery applies unchanged; owned_indices holds their facet list. Appended
+    // AFTER Plane on purpose: get_measurement orders a feature pair by this numeric value.
+    Triangle = 1 << 4, // a single raw mesh facet
+    Curve    = 1 << 5  // a low-curvature patch grown from the hit facet
 };
 
 bool get_point_projection_to_plane(const Vec3d &pt, const Vec3d &plane_origin, const Vec3d &plane_normal, Vec3d &intersection_pt);
@@ -37,6 +42,7 @@ public:
         this->clone(sf);
         volume                 = sf.volume;
         plane_indices          = sf.plane_indices;
+        owned_indices          = sf.owned_indices;
         world_tran             = sf.world_tran;
         world_plane_features   = sf.world_plane_features;
         origin_surface_feature = sf.origin_surface_feature;
@@ -66,6 +72,10 @@ public:
     // For planes, return index into vector provided by Measuring::get_plane_triangle_indices, normal and point.
     std::tuple<int, Vec3d, Vec3d> get_plane() const { assert(m_type == SurfaceFeatureType::Plane); return std::make_tuple(int(m_value), m_pt1, m_pt2); }
 
+    // Ultra: for Triangle / Curve, return (normal, centroid). Their facet list is `owned_indices`.
+    std::pair<Vec3d, Vec3d> get_patch() const { assert(m_type == SurfaceFeatureType::Triangle || m_type == SurfaceFeatureType::Curve); return std::make_pair(m_pt1, m_pt2); }
+    bool is_planar() const { return m_type == SurfaceFeatureType::Plane || m_type == SurfaceFeatureType::Triangle || m_type == SurfaceFeatureType::Curve; }
+
     // For anything, return an extra point that should also be considered a part of this.
     std::optional<Vec3d> get_extra_point() const { assert(m_type != SurfaceFeatureType::Undef); return m_pt3; }
 
@@ -79,6 +89,8 @@ public:
             return (this->m_pt1.isApprox(other.m_pt1) && this->m_pt2.isApprox(other.m_pt2)) ||
                    (this->m_pt1.isApprox(other.m_pt2) && this->m_pt2.isApprox(other.m_pt1));
         }
+        case SurfaceFeatureType::Triangle:
+        case SurfaceFeatureType::Curve:
         case SurfaceFeatureType::Plane:
         case SurfaceFeatureType::Circle: {
             return (this->m_pt1.isApprox(other.m_pt1) && this->m_pt2.isApprox(other.m_pt2) && std::abs(this->m_value - other.m_value) < EPSILON);
@@ -94,6 +106,7 @@ public:
 
     void* volume{nullptr};
     std::vector<int>*    plane_indices{nullptr};
+    std::shared_ptr<std::vector<int>> owned_indices; // Ultra: owning facet list for Triangle/Curve (plane_indices points into it)
     Transform3d                  world_tran;
     std::shared_ptr<std::vector<SurfaceFeature>> world_plane_features{nullptr};
     std::shared_ptr<SurfaceFeature> origin_surface_feature{nullptr};
@@ -125,7 +138,10 @@ public:
 
     // Given a face_idx where the mouse cursor points, return a feature that
     // should be highlighted (if any).
-    std::optional<SurfaceFeature> get_feature(size_t face_idx, const Vec3d& point, const Transform3d & world_tran,bool only_select_plane) const;
+    // Ultra: `snap_radius` (mesh units, view-scaled by the caller) overrides the fixed 0.5 mm hover limit
+    // and enables direct VERTEX picking from the hit facet; < 0 keeps the legacy fixed-radius behaviour.
+    // `pick_kind`: 0 = legacy features, 1 = the hit facet as a Triangle, 2 = a low-curvature patch as a Curve.
+    std::optional<SurfaceFeature> get_feature(size_t face_idx, const Vec3d& point, const Transform3d & world_tran,bool only_select_plane, double snap_radius = -1.0, int pick_kind = 0) const;
 
     // Return total number of planes.
     int get_num_of_planes() const;

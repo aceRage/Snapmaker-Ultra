@@ -23,6 +23,9 @@ enum class EMeasureMode : unsigned char {
 enum class AssemblyMode : unsigned char {
     FACE_FACE,
     POINT_POINT,
+    // Ultra: appended in this order -- the mode combo maps its item index straight to this enum.
+    TRIANGLE_TRIANGLE, // pick one raw mesh facet on each part
+    CURVE_CURVE,       // pick a low-curvature patch (mostly flat but curved) on each part
 };
 static const Slic3r::ColorRGBA SELECTED_1ST_COLOR = {0.25f, 0.75f, 0.75f, 1.0f};
 static const Slic3r::ColorRGBA SELECTED_2ND_COLOR = {0.75f, 0.25f, 0.75f, 1.0f};
@@ -297,7 +300,7 @@ protected:
     void set_distance(bool same_model_object, const Vec3d &displacement, bool take_shot = true);
     void set_to_parallel(bool same_model_object, bool take_shot = true, bool is_anti_parallel = false);
     void set_to_reverse_rotation(bool same_model_object,int feature_index);
-    void set_to_around_center_of_faces(bool same_model_object,float rotate_degree);
+    void set_to_around_center_of_faces(bool same_model_object,float rotate_degree, bool take_shot = true);
     void set_to_center_coincidence(bool same_model_object);
     void set_parallel_distance(bool same_model_object,float dist);
     // Ultra (guided Auto-Fit): mate the two picked features on the PRINT transform (view-independent),
@@ -307,6 +310,16 @@ protected:
     // from its longest boundary edge. Lets the mate align faces' EDGES (roll), not just their normals.
     bool ultra_plane_axis_world(GLVolume* v, const Measure::SurfaceFeature& f, Vec3d& axis_world, double& aspect,
                                 std::vector<Vec3d>* boundary_world = nullptr);
+    // Ultra (Point/Point mode): translate part 2 so its picked point / circle centre lands on part 1's.
+    void ultra_coincide_points();
+    // Ultra assembly actions + live adjust (all modes). Auto-fit = ultra_fit_for_print_and_merge (mates on
+    // both transforms, keeps the objects separate + picks alive); "Merge parts" fuses them afterwards.
+    void ultra_merge_parts();
+    void ultra_adjust_rotate(double deg_delta, bool take_shot); // spin part 2 about the mating axis
+    void ultra_adjust_offset(double mm_delta,  bool take_shot); // slide part 2 along the mating axis
+    void ultra_show_adjust_ui();                                // the two sliders
+    bool ultra_w2p(GLVolume* v, const Measure::SurfaceFeature& f, Transform3d& out); // view -> print world
+    void ultra_apply_attachment_print_pose(const Transform3d& new_print);            // print + mirrored assembly pose
 
     bool is_pick_meet_assembly_mode(const SelectedFeatures::Item& item);
  protected:
@@ -322,6 +335,8 @@ protected:
     float                    m_input_size_max;
     bool                     m_use_inches;
     bool                     m_only_select_plane{false};
+    float                    m_ultra_adjust_rot{0.f}; // Ultra: cumulative slider spin (deg) since the last mate / pick
+    float                    m_ultra_adjust_off{0.f}; // Ultra: cumulative slider offset (mm) since the last mate / pick
     std::string              m_units;
     mutable bool             m_same_model_object;
     mutable unsigned int     m_current_active_imgui_id;

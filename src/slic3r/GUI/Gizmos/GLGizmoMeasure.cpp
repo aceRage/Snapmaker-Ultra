@@ -4,6 +4,7 @@
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
+#include "slic3r/GUI/UltraFitGeometry.hpp"
 #include <boost/log/trivial.hpp>
 #include <boost/format.hpp>
 #include "slic3r/GUI/Gizmos/GizmoObjectManipulation.hpp"
@@ -48,6 +49,8 @@ std::string GLGizmoMeasure::surface_feature_type_as_string(Measure::SurfaceFeatu
     case Measure::SurfaceFeatureType::Edge:   { return _u8L("Edge"); }
     case Measure::SurfaceFeatureType::Circle: { return _u8L("Circle"); }
     case Measure::SurfaceFeatureType::Plane:  { return _u8L("Plane"); }
+    case Measure::SurfaceFeatureType::Triangle: { return _u8L("Triangle"); }
+    case Measure::SurfaceFeatureType::Curve:    { return _u8L("Curved patch"); }
     }
 }
 
@@ -59,6 +62,8 @@ std::string GLGizmoMeasure::point_on_feature_type_as_string(Measure::SurfaceFeat
     case Measure::SurfaceFeatureType::Edge:   { ret = _u8L("Point on edge"); break; }
     case Measure::SurfaceFeatureType::Circle: { ret = _u8L("Point on circle"); break; }
     case Measure::SurfaceFeatureType::Plane:  { ret = _u8L("Point on plane"); break; }
+    case Measure::SurfaceFeatureType::Triangle: { ret = _u8L("Point on triangle"); break; }
+    case Measure::SurfaceFeatureType::Curve:    { ret = _u8L("Point on curved patch"); break; }
     default:                                  { assert(false); break; }
     }
     return ret;
@@ -545,7 +550,11 @@ void GLGizmoMeasure::init_plane_glmodel(GripperType gripper_type, const Measure:
     const ModelObject* obj      = selection.get_model()->objects[volume->object_idx()];
     const ModelVolume* vol      = obj->volumes[volume->volume_idx()];
     auto               mesh = vol->mesh_ptr();
-    const auto &[idx, normal, pt] = feature.get_plane();
+    if (!feature.plane_indices) { return; }
+    // Ultra: Triangle / Curve reuse the plane highlighter. Their cache key is the (negated, offset) facet
+    // index so it can never collide with a real plane index.
+    const int idx = feature.get_type() == Measure::SurfaceFeatureType::Plane ? std::get<0>(feature.get_plane())
+                                                                              : -int(feature.get_value()) - 1;
     if (plane_gl_model.plane_idx != idx) {
         plane_gl_model.plane.reset();
     }
@@ -677,10 +686,20 @@ void GLGizmoMeasure::on_render()
         else {
             std::optional<Measure::SurfaceFeature> curr_feature = std::nullopt;
             if (m_curr_measuring) {
-                curr_feature = wxGetMouseState().LeftIsDown() ? m_curr_feature :
-                               mouse_on_object                ? m_curr_measuring->get_feature(model_facet_idx, position_on_model,
-                                                                               m_mesh_raycaster_map[m_last_hit_volume]->get_transform(), m_only_select_plane) :
-                                                              std::nullopt;
+                if (wxGetMouseState().LeftIsDown()) {
+                    curr_feature = m_curr_feature;
+                } else if (mouse_on_object) {
+                    // Ultra: view-scaled pick radius (~8 px) expressed in MESH units, so vertices and edges
+                    // stay pickable at any zoom and on scaled instances (the legacy limit was a fixed
+                    // 0.5 mm in mesh space -- sub-pixel when zoomed out).
+                    const Transform3d hit_tran   = m_mesh_raycaster_map[m_last_hit_volume]->get_transform();
+                    const double      mesh_scale = std::max(1e-6, (hit_tran.linear() * Vec3d::UnitX()).norm());
+                    const double      snap_radius = 8.0 * double(inv_zoom) / mesh_scale;
+                    // Ultra: Triangle / Curve assembly modes pick the raw facet / a curved patch directly.
+                    const int pick_kind = (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY && m_assembly_mode == AssemblyMode::TRIANGLE_TRIANGLE) ? 1 :
+                                          (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY && m_assembly_mode == AssemblyMode::CURVE_CURVE)       ? 2 : 0;
+                    curr_feature = m_curr_measuring->get_feature(model_facet_idx, position_on_model, hit_tran, m_only_select_plane, snap_radius, pick_kind);
+                }
             }
             if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY) {
                 if (m_assembly_mode == AssemblyMode::FACE_FACE) {
@@ -690,8 +709,18 @@ void GLGizmoMeasure::on_render()
                         curr_feature->get_type() != Measure::SurfaceFeatureType::Circle) {
                         curr_feature.reset();
                     }
+                } else if (m_assembly_mode == AssemblyMode::TRIANGLE_TRIANGLE) {
+                    // Ultra: only the raw facet pick counts in this mode.
+                    if (curr_feature.has_value() && curr_feature->get_type() != Measure::SurfaceFeatureType::Triangle)
+                        curr_feature.reset();
+                } else if (m_assembly_mode == AssemblyMode::CURVE_CURVE) {
+                    // Ultra: only a curved-patch pick counts in this mode (Stage C wires the patch grow).
+                    if (curr_feature.has_value() && curr_feature->get_type() != Measure::SurfaceFeatureType::Curve)
+                        curr_feature.reset();
                 } else if (m_assembly_mode == AssemblyMode::POINT_POINT) {
-                    if (!(curr_feature->get_type() == Measure::SurfaceFeatureType::Point ||
+                    // Ultra: guard the empty case (cursor off the mesh) -- this used to dereference nullopt.
+                    if (curr_feature.has_value() &&
+                        !(curr_feature->get_type() == Measure::SurfaceFeatureType::Point ||
                         curr_feature->get_type() == Measure::SurfaceFeatureType::Circle ||
                         (m_mode == EMode::PointSelection && (curr_feature->get_type() == Measure::SurfaceFeatureType::Plane || curr_feature->get_type() == Measure::SurfaceFeatureType::Edge)))) {
                         curr_feature.reset();
@@ -728,6 +757,14 @@ void GLGizmoMeasure::on_render()
                 }
                 case Measure::SurfaceFeatureType::Plane: {
                     update_world_plane_features(m_curr_measuring.get(), *m_curr_feature);
+                    m_curr_plane.plane_idx = -1;
+                    init_plane_glmodel(GripperType::PLANE, *m_curr_feature, m_curr_plane);
+                    break;
+                }
+                // Ultra: Triangle / Curve carry their own facet list -> highlight via the plane model,
+                // but no plane-border features to gather.
+                case Measure::SurfaceFeatureType::Triangle:
+                case Measure::SurfaceFeatureType::Curve: {
                     m_curr_plane.plane_idx = -1;
                     init_plane_glmodel(GripperType::PLANE, *m_curr_feature, m_curr_plane);
                     break;
@@ -926,6 +963,8 @@ void GLGizmoMeasure::on_render()
                 }
                 break;
             }
+            case Measure::SurfaceFeatureType::Triangle: // Ultra: facet / patch highlights reuse the plane model
+            case Measure::SurfaceFeatureType::Curve:
             case Measure::SurfaceFeatureType::Plane: {
                 if (featura_index == -1) {
                     render_glmodel(m_curr_plane.plane, colors.back(), feature.world_tran, hover);
@@ -999,6 +1038,8 @@ void GLGizmoMeasure::on_render()
                     colors = { hovering_color(), hovering_color() };
                 break;
             }
+            case Measure::SurfaceFeatureType::Triangle:
+            case Measure::SurfaceFeatureType::Curve:
             case Measure::SurfaceFeatureType::Plane:
             {
                 colors.emplace_back(hovering_color());
@@ -1828,11 +1869,8 @@ void GLGizmoMeasure::show_selection_ui()
 
         float selection_cap_length = 0;
         if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY) {
-            if (m_assembly_mode == AssemblyMode::FACE_FACE) {
-                selection_cap_length = ImGui::CalcTextSize((_u8L("Selection") + " 1" + _u8L(" (Moving)")).c_str()).x * 1.2;
-            } else if (m_assembly_mode == AssemblyMode::POINT_POINT) {
-                selection_cap_length = ImGui::CalcTextSize((_u8L("Selection") + " 1" + _u8L(" (Moving)")).c_str()).x * 1.2;
-            }
+            // Ultra: one width for every assembly mode, measured off the widest label ("Triangle").
+            selection_cap_length = ImGui::CalcTextSize((_u8L("Triangle") + " 1" + _u8L(" (Moving)")).c_str()).x * 1.2;
         }
         else {
             selection_cap_length = ImGui::CalcTextSize((_u8L("Selection") + " 1").c_str()).x * 1.2;
@@ -1848,6 +1886,10 @@ void GLGizmoMeasure::show_selection_ui()
                 m_imgui->text(_u8L("Select 2 faces on objects and \n make objects assemble together.")); // tip
             } else if (m_assembly_mode == AssemblyMode::POINT_POINT) {
                 m_imgui->text(_u8L("Select 2 points or circles on objects and \n specify distance between them.")); // tip
+            } else if (m_assembly_mode == AssemblyMode::TRIANGLE_TRIANGLE) {
+                m_imgui->text(_u8L("Select 1 mesh triangle on each object and \n make them assemble together.")); // tip
+            } else if (m_assembly_mode == AssemblyMode::CURVE_CURVE) {
+                m_imgui->text(_u8L("Select 1 curved surface patch on each object and \n make them assemble together.")); // tip
             }
         }
         ImGui::PushStyleColor(ImGuiCol_Text, ImGuiWrapper::to_ImVec4(SELECTED_1ST_COLOR));
@@ -1856,6 +1898,10 @@ void GLGizmoMeasure::show_selection_ui()
                 m_imgui->text(_u8L("Face") + " 1" + _u8L(" (Fixed)"));
             } else if (m_assembly_mode == AssemblyMode::POINT_POINT) {
                 m_imgui->text(_u8L("Point") + " 1" + _u8L(" (Fixed)"));
+            } else if (m_assembly_mode == AssemblyMode::TRIANGLE_TRIANGLE) {
+                m_imgui->text(_u8L("Triangle") + " 1" + _u8L(" (Fixed)"));
+            } else if (m_assembly_mode == AssemblyMode::CURVE_CURVE) {
+                m_imgui->text(_u8L("Curve") + " 1" + _u8L(" (Fixed)"));
             }
         }
         else {
@@ -1882,6 +1928,10 @@ void GLGizmoMeasure::show_selection_ui()
                 m_imgui->text(_u8L("Face") + " 2"+ _u8L(" (Moving)"));
             } else if (m_assembly_mode == AssemblyMode::POINT_POINT) {
                 m_imgui->text(_u8L("Point") + " 2"+ _u8L(" (Moving)"));
+            } else if (m_assembly_mode == AssemblyMode::TRIANGLE_TRIANGLE) {
+                m_imgui->text(_u8L("Triangle") + " 2"+ _u8L(" (Moving)"));
+            } else if (m_assembly_mode == AssemblyMode::CURVE_CURVE) {
+                m_imgui->text(_u8L("Curve") + " 2"+ _u8L(" (Moving)"));
             }
         } else {
             m_imgui->text(_u8L("Selection") + " 2");
@@ -1913,9 +1963,13 @@ void GLGizmoMeasure::show_selection_ui()
     if (m_selected_wrong_feature_waring_tip) {
         if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY) {
             if (m_assembly_mode == AssemblyMode::FACE_FACE) {
-                m_imgui->warning_text(_L("Warning: please select Plane's feature."));
+                m_imgui->warning_text(_L("Warning: please select a Plane or Circle feature."));
             } else if (m_assembly_mode == AssemblyMode::POINT_POINT) {
                 m_imgui->warning_text(_L("Warning: please select Point's or Circle's feature."));
+            } else if (m_assembly_mode == AssemblyMode::TRIANGLE_TRIANGLE) {
+                m_imgui->warning_text(_L("Warning: please select a mesh triangle."));
+            } else if (m_assembly_mode == AssemblyMode::CURVE_CURVE) {
+                m_imgui->warning_text(_L("Warning: please select a curved surface patch."));
             }
         }
     }
@@ -2061,8 +2115,7 @@ void GLGizmoMeasure::show_face_face_assembly_common() {
     // Ultra: accept Plane OR Circle picks (Stage 2 lets peg/hole rims mate, not just flat faces).
     auto feat_ok = [](const SelectedFeatures::Item& it) {
         return it.feature.has_value() &&
-               (it.feature->get_type() == Measure::SurfaceFeatureType::Plane ||
-                it.feature->get_type() == Measure::SurfaceFeatureType::Circle);
+               (it.feature->is_planar() || it.feature->get_type() == Measure::SurfaceFeatureType::Circle);
     };
     if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY && m_hit_different_volumes.size() == 2 &&
         feat_ok(m_selected_features.first) && feat_ok(m_selected_features.second)) {
@@ -2096,8 +2149,8 @@ void GLGizmoMeasure::show_face_face_assembly_common() {
 void GLGizmoMeasure::show_face_face_assembly_senior()
 {
     if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY && m_hit_different_volumes.size() == 2 &&
-        m_selected_features.first.feature->get_type() == Measure::SurfaceFeatureType::Plane &&
-        m_selected_features.second.feature->get_type() == Measure::SurfaceFeatureType::Plane) {
+        m_selected_features.first.feature.has_value() && m_selected_features.second.feature.has_value() &&
+        m_selected_features.first.feature->is_planar() && m_selected_features.second.feature->is_planar()) {
         auto &action                         = m_assembly_action;
         auto  feature_text_size              = m_imgui->calc_button_size(_L("Feature 1")).x + m_imgui->calc_button_size(":").x;
         auto  set_to_reverse_rotation_size   = m_imgui->calc_button_size(_L("Reverse rotation")).x;
@@ -2108,27 +2161,9 @@ void GLGizmoMeasure::show_face_face_assembly_senior()
             set_to_reverse_rotation(m_same_model_object, 1);
         }
 
-        if (action.has_parallel_distance) {
-            m_imgui->text(_u8L("Parallel distance:"));
-            ImGui::SameLine(parallel_distance_size + m_space_size);
-            ImGui::PushItemWidth(m_input_size_max);
-            ImGui::BBLInputDouble("##parallel_distance_z", &m_buffered_parallel_distance, 0.0f, 0.0f, "%.2f");
-            if (m_last_active_item_imgui != m_current_active_imgui_id && std::abs(m_buffered_parallel_distance - action.parallel_distance) > EPSILON) {
-                set_parallel_distance(m_same_model_object, m_buffered_parallel_distance);
-            }
-        }
-        if (action.can_around_center_of_faces) {
-            m_imgui->text(_u8L("Rotate around center:"));
-            ImGui::SameLine(rotate_around_center_size + m_space_size);
-            ImGui::PushItemWidth(m_input_size_max);
-            ImGui::BBLInputDouble("##rotate_around_center", &m_buffered_around_center, 0.0f, 0.0f, "%.2f");
-            if (m_last_active_item_imgui != m_current_active_imgui_id && std::abs(m_buffered_around_center) > EPSILON) {
-                set_to_around_center_of_faces(m_same_model_object, m_buffered_around_center);
-                m_buffered_around_center = 0;
-            }
-            ImGui::SameLine(rotate_around_center_size + m_space_size + m_input_size_max + m_space_size / 2.0f);
-            m_imgui->text("°");
-        }
+        // Ultra: the "Parallel distance" / "Rotate around center" text boxes were replaced by the live
+        // Adjust sliders (ultra_show_adjust_ui), which work in every assembly mode.
+        (void) action; (void) parallel_distance_size; (void) rotate_around_center_size;
     }
 }
 
@@ -2326,6 +2361,7 @@ void GLGizmoMeasure::register_single_mesh_pick()
      m_hit_different_volumes.clear();
      m_hit_order_volumes.clear();
      m_last_hit_volume = nullptr;
+     m_ultra_adjust_rot = 0.f; m_ultra_adjust_off = 0.f; // Ultra: sliders start fresh with a new pick
  }
 
 void GLGizmoMeasure::reset_feature1_render()
@@ -2455,6 +2491,8 @@ void GLGizmoMeasure::update_feature_by_tran(Measure::SurfaceFeature &feature)
     case Measure::SurfaceFeatureType::Point:
     case Measure::SurfaceFeatureType::Edge:
     case Measure::SurfaceFeatureType::Circle:
+    case Measure::SurfaceFeatureType::Triangle: // Ultra: re-sync facet/patch picks after a mate too
+    case Measure::SurfaceFeatureType::Curve:
     case Measure::SurfaceFeatureType::Plane: {
         feature.clone(*feature.origin_surface_feature);
         feature.translate(feature.world_tran);
@@ -2513,6 +2551,8 @@ static bool ultra_feature_dir_point(const Measure::SurfaceFeature& f, Vec3d& dir
     switch (f.get_type()) {
     case Measure::SurfaceFeatureType::Plane:  { const auto [i, n, p]  = f.get_plane();  dir = n;  pt = p; return true; }
     case Measure::SurfaceFeatureType::Circle: { const auto [c, r, ax] = f.get_circle(); dir = ax; pt = c; return true; }
+    case Measure::SurfaceFeatureType::Triangle:
+    case Measure::SurfaceFeatureType::Curve:  { const auto [n, p]     = f.get_patch();  dir = n;  pt = p; return true; }
     default: return false;
     }
 }
@@ -2616,23 +2656,23 @@ void GLGizmoMeasure::set_to_reverse_rotation(bool same_model_object, int feature
     }
 }
 
-void GLGizmoMeasure::set_to_around_center_of_faces(bool same_model_object, float rotate_degree)
+void GLGizmoMeasure::set_to_around_center_of_faces(bool same_model_object, float rotate_degree, bool take_shot)
 {
     if (m_hit_different_volumes.size() == 2 ) {
         auto &action    = m_assembly_action;
         auto  v         = m_hit_different_volumes[1];
         auto  selection = const_cast<Selection *>(&m_parent.get_selection());
         selection->setup_cache();
-        wxGetApp().plater()->take_snapshot("ReverseRotateInMeasure", UndoRedo::SnapshotType::GizmoAction); // avoid storing another snapshot
+        if (take_shot)
+            wxGetApp().plater()->take_snapshot("ReverseRotateInMeasure", UndoRedo::SnapshotType::GizmoAction); // avoid storing another snapshot
 
         selection->set_mode(same_model_object ? Selection::Volume : Selection::Instance);
         m_pending_scale = 1;
 
         auto  radian = Geometry::deg2rad(rotate_degree);
         Vec3d plane_normal, plane_center;
-        const auto [idx2, normal2, pt2] = m_selected_features.second.feature->get_plane();
-        plane_normal                    = normal2;
-        plane_center                    = pt2;
+        // Ultra: any feature with a direction + point (Plane / Circle / Triangle / Curve), not only Plane.
+        if (!ultra_feature_dir_point(*m_selected_features.second.feature, plane_normal, plane_center)) return;
 
         if (same_model_object == false) {
             Geometry::Transformation inMat(v->get_instance_transformation());
@@ -2672,14 +2712,14 @@ void GLGizmoMeasure::set_to_center_coincidence(bool same_model_object) {
 bool GLGizmoMeasure::ultra_plane_axis_world(GLVolume* v, const Measure::SurfaceFeature& f, Vec3d& axis_world, double& aspect,
                                             std::vector<Vec3d>* boundary_world)
 {
-    if (!v || f.get_type() != Measure::SurfaceFeatureType::Plane || !f.plane_indices) return false;
+    if (!v || !f.is_planar() || !f.plane_indices) return false; // Plane, Triangle or Curve (all carry a facet list)
     auto it = m_mesh_measure_map.find(v);
     if (it == m_mesh_measure_map.end() || !it->second) return false;
     const indexed_triangle_set& its = it->second->get_its();
     const Transform3d& W  = f.world_tran;
     // Feature coords are already WORLD (baked via world_tran), so the normal is used as-is; only the
     // raw mesh vertices below need W applied.
-    const auto [pi, n, p] = f.get_plane();
+    const Vec3d n  = f.get_pt1(); // normal -- Plane, Triangle and Curve share the (normal, point) layout
     const Vec3d nw = n.normalized();
     const Vec3d bu = nw.unitOrthogonal();
     const Vec3d bw = nw.cross(bu).normalized();
@@ -2747,16 +2787,41 @@ void GLGizmoMeasure::ultra_fit_for_print_and_merge()
     GLVolume* va = m_hit_different_volumes[1]; // attachment -- moves onto target
     if (!vt || !va) return;
     if (vt->object_idx() == va->object_idx()) {
-        // Two PARTS of one object: no merge needed (already one printable object). Mate the attachment
-        // part's volume via the proven same-object path, which moves the ModelVolume transform used by
-        // slicing, so it assembles for printing too.
+        // Two PARTS of one object: no merge needed (already one printable object). Mate via the proven
+        // same-object path (it moves the ModelVolume transform slicing uses), then pin the free spin about
+        // the mating normal by containment, applied through the stock rotate-about-face-centre action so
+        // refresh + undo stay standard. The roll is computed from the PRE-mate features by predicting the
+        // post-mate outline (same object == same frame), so it does not depend on feature refresh timing.
         if (vt->volume_idx() == va->volume_idx()) {
             notify(_u8L("Fit for Print: pick two different parts."));
             return;
         }
+        double roll_deg = 0.0; bool rolled = false;
+        if (m_selected_features.first.feature->is_planar() && m_selected_features.second.feature->is_planar()) {
+            Vec3d n1, c1, n2, c2, ax; double asp; std::vector<Vec3d> o1, o2;
+            if (ultra_feature_dir_point(*m_selected_features.first.feature,  n1, c1) &&
+                ultra_feature_dir_point(*m_selected_features.second.feature, n2, c2) &&
+                ultra_plane_axis_world(vt, *m_selected_features.first.feature,  ax, asp, &o1) &&
+                ultra_plane_axis_world(va, *m_selected_features.second.feature, ax, asp, &o2) &&
+                o1.size() >= 3 && o2.size() >= 3) {
+                Vec3d axis; double phi; Matrix3d R;
+                Geometry::rotation_from_two_vectors(n2, -n1, axis, phi, &R);
+                std::vector<Vec3d> o2m; o2m.reserve(o2.size());
+                for (const auto& P : o2) o2m.push_back(c1 + R * (P - c2)); // face 2 outline after the normal mate
+                const UltraFit::RollResult rr = UltraFit::roll_by_containment(n1, c1, o1, o2m);
+                if (rr.ok && std::abs(rr.roll) > 1e-6) { roll_deg = rr.roll * 180.0 / M_PI; rolled = true; }
+                BOOST_LOG_TRIVIAL(warning) << "[UltraFit] parts roll by containment: " << (rr.roll * 180.0 / M_PI)
+                                           << " deg, residual=" << rr.protrusion << " clearance=" << rr.clearance;
+            }
+        }
         set_to_center_coincidence(true);
-        reset_all_feature();
-        notify(_u8L("Fit for Print: parts mated for assembly."));
+        // set_to_around_center_of_faces spins volume[1] about FACE 2's normal, which is -n1 after the
+        // anti-parallel mate, so negate to express the roll about n1.
+        if (rolled) set_to_around_center_of_faces(true, (float) (-roll_deg));
+        // Keep the picks alive (the Adjust sliders need them); only the slider accumulators restart.
+        m_ultra_adjust_rot = 0.f; m_ultra_adjust_off = 0.f;
+        notify(rolled ? (boost::format(_u8L("Fit for Print: parts mated, roll %.2f deg.")) % roll_deg).str()
+                      : _u8L("Fit for Print: parts mated for assembly."));
         return;
     }
 
@@ -2793,84 +2858,52 @@ void GLGizmoMeasure::ultra_fit_for_print_and_merge()
     Vec3d axis; double phi; Matrix3d R;
     Geometry::rotation_from_two_vectors(d2, -d1, axis, phi, &R);
 
-    // Roll alignment BY CONTAINMENT. A face-pair mate leaves spin about the shared normal free; edge /
-    // bounding-box heuristics proved fragile on filleted faces (landed 45 deg). So sweep the spin and
-    // keep the angle where the SMALLER face's outline protrudes LEAST outside the LARGER face's outline
-    // -- the pose with no side contact ("parts touch, never intersect"). Ties -> least rotation.
+    // Roll alignment BY CONTAINMENT (shared helper, UltraFitGeometry.hpp): keep the spin about the shared
+    // normal where the smaller outline protrudes least outside the larger -- "parts touch, never intersect".
     double roll_deg = 0.0, roll_res = -1.0, roll_clear = 0.0; // reported in the notification
     if (have_b1 && have_b2 && b1.size() >= 3 && b2.size() >= 3) {
-        const Vec3d n  = d1.normalized();
-        const Vec3d bu = n.unitOrthogonal();
-        const Vec3d bw = n.cross(bu).normalized(); // (bu,bw,n) right-handed: 2D CCW == AngleAxis(+t, n)
-        auto to2 = [&](const Vec3d& P) { const Vec3d d = P - p1; return Eigen::Vector2d(d.dot(bu), d.dot(bw)); };
-        std::vector<Eigen::Vector2d> T2, A2;
-        for (const auto& P : b1) T2.push_back(to2(P));
-        for (const auto& P : b2) A2.push_back(to2(p1 + R * (P - p2))); // attachment outline after the mate
-        // 2D convex hull (Andrew monotone chain), CCW.
-        auto hull = [](std::vector<Eigen::Vector2d> q) {
-            std::sort(q.begin(), q.end(), [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
-                return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y()); });
-            auto cr = [](const Eigen::Vector2d& o, const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
-                return (a.x() - o.x()) * (b.y() - o.y()) - (a.y() - o.y()) * (b.x() - o.x()); };
-            std::vector<Eigen::Vector2d> h(2 * q.size()); size_t k = 0;
-            for (size_t i = 0; i < q.size(); ++i) { while (k >= 2 && cr(h[k-2], h[k-1], q[i]) <= 0) --k; h[k++] = q[i]; }
-            for (size_t i = q.size() - 1, lo = k + 1; i > 0; --i) { while (k >= lo && cr(h[k-2], h[k-1], q[i-1]) <= 0) --k; h[k++] = q[i-1]; }
-            h.resize(k > 1 ? k - 1 : k);
-            return h;
-        };
-        auto area = [](const std::vector<Eigen::Vector2d>& h) {
-            double s = 0.0;
-            for (size_t i = 0, m = h.size(); i < m; ++i) { const auto& a = h[i]; const auto& b = h[(i + 1) % m]; s += a.x() * b.y() - b.x() * a.y(); }
-            return std::abs(s) * 0.5;
-        };
-        // Signed distance of a point to a CCW convex hull: >0 outside (protrusion), <0 inside (clearance).
-        auto sdist = [](const Eigen::Vector2d& p, const std::vector<Eigen::Vector2d>& h) {
-            double worst = -std::numeric_limits<double>::infinity();
-            for (size_t i = 0, m = h.size(); i < m; ++i) {
-                const Eigen::Vector2d a = h[i], e = h[(i + 1) % m] - a; const double L = e.norm(); if (L < 1e-12) continue;
-                worst = std::max(worst, -(e.x() * (p.y() - a.y()) - e.y() * (p.x() - a.x())) / L); // >0 = right of edge = outside
-            }
-            return worst;
-        };
-        const auto hT = hull(T2), hA = hull(A2);
-        if (hT.size() >= 3 && hA.size() >= 3) {
-            const bool att_is_small = area(hA) <= area(hT);
-            auto rot2 = [](const Eigen::Vector2d& q, double t) { const double c = std::cos(t), s = std::sin(t); return Eigen::Vector2d(c * q.x() - s * q.y(), s * q.x() + c * q.y()); };
-            // For a spin t: protrusion = sum of squared outside distances of the smaller outline beyond the
-            // larger hull; clearance = the smallest inside margin (negative if anything pokes out).
-            auto eval = [&](double t, double& prot, double& clear) {
-                prot = 0.0; clear = std::numeric_limits<double>::infinity();
-                auto acc = [&](double sd) { if (sd > 0) prot += sd * sd; clear = std::min(clear, -sd); };
-                if (att_is_small) {
-                    for (const auto& q : A2) acc(sdist(rot2(q, t), hT));
-                } else {
-                    std::vector<Eigen::Vector2d> hAr; hAr.reserve(hA.size());
-                    for (const auto& q : hA) hAr.push_back(rot2(q, t));
-                    for (const auto& q : T2) acc(sdist(q, hAr));
-                }
-            };
-            // Primary: least protrusion. Secondary: a peg with slack fits at MANY angles, so MAXIMISE the
-            // minimum wall clearance -> the centred, side-aligned pose instead of an arbitrary in-band spin.
-            double best = std::numeric_limits<double>::infinity(), best_t = 0.0, best_clear = -std::numeric_limits<double>::infinity();
-            auto consider = [&](double t) {
-                double m, c; eval(t, m, c);
-                const bool better = m < best - 1e-3 ||
-                    (std::abs(m - best) <= 1e-3 && (c > best_clear + 1e-6 ||
-                        (std::abs(c - best_clear) <= 1e-6 && std::abs(t) < std::abs(best_t))));
-                if (better) { best = m; best_t = t; best_clear = c; }
-            };
-            for (int deg = -180; deg < 180; ++deg) consider(deg * M_PI / 180.0);
-            const double coarse_t = best_t;                                      // refine +/-1 deg at 0.05 deg
-            for (int k = -20; k <= 20; ++k) consider(coarse_t + k * (0.05 * M_PI / 180.0));
-            if (std::abs(best_t) > 1e-9)
-                R = Eigen::AngleAxisd(best_t, n).toRotationMatrix() * R;
-            roll_deg = best_t * 180.0 / M_PI; roll_res = best; roll_clear = best_clear;
-            BOOST_LOG_TRIVIAL(warning) << "[UltraFit] roll by containment: " << roll_deg << " deg, residual=" << best
-                                       << " clearance=" << best_clear << " att_small=" << att_is_small << " asp1=" << asp1 << " asp2=" << asp2;
+        std::vector<Vec3d> b2m; b2m.reserve(b2.size());
+        for (const auto& P : b2) b2m.push_back(p1 + R * (P - p2)); // attachment outline after the normal mate
+        const UltraFit::RollResult rr = UltraFit::roll_by_containment(d1, p1, b1, b2m);
+        if (rr.ok) {
+            if (std::abs(rr.roll) > 1e-9) R = Eigen::AngleAxisd(rr.roll, d1.normalized()).toRotationMatrix() * R;
+            roll_deg = rr.roll * 180.0 / M_PI; roll_res = rr.protrusion; roll_clear = rr.clearance;
+            BOOST_LOG_TRIVIAL(warning) << "[UltraFit] roll by containment: " << roll_deg << " deg, residual=" << rr.protrusion
+                                       << " clearance=" << rr.clearance << " att_small=" << rr.attach_is_smaller
+                                       << " asp1=" << asp1 << " asp2=" << asp2;
         }
     }
     Transform3d rot = Transform3d::Identity(); rot.linear() = R;
-    const Transform3d M = Eigen::Translation3d(p1) * rot * Eigen::Translation3d(-p2);
+    Transform3d M = Eigen::Translation3d(p1) * rot * Eigen::Translation3d(-p2);
+
+    // Body-level collision-aware roll (UltraFitGeometry.hpp): the containment above only sees the two picked
+    // faces, and a curved patch has no rotational cue, so spin the attachment about the mating axis and keep
+    // the angle where its whole mesh penetrates the target's solid least (ties -> least extra spin).
+    double coll_deg = 0.0, coll_pen = -1.0;
+    {
+        auto mt = m_mesh_measure_map.find(vt), ma = m_mesh_measure_map.find(va);
+        Transform3d tW2p, aW2p;
+        if (mt != m_mesh_measure_map.end() && ma != m_mesh_measure_map.end() && mt->second && ma->second &&
+            ultra_w2p(vt, *m_selected_features.first.feature,  tW2p) &&
+            ultra_w2p(va, *m_selected_features.second.feature, aW2p)) {
+            // mesh -> print == (view -> print) * (mesh -> view == world_tran); attachment taken AFTER the mate.
+            const Transform3d t_mesh2print = tW2p * m_selected_features.first.feature->world_tran;
+            const Transform3d a_mesh2print = M * (aW2p * m_selected_features.second.feature->world_tran);
+            const UltraFit::CollisionRoll cr = UltraFit::roll_by_collision(mt->second->get_its(), t_mesh2print,
+                                                                           ma->second->get_its(), a_mesh2print, d1, p1);
+            if (cr.ok) {
+                coll_pen = cr.penetration;
+                if (std::abs(cr.roll) > 1e-6) {
+                    R   = Eigen::AngleAxisd(cr.roll, d1.normalized()).toRotationMatrix() * R;
+                    rot = Transform3d::Identity(); rot.linear() = R;
+                    M   = Eigen::Translation3d(p1) * rot * Eigen::Translation3d(-p2);
+                    coll_deg = cr.roll * 180.0 / M_PI;
+                }
+            }
+            BOOST_LOG_TRIVIAL(warning) << "[UltraFit] roll by collision: " << coll_deg << " deg, penetration=" << coll_pen
+                                       << " samples=" << cr.samples;
+        }
+    }
 
     ModelObject* tmo = model.objects[vt->object_idx()];
     ModelObject* amo = model.objects[va->object_idx()];
@@ -2880,21 +2913,156 @@ void GLGizmoMeasure::ultra_fit_for_print_and_merge()
         << " move=(" << mv.x() << "," << mv.y() << "," << mv.z() << ") d1=(" << d1.transpose()
         << ") d2=(" << d2.transpose() << ")";
 
-    const size_t before = model.objects.size();
-    wxGetApp().plater()->take_snapshot("Fit for Print");
-    amo->instances[0]->set_transformation(Geometry::Transformation(M * amo->instances[0]->get_transformation().get_matrix()));
+    // Ultra Auto-fit: apply the mate to the attachment's PRINT pose and mirror the same pose RELATIVE TO THE
+    // TARGET onto its assembly pose (so the assembly view shows it). Objects stay separate with the picks
+    // alive: nudge with the Adjust sliders, then "Merge parts".
+    (void) tmo;
+    wxGetApp().plater()->take_snapshot("Auto-fit");
+    ultra_apply_attachment_print_pose(M * amo->instances[0]->get_transformation().get_matrix());
+    m_ultra_adjust_rot = 0.f; m_ultra_adjust_off = 0.f;
+    notify((boost::format(_u8L("Auto-fit: moved %.1fmm; outline roll %.1f deg (protrusion %.3f, clearance %.2fmm); collision roll %.1f deg (penetration %.3f). Nudge with the sliders, then Merge parts."))
+            % mv.norm() % roll_deg % roll_res % roll_clear % coll_deg % coll_pen).str());
+}
 
-    // Merge exactly these two objects (regardless of the current tree selection) into one rigid part.
+// Ultra: view-frame -> PRINT-world transform for a picked volume. Feature coords are baked with
+// world_tran (the view's frame, i.e. the exploded assembly pose when picking there).
+bool GLGizmoMeasure::ultra_w2p(GLVolume* v, const Measure::SurfaceFeature& f, Transform3d& out)
+{
+    Model& model = wxGetApp().plater()->model();
+    const int oi = v ? v->object_idx() : -1, vi = v ? v->volume_idx() : -1;
+    if (oi < 0 || oi >= (int) model.objects.size()) return false;
+    ModelObject* mo = model.objects[oi];
+    if (mo->instances.empty() || vi < 0 || vi >= (int) mo->volumes.size()) return false;
+    const Transform3d printW = mo->instances[0]->get_transformation().get_matrix()
+                             * mo->volumes[vi]->get_transformation().get_matrix();
+    out = printW * f.world_tran.inverse();
+    return true;
+}
+
+// Ultra: give the attachment (volume[1]) a new PRINT pose and mirror the same pose RELATIVE TO THE TARGET onto
+// its assembly pose. The transform the current canvas SHOWS is committed through the stock selection path
+// (do_rotate writes the assembly pose in the assembly view, the print pose in the 3D view) so GLVolumes and
+// raycasters stay valid and the view updates; the other one is written directly on the ModelInstance.
+void GLGizmoMeasure::ultra_apply_attachment_print_pose(const Transform3d& new_print)
+{
+    if (m_hit_different_volumes.size() != 2) return;
+    GLVolume* vt = m_hit_different_volumes[0];
+    GLVolume* va = m_hit_different_volumes[1];
+    Model& model = wxGetApp().plater()->model();
+    if (!vt || !va || vt->object_idx() < 0 || va->object_idx() < 0 ||
+        vt->object_idx() >= (int) model.objects.size() || va->object_idx() >= (int) model.objects.size()) return;
+    ModelObject* tmo = model.objects[vt->object_idx()];
+    ModelObject* amo = model.objects[va->object_idx()];
+    if (tmo->instances.empty() || amo->instances.empty()) return;
+    ModelInstance* ti = tmo->instances[0];
+    ModelInstance* ai = amo->instances[0];
+    const Transform3d rel          = ti->get_transformation().get_matrix().inverse() * new_print; // attachment in target's frame
+    const Transform3d new_assemble = ti->get_assemble_transformation().get_matrix() * rel;
+    const bool in_assembly_view    = m_parent.get_canvas_type() == GLCanvas3D::ECanvasType::CanvasAssembleView;
+
+    // Write BOTH poses on the ModelInstance directly and update the shown GLVolume through the selection,
+    // deliberately NOT via GLCanvas3D::do_rotate: its "fix flying instances" pass grounds any lifted
+    // separate object the moment the gizmo runs in the Prepare view, which un-did the fit. The part stays
+    // where the fit put it until "Merge parts" (a later manual move would still ground it -- merge first).
+    ai->set_transformation(Geometry::Transformation(new_print));
+    ai->set_assemble_transformation(Geometry::Transformation(new_assemble));
+
+    auto selection = const_cast<Selection*>(&m_parent.get_selection());
+    selection->setup_cache();
+    selection->set_mode(Selection::Instance);
+    m_pending_scale = 1;
+    va->set_instance_transformation(Geometry::Transformation(in_assembly_view ? new_assemble : new_print));
+    selection->rotate(va->object_idx(), va->instance_idx(), va->get_instance_transformation().get_matrix());
+    m_parent.set_as_dirty();
+    wxGetApp().plater()->schedule_background_process(); // print pose changed -> invalidate the slice
+    register_single_mesh_pick();
+    if (m_selected_features.second.feature.has_value()) update_feature_by_tran(*m_selected_features.second.feature);
+}
+
+// Ultra: fuse the two picked objects into one multi-part object (durable: drops / moves / prints as a unit).
+void GLGizmoMeasure::ultra_merge_parts()
+{
+    auto notify = [](const std::string& t) {
+        wxGetApp().plater()->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel, t);
+    };
+    if (m_hit_different_volumes.size() != 2) return;
+    GLVolume* vt = m_hit_different_volumes[0];
+    GLVolume* va = m_hit_different_volumes[1];
+    Model& model = wxGetApp().plater()->model();
+    if (!vt || !va || vt->object_idx() < 0 || va->object_idx() < 0 ||
+        vt->object_idx() >= (int) model.objects.size() || va->object_idx() >= (int) model.objects.size()) return;
+    if (vt->object_idx() == va->object_idx()) { notify(_u8L("Merge parts: these are already parts of one object.")); return; }
+    ModelObject* tmo = model.objects[vt->object_idx()];
+    ModelObject* amo = model.objects[va->object_idx()];
+    const size_t before = model.objects.size();
     ObjectList* ol = wxGetApp().obj_list();
     ol->select_items(std::vector<ObjectVolumeID>{ ObjectVolumeID{ tmo, nullptr }, ObjectVolumeID{ amo, nullptr } });
     ol->merge(true);
-    const size_t after = model.objects.size();
-    BOOST_LOG_TRIVIAL(warning) << "[UltraFit] merge objects " << before << " -> " << after;
+    reset_all_feature(); // merge() deleted the two source objects -> picked GLVolume* would dangle
+    notify((boost::format(_u8L("Merged into one object (objects %d -> %d). Check the Prepare view.")) % (int) before % (int) model.objects.size()).str());
+}
 
-    // merge() deleted the two source objects -> our picked GLVolume* are now dangling. Clear them.
-    reset_all_feature();
-    notify((boost::format(_u8L("Fit for Print: moved %.1fmm, roll %.2f deg (protrusion %.3f, clearance %.2fmm); objects %d -> %d. Check the Prepare view."))
-            % mv.norm() % roll_deg % roll_res % roll_clear % (int) before % (int) after).str());
+// Ultra: spin part 2 about the mating axis (feature 1's direction through its point).
+void GLGizmoMeasure::ultra_adjust_rotate(double deg_delta, bool take_shot)
+{
+    if (m_hit_different_volumes.size() != 2 || std::abs(deg_delta) < 1e-6) return;
+    if (!m_selected_features.first.feature.has_value() || !m_selected_features.second.feature.has_value()) return;
+    if (m_same_model_object) { set_to_around_center_of_faces(true, (float) deg_delta, take_shot); return; } // stock volume path
+    Vec3d d1, p1;
+    if (!ultra_feature_dir_point(*m_selected_features.first.feature, d1, p1)) return;
+    Transform3d W1;
+    if (!ultra_w2p(m_hit_different_volumes[0], *m_selected_features.first.feature, W1)) return;
+    const Vec3d dp = (W1.linear() * d1).normalized(), pp = W1 * p1;
+    Model& model = wxGetApp().plater()->model();
+    ModelObject* amo = model.objects[m_hit_different_volumes[1]->object_idx()];
+    if (take_shot) wxGetApp().plater()->take_snapshot("Adjust rotation", UndoRedo::SnapshotType::GizmoAction);
+    const Transform3d delta = Eigen::Translation3d(pp) * Eigen::AngleAxisd(Geometry::deg2rad(deg_delta), dp) * Eigen::Translation3d(-pp);
+    ultra_apply_attachment_print_pose(delta * amo->instances[0]->get_transformation().get_matrix());
+}
+
+// Ultra: slide part 2 along the mating axis.
+void GLGizmoMeasure::ultra_adjust_offset(double mm_delta, bool take_shot)
+{
+    if (m_hit_different_volumes.size() != 2 || std::abs(mm_delta) < 1e-6) return;
+    if (!m_selected_features.first.feature.has_value() || !m_selected_features.second.feature.has_value()) return;
+    Vec3d d1, p1;
+    if (!ultra_feature_dir_point(*m_selected_features.first.feature, d1, p1)) return;
+    if (m_same_model_object) { set_distance(true, d1.normalized() * mm_delta, take_shot); return; } // stock volume path
+    Transform3d W1;
+    if (!ultra_w2p(m_hit_different_volumes[0], *m_selected_features.first.feature, W1)) return;
+    const Vec3d dp = (W1.linear() * d1).normalized();
+    Model& model = wxGetApp().plater()->model();
+    ModelObject* amo = model.objects[m_hit_different_volumes[1]->object_idx()];
+    if (take_shot) wxGetApp().plater()->take_snapshot("Adjust offset", UndoRedo::SnapshotType::GizmoAction);
+    const Transform3d delta = Transform3d(Eigen::Translation3d(dp * mm_delta));
+    ultra_apply_attachment_print_pose(delta * amo->instances[0]->get_transformation().get_matrix());
+}
+
+// Ultra: live Adjust sliders (all modes). Values are cumulative since the last mate / pick; each change is
+// applied as a delta. One undo snapshot per drag (taken when the slider is grabbed).
+void GLGizmoMeasure::ultra_show_adjust_ui()
+{
+    if (m_measure_mode != EMeasureMode::ONLY_ASSEMBLY || m_hit_different_volumes.size() != 2) return;
+    if (!m_selected_features.first.feature.has_value() || !m_selected_features.second.feature.has_value()) return;
+    Vec3d d, p;
+    if (!ultra_feature_dir_point(*m_selected_features.first.feature, d, p)) return; // points have no axis
+    ImGui::Separator();
+    m_imgui->text(_u8L("Adjust part 2 (live)"));
+    ImGui::PushItemWidth(std::max(180.0f, ImGui::CalcTextSize("Offset -20.00 mm").x * 2.2f));
+    float rot = m_ultra_adjust_rot;
+    if (ImGui::SliderFloat("##ultra_adjust_rot", &rot, -180.0f, 180.0f, "Rotate %.1f deg")) {
+        const bool shot = ImGui::IsItemActivated();
+        ultra_adjust_rotate(double(rot - m_ultra_adjust_rot), shot);
+        m_ultra_adjust_rot = rot;
+    }
+    float off = m_ultra_adjust_off;
+    if (ImGui::SliderFloat("##ultra_adjust_off", &off, -20.0f, 20.0f, "Offset %.2f mm")) {
+        const bool shot = ImGui::IsItemActivated();
+        ultra_adjust_offset(double(off - m_ultra_adjust_off), shot);
+        m_ultra_adjust_off = off;
+    }
+    ImGui::PopItemWidth();
 }
 
 void GLGizmoMeasure::set_parallel_distance(bool same_model_object, float dist)
@@ -2931,9 +3099,38 @@ void GLGizmoMeasure::set_parallel_distance(bool same_model_object, float dist)
     }
 }
 
+// Ultra (Point/Point mode): the stock tool offered no mate for two points. Translate part 2 so its picked
+// point (or circle centre) lands on part 1's -- same displacement path the face mate uses.
+void GLGizmoMeasure::ultra_coincide_points()
+{
+    if (m_hit_different_volumes.size() != 2) return;
+    if (!m_selected_features.first.feature.has_value() || !m_selected_features.second.feature.has_value()) return;
+    auto pt_of = [](const Measure::SurfaceFeature& f, Vec3d& p) -> bool {
+        switch (f.get_type()) {
+        case Measure::SurfaceFeatureType::Point:  p = f.get_point(); return true;
+        case Measure::SurfaceFeatureType::Circle: p = std::get<0>(f.get_circle()); return true;
+        default: return false;
+        }
+    };
+    Vec3d p1, p2;
+    if (!pt_of(*m_selected_features.first.feature, p1) || !pt_of(*m_selected_features.second.feature, p2)) return;
+    set_distance(m_same_model_object, p1 - p2, true);
+}
+
 bool GLGizmoMeasure::is_pick_meet_assembly_mode(const SelectedFeatures::Item &item) {
     if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY) {
-        if (m_assembly_mode == AssemblyMode::FACE_FACE && item.feature->get_type() == Measure::SurfaceFeatureType::Plane) {
+        // Ultra: Face/Face also accepts Circle rims (peg/hole) -- the hover filter and the mate buttons
+        // already did, but the click was still rejected here ("please select Plane's feature").
+        if (m_assembly_mode == AssemblyMode::FACE_FACE &&
+            (item.feature->get_type() == Measure::SurfaceFeatureType::Plane ||
+             item.feature->get_type() == Measure::SurfaceFeatureType::Circle)) {
+            return true;
+        }
+        // Ultra: the facet / curved-patch modes accept exactly their own pick kind.
+        if (m_assembly_mode == AssemblyMode::TRIANGLE_TRIANGLE && item.feature->get_type() == Measure::SurfaceFeatureType::Triangle) {
+            return true;
+        }
+        if (m_assembly_mode == AssemblyMode::CURVE_CURVE && item.feature->get_type() == Measure::SurfaceFeatureType::Curve) {
             return true;
         }
         if (m_assembly_mode == AssemblyMode::POINT_POINT &&

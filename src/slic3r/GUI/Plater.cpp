@@ -89,6 +89,7 @@
 #include "libslic3r/Measure.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/TriangleMesh.hpp"
+#include "slic3r/GUI/UltraFitGeometry.hpp"
 #include <Eigen/Eigenvalues>
 #include "libslic3r/SLA/Hollowing.hpp"
 #include "libslic3r/SLA/SupportPoint.hpp"
@@ -13808,6 +13809,7 @@ struct UltraFitFeat {
     Vec3d  pt;     // world centroid (plane) / center (circle, sphere) / point-on-axis (cylinder)
     double radius; // world radius (circle/cylinder/sphere); 0 for plane
     double area;   // world plane area; 0 for round features
+    std::vector<Vec3d> outline; // world boundary vertices (planes only) for roll-by-containment
 };
 
 static double ultra_tri_area(const indexed_triangle_set& its, int tri)
@@ -13860,8 +13862,10 @@ static void ultra_soft_planes(const indexed_triangle_set& its, const Transform3d
         const Vec3d nseed = fn[s];
         stack.clear(); stack.push_back(s); seen[s] = 1;
         Vec3d nsum = Vec3d::Zero(), csum = Vec3d::Zero(); double area = 0.0;
+        std::vector<int> ptris; // this patch's triangles, for its boundary outline
         while (!stack.empty()) {
             int t = stack.back(); stack.pop_back();
+            ptris.push_back(t);
             nsum += fn[t] * fa[t]; csum += ultra_tri_centroid(its, t) * fa[t]; area += fa[t];
             const Vec3i32& adj = nb[t];
             for (int k = 0; k < 3; ++k) {
@@ -13873,7 +13877,9 @@ static void ultra_soft_planes(const indexed_triangle_set& its, const Transform3d
         if (area <= 0 || nsum.norm() < 1e-9) continue;
         double area_world = area * scale * scale;
         if (area_world < min_area_world) continue;
-        out.push_back({0, (lin * nsum.normalized()).normalized(), world * (csum / area), 0.0, area_world});
+        UltraFitFeat pf{0, (lin * nsum.normalized()).normalized(), world * (csum / area), 0.0, area_world};
+        pf.outline = UltraFit::patch_boundary(its, ptris, world); // for roll-by-containment
+        out.push_back(std::move(pf));
     }
 }
 
@@ -14030,7 +14036,18 @@ static Transform3d ultra_mate_delta_feat(const UltraFitFeat& t, const UltraFitFe
         M.translation() = t.pt - a.pt;
         return M;
     }
-    return ultra_mate_delta(t.dir, t.pt, a.dir, a.pt);
+    // Normal alignment, then (planes with outlines) pin the free spin about the shared normal by
+    // containment -- the same helper as the guided Fit for Print, so auto-fit seats parts square too.
+    Vec3d axis; double phi; Matrix3d R;
+    Geometry::rotation_from_two_vectors(a.dir, -t.dir, axis, phi, &R);
+    if (t.kind == 0 && a.kind == 0 && t.outline.size() >= 3 && a.outline.size() >= 3) {
+        std::vector<Vec3d> am; am.reserve(a.outline.size());
+        for (const auto& P : a.outline) am.push_back(t.pt + R * (P - a.pt)); // attachment outline after the normal mate
+        const UltraFit::RollResult rr = UltraFit::roll_by_containment(t.dir, t.pt, t.outline, am);
+        if (rr.ok && std::abs(rr.roll) > 1e-9) R = Eigen::AngleAxisd(rr.roll, t.dir.normalized()).toRotationMatrix() * R;
+    }
+    Transform3d rot = Transform3d::Identity(); rot.linear() = R;
+    return Eigen::Translation3d(t.pt) * rot * Eigen::Translation3d(-a.pt);
 }
 } // anonymous namespace
 

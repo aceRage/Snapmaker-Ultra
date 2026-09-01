@@ -89,7 +89,7 @@ public:
         bool features_extracted = false;
     };
 
-    std::optional<SurfaceFeature>      get_feature(size_t face_idx, const Vec3d &point, const Transform3d &world_tran,bool only_select_plane);
+    std::optional<SurfaceFeature>      get_feature(size_t face_idx, const Vec3d &point, const Transform3d &world_tran,bool only_select_plane, double snap_radius, int pick_kind);
     int get_num_of_planes() const;
     const std::vector<int>& get_plane_triangle_indices(int idx) const;
     std::vector<int>* get_plane_tri_indices(int idx);
@@ -100,10 +100,13 @@ public:
 private:
     void update_planes();
     void extract_features(int plane_idx);
+    std::vector<int> grow_curve_patch(size_t seed_facet) const; // Ultra: low-curvature patch for Curve picks
 
     std::vector<PlaneData> m_planes;
     std::vector<size_t>    m_face_to_plane;
     indexed_triangle_set   m_its;
+    std::vector<Vec3f>     m_face_normals;   // Ultra: cached once; reused by Curve picks at hover time
+    std::vector<Vec3i32>   m_face_neighbors; // Ultra: cached once; reused by Curve picks at hover time
 };
 
 
@@ -131,8 +134,10 @@ void MeasuringImpl::update_planes()
     // This part is still performed in mesh coordinate system.
     const size_t             num_of_facets = m_its.indices.size();
     m_face_to_plane.resize(num_of_facets, size_t(-1));
-    const std::vector<Vec3f> face_normals = its_face_normals(m_its);
-    const std::vector<Vec3i32> face_neighbors = its_face_neighbors(m_its);
+    m_face_normals   = its_face_normals(m_its);   // Ultra: cached (Curve picks reuse them at hover time)
+    m_face_neighbors = its_face_neighbors(m_its);
+    const std::vector<Vec3f>&   face_normals   = m_face_normals;
+    const std::vector<Vec3i32>& face_neighbors = m_face_neighbors;
     std::vector<int>         facet_queue(num_of_facets, 0);
     int                      facet_queue_cnt = 0;
     const stl_normal*        normal_ptr      = nullptr;
@@ -522,10 +527,76 @@ void MeasuringImpl::extract_features(int plane_idx)
     plane.features_extracted = true;
 }
 
-std::optional<SurfaceFeature> MeasuringImpl::get_feature(size_t face_idx, const Vec3d &point, const Transform3d &world_tran,bool only_select_plane)
+// Ultra (Curve picks): region-grow a low-curvature patch from the hit facet -- 8 deg per step so a gently
+// curved face grows across its curvature (Measure's exact 0.001 seed test shatters it into one-triangle
+// planes), CAPPED at 20 deg total spread vs the seed so a full cylinder is not swallowed. Bounded for
+// hover-time use.
+std::vector<int> MeasuringImpl::grow_curve_patch(size_t seed_facet) const
+{
+    std::vector<int> out;
+    const size_t F = m_its.indices.size();
+    if (seed_facet >= F || m_face_normals.size() != F || m_face_neighbors.size() != F) return out;
+    const Vec3f nseed    = m_face_normals[seed_facet];
+    const float cos_step = std::cos(8.0f  * float(M_PI) / 180.0f);
+    const float cos_cap  = std::cos(20.0f * float(M_PI) / 180.0f);
+    const size_t max_facets = 20000;
+    std::vector<char> seen(F, 0);
+    std::vector<int>  stack{ int(seed_facet) };
+    seen[seed_facet] = 1;
+    while (!stack.empty() && out.size() < max_facets) {
+        const int t = stack.back(); stack.pop_back();
+        out.push_back(t);
+        const Vec3f& nt = m_face_normals[t];
+        for (int k = 0; k < 3; ++k) {
+            const int u = m_face_neighbors[t][k];
+            if (u < 0 || seen[u]) continue;
+            const Vec3f& nu = m_face_normals[u];
+            if (nu.dot(nt) > cos_step && nu.dot(nseed) > cos_cap) { seen[u] = 1; stack.push_back(u); }
+        }
+    }
+    return out;
+}
+
+std::optional<SurfaceFeature> MeasuringImpl::get_feature(size_t face_idx, const Vec3d &point, const Transform3d &world_tran,bool only_select_plane, double snap_radius, int pick_kind)
 {
     if (face_idx >= m_face_to_plane.size())
         return std::optional<SurfaceFeature>();
+
+    // Ultra: Triangle pick -- the hit facet itself (normal, centroid), owning its one-facet list so the
+    // plane highlighter / raycaster can render it without dangling into PlaneData.
+    if (pick_kind == 1 && face_idx < m_its.indices.size()) {
+        const auto& tri = m_its.indices[face_idx];
+        const Vec3d a = m_its.vertices[tri[0]].cast<double>(), b = m_its.vertices[tri[1]].cast<double>(), c = m_its.vertices[tri[2]].cast<double>();
+        Vec3d n = (b - a).cross(c - a); const double l = n.norm(); n = l > 1e-12 ? Vec3d(n / l) : Vec3d::UnitZ();
+        SurfaceFeature f(SurfaceFeatureType::Triangle, n, (a + b + c) / 3.0, std::nullopt, double(face_idx));
+        f.owned_indices = std::make_shared<std::vector<int>>(1, int(face_idx));
+        f.plane_indices = f.owned_indices.get();
+        f.origin_surface_feature = std::make_shared<SurfaceFeature>(f);
+        f.translate(world_tran);
+        return std::make_optional(f);
+    }
+
+    // Ultra: Curve pick -- a low-curvature patch grown from the hit facet (area-weighted mean normal,
+    // area-weighted centroid), owning its facet list. Mates through the same (normal, point) machinery.
+    if (pick_kind == 2 && face_idx < m_its.indices.size()) {
+        std::vector<int> patch = grow_curve_patch(face_idx);
+        Vec3d nsum = Vec3d::Zero(), csum = Vec3d::Zero(); double area = 0.0;
+        for (int t : patch) {
+            const auto& tri = m_its.indices[t];
+            const Vec3d a = m_its.vertices[tri[0]].cast<double>(), b = m_its.vertices[tri[1]].cast<double>(), c = m_its.vertices[tri[2]].cast<double>();
+            const Vec3d cr = (b - a).cross(c - a); const double ta = 0.5 * cr.norm();
+            if (ta <= 0.0) continue;
+            nsum += cr.normalized() * ta; csum += (a + b + c) / 3.0 * ta; area += ta;
+        }
+        if (!patch.empty() && area > 0.0 && nsum.norm() > 1e-9) {
+            SurfaceFeature f(SurfaceFeatureType::Curve, nsum.normalized(), csum / area, std::nullopt, double(face_idx));
+            f.owned_indices = std::make_shared<std::vector<int>>(std::move(patch));
+            f.plane_indices = f.owned_indices.get();
+            f.origin_surface_feature = std::make_shared<SurfaceFeature>(f);
+            f.translate(world_tran);
+            return std::make_optional(f);
+        }
+    }
 
     const PlaneData& plane = m_planes[m_face_to_plane[face_idx]];
 
@@ -540,6 +611,28 @@ std::optional<SurfaceFeature> MeasuringImpl::get_feature(size_t face_idx, const 
 
     assert(plane.surface_features.empty() || plane.surface_features.back().get_type() == SurfaceFeatureType::Plane);
 
+    // Ultra: a view-scaled pick radius (mesh units) from the caller replaces the fixed 0.5 mm limits,
+    // which were sub-pixel when zoomed out; < 0 keeps the legacy behaviour.
+    const double hover_limit = snap_radius >= 0.0 ? snap_radius : feature_hover_limit;
+
+    if (!only_select_plane && snap_radius >= 0.0 && face_idx < m_its.indices.size()) {
+        // Ultra: direct VERTEX pick from the hit facet's corners. Previously a vertex was reachable only
+        // as an endpoint snap after an Edge had already won the contest, so corners were nearly
+        // impossible to select.
+        const auto& tri = m_its.indices[face_idx];
+        double best = snap_radius * snap_radius; int best_v = -1;
+        for (int k = 0; k < 3; ++k) {
+            const double d2 = (point - m_its.vertices[tri[k]].cast<double>()).squaredNorm();
+            if (d2 < best) { best = d2; best_v = tri[k]; }
+        }
+        if (best_v >= 0) {
+            SurfaceFeature local_f(m_its.vertices[best_v].cast<double>());
+            local_f.origin_surface_feature = std::make_shared<SurfaceFeature>(local_f);
+            local_f.translate(world_tran);
+            return std::make_optional(local_f);
+        }
+    }
+
     if (!only_select_plane) {
         for (size_t i = 0; i < plane.surface_features.size() - 1; ++i) {
             // The -1 is there to prevent measuring distance to the plane itself,
@@ -547,7 +640,7 @@ std::optional<SurfaceFeature> MeasuringImpl::get_feature(size_t face_idx, const 
             res = get_measurement(plane.surface_features[i], point_sf);
             if (res.distance_strict) { // TODO: this should become an assert after all combinations are implemented.
                 double dist = res.distance_strict->dist;
-                if (dist < feature_hover_limit && dist < min_dist) {
+                if (dist < hover_limit && dist < min_dist) {
                     min_dist            = std::min(dist, min_dist);
                     closest_feature_idx = i;
                 }
@@ -559,10 +652,11 @@ std::optional<SurfaceFeature> MeasuringImpl::get_feature(size_t face_idx, const 
             if (f.get_type() == SurfaceFeatureType::Edge) {
                 // If this is an edge, check if we are not close to the endpoint. If so,
                 // we will include the endpoint as well. Close = 10% of the lenghth of
-                // the edge, clamped between 0.025 and 0.5 mm.
+                // the edge, clamped between 0.025 and 0.5 mm (or the caller's view-scaled radius).
                 const auto &[sp, ep] = f.get_edge();
                 double len_sq        = (ep - sp).squaredNorm();
-                double limit_sq      = std::max(0.025 * 0.025, std::min(0.5 * 0.5, 0.1 * 0.1 * len_sq));
+                double limit_sq      = snap_radius >= 0.0 ? snap_radius * snap_radius
+                                                          : std::max(0.025 * 0.025, std::min(0.5 * 0.5, 0.1 * 0.1 * len_sq));
                 if ((point - sp).squaredNorm() < limit_sq) {
                     SurfaceFeature local_f(sp);
                     local_f.origin_surface_feature = std::make_shared<SurfaceFeature>(local_f);
@@ -644,12 +738,9 @@ Measuring::~Measuring() {}
 
 
 
-std::optional<SurfaceFeature> Measuring::get_feature(size_t face_idx, const Vec3d &point, const Transform3d &world_tran, bool only_select_plane) const
+std::optional<SurfaceFeature> Measuring::get_feature(size_t face_idx, const Vec3d &point, const Transform3d &world_tran, bool only_select_plane, double snap_radius, int pick_kind) const
 {
-    if (face_idx == 7516 || face_idx == 7517) {
-        std::cout << "";
-    }
-    return priv->get_feature(face_idx, point, world_tran, only_select_plane);
+    return priv->get_feature(face_idx, point, world_tran, only_select_plane, snap_radius, pick_kind);
 }
 
 
@@ -1320,6 +1411,8 @@ static bool assembly_feature_dir_point(const SurfaceFeature& f, Vec3d& dir, Vec3
     switch (f.get_type()) {
     case SurfaceFeatureType::Plane:  { const auto [i, n, p]  = f.get_plane();  dir = n;  pt = p; return true; }
     case SurfaceFeatureType::Circle: { const auto [c, r, ax] = f.get_circle(); dir = ax; pt = c; return true; }
+    case SurfaceFeatureType::Triangle:
+    case SurfaceFeatureType::Curve:  { const auto [n, p]     = f.get_patch();  dir = n;  pt = p; return true; }
     default: return false;
     }
 }
@@ -1334,7 +1427,7 @@ AssemblyAction get_assembly_action(const SurfaceFeature& a, const SurfaceFeature
 
     // Plane-specific extras (parallel-distance handle, rotate-around-center-of-faces) only make sense when
     // BOTH picks are flat faces; circle mates use only coaxial-align + concentric center coincidence.
-    const bool both_planes = (a.get_type() == SurfaceFeatureType::Plane && b.get_type() == SurfaceFeatureType::Plane);
+    const bool both_planes = a.is_planar() && b.is_planar(); // Plane, Triangle or Curve all carry a flat normal+point
 
     action.can_set_feature_1_reverse_rotation = true;
     action.can_set_feature_2_reverse_rotation = true;
@@ -1377,6 +1470,8 @@ void SurfaceFeature::translate(const Vec3d& displacement) {
         }
         break;
     }
+    case Measure::SurfaceFeatureType::Triangle:
+    case Measure::SurfaceFeatureType::Curve:
     case Measure::SurfaceFeatureType::Plane: {
         //m_pt1 is normal;
         m_pt2 = m_pt2 + displacement;
@@ -1406,6 +1501,8 @@ void SurfaceFeature::translate(const Transform3d &tran)
         }
         break;
     }
+    case Measure::SurfaceFeatureType::Triangle:
+    case Measure::SurfaceFeatureType::Curve:
     case Measure::SurfaceFeatureType::Plane: {
         // m_pt1 is normal;
         Vec3d temp_pt1 = m_pt2 + m_pt1;

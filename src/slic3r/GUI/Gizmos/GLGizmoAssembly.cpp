@@ -94,7 +94,7 @@ void GLGizmoAssembly::on_render_input_window(float x, float y, float bottom_limi
     init_render_input_window();
 
     float moving_size = m_imgui->calc_text_size(_L("(Moving)")).x;
-    float combox_content_size = m_imgui->calc_text_size(_L("Point and point assembly")).x*1.1 + ImGui::GetStyle().FramePadding.x * 18.0f;
+    float combox_content_size = m_imgui->calc_text_size(_L("Triangle and triangle assembly")).x*1.1 + ImGui::GetStyle().FramePadding.x * 18.0f; // widest mode label
     float caption_size = moving_size + 2 * m_space_size;
     if (render_assembly_mode_combo(caption_size + 0.5 * m_space_size,  combox_content_size)) {
         ;
@@ -103,23 +103,36 @@ void GLGizmoAssembly::on_render_input_window(float x, float y, float bottom_limi
     show_face_face_assembly_common();
     ImGui::Separator();
     show_face_face_assembly_senior();
-    // Ultra guided Auto-Fit: always shown in Face/Face mode so it is discoverable; enabled once two
-    // features are picked. Mates the two picks on the PRINT transform, then merges into one part.
-    if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY && m_assembly_mode == AssemblyMode::FACE_FACE) {
-        ImGui::Separator();
+    // Ultra: assembly actions for every mode.
+    //  Point/Point          -> "Coincide points" (translate part 2's point onto part 1's).
+    //  Face/Triangle/Curve  -> "Auto-fit": mates the two picks on BOTH the print and the assembly transform,
+    //                          keeps the objects separate and the picks alive so the sliders can nudge the
+    //                          result; "Merge parts" then fuses them into one printable object.
+    //  All modes            -> live Adjust sliders: spin about / slide along the mating axis.
+    if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY) {
         const bool ready = m_hit_different_volumes.size() == 2 &&
                            m_selected_features.first.feature.has_value() &&
                            m_selected_features.second.feature.has_value();
-        m_imgui->disabled_begin(!ready);
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4( 33 / 255.0f, 150 / 255.0f, 243 / 255.0f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4( 66 / 255.0f, 165 / 255.0f, 245 / 255.0f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4( 30 / 255.0f, 136 / 255.0f, 229 / 255.0f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(254 / 255.0f, 254 / 255.0f, 254 / 255.0f, 1.0f));
-        if (m_imgui->button(_L("Fit for Print & Merge"))) {
-            ultra_fit_for_print_and_merge();
+        ImGui::Separator();
+        if (m_assembly_mode == AssemblyMode::POINT_POINT) {
+            m_imgui->disabled_begin(!ready);
+            if (m_imgui->button(_L("Coincide points"))) { ultra_coincide_points(); }
+            m_imgui->disabled_end();
+        } else {
+            m_imgui->disabled_begin(!ready);
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4( 33 / 255.0f, 150 / 255.0f, 243 / 255.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4( 66 / 255.0f, 165 / 255.0f, 245 / 255.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4( 30 / 255.0f, 136 / 255.0f, 229 / 255.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(254 / 255.0f, 254 / 255.0f, 254 / 255.0f, 1.0f));
+            if (m_imgui->button(_L("Auto-fit"))) { ultra_fit_for_print_and_merge(); }
+            ImGui::PopStyleColor(4);
+            m_imgui->disabled_end();
+            ImGui::SameLine();
+            m_imgui->disabled_begin(!ready || m_same_model_object);
+            if (m_imgui->button(_L("Merge parts"))) { ultra_merge_parts(); }
+            m_imgui->disabled_end();
         }
-        ImGui::PopStyleColor(4);
-        m_imgui->disabled_end();
+        ultra_show_adjust_ui();
     }
     show_distance_xyz_ui();
     render_input_window_warning(m_same_model_object);
@@ -169,7 +182,9 @@ bool GLGizmoAssembly::render_assembly_mode_combo(double label_width, float item_
 {
     ImGui::AlignTextToFramePadding();
     int                      selection_idx = int(m_assembly_mode);
-    std::vector<std::string> modes         = {_u8L("Face and face assembly"), _u8L("Point and point assembly")};
+    // Ultra: positional -- order must match AssemblyMode.
+    std::vector<std::string> modes         = {_u8L("Face and face assembly"), _u8L("Point and point assembly"),
+                                              _u8L("Triangle and triangle assembly"), _u8L("Curve and curve assembly")};
     bool                     is_changed    = false;
 
     ImGuiWrapper::push_combo_style(m_parent.get_scale());
