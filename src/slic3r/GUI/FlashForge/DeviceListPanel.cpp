@@ -323,9 +323,6 @@ DeviceInfoItemPanel::DeviceInfoItemPanel(wxWindow *parent, const DeviceInfo& inf
         if (m_info.lanFlag) {
             MessageDialog msg_wingow(nullptr, _L("Are you sure to unbind this device?"), _L("Question"), wxYES_NO);
             if (wxID_YES == msg_wingow.ShowModal()) {
-#ifdef __APPLE__
-                SelectMachinePopup::m_wan_bind_enable = false;
-#endif
                 devOpr->unbind_lan_machine(it->second);
 
                 MessageDialog msg_wingow1(nullptr, _L("Log out successful."), "", wxAPPLY | wxOK);
@@ -335,9 +332,6 @@ DeviceInfoItemPanel::DeviceInfoItemPanel(wxWindow *parent, const DeviceInfo& inf
             } else {
                 restore_unbind_button();
             }
-#ifdef __APPLE__
-            SelectMachinePopup::m_wan_bind_enable = false;
-#endif
         } else {
             BindInfo*           info = it->second->get_bind_info();
             UnBindMachineDialog dlg;
@@ -348,9 +342,6 @@ DeviceInfoItemPanel::DeviceInfoItemPanel(wxWindow *parent, const DeviceInfo& inf
             /*if (dlg.ShowModal() == wxID_OK) {
                 devOpr->set_selected_machine("");
             }*/
-#ifdef __APPLE__
-            SelectMachinePopup::m_wan_bind_enable = false;
-#endif
         }
     });
 
