@@ -284,12 +284,29 @@ unsigned int LayerTools::resolve_mixed_1based(unsigned int filament_id) const
                                             this->current_object);
 }
 
+// Wave A fix-wave / C-1 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md): wall_filament,
+// sparse_infill_filament and solid_infill_filament all route their id through this one helper so
+// they can never resolve the SAME configured filament id to DIFFERENT physical extruders again.
+// Before this fix wall_filament called resolve_mixed_1based directly, skipping the
+// grouped_manual_pattern_infill_filament_1based step sparse_infill_filament/solid_infill_filament
+// already applied - harmless wherever wall_filament == sparse_infill_filament resolve to the SAME
+// physical extruder either way (every non-mixed print, hence the unpainted byte-parity gate), but
+// not for a mixed filament whose manual_pattern groups perimeters differently than the flattened
+// (layer-cycle) pattern resolve_mixed_1based reads: gap fill (routed through wall_filament, since
+// it is generated as part of the wall stack) could then print on a different physical extruder
+// than the walls it sits directly behind, on a print with no MM painting anywhere.
+unsigned int LayerTools::resolve_grouped_or_mixed_1based(const PrintRegion &region, unsigned int filament_id) const
+{
+    const unsigned int grouped = grouped_manual_pattern_infill_filament_1based(*this, region, filament_id);
+    return (grouped != 0) ? grouped : resolve_mixed_1based(filament_id);
+}
+
 // Return a zero based extruder from the region, or extruder_override if overriden.
 unsigned int LayerTools::wall_filament(const PrintRegion &region) const
 {
 	assert(region.config().wall_filament.value > 0);
 	unsigned int id = (this->extruder_override == 0) ? region.config().wall_filament.value : this->extruder_override;
-	return resolve_mixed_1based(id) - 1;
+	return resolve_grouped_or_mixed_1based(region, id) - 1;
 }
 
 // Ultra: zero based extruder for outer walls (falls back to wall_filament when unset).
@@ -307,16 +324,14 @@ unsigned int LayerTools::sparse_infill_filament(const PrintRegion &region) const
 {
 	assert(region.config().wall_filament.value > 0);
 	unsigned int id = (this->extruder_override == 0) ? sparse_infill_filament_id_1based(region) : this->extruder_override;
-    const unsigned int grouped = grouped_manual_pattern_infill_filament_1based(*this, region, id);
-	return ((grouped != 0) ? grouped : resolve_mixed_1based(id)) - 1;
+	return resolve_grouped_or_mixed_1based(region, id) - 1;
 }
 
 unsigned int LayerTools::solid_infill_filament(const PrintRegion &region) const
 {
 	assert(region.config().solid_infill_filament.value > 0);
 	unsigned int id = (this->extruder_override == 0) ? region.config().solid_infill_filament.value : this->extruder_override;
-    const unsigned int grouped = grouped_manual_pattern_infill_filament_1based(*this, region, id);
-	return ((grouped != 0) ? grouped : resolve_mixed_1based(id)) - 1;
+	return resolve_grouped_or_mixed_1based(region, id) - 1;
 }
 
 // Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
@@ -829,12 +844,22 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                 // fill represents infill extrusions of a single island.
                 const auto *fill = dynamic_cast<const ExtrusionEntityCollection*>(ee);
                 ExtrusionRole role = fill->entities.empty() ? erNone : fill->entities.front()->role();
-                if (internal_solid_infill_uses_sparse_filament(region, role))
-                    has_sparse_infill = true;
-                else if (is_solid_infill(role))
-                    has_solid_infill = true;
-                else if (role != erNone)
-                    has_sparse_infill = true;
+                // Wave A fix-wave / I-3 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md):
+                // bucket through the SAME fill_filament_source resolution GCode.cpp's emission
+                // uses (single source of truth), instead of a second, independently-drifted copy
+                // of the same role rule. Gap fill now emits with wall_filament (PrintRegion.cpp),
+                // and the perimeters loop above already registers wall_ext for this region - so a
+                // gap-fill-only collection must contribute NOTHING here, not sparse_infill_filament,
+                // or the layer's computed extruder set disagrees with what is actually emitted
+                // (a spurious tool change / wipe-tower purge for an extruder nothing prints with).
+                if (role != erNone) {
+                    switch (fill_filament_source(region.config(), role)) {
+                    case FillFilamentSource::Wall:        break; // covered by the perimeters loop above
+                    case FillFilamentSource::SolidInfill: has_solid_infill  = true; break;
+                    case FillFilamentSource::SparseInfill:
+                    default:                              has_sparse_infill = true; break;
+                    }
+                }
 
                 if (m_print_config_ptr) {
                     if (! layer_tools.wiping_extrusions().is_overriddable_and_mark(*fill, *m_print_config_ptr, object, region))

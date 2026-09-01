@@ -1215,25 +1215,44 @@ static void remove_multiple_edges_in_vertex(const VD::vertex_type &vertex) {
 // nothing where it actually helps - in millimetres mode at 4-6mm, band/4 is 1.0-1.5mm, well above
 // one bead for steps 0-1 - and removes the entire sub-bead regime.
 //
-// WAVE A / I-2: THE LADDER'S THRESHOLDS COME FROM THE UN-NOTCHED BAND (`ladder_band`), while the
-// full-band core erosion still uses the notched one (`band`). cut_segmented_layers narrows the
-// band by the interlocking notch on even layers; feeding that notched value to the ladder moved
-// its membership thresholds (2b = band/2, band/4, ...) by the notch, so a part whose local
-// half-thickness sat between the two selected step 0 on one parity and step 1 on the other - the
-// painted skin HALVING AND DOUBLING on alternating layers (0.18mm at stock settings), a smaller
-// cousin of the 3/2/3/2 wall alternation F4 exists to remove. Choosing the step from the
-// un-notched band makes `b` parity-independent by construction. The notch is thereby not applied
-// to degraded (thin-geometry) claims at all, which is deliberate: on geometry too thin to carry
-// the full band, a mechanical interlocking tooth is not the priority and an alternating skin is
-// strictly worse than none.
+// WAVE A / I-2, corrected by the fix wave (.superpowers/sdd/2026-08-31-paint-depth/
+// wave-a-review.md): THE LADDER'S THRESHOLDS COME FROM THE UN-NOTCHED BAND (`ladder_band`), AND
+// SO DOES WHETHER A PART ENTERS THE LADDER AT ALL. cut_segmented_layers narrows the band by the
+// interlocking notch on even layers. The first fix-wave pass moved the ladder's STEP (b) to
+// ladder_band but left `core`/`thin` - the decision of whether a part is thick enough to skip the
+// ladder entirely - reading the (possibly notched) `band`. That decision was therefore still
+// parity-dependent: a part whose local half-thickness sits between the notched and un-notched
+// band was "thick enough" (full band) on the parity with the narrower (notched) threshold and
+// "too thin" (ladder-degraded) on the parity with the wider (un-notched) one - an alternation
+// between the FULL band and the ladder's first step, an order of magnitude larger than the notch
+// itself, on exactly the geometry this fix exists to protect (reachable once
+// 0.25*ladder_band >= min_claim_width, i.e. paint_depth_walls >= 4 at stock flows, or in
+// millimetres mode once the band is wide enough to arm the ladder at all).
+//
+// Fix: decide core/thin from `ladder_band` (parity-independent) throughout, so the SET of
+// geometry the ladder touches cannot depend on parity either. The ACTUAL erosion depth for
+// geometry that is NOT degraded still uses the real (possibly notched) `band` - the interlocking
+// tooth's intentional alternation on non-degraded geometry is unchanged; only whether a part
+// counts as "non-degraded" in the first place is now parity-independent. At the shipped default
+// (walls = 3) the ladder is floored off by min_claim_width before this distinction can ever
+// matter, so this is unchanged there (see the Wave A / C-1 comment above).
 static ExPolygons paint_depth_clamp_keep_core(const ExPolygons &layer_slices, const float band,
                                               const float ladder_band, const float min_claim_width)
 {
-    ExPolygons core = offset_ex(layer_slices, -band);
-    // `thin` = the parts of the layer a full-band inset leaves no core in, i.e. everything
-    // thinner than 2*band. Built by re-dilating `core` rather than calling opening_ex(), which
-    // would repeat the erosion we already have.
-    ExPolygons thin = core.empty() ? layer_slices : diff_ex(layer_slices, offset_ex(core, band));
+    // Membership test: is a part thick enough to skip the ladder? Always against ladder_band, the
+    // un-notched value, so the answer cannot alternate with parity.
+    ExPolygons core_full = offset_ex(layer_slices, -ladder_band);
+    // `thin` = the parts of the layer a full-ladder_band inset leaves no core in, i.e. everything
+    // thinner than 2*ladder_band. Built by re-dilating `core_full` rather than calling
+    // opening_ex(), which would repeat the erosion we already have.
+    ExPolygons thin = core_full.empty() ? layer_slices : diff_ex(layer_slices, offset_ex(core_full, ladder_band));
+
+    // The baseline claim for non-degraded geometry still erodes by the REAL (possibly notched)
+    // band, preserving the interlocking tooth's intended parity alternation there. band ==
+    // ladder_band on every layer where the notch is not currently narrowing this call (odd
+    // layers, or any layer once interlocking_cut_width <= 0) - reuse core_full rather than paying
+    // a second, identical erosion.
+    ExPolygons core = (band == ladder_band) ? core_full : offset_ex(layer_slices, -band);
 
     constexpr int max_ladder_steps = 6;
     float b = 0.25f * ladder_band;
@@ -2929,14 +2948,20 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // `wall_stack`, the same quantity F1 insets its top/bottom claim by. See
     // paint_depth_band_classic_floor_mm for the three defects that floor closes.
     const bool           wall_generator_classic = print_object.config().wall_generator.value == PerimeterGeneratorType::Classic;
+    // Wave A fix-wave / I-1: the widest wall_stack across the object's classic-generated
+    // regions, tracked alongside the per-region floor above so it is available once
+    // interlocking_depth is known below - see paint_depth_classic_notch_cap_mm.
+    float                max_wall_stack = 0.f;
     for (size_t region_idx = 0; region_idx < print_object.num_printing_regions(); ++region_idx) {
         const PrintRegion &region                 = print_object.printing_region(region_idx);
         const float         ext_perimeter_width   = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).width();
         const float         ext_perimeter_spacing = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).spacing();
         const float         perimeter_spacing     = region.flow(print_object, frPerimeter, print_object.config().layer_height).spacing();
         float               region_band           = paint_depth_band_mm(paint_depth_mode, paint_depth_walls, paint_depth_mm, ext_perimeter_width, ext_perimeter_spacing, perimeter_spacing);
-        if (wall_generator_classic)
-            region_band = paint_depth_band_classic_floor_mm(region_band, ext_perimeter_width, ext_perimeter_spacing);
+        if (wall_generator_classic) {
+            region_band    = paint_depth_band_classic_floor_mm(region_band, ext_perimeter_width, ext_perimeter_spacing);
+            max_wall_stack = std::max(max_wall_stack, ext_perimeter_width + ext_perimeter_spacing);
+        }
         max_width = std::max(max_width, region_band);
         max_ext_perimeter_width = std::max(max_ext_perimeter_width, ext_perimeter_width);
         if (perimeter_spacing > 0.f)
@@ -2958,9 +2983,25 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // painted region a wall loop on even layers (the 3/2/3/2 alternation the user reported).
     // Wave A / I-3: that cap is walls-mode-only, which is why the mode is passed in - see
     // paint_depth_interlocking_depth_mm's header comment.
-    const float  interlocking_depth = paint_depth_mode != pdmUnlimited
+    float        interlocking_depth = paint_depth_mode != pdmUnlimited
                                         ? paint_depth_interlocking_depth_mm(paint_depth_mode, print_object.config().mmu_segmented_region_interlocking_depth.value, min_perimeter_spacing)
                                         : 0.f;
+    // Wave A fix-wave / I-1 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md): the
+    // per-region classic floor above ensures the ODD-layer band (cut_width, passed through
+    // untouched by cut_segmented_layers) reaches wall_stack. EVEN layers additionally subtract
+    // interlocking_depth from that same band, which this floor could not account for above - it
+    // runs before interlocking_depth is known, since that value depends on min_perimeter_spacing
+    // from every region in the SAME loop. Cap the notch itself here, now that both are in hand, at
+    // whatever slack the (already classic-floored) band has above wall_stack, so the EVEN-layer
+    // effective band (max_width - interlocking_depth) can never drop below wall_stack - closing
+    // the classic floor's void ring on both parities instead of odd ones only. Capping the notch
+    // rather than raising max_width leaves the ODD-layer band (which never subtracts the notch at
+    // all) untouched, so this cannot widen the odd-layer band beyond what the floor above already
+    // promises - e.g. at paint_depth_walls = 1, where the floored band already equals wall_stack
+    // exactly (zero slack), the notch is capped to 0: a mechanical interlocking tooth is not
+    // printable at all in the one configuration where the band itself is already at its own floor.
+    if (wall_generator_classic)
+        interlocking_depth = paint_depth_classic_notch_cap_mm(interlocking_depth, max_width, max_wall_stack);
     const bool   interlocking_beam  = print_object.config().interlocking_beam.value;
 
     size_t max_painted_state = 0;

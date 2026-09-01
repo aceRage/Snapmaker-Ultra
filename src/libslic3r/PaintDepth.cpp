@@ -38,6 +38,16 @@ float paint_depth_band_classic_floor_mm(float band, float ext_perimeter_width, f
     return wall_stack > 0.f ? std::max(band, wall_stack) : band;
 }
 
+float paint_depth_classic_notch_cap_mm(float interlocking_depth, float cut_width, float wall_stack)
+{
+    // Wave A / I-1 - see the header comment. Each non-positive input already means "nothing to
+    // cap": the notch is off, the band is disabled (unlimited mode, or an explicit zero
+    // millimetre depth), or there is no wall_stack to floor against.
+    if (interlocking_depth <= 0.f || cut_width <= 0.f || wall_stack <= 0.f)
+        return interlocking_depth;
+    return std::min(interlocking_depth, std::max(0.f, cut_width - wall_stack));
+}
+
 float paint_depth_interlocking_depth_mm(PaintDepthMode mode, double configured_depth, float perimeter_spacing)
 {
     // Fix-wave F4 - see the header comment. Nothing to clamp against without a real spacing,

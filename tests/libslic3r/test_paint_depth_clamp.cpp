@@ -2667,3 +2667,322 @@ TEST_CASE("multi_material_segmentation_by_painting: the normal-shell descent is 
         CHECK_FALSE(any_contains(claim, layer_edge_probe(*object, probe_layer, 3.0)));
     }
 }
+
+// ===========================================================================================
+// WAVE A FIX WAVE (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md). C-1, I-1, I-2.
+// I-3's test lives further below, next to the process()-level fixtures it needs.
+// ===========================================================================================
+
+// I-1: the classic floor above guarantees the LATERAL band reaches wall_stack on ODD layers
+// (region_cut_width == cut_width, the floored value, untouched). On EVEN layers
+// cut_segmented_layers additionally subtracts the interlocking notch (region_cut_width =
+// cut_width - notch), so the EFFECTIVE even-layer band fell short of wall_stack by exactly the
+// notch (0.1mm default) - reopening, on every even layer, the same base-region ring under a
+// painted band that the classic floor exists to close. This pins the floor's OWN promise ("meets
+// wall_stack by construction") on the parity the classic-floor test above never distinguishes
+// (it probes at 0.65mm, comfortably below BOTH 0.778540mm even and 0.878540mm odd at its 0.2mm
+// layer height, so it cannot tell the two apart).
+//
+// Stock flow at 0.1mm layers / 0.45mm lines (matches the review's own worked numbers): s =
+// 0.428540, wall_stack = ext_w + ext_s = 0.878540, notch (uncapped at the 0.1mm default, under
+// the 0.25*s = 0.107135 cap) = 0.1. RED pre-fix: even-layer region_cut_width = 0.878540 - 0.1 =
+// 0.778540, short of wall_stack by exactly the notch - so a probe 0.05mm inside wall_stack is
+// claimed on the odd layer but not the even one.
+//
+// This pins the arithmetic invariant the review's "void ring" defect is built on (the classic
+// floor's promised depth is not actually reached on even layers) rather than the downstream
+// classic-toolpath consequence ("prints as nothing") directly - that would need per-role
+// G-code/perimeter inspection of a base-coloured annulus a fraction of a millimetre wide, which
+// this suite has no existing harness for and which the segmentation-level boundary this test
+// pins is the precondition for either way: if the boundary itself is wrong on even layers (as it
+// is pre-fix), the downstream toolpath question is moot.
+TEST_CASE("multi_material_segmentation_by_painting: the classic floor closes the void ring on BOTH layer parities, not odd ones only (I-1)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_box(/*x=*/40., /*y=*/40., /*z=*/6., PLUS_X_FACE,
+                                             pdmWalls, /*walls=*/1, /*paint_depth_mm=*/1.5,
+                                             /*layer_height=*/0.1, print, /*interlocking_depth=*/-1.,
+                                             PerimeterGeneratorType::Classic);
+    REQUIRE(object->layer_count() >= 20);
+    const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+    const size_t odd_layer  = even_layer + 1;
+    REQUIRE(even_layer % 2 == 0);
+    REQUIRE(odd_layer % 2 == 1);
+
+    const BoundingBox bb = get_extents(object->get_layer(int(even_layer))->lslices);
+    REQUIRE(bb.defined);
+    const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+    auto probe = [&](double inset_mm) { return Point(coord_t(bb.max.x() - scale_(inset_mm)), mid_y); };
+
+    for (size_t layer_idx : {even_layer, odd_layer}) {
+        CAPTURE(layer_idx);
+        const ExPolygons claim = extruder2_claim_for_layer(*object, layer_idx);
+        // Just inside wall_stack (0.878540 - 0.05): claimed on BOTH parities - the floor's
+        // promise. RED pre-fix on the even layer only.
+        CHECK(any_contains(claim, probe(0.828540)));
+        // Just outside wall_stack (+0.05): NOT claimed on either parity - the floor is a floor,
+        // not unlimited.
+        CHECK_FALSE(any_contains(claim, probe(0.928540)));
+    }
+}
+
+// I-2: paint_depth_clamp_keep_core's ladder STEP (b) was already computed from the un-notched
+// ladder_band (Wave A's own partial fix), but whether a part enters the ladder AT ALL -
+// core/thin - was still decided from the (possibly notched) band, so the SET of geometry the
+// ladder touches still alternated with parity. A part whose local half-thickness sits between
+// the notched and un-notched band (a ~0.1mm-wide window at these flows) got the FULL band on one
+// parity (thick enough to skip the ladder under the narrower notched threshold) and the ladder's
+// degraded, much narrower claim on the other (not thick enough under the wider un-notched
+// threshold) - the exact class of alternation this ladder exists to remove, just moved from
+// "every layer" to "this narrow thickness window".
+//
+// walls = 5 at stock flow (0.45mm lines, 0.1mm layers, s = 0.428540; equal in/out walls so
+// paint_depth_band_mm's 2*(ext_w-ext_s) term is zero): band = 5.25*s = 2.249835mm, notch
+// (uncapped, 0.1 < 0.25*s = 0.107135) = 0.1, band_even = 2.149835mm. b0 = 0.25*2.249835 =
+// 0.562459 >= min_claim_width (0.45mm) - the ladder is armed (reachable whenever
+// paint_depth_walls >= 4, per the review's own derivation; 5 is used here for a more comfortable
+// margin on that gate than 4 gives).
+//
+// Fixture: a 4.40mm-thin (half-thickness 2.20mm), 40mm-long, ALL-SIDE-painted bar - half-
+// thickness 2.20mm sits inside (band_even, band) = (2.149835, 2.249835), the narrow window this
+// finding is about, with ~0.05mm margin on each side.
+TEST_CASE("multi_material_segmentation_by_painting: the degradation ladder's membership does not alternate with parity at walls = 5 (I-2)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_box(/*x=*/4.40, /*y=*/40., /*z=*/6., ALL_SIDE_FACE,
+                                             pdmWalls, /*walls=*/5, /*paint_depth_mm=*/1.5,
+                                             /*layer_height=*/0.1, print, /*interlocking_depth=*/-1.);
+    REQUIRE(object->layer_count() >= 20);
+    const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+    const size_t odd_layer  = even_layer + 1;
+    REQUIRE(even_layer % 2 == 0);
+    REQUIRE(odd_layer % 2 == 1);
+
+    for (size_t layer_idx : {even_layer, odd_layer}) {
+        CAPTURE(layer_idx);
+        const BoundingBox bb = get_extents(object->get_layer(int(layer_idx))->lslices);
+        REQUIRE(bb.defined);
+        const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+        const ExPolygons claim = extruder2_claim_for_layer(*object, layer_idx);
+
+        // Shallow probe: claimed either way - the degraded skin is real, at least one extrusion.
+        CHECK(any_contains(claim, Point(coord_t(bb.max.x() - scale_(0.3)), mid_y)));
+        // Deep probe (0.6mm), inside the FULL band but outside the ladder's ~0.562mm degraded
+        // step: RED pre-fix on the even layer (pre-fix reach there is the full 2.149835mm band,
+        // since this part was never classified as "thin" under the narrower notched threshold);
+        // GREEN post-fix on both (the degraded ~0.562mm claim, identical on both parities).
+        CHECK_FALSE(any_contains(claim, Point(coord_t(bb.max.x() - scale_(0.6)), mid_y)));
+    }
+}
+
+// C-1 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md): LayerTools::wall_filament
+// omits the grouped-manual-pattern resolution step that sparse_infill_filament (and
+// solid_infill_filament) apply, so an UNPAINTED object using a grouped-manual-pattern mixed
+// filament as both its wall and sparse-infill filament could get gap fill (which resolves via
+// wall_filament, GCode.cpp's FillFilamentSource::Wall arm) on a DIFFERENT PHYSICAL EXTRUDER than
+// its walls even though both config ids are equal - the two lookups diverge on a print with no
+// painting anywhere.
+//
+// Smallest honest reproduction: no mesh painting, no gap-fill geometry needed at all - the
+// divergence is a pure property of the two LayerTools resolver functions given the SAME
+// configured id. Built through the real production path every other fixture in this file uses
+// (Print::apply + PrintObject::slice(), so PrintRegion and its config come from the genuine
+// pipeline, not a hand-built stub), then the two resolvers are called directly - exactly what
+// GCode.cpp's configured_extruder_id lambda does for a gap-fill collection (FillFilamentSource::
+// Wall -> wall_filament(region)) versus a real infill collection (-> sparse_infill_filament
+// (region)).
+//
+// manual_pattern "12,21" flattens (the plain/wall_filament path, MixedFilamentManager::resolve)
+// to "1221", whose layer-0 token is "1" -> component_a. The grouped path
+// (MixedFilamentManager::resolve_perimeter) instead reads the group at index wall_loops - 1 (the
+// default wall_loops = 2, so index 1 = "21"), whose layer-0 token is "2" -> component_b.
+// component_a and component_b are physical filaments 1 and 2, so the two functions are proven -
+// by the actual production resolution code in MixedFilament.cpp, not by construction of the
+// fixture - to pick DIFFERENT physical extruders at layer_index = 0.
+TEST_CASE("LayerTools::wall_filament applies the same grouped-manual-pattern resolution as sparse_infill_filament (C-1)", "[paintdepth]")
+{
+    struct AutoGenerateGuard
+    {
+        explicit AutoGenerateGuard(bool enabled) : previous(MixedFilamentManager::auto_generate_enabled())
+        {
+            MixedFilamentManager::set_auto_generate_enabled(enabled);
+        }
+        ~AutoGenerateGuard() { MixedFilamentManager::set_auto_generate_enabled(previous); }
+        bool previous;
+    };
+    // Disabled so Print::apply's auto_generate(colors) does not ALSO create an auto pair for the
+    // same (1,2) physical pair my custom row below uses - with only 2 physical filaments there is
+    // no pair to pick that avoids that collision, and the collision would push my row to virtual
+    // id 4 instead of the 3 this test's wall_filament/sparse_infill_filament config below assumes.
+    AutoGenerateGuard auto_generate_guard(false);
+
+    MixedFilamentManager seed_mgr;
+    seed_mgr.add_custom_filament(/*component_a=*/1, /*component_b=*/2, /*mix_b_percent=*/50,
+                                  /*filament_colours=*/{"#FFFFFF", "#804020"});
+    REQUIRE(seed_mgr.mixed_filaments().size() == 1);
+    seed_mgr.mixed_filaments().front().manual_pattern = MixedFilamentManager::normalize_manual_pattern("12,21");
+    REQUIRE(seed_mgr.mixed_filaments().front().manual_pattern == "12,21");
+    const std::string serialized_mixed = seed_mgr.serialize_custom_entries();
+
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "unpainted-grouped-pattern.stl";
+    object->add_volume(make_cube(20., 20., 4.));
+    object->add_instance();
+    object->ensure_on_bed();
+    // No mmu_segmentation_facets set anywhere - genuinely unpainted.
+
+    DynamicPrintConfig config = paint_depth_test_config(pdmUnlimited, 3);
+    config.option<ConfigOptionString>("mixed_filament_definitions")->value = serialized_mixed;
+    // The precondition the leak needs: wall_filament and sparse_infill_filament configured to
+    // the SAME grouped mixed filament id (3 = num_physical(2) + the one mixed row above, with
+    // auto-generation disabled above so that arithmetic actually holds).
+    config.option<ConfigOptionInt>("wall_filament")->value          = 3;
+    config.option<ConfigOptionInt>("sparse_infill_filament")->value = 3;
+    config.option<ConfigOptionInt>("solid_infill_filament")->value  = 3;
+    // wall_loops stays at its default (2), which is what grouped_manual_pattern_infill_filament_
+    // 1based reads as the innermost perimeter index (wall_loops - 1 = 1 -> pattern group "21").
+
+    Print print;
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+    REQUIRE(out_object->num_printing_regions() >= 1);
+
+    const PrintRegion &region = out_object->printing_region(0);
+    REQUIRE(region.config().wall_filament.value == 3);
+    REQUIRE(region.config().sparse_infill_filament.value == 3);
+    REQUIRE(print.mixed_filament_manager().is_mixed(3, 2));
+
+    LayerTools layer_tools(/*z=*/0.2);
+    layer_tools.mixed_mgr    = &print.mixed_filament_manager();
+    layer_tools.num_physical = 2;
+    layer_tools.layer_index  = 0;
+    layer_tools.layer_height = 0.2;
+
+    // RED pre-fix: wall_filament resolves via the plain (flattened-pattern) path and returns
+    // component_a - 1 = 0 (physical filament 1); sparse_infill_filament resolves via the grouped
+    // path and returns component_b - 1 = 1 (physical filament 2). Same configured id, different
+    // physical extruder.
+    CHECK(layer_tools.wall_filament(region) == layer_tools.sparse_infill_filament(region));
+    // ...and pinned to the specific physical extruder the grouped (correct) resolution gives, so
+    // a future change that makes them agree on the WRONG extruder does not pass silently.
+    CHECK(layer_tools.wall_filament(region) == 1u); // physical filament 2 (component_b), zero-based
+}
+
+// Same construction as process_painted_cube() above, but with the box's X and Y footprint as
+// separate parameters - needed below to build an elongated, thin bar rather than a square.
+PrintObject *process_painted_cuboid(double x, double y, double height, const std::vector<int> &painted_facets,
+                                     PaintDepthMode mode, int walls, bool paint_infill_override,
+                                     PerimeterGeneratorType wall_generator, Print &print)
+{
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-generator-cuboid.stl";
+    ModelVolume *volume  = object->add_volume(make_cube(x, y, height));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : painted_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    DynamicPrintConfig config = paint_depth_test_config(mode, walls, paint_infill_override);
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
+    config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = wall_generator;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    print.process();
+    PrintObject *out_object = print.objects_mutable().front();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// I-3 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md): ToolOrdering::collect_extruders
+// still buckets ANY non-solid-infill fill role (including gap fill) as needing
+// sparse_infill_filament, even though emission (GCode.cpp's fill_filament_source, PrintRegion.cpp)
+// now routes gap fill through wall_filament instead. Where wall_filament != sparse_infill_filament
+// and a region's only fill content on a layer is gap fill (routine on thin-walled features where
+// the perimeters consume the whole cross-section), the layer's computed extruder SET disagrees
+// with what actually gets emitted: a spurious tool change and wipe-tower purge for an extruder
+// that prints nothing on that layer.
+//
+// Fixture: an elongated (20 x 2.4 x 4mm), ALL-SIDE-painted bar. Walls-mode band(3) = 1.435675mm
+// is more than half of the 2.4mm short dimension (margin 0.236mm), so the paint claim covers the
+// ENTIRE cross-section at every mid-length layer - no base-coloured region exists there at all,
+// so nothing legitimate can push the base extruder into that layer's set. Two classic wall loops
+// (2*wall_stack = 1.757080mm at 0.45mm lines/0.2mm layers, this fixture's default layer height)
+// leave a genuinely thin (~0.64mm) residual down the middle, which classic fills with a gap-fill
+// line rather than sparse infill - exactly as the "on the classic generator the painted band's
+// gap fill follows..." sibling test forces on an annulus, just reshaped into a straight bar so
+// the WHOLE cross-section (not just a band around a separate interior region) is the one painted
+// region. paint_infill_override = false keeps sparse_infill_filament on the BASE colour while
+// wall/solid stay painted - the precondition I-3's bug needs: if collect_extruders still buckets
+// this layer's gap fill as sparse infill, it pushes the BASE extruder even though nothing on the
+// layer emits with it.
+TEST_CASE("ToolOrdering::collect_extruders does not add the base filament to a layer whose only fill content is gap fill (I-3)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = process_painted_cuboid(/*x=*/20., /*y=*/2.4, /*height=*/4., ALL_SIDE_FACE,
+                                                  pdmWalls, /*walls=*/3, /*paint_infill_override=*/false,
+                                                  PerimeterGeneratorType::Classic, print);
+    REQUIRE(object->layer_count() >= 12);
+
+    const size_t        mid_layer = 10;
+    const LayerRegion   *painted  = extruder2_layer_region(*object, mid_layer);
+    REQUIRE(painted != nullptr);
+    const size_t gap_fills = count_role_recursive(&painted->thin_fills, erGapFill);
+    CAPTURE(gap_fills);
+    // The fixture precondition: this layer's painted region really does carry gap fill.
+    REQUIRE(gap_fills >= 1);
+
+    const Layer *layer = object->get_layer(int(mid_layer));
+    // No OTHER region has content on this layer to legitimately need the base extruder either -
+    // the whole cross-section belongs to the one painted region.
+    for (size_t region_idx = 0; region_idx < object->num_printing_regions(); ++region_idx) {
+        const PrintRegion &region = object->printing_region(region_idx);
+        if (region.config().wall_filament.value == 2)
+            continue; // the painted region itself, already accounted for above
+        const int local_id = region.print_object_region_id();
+        if (local_id < 0 || local_id >= layer->region_count())
+            continue;
+        const LayerRegion *layerm = layer->get_region(local_id);
+        if (layerm == nullptr)
+            continue;
+        CAPTURE(region_idx);
+        CHECK(layerm->perimeters.entities.empty());
+        CHECK(layerm->fills.entities.empty());
+    }
+
+    const PrintRegionConfig &cfg = extruder2_region_config(*object);
+    REQUIRE(cfg.wall_filament.value == 2);
+    REQUIRE(cfg.sparse_infill_filament.value == 1);
+
+    // ToolOrdering::reorder_extruders re-indexes LayerTools::extruders to ZERO-based as its very
+    // last step (ToolOrdering.cpp, "Reindex the extruders, so they are zero based, not 1 based"),
+    // after resolving any "dontcare" placeholders in 1-based space - matching the field's own
+    // header comment ("Zero based extruder IDs"). So physical filament 1 (base) reads back as 0
+    // and physical filament 2 (painted) as 1 here.
+    const LayerTools &layer_tools = print.tool_ordering().tools_for_layer(layer->print_z);
+    CAPTURE(layer_tools.extruders.size());
+    const bool has_base_extruder =
+        std::find(layer_tools.extruders.begin(), layer_tools.extruders.end(), 0u) != layer_tools.extruders.end();
+    const bool has_painted_extruder =
+        std::find(layer_tools.extruders.begin(), layer_tools.extruders.end(), 1u) != layer_tools.extruders.end();
+    // Positive control: the painted extruder itself is genuinely needed and present (from the
+    // perimeters loop registering wall_filament - unaffected by this fix), so a test that failed
+    // to build real gap-fill-only geometry would show up here, not as a false pass below.
+    REQUIRE(has_painted_extruder);
+    // RED pre-fix: collect_extruders buckets gap fill as sparse infill (any role other than
+    // erNone/solid-infill fell into has_sparse_infill), pushing the base extruder even though
+    // nothing on this layer emits with it.
+    CHECK_FALSE(has_base_extruder);
+}

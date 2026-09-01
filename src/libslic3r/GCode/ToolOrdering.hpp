@@ -159,6 +159,13 @@ public:
 private:
     // Resolve a 1-based filament ID through the mixed-filament manager for this layer.
     unsigned int resolve_mixed_1based(unsigned int filament_id) const;
+    // Wave A fix-wave / C-1 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md): resolve a
+    // 1-based filament id for a wall/gap-fill/infill role through the grouped-manual-pattern
+    // resolution first (if the id is a mixed filament with a grouped manual pattern), falling
+    // back to resolve_mixed_1based otherwise. Shared by wall_filament, sparse_infill_filament and
+    // solid_infill_filament so the three lookups can never diverge again - see wall_filament's
+    // own comment for why that mattered.
+    unsigned int resolve_grouped_or_mixed_1based(const PrintRegion &region, unsigned int filament_id) const;
     // This object holds list of extrusion that will be used for extruder wiping
     WipingExtrusions m_wiping_extrusions;
 };

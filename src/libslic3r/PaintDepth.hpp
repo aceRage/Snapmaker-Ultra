@@ -148,6 +148,47 @@ float paint_depth_band_mm(PaintDepthMode mode, int walls, double mm,
 // untouched - flooring it would silently switch the clamp back on.
 float paint_depth_band_classic_floor_mm(float band, float ext_perimeter_width, float ext_perimeter_spacing);
 
+// Wave A fix-wave / I-1 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md): the floor
+// above guarantees `cut_width >= wall_stack`, so the ODD-layer lateral band (which
+// cut_segmented_layers passes cut_width through untouched) reaches exactly the F1 inset and the
+// void ring the floor exists to close has zero width - "by construction". But
+// cut_segmented_layers additionally narrows the band by the (possibly capped) interlocking notch
+// on EVEN layers (`interlocking_cut_width = cut_width - interlocking_depth`), and that narrowing
+// happens AFTER the floor above, which has no notch value to floor against - the notch is only
+// known once every region's flow has been scanned for `min_perimeter_spacing`, at the SAME call
+// site but after this floor's own per-region loop. So the floor's promise held only for the
+// parity that never subtracts the notch: the EFFECTIVE even-layer band fell short of wall_stack
+// by exactly the notch (0.1mm at the shipped default), reopening a notch-wide version of the
+// same void ring on every even sub-surface shell layer - better than the pre-floor 0.3mm ring,
+// but not closed.
+//
+// Fix: cap the NOTCH (not the band) at the slack the already-classic-floored band has above
+// wall_stack, i.e. `min(interlocking_depth, max(0, cut_width - wall_stack))`. Since
+// interlocking_depth is only ever subtracted on EVEN layers (cut_segmented_layers never applies
+// it to the odd-layer cut_width at all), capping it here leaves cut_width - and therefore the
+// ODD-layer band - completely untouched: this closes the void ring on even layers without
+// widening the odd-layer band beyond what the floor above already promises there. Raising the
+// band instead (the mirror-image fix) was tried and rejected: cut_width feeds the ODD-layer band
+// too, so it would have widened odd layers by the same amount for no reason, and did - on the
+// classic-floor regression test at wall_stack = 0.85708mm (0.2mm layers), it grew a comfortably-
+// bounded 0.85708mm reach into 0.95708mm, past that test's own upper-bound probe.
+//
+// Called once, object-wide, against the WIDEST wall_stack across the object's classic-generated
+// regions - the same conservative direction the floor above already takes, and for the same
+// reason (a narrower region's thinner walls must never under-clamp a wider region's paint claim).
+//
+// At paint_depth_walls = 1 the floored band already EQUALS wall_stack (zero slack), so the cap
+// forces the notch to exactly 0: a mechanical interlocking tooth is not printable there at all,
+// since carving one would need MORE than one wall_stack of unpainted material at the same point
+// the floor exists to guarantee only one of. That is the correct, not merely convenient,
+// consequence: wanting both the narrowest printable classic band and a notch cut into it is
+// asking for two contradictory guarantees on the same millimetre of material.
+//
+// A non-positive interlocking_depth, cut_width or wall_stack is returned untouched - each already
+// means "nothing to cap" (the notch is off, the band is disabled, or there is no wall_stack to
+// floor against).
+float paint_depth_classic_notch_cap_mm(float interlocking_depth, float cut_width, float wall_stack);
+
 // Fix-wave F4 (.superpowers/sdd/2026-08-31-paint-depth/wall-count-investigation.md section 3):
 // the EFFECTIVE interlocking depth cut_segmented_layers may use, given the region flow the
 // band above was sized against.

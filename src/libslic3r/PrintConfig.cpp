@@ -3996,12 +3996,24 @@ void PrintConfigDef::init_fff_params()
     // Fix-wave F4: the tooltip now also documents the effective-depth clamp, because a user
     // who types 0.5 here and measures 0.107 in the preview would otherwise have no way to
     // know why. See paint_depth_interlocking_depth_mm (PaintDepth.hpp) for the reasoning.
+    //
+    // Wave A fix-wave / I-4 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md): the cap
+    // is WALLS-MODE ONLY (paint_depth_interlocking_depth_mm), but this sentence stated it
+    // unconditionally - false in millimetres mode, where a hand-set notch is honoured verbatim
+    // and, set large relative to the configured depth, can reintroduce the same alternating-
+    // layer loop-count difference the cap exists to prevent in walls mode.
     def->tooltip  = L("Interlocking depth of a segmented region. Only active when \"Paint depth "
-                    "mode\" is not \"Unlimited\". Zero disables this feature. The effective "
-                    "depth is capped at a quarter of one perimeter spacing (about 0.11mm at a "
-                    "0.45mm line width), because a deeper notch would narrow the painted band "
-                    "on alternating layers by more than a whole wall loop - so \"Paint depth "
-                    "walls\" would silently deliver one wall fewer on every other layer.");
+                    "mode\" is not \"Unlimited\". Zero disables this feature. When \"Paint depth "
+                    "mode\" is \"Limited by walls\", the effective depth is capped at a quarter "
+                    "of one perimeter spacing (about 0.11mm at a 0.45mm line width), because a "
+                    "deeper notch would narrow the painted band on alternating layers by more "
+                    "than a whole wall loop - so \"Paint depth walls\" would silently deliver one "
+                    "wall fewer on every other layer. That cap does not apply when \"Paint depth "
+                    "mode\" is \"Limited by distance\": the value there is used exactly as "
+                    "entered, and setting it large relative to \"Paint depth distance\" can "
+                    "narrow the band on alternating layers enough to cost a loop there too - keep "
+                    "it small relative to that depth if you want the same loop count on every "
+                    "layer.");
     def->sidetext = "mm";	// milimeters, don't need translation
     def->min      = 0;
     def->category = L("Advanced");
