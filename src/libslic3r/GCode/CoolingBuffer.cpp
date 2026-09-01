@@ -509,7 +509,8 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
                     }
                 } else {
                     // Only log the error in case of MM printer. Single extruder printers likely ignore any T anyway.
-                    if (map_extruder_to_per_extruder_adjustment.size() > 1)
+                    // Reserved BBL special T markers (T1000/T65535/...) are not toolchanges; don't warn.
+                    if (map_extruder_to_per_extruder_adjustment.size() > 1 && !is_bbl_special_tool_command((int) new_extruder))
                         BOOST_LOG_TRIVIAL(error) << "CoolingBuffer encountered an invalid toolchange, maybe from a custom gcode: " << sline;
                 }
             }

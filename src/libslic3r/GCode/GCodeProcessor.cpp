@@ -3984,9 +3984,9 @@ void GCodeProcessor::process_T(const std::string_view command)
 
     if (command.length() > 1) {
         if (new_extruder < 0 || new_extruder > 254) {
-            //BBS: T255, T1000 and T1100 is used as special command for BBL machine and does not cost time. return directly
+            //BBS: reserved BBL special T commands (T255/T1000/T1001/T1100/T65279/T65535) cost no time. return directly
             if ((m_flavor == gcfMarlinLegacy || m_flavor == gcfMarlinFirmware) && (command == "Tx" || command == "Tc" || command == "T?" ||
-                 new_extruder == 1000 || new_extruder == 1100 || new_extruder == 255))
+                 is_bbl_special_tool_command(new_extruder)))
                 return;
 
             // T-1 is a valid gcode line for RepRap Firmwares (used to deselects all tools)
@@ -4609,7 +4609,8 @@ void GCodeProcessor::run_post_process()
             return;
         }
         if (cmd.size() >= 2) {
-            if (tool_number != -1) {
+            // Reserved BBL special T markers (T1000/T65535/...) are not toolchanges; don't clamp or warn.
+            if (tool_number != -1 && !is_bbl_special_tool_command(tool_number)) {
                 if (tool_number < 0 || (int)m_extruder_temps_config.size() <= tool_number) {
                     // found an invalid value, clamp it to a valid one
                     tool_number = std::clamp<int>(0, m_extruder_temps_config.size() - 1, tool_number);

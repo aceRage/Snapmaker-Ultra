@@ -19,6 +19,18 @@ namespace Slic3r {
 
 class Print;
 
+// Ultra: Bambu machine start/end/change gcode emits reserved T<n> markers (n > 254) that are NOT tool
+// changes and cost no print time: T255, T1000/T1001 (mech-sweep / hotend-type detection), T1100, and the
+// AMS pull-back sentinels T65279 (0xFEFF) / T65535 (0xFFFF). The time estimator, the M104 post-processor,
+// and the cooling buffer must treat these as no-ops instead of flagging "invalid toolchange".
+inline bool is_bbl_special_tool_command(int tool_number)
+{
+    switch (tool_number) {
+    case 255: case 1000: case 1001: case 1100: case 65279: case 65535: return true;
+    default: return false;
+    }
+}
+
 // slice warnings enum strings
 #define NOZZLE_HRC_CHECKER                                          "the_actual_nozzle_hrc_smaller_than_the_required_nozzle_hrc"
 #define BED_TEMP_TOO_HIGH_THAN_FILAMENT                             "bed_temperature_too_high_than_filament"
