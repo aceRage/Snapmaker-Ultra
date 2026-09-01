@@ -981,16 +981,35 @@ TEST_CASE("multi_material_segmentation_by_painting: bottom claim depth follows t
 //   - WITH the erosion (and with the taper bound's guard): step 1 intersects the band with the
 //     layer outline eroded by ~0.836mm. The band lies within 0.45mm of that outline, so the
 //     result is empty and the loop breaks. Layer 10's Extruder2 area is its OWN surface band
-//     ([0, ~0.45mm] in from its contour) plus the Stage-1 lateral band (pdmWalls/1 wall =>
-//     <= ~0.45mm in from the contour, cut_segmented_layers) - nothing else.
+//     ([0, ~0.45mm] in from its contour, from that layer's OWN sloped-facet cross-section,
+//     appended unconditionally - independent of any other layer's descent) plus the Stage-1
+//     lateral band (cut_segmented_layers) - nothing else.
 //   - WITHOUT the erosion (offset stays 0, whether by deleting the term or by regressing N1's
 //     extrusion stats to 0.f): band(L) propagates to L-1, L-2, L-3 at full width, so layer 10
 //     collects bands 11, 12 and 13 - the annulus from 0.45mm to 1.8mm in from its contour.
-// The probe therefore sits 1.0mm in from layer 10's own contour: outside the surface band and
-// the lateral band by more than a full band width, and squarely inside band(12)'s
+// The negative probe therefore sits 1.0mm in from layer 10's own contour: outside the surface
+// band and the lateral band by more than a full band width, and squarely inside band(12)'s
 // [0.9mm, 1.35mm] slot. It is claimed if and only if the deep full-width smear happened.
 // (Hand-verified as genuinely discriminating, and confirmed empirically by a scratch build
 // with the erosion term deleted - see the report.)
+//
+// taper-bound-review.md IMPORTANT 2: the positive probe's original placement (0.2mm in,
+// against a pdmWalls/1-wall fixture) sat inside BOTH the ~0.45mm surface band above AND the
+// Stage-1 lateral band, which for pdmWalls/1 is ALSO ext_perimeter_width = 0.45mm
+// (PaintDepth.cpp's pdmWalls case, walls clamped to >= 1) - the two coincide exactly at that
+// probe. Any regression that kills the vertical projection path alone (slice_mesh_slabs
+// re-classifying the sloped facets as Vertical, the max_top_layers gate closing, top_raw being
+// filtered away, stat.top_shell_layers misfiring) would leave the positive CHECK green via the
+// lateral band alone, proving nothing about the path this test exists to guard. Fix: switch to
+// pdmMillimeters/0.15mm, which shrinks the lateral band to [0, 0.15mm] - well clear of the
+// vertical surface band's [0, 0.45mm] - and move the positive probe to 0.30mm in: outside the
+// shrunk lateral band, inside the surface band, so it can now be satisfied ONLY by the vertical
+// path. interlocking_cut_width = max(0.15 - 0.3, 0) = 0 (mmu_segmented_region_interlocking_depth
+// defaults to 0.3, MultiMaterialSegmentation.cpp:1164), so region_cut_width stays 0.15mm on
+// both layer parities (:1169) - no even/odd surprise. The negative probe (1.0mm) and every
+// number in the derivation above are unaffected: paint_depth_mode only ever touches the
+// Stage-1 lateral clamp, never the vertical projection/descent path (vertical-depth-
+// investigation.md section 2).
 TEST_CASE("multi_material_segmentation_by_painting: a steep painted surface gains no deep full-width claim (anti-smear guard)", "[paintdepth]")
 {
     Model        model;
@@ -1005,13 +1024,15 @@ TEST_CASE("multi_material_segmentation_by_painting: a steep painted surface gain
         selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
     REQUIRE(volume->mmu_segmentation_facets.set(selector));
 
-    // pdmWalls with a single wall (unlike every other vertical-depth fixture, which uses
+    // pdmMillimeters/0.15mm (unlike every other vertical-depth fixture, which uses
     // pdmUnlimited): the painted walls DO cross every layer's contour, so the Stage-1 lateral
     // path claims the whole layer for Extruder2 via the has_layer_only_one_color
-    // short-circuit. Clamping it to a one-wall band (~0.45mm in from the contour, pinned by
-    // the "fully-painted boundary still clamps to the band" test above) keeps that claim well
-    // clear of the 1.0mm probe, so this test reads the vertical projection alone.
-    DynamicPrintConfig config = paint_depth_test_config(pdmWalls, 1);
+    // short-circuit. Clamping it to a 0.15mm band keeps that claim well clear of the 1.0mm
+    // negative probe, so the negative side still reads the vertical projection alone - and,
+    // per Important 2 above, keeps it clear of the 0.30mm positive probe too, so the positive
+    // side does as well.
+    DynamicPrintConfig config = paint_depth_test_config(pdmMillimeters, 1);
+    config.option<ConfigOptionFloat>("paint_depth_mm")->value             = 0.15;
     config.option<ConfigOptionFloat>("layer_height")->value               = 0.3;
     config.option<ConfigOptionFloat>("initial_layer_print_height")->value = 0.3;
     config.option<ConfigOptionInt>("top_shell_layers")->value             = 4;
@@ -1033,8 +1054,10 @@ TEST_CASE("multi_material_segmentation_by_painting: a steep painted surface gain
     // Two-sided on purpose. Extruder2 IS present on this layer - its own surface band, and the
     // Stage-1 lateral band, both hug the contour - so the CHECK_FALSE below is about HOW FAR IN
     // the claim reaches, never about the paint being absent or the fixture failing to slice.
+    // Important 2: 0.30mm, not 0.2mm - outside the shrunk [0, 0.15mm] lateral band, inside the
+    // [0, ~0.45mm] vertical surface band, so only the vertical projection path can satisfy it.
     CHECK(any_contains(extruder2_claim_for_layer(*out_object, probe_layer),
-                       layer_edge_probe(*out_object, probe_layer, 0.2)));
+                       layer_edge_probe(*out_object, probe_layer, 0.30)));
     const Point probe = layer_edge_probe(*out_object, probe_layer, 1.0);
     CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, probe_layer), probe));
 }
@@ -1296,4 +1319,119 @@ TEST_CASE("multi_material_segmentation_by_painting: a zero-shell region's painte
     REQUIRE(out_object->layer_count() > 4);
 
     CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, 0), slab_center_point(*out_object)));
+}
+
+// ===========================================================================================
+// taper-bound-review.md, IMPORTANT 1: exposed_surface_part()'s early return
+// (MultiMaterialSegmentation.cpp:1331-1333) fires whenever `reference_layer_idx >= num_layers`
+// - i.e. for EVERY painted flat top face, since layer_idx+1 == num_layers there - and hands
+// back the whole projected patch with NO clearance test at all. The surrounding comment's
+// claimed invariant ("the base material left at that layer's perimeter is either nothing at
+// all or at least one wall stack wide - never a sliver") is enforced by the diff_ex/offset_ex
+// call on every OTHER path, but not on this one. The anti-smear test above cannot see this: it
+// paints STEEP side walls whose own slope keeps the test's `run` equal to the taper below it
+// (a locally monotone slope), which is exactly the case the early-return does not take. This
+// fixture instead paints a FLAT cap sitting on top of a taper - the report's own conflated-run
+// case - so the gap is governed entirely by the (here, unconstrained pre-fix) taper below.
+// ===========================================================================================
+
+// make_square_frustum(40., 22., 6.) painted on its TOP CAP (facets {2,3}, the flat 22x22 face)
+// instead of its sloped walls - the fixture the anti-smear test's own comment calls out as
+// missing ("the only 'paint reaches the silhouette' fixture is the 40x40 slab, whose vertical
+// walls make the gap exactly zero"). The cap is flat (paint reaches the silhouette with zero
+// clearance, same as a plain box's top), but the object WIDENS below it: half-width grows from
+// 11mm at the cap to 20mm at the base, 1.5mm of horizontal run per 1mm of height - the same
+// shallow-taper shape a 45-degree chamfer gives at a steeper 1mm-run-per-mm-height, just
+// reusing an already-existing fixture instead of a new mesh.
+//
+// top_ex at the top layer is the cap's own exact flat-facet footprint: half-width 11.000mm,
+// fixed, independent of layer height (the "small painted top feature" test above already
+// establishes that a fully-painted flat cap's depth-0 claim is exactly its own facet
+// footprint). reference_layer_idx = layer_idx+1 = num_layers at the very top layer, so
+// exposed_surface_part() takes the FIRST early-return branch and hands back top_ex unclamped.
+// Because the frustum only widens going down, the running containment intersection
+// (layer_slices_trimmed) never shrinks below the TOP layer's own outline (half-width
+// ~11.075mm at 0.1mm layers - the cross-section a hair below the z=6 tip, since
+// Layer::slice_z sits at the layer's z-midpoint, not its top) - so the "exposed" full-width
+// term stays pinned at the cap's fixed 11.000mm footprint at EVERY descent depth, while each
+// layer's own true contour keeps growing underneath it:
+//   depth k contour half-width  = 11.075 + 0.15*k
+//   pre-fix claim edge          = 11.000 (fixed, every k)
+//   base ring width gap(k)      = 0.075 + 0.15*k   (k=1: 0.225mm ... k=5: 0.825mm)
+// matching the general gap(k) ~= (k + 1/2)*r form from the report/review (r = 0.15mm/layer
+// here). Every one of gap(1..5) is a sub-wall-stack sliver (< w+s = extrusion_width +
+// extrusion_spacing = 0.45 + 0.42854 = 0.87854mm at 0.1mm layers / 0.45mm walls) that
+// is_perimeter_compatible (Layer.cpp:184) will never merge into the base region (they differ
+// in wall_filament) and that no downstream cleanup catches (SCALED_EPSILON / 5*EPSILON scale
+// only, MultiMaterialSegmentation.cpp:2150 / PrintObjectSlice.cpp:4585,5033,5151). This is
+// Important 1's failure mode, reached with an already-existing fixture and no new mesh.
+TEST_CASE("multi_material_segmentation_by_painting: a chamfered/tapered painted top leaves no sub-wall-stack base ring on the layers below the cap (taper-bound-review Important 1)", "[paintdepth]")
+{
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-taper-bound-cap.stl";
+    ModelVolume *volume  = object->add_volume(make_square_frustum(40., 22., 6.));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : TOP_CAP_FACE)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    // pdmUnlimited (not pdmWalls, unlike the anti-smear test): only the flat top CAP is
+    // painted, never a side facet, so there is no painted boundary anywhere in any layer's own
+    // cross-section for the Stage-1 lateral clamp to act on - the entire claim below the
+    // surface layer comes from the vertical projection/descent path this fixture targets. See
+    // slice_capped_slab()'s file comment above for the identical reasoning.
+    DynamicPrintConfig config = paint_depth_test_config(pdmUnlimited, 3);
+    config.option<ConfigOptionFloat>("layer_height")->value               = 0.1;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = 0.1;
+    config.option<ConfigOptionInt>("top_shell_layers")->value             = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value        = 0.6;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value          = 3;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value     = 0.0;
+
+    Print print;
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+
+    // 6mm / 0.1mm = 60 layers; top_shell_layers=4 / thickness=0.6mm at 0.1mm layers is the same
+    // "6-layer effective shell" arithmetic as the "thin layers..." and "small painted top
+    // feature" tests above (0.6 / 0.1 = 6 >= the 4-layer count bound).
+    const size_t top_index = out_object->layer_count() - 1;
+    REQUIRE(top_index >= 6);
+
+    // Positive control: comfortably inside the cap's own 11mm half-width footprint at the
+    // surface layer itself (1mm in from that layer's own ~11.075mm contour is still well
+    // inside the 11.000mm cap edge), claimed both before and after the fix - proves the
+    // fixture actually sliced and painted, so the CHECKs below are about how far IN the claim
+    // reaches, never about the paint being absent.
+    CHECK(any_contains(extruder2_claim_for_layer(*out_object, top_index),
+                       layer_edge_probe(*out_object, top_index, 1.0)));
+
+    for (size_t depth = 1; depth <= 5; ++depth) {
+        const size_t layer_idx = top_index - depth;
+        // 0.1mm inside THIS layer's own true contour sits well inside gap(depth) (0.225mm at
+        // depth 1, growing to 0.825mm at depth 5 - see derivation above), i.e. inside the
+        // sub-wall-stack base ring the early-return leaves behind pre-fix. Per
+        // exposed_surface_part()'s own stated invariant this ring must be absorbed into the
+        // claim, not left as a sliver: CHECK is the post-fix behavior. RED pre-fix - the claim
+        // edge is pinned at the cap's fixed 11.000mm footprint, 0.125mm (depth 1) to 0.725mm
+        // (depth 5) short of this probe at every one of these depths.
+        CHECK(any_contains(extruder2_claim_for_layer(*out_object, layer_idx),
+                           layer_edge_probe(*out_object, layer_idx, 0.1)));
+    }
+
+    // No over-claim regression: depth 6 is past the 6-layer effective shell (structurally
+    // outside the descent loop's own bound regardless of this fix), so it must stay unclaimed
+    // even 0.1mm in from its own contour.
+    const size_t past_shell = top_index - 6;
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, past_shell),
+                             layer_edge_probe(*out_object, past_shell, 0.1)));
 }

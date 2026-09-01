@@ -1655,6 +1655,27 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                     // (the containment guard), never by `offset`.
                                     append(last, intersection_ex(top_exposed_ex, layer_slices_trimmed));
                                     last = union_ex(last);
+                                    // taper-bound-review.md Important 1: exposed_surface_part()'s
+                                    // early return (reference_layer_idx >= num_layers - i.e. every
+                                    // painted flat top face) hands back the whole patch with NO
+                                    // clearance test, so on that path `last` can sit strictly inside
+                                    // this layer's own contour by less than one wall stack - a
+                                    // sub-wall-stack base ring that is_perimeter_compatible
+                                    // (Layer.cpp:184) never merges away (painted/base regions differ
+                                    // in wall_filament) and that no downstream cleanup catches
+                                    // (SCALED_EPSILON / 5*EPSILON scale only). Enforce the invariant
+                                    // the comment above already claims: the base material left at
+                                    // this layer's contour is either nothing or at least one wall
+                                    // stack wide. Absorb anything thinner into the claim. Inert
+                                    // whenever the claim already reaches the contour (base_rest
+                                    // empty) or the remaining ring is already >= one wall stack wide
+                                    // (opening_ex leaves it untouched, so the diff below is empty).
+                                    const float wall_stack = stat.extrusion_spacing + stat.extrusion_width;
+                                    ExPolygons base_rest = diff_ex(input_expolygons[last_idx], last);
+                                    if (! base_rest.empty()) {
+                                        append(last, diff_ex(base_rest, opening_ex(base_rest, 0.5f * wall_stack)));
+                                        last = union_ex(last);
+                                    }
                                 }
                                 last = opening_ex(last, stat.small_region_threshold);
                                 if (last.empty())
@@ -1698,6 +1719,15 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                 if (! bottom_exposed_ex.empty()) {
                                     append(last, intersection_ex(bottom_exposed_ex, layer_slices_trimmed));
                                     last = union_ex(last);
+                                    // taper-bound-review.md Important 1, mirrored - see the top loop's
+                                    // comment above and exposed_surface_part(). Absorb any
+                                    // sub-wall-stack base ring the early return left behind.
+                                    const float wall_stack = stat.extrusion_spacing + stat.extrusion_width;
+                                    ExPolygons base_rest = diff_ex(input_expolygons[last_idx], last);
+                                    if (! base_rest.empty()) {
+                                        append(last, diff_ex(base_rest, opening_ex(base_rest, 0.5f * wall_stack)));
+                                        last = union_ex(last);
+                                    }
                                 }
                                 last = opening_ex(last, stat.small_region_threshold);
                                 if (last.empty())
