@@ -4,7 +4,7 @@
 
 [Releases](https://github.com/aceRage/Snapmaker-Ultra/releases) · Windows installer & portable · Linux AppImage · macOS (unsigned) · Based on [Snapmaker Orca](https://github.com/Snapmaker/OrcaSlicer) 2.3.6 (the app still reports itself as Snapmaker Orca 2.3.6.x) · AGPL-3.0
 
-![Prepare view with a multi-part assembly, the eye column in the object list and the Assemble tool open](docs/images/hero-prepare-view.png)
+![Stream camera wall, Support Filament Matching, Compare Slices and the Assemble tool's Auto-fit](docs/images/hero.jpg)
 
 Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Artisan / A-series support and the full OrcaSlicer printer library — and adds features pulled from Bambu Studio, OrcaSlicer pull requests and our own work.
 
@@ -21,8 +21,6 @@ Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Art
 - **Printer connectivity** — an optional network / printer-connectivity plugin, developed separately and not part of this repository, adds live status, camera and send-to-printer for supported Bambu Lab machines (Preferences → Ultra → Bambu Network).
 - **Status:** slicing is verified; physical validation on Bambu hardware is still in progress — treat this group as beta.
 
-![H2D slice with filaments split across the two nozzles](docs/images/dual-nozzle-grouping.png)
-
 ### Multicolor and materials
 
 - **Support Filament Matching** (opt-in) — supports, interfaces, ironing and brims print in the colour of the surface they touch; **Brim filament → Nearest wall** for brims alone.
@@ -30,7 +28,8 @@ Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Art
 - **Filament colours and count survive printer switches**; **Apply All** sets every filament slot in one click; **per-filament Z offset**.
 - **Spool Manager** — [Spoolman](https://github.com/Donkie/Spoolman) inventory, spool-to-slot bindings, automatic usage deduction when a job is sent.
 
-![Two-colour model with supports and brim matching the colour they touch](docs/images/support-filament-matching.png)
+![Normal and tree supports printing in the colour of the surface they touch, and the Support Filament Matching option](docs/images/support-matching.png)
+![Apply All, the Outer wall filament setting and the Spool Manager preferences](docs/images/materials.png)
 
 ### Assembly and fitting
 
@@ -38,8 +37,7 @@ Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Art
 - **Assemble tool → Auto-fit** — pick one feature on each part (flat face, circular rim, a single triangle or a curved patch), press *Auto-fit*, nudge with the live **Rotate / Offset** sliders, then **Merge parts**. Rotation is chosen by outline fit *and* a whole-mesh collision check, so pegs seat square without intersecting.
 - New assembly modes **Triangle and triangle** and **Curve and curve**; **Point and point** snaps to vertices at any zoom and has one-click **Coincide points**.
 
-![Loose parts, then the same parts mated and merged](docs/images/auto-fit-before-after.png)
-![Assemble tool with two picked features, the Auto-fit button and the adjust sliders](docs/images/assemble-fit-for-print.png)
+![Assemble tool: the four assembly modes, and a curve-and-curve mate with Auto-fit, live Rotate / Offset sliders and Merge parts](docs/images/assembly.png)
 
 ### Modeling and Prepare view
 
@@ -48,11 +46,11 @@ Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Art
 - **Move panel align & distribute**, **bottom-referenced Z**, **keep imported Z** (drop-to-bed toggle), double-click to select a part.
 - **Assemble Separately / Separate** parts out of an assembly in place; **Merge into Single Part** keeps paint and seam annotations.
 
-![Object list eye icons with a ghosted object](docs/images/visibility-eye-column.png)
-
 ### Print quality
 
 - **Offset layers** (experimental), **Print unsupported walls last**, **Undertop surface pattern**, **Z overrides X/Y** support option, **machine prepare time** in estimates, deterministic toolpaths.
+
+![Offset layers and Z overrides X/Y print settings](docs/images/print-quality.png)
 
 ### Workflow and UX (Preferences → Ultra)
 
@@ -61,9 +59,9 @@ Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Art
 - **Import Config from G-code**, `orcaslicer://` links, silent exit.
 - **Stream tab** — live camera wall up to 4×4 for Snapmaker U1, Moonraker and Bambu Lab (LAN liveview) cameras; bundles the open-source [go2rtc](https://github.com/AlexxIT/go2rtc) helper.
 
-![Preferences on the Ultra tab](docs/images/ultra-preferences.png)
-![Compare Slices side-by-side with a changed layer highlighted](docs/images/compare-slices.png)
-![Stream tab 2x2 camera wall](docs/images/stream-tab.png)
+![Auto-Save project setting on the Ultra preferences tab](docs/images/options-autosave.png)
+![Compare Slices window: time and filament deltas, the changed setting, and a per-layer toolpath overlay](docs/images/compare-slices.png)
+![Stream tab showing five printer cameras in a 3x2 wall](docs/images/menu-stream.jpg)
 
 ### Fixes to upstream issues
 

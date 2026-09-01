@@ -1,16 +1,22 @@
-# README screenshots
+# README images
 
-Drop PNG files with exactly these names into this folder; the top-level `README.md` already references them.
-Aim for ~1600 px wide, light or dark theme (be consistent), no personal data in the object list / device names.
+Raw screenshot crops live here; `make_collages.py` stitches the small ones into the collages the top-level `README.md` embeds.
+After replacing or adding a crop, run:
 
-| File | What to capture |
+```bash
+python docs/images/make_collages.py
+```
+
+| Used in README | Built from |
 |---|---|
-| `hero-prepare-view.png` | Prepare view with a multi-part assembly on the plate, the eye column visible in the object list, and the Assemble tool open |
-| `dual-nozzle-grouping.png` | An H2D/H2C/X2D slice showing filaments split across the two nozzles (or the send-dialog AMS mapping) |
-| `support-filament-matching.png` | A two-colour model with supports and brim printing in the colour of the surface they touch |
-| `auto-fit-before-after.png` | Left: loose parts. Right: the same parts after right-click → Auto-Fit Assembly (mated and merged) |
-| `assemble-fit-for-print.png` | Assemble tool with two picked features, the blue **Auto-fit** button and the Rotate / Offset sliders |
-| `visibility-eye-column.png` | Object list eye icons with one object in Ghost (X-ray) mode |
-| `ultra-preferences.png` | Preferences dialog on the **Ultra** tab |
-| `compare-slices.png` | Compare Slices (View menu) side by side with a changed layer highlighted |
-| `stream-tab.png` | Stream tab showing a 2×2 camera wall |
+| `hero.jpg` | `menu-stream.jpg`, `supportmatch-normal.png`, `compare-ui.png`, `assembly-menuupdate.png`, `assembly-newtypes.png` |
+| `assembly.png` | `assembly-newtypes.png`, `assembly-menuupdate.png` |
+| `support-matching.png` | `supportmatch-normal.png`, `supportmatch-tree.png`, `supportmatch-option.png` |
+| `materials.png` | `filament-applyall.png`, `features-outerwallfilament.png`, `options-spoolman.png` |
+| `print-quality.png` | `features-offsetwall.png`, `features-zoverridexy.png` |
+| `compare-slices.png` | `compare-menu.png`, `compare-ui.png` |
+| `options-autosave.png`, `menu-stream.jpg` | used directly |
+
+Still worth capturing (not yet in the README): an H2D/X2D slice with filaments split across the two nozzles,
+the object-list eye column with a ghosted object, a before/after of right-click → Auto-Fit Assembly, and the full Ultra preferences tab.
+Aim for ~1600 px wide, dark theme to match the existing crops, no personal data in object or device names.
