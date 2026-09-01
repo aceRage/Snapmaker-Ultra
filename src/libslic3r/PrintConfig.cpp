@@ -3908,11 +3908,17 @@ void PrintConfigDef::init_fff_params()
 
     def           = this->add("paint_depth_walls", coInt);
     def->label    = L("Paint depth walls");
-    def->tooltip  = L("Number of wall widths a painted claim is allowed to reach inward from the "
+    // Fix-wave F3: the tooltip described the old `ext_width + (walls-1)*spacing` band, which
+    // is no longer the formula (see paint_depth_band_mm, PaintDepth.hpp).
+    def->tooltip  = L("Number of wall loops a painted claim is allowed to reach inward from the "
                     "sliced boundary, when \"Paint depth mode\" is \"Limited by walls\". The depth "
-                    "in millimeters is derived from the painted region's own external perimeter "
-                    "width plus (walls-1) perimeter spacings, the same width/spacing precedent "
-                    "already used to bound fuzzy skin depth.");
+                    "in millimeters is sized so the painted region really does receive this many "
+                    "wall loops: one perimeter spacing per wall, plus the inset the wall "
+                    "generator applies before laying its outer loop, plus a margin so the count "
+                    "does not sit on a rounding boundary. Note that the wall generator will not "
+                    "produce more than twice \"Wall loops\" loops in any region, so a painted "
+                    "depth beyond that prints as painted solid/sparse infill rather than as "
+                    "further loops.");
     def->sidetext = "walls";
     def->min      = 1;
     def->category = L("Advanced");
@@ -3958,18 +3964,34 @@ void PrintConfigDef::init_fff_params()
     // band is not ignored/rejected either: cut_segmented_layers clamps the even-layer cut to
     // max(band - depth, 0), so an over-large depth simply saturates at a full-band cut on
     // even layers rather than erroring or being skipped (see its fix-wave F1 comment).
+    // Fix-wave F4: the tooltip now also documents the effective-depth clamp, because a user
+    // who types 0.5 here and measures 0.107 in the preview would otherwise have no way to
+    // know why. See paint_depth_interlocking_depth_mm (PaintDepth.hpp) for the reasoning.
     def->tooltip  = L("Interlocking depth of a segmented region. Only active when \"Paint depth "
-                    "mode\" is not \"Unlimited\". Zero disables this feature.");
+                    "mode\" is not \"Unlimited\". Zero disables this feature. The effective "
+                    "depth is capped at a quarter of one perimeter spacing (about 0.11mm at a "
+                    "0.45mm line width), because a deeper notch would narrow the painted band "
+                    "on alternating layers by more than a whole wall loop - so \"Paint depth "
+                    "walls\" would silently deliver one wall fewer on every other layer.");
     def->sidetext = "mm";	// milimeters, don't need translation
     def->min      = 0;
     def->category = L("Advanced");
     def->mode     = comAdvanced;
-    // Paint Depth Stage 1 (spec decision 3): default flips 0 -> 0.3 now that depth is
+    // Paint Depth Stage 1 (spec decision 3): default flips 0 -> nonzero now that depth is
     // bounded by default (paint_depth_mode default = walls) - the gate that makes this
     // value only active when the depth clamp is actually applied is unchanged (see the
     // segmentation call site, Task 2), so this default only takes effect together with
     // the bounded-by-default flip.
-    def->set_default_value(new ConfigOptionFloat(0.3));
+    //
+    // Fix-wave F4 (.superpowers/sdd/2026-08-31-paint-depth/wall-count-investigation.md
+    // section 3): that Stage-1 default was 0.3mm - roughly 0.70 * perimeter_spacing, i.e.
+    // most of a whole Arachne bead-count window, and 3.6x-5.3x the margin the band had. It
+    // dropped the painted region from N wall loops to N-1 on every even-indexed layer
+    // (cut_segmented_layers :1164/:1169), producing the 3/2/3/2 alternation the user
+    // reported as "clearly only 1-2 walls being used". 0.1mm is a real mechanical tooth
+    // that sits inside the band's own count-window margin at stock flows, so it cannot cost
+    // a loop; paint_depth_interlocking_depth_mm enforces that bound for any value set here.
+    def->set_default_value(new ConfigOptionFloat(0.1));
 
     def           = this->add("interlocking_beam", coBool);
     def->label    = L("Use beam interlocking");

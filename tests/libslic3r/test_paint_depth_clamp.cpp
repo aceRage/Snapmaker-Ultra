@@ -115,6 +115,46 @@ PrintObject *slice_painted_cube(const std::vector<int> &painted_facets, PaintDep
     return out_object;
 }
 
+// Fix-wave F2/F3/F4: same construction as slice_painted_cube() above, but with the box's XY
+// footprint as a parameter (so a cross-section THINNER than the clamp band can be built - the
+// 40x40 cube cannot express that at any plausible band) and with paint_depth_mm, layer height
+// and the INNER wall width pinned explicitly. paint_depth_test_config() only pins the outer
+// wall width, but the band formula (paint_depth_band_mm) is driven by the frPerimeter spacing
+// too, so pinning both makes the band arithmetic in these tests exact rather than dependent on
+// whatever inner_wall_line_width resolves to from the bare option registry.
+PrintObject *slice_painted_box(double x, double y, double z, const std::vector<int> &painted_facets,
+                                PaintDepthMode mode, int walls, double paint_depth_mm,
+                                double layer_height, Print &print)
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name        = "paint-depth-box.stl";
+    ModelVolume *volume  = object->add_volume(make_cube(x, y, z));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : painted_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    DynamicPrintConfig config = paint_depth_test_config(mode, walls);
+    config.option<ConfigOptionFloat>("paint_depth_mm")->value              = paint_depth_mm;
+    config.option<ConfigOptionFloat>("layer_height")->value                = layer_height;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value  = layer_height;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
 // Paint Depth Stage 2 (Task 3 item 2/3): the PrintRegionConfig apply_mm_segmentation built
 // for the Extruder2 paint claim (config().wall_filament == 2) - i.e. what filament each
 // feature (walls / solid infill / sparse infill) will actually print in, independent of any
@@ -323,17 +363,24 @@ TEST_CASE("multi_material_segmentation_by_painting: walls-mode band width is pin
     // regions) - read off the already-sliced object so this test tracks the production
     // formula rather than hardcoding a value that would silently drift from it.
     float band_mm = 0.f;
+    float min_perimeter_spacing = 0.f;
     for (size_t region_idx = 0; region_idx < object->num_printing_regions(); ++region_idx) {
-        const PrintRegion &region               = object->printing_region(region_idx);
-        const float         ext_perimeter_width = region.flow(*object, frExternalPerimeter, object->config().layer_height).width();
-        const float         perimeter_spacing   = region.flow(*object, frPerimeter, object->config().layer_height).spacing();
-        band_mm = std::max(band_mm, paint_depth_band_mm(pdmWalls, 3, 0.0, ext_perimeter_width, perimeter_spacing));
+        const PrintRegion &region                 = object->printing_region(region_idx);
+        const float         ext_perimeter_width   = region.flow(*object, frExternalPerimeter, object->config().layer_height).width();
+        const float         ext_perimeter_spacing = region.flow(*object, frExternalPerimeter, object->config().layer_height).spacing();
+        const float         perimeter_spacing     = region.flow(*object, frPerimeter, object->config().layer_height).spacing();
+        band_mm = std::max(band_mm, paint_depth_band_mm(pdmWalls, 3, 0.0, ext_perimeter_width, ext_perimeter_spacing, perimeter_spacing));
+        if (perimeter_spacing > 0.f)
+            min_perimeter_spacing = min_perimeter_spacing > 0.f ? std::min(min_perimeter_spacing, perimeter_spacing) : perimeter_spacing;
     }
     REQUIRE(band_mm > 0.f);
 
-    const double interlock_mm = object->config().mmu_segmented_region_interlocking_depth.value;
+    // Fix-wave F4: the notch the segmentation actually applies is the CLAMPED one, not the
+    // raw config value, so read it the same way production does.
+    const double interlock_mm = paint_depth_interlocking_depth_mm(object->config().mmu_segmented_region_interlocking_depth.value,
+                                                                  min_perimeter_spacing);
     // Test assumption (true of today's defaults - mmu_segmented_region_interlocking_depth
-    // default 0.3, walls=3 band well over 1mm): fails loudly, not silently, if that ever
+    // default 0.1, walls=3 band well over 1mm): fails loudly, not silently, if that ever
     // stops holding.
     REQUIRE(interlock_mm > 0.);
     REQUIRE(interlock_mm < band_mm);
@@ -1173,20 +1220,29 @@ TEST_CASE("multi_material_segmentation_by_painting: bottom_shell_layers=0 with n
 // ===========================================================================================
 
 // The user's actual bug, stated as a test. An 8mm painted feature (an eye, a cheek) on a top
-// face must keep its FULL footprint at every layer of the solid shell it caps. 8x8x4mm prism,
-// whole top cap painted, 0.1mm layers, top_shell_layers=4 / top_shell_thickness=0.6mm => a
-// 6-layer effective shell (same arithmetic as the "thin layers..." test above). Pre-change the
-// erosion accumulates 0.8785mm per descent step on a 4mm half-width, so:
-//   - depth 0 (the painted surface layer itself, offset 0) claims the full 8mm - passes both
-//     before and after, which is what makes the 0.5mm-from-edge probe below trustworthy: if it
-//     were too close to the silhouette for the geometry to resolve, depth 0 would fail too;
-//   - depths 1..4 claim only 8 - 2*k*0.8785 mm, so the 0.5mm-from-edge probe is unclaimed
-//     from depth 1 on (the claim's edge is already 0.8785mm in);
-//   - depth 5 needs 8.785mm of a 8mm cross-section, so the claim is empty and the descent
-//     breaks - even the CENTER of the feature is unpainted there.
-// Post-change all six layers claim the whole 8x8 footprint: no base-coloured solid anywhere
-// under the painted skin.
-TEST_CASE("multi_material_segmentation_by_painting: a small painted top feature keeps its full footprint at every solid-shell layer", "[paintdepth]")
+// face must keep its footprint - at DEPTH - at every layer of the solid shell it caps. 8x8x4mm
+// prism, whole top cap painted, 0.1mm layers, top_shell_layers=4 / top_shell_thickness=0.6mm
+// => a 6-layer effective shell (same arithmetic as the "thin layers..." test above).
+// Pre-taper-bound the erosion accumulated 0.8785mm per descent step on a 4mm half-width, so:
+//   - depths 1..4 claimed only 8 - 2*k*0.8785 mm, retreating inward layer by layer;
+//   - depth 5 needed 8.785mm of an 8mm cross-section, so the claim was empty and the descent
+//     broke - even the CENTER of the feature was unpainted there.
+// The taper bound fixed that: the footprint no longer retreats with depth.
+//
+// Fix-wave F1 amends what "full footprint" means on a feature whose paint REACHES ITS OWN
+// SILHOUETTE, which this one does (the whole 8x8 cap is painted, so the claim runs out to the
+// prism's own contour). The sub-surface claim is now held one wall stack (extrusion_width +
+// extrusion_spacing = 0.87854mm here) clear of each layer's contour, because otherwise the
+// painted colour owns the EXTERIOR perimeter of every shell layer below the cap - a 0.7-1.0mm
+// ring of the wrong colour on the visible side wall of every painted flat-topped object, which
+// is what the user reported (outward-bleed-investigation.md section 1.2). So:
+//   - depth 0 (the painted surface layer itself) still claims the full 8mm out to the contour -
+//     that IS what the user painted, and it is appended with zero margin;
+//   - depths 1..5 claim the footprint inset by exactly one wall stack - constant with depth,
+//     not growing like the pre-taper-bound k*wall_stack erosion, and never empty;
+//   - the feature's CENTER stays claimed at every one of the six shell layers, which is the
+//     taper bound's actual win and is what this test has always been about.
+TEST_CASE("multi_material_segmentation_by_painting: a small painted top feature keeps its footprint at depth, held one wall stack clear of the contour", "[paintdepth]")
 {
     Print        print;
     PrintObject *object = slice_capped_prism(TOP_CAP_FACE, /*xy_size=*/8., /*height=*/4.,
@@ -1198,14 +1254,26 @@ TEST_CASE("multi_material_segmentation_by_painting: a small painted top feature 
     const size_t top_index = object->layer_count() - 1;
     REQUIRE(top_index >= 7);
 
+    // The painted surface layer itself: full width, right out to the silhouette.
+    CHECK(any_contains(extruder2_claim_for_layer(*object, top_index),
+                       layer_edge_probe(*object, top_index, 0.3)));
+
     for (size_t depth = 0; depth <= 5; ++depth) {
         const size_t layer_idx = top_index - depth;
-        // Full width: 0.5mm in from this layer's own silhouette, i.e. inside the 0.8785mm the
-        // first erosion step alone would have removed.
+        // Deep inside the wall-stack inset (2.5mm from centre on a 4mm half-width): claimed at
+        // every shell layer. Pre-taper-bound this failed from depth 2 on.
         CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx),
-                           layer_edge_probe(*object, layer_idx, 0.5)));
-        // ...and the feature's center, which the erosion erases outright at depth 5.
+                           layer_edge_probe(*object, layer_idx, 1.5)));
+        // ...and the feature's centre, which the pre-taper-bound erosion erased outright at
+        // depth 5.
         CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx), slab_center_point(*object)));
+    }
+    // Fix-wave F1: no painted material within one wall stack of the contour on any SUB-SURFACE
+    // layer. RED pre-F1 (the claim reached the contour exactly on every one of these layers).
+    for (size_t depth = 1; depth <= 5; ++depth) {
+        const size_t layer_idx = top_index - depth;
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                                 layer_edge_probe(*object, layer_idx, 0.3)));
     }
     // No over-claim past the shell: depth 6 is outside the 6-layer effective shell.
     CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, top_index - 6), slab_center_point(*object)));
@@ -1215,9 +1283,9 @@ TEST_CASE("multi_material_segmentation_by_painting: a small painted top feature 
 // bottom_shell_thickness=0.6mm at 0.1mm layers: the thickness walk over real bottom_z values
 // reaches layer 6 (bottom_z 0.6 >= 0.6 - EPSILON) => a 6-layer effective shell, layers 0..5,
 // with layer 6 outside it. The bottom descent applies the identical per-step erosion
-// (offset -= extrusion_spacing + extrusion_width), so pre-change this fails at exactly the
-// same depths, in the same two ways, as the top case.
-TEST_CASE("multi_material_segmentation_by_painting: a small painted bottom feature keeps its full footprint at every solid-shell layer", "[paintdepth]")
+// (offset -= extrusion_spacing + extrusion_width) and the identical fix-wave F1 inset, so this
+// pins exactly the same three things at the same depths as the top case.
+TEST_CASE("multi_material_segmentation_by_painting: a small painted bottom feature keeps its footprint at depth, held one wall stack clear of the contour", "[paintdepth]")
 {
     Print        print;
     PrintObject *object = slice_capped_prism(BOTTOM_CAP_FACE, /*xy_size=*/8., /*height=*/4.,
@@ -1228,11 +1296,16 @@ TEST_CASE("multi_material_segmentation_by_painting: a small painted bottom featu
 
     REQUIRE(object->layer_count() >= 8);
 
+    CHECK(any_contains(extruder2_claim_for_layer(*object, 0), layer_edge_probe(*object, 0, 0.3)));
+
     for (size_t layer_idx = 0; layer_idx <= 5; ++layer_idx) {
         CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx),
-                           layer_edge_probe(*object, layer_idx, 0.5)));
+                           layer_edge_probe(*object, layer_idx, 1.5)));
         CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx), slab_center_point(*object)));
     }
+    for (size_t layer_idx = 1; layer_idx <= 5; ++layer_idx)
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                                 layer_edge_probe(*object, layer_idx, 0.3)));
     CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, 6), slab_center_point(*object)));
 }
 
@@ -1335,6 +1408,26 @@ TEST_CASE("multi_material_segmentation_by_painting: a zero-shell region's painte
 // case - so the gap is governed entirely by the (here, unconstrained pre-fix) taper below.
 // ===========================================================================================
 
+// FIX-WAVE F1 UPDATE. The version of this test committed at cfe7fae1df asserted the OPPOSITE
+// of the assertions below: that the sub-wall-stack base ring was ABSORBED INTO the painted
+// claim (the "I1 absorb", MultiMaterialSegmentation.cpp:1673-1678 / :1725-1730), so the claim
+// reached to within 0.1mm of each layer's own contour. That satisfied the no-sliver invariant
+// by painting the sliver - and outward-bleed-investigation.md section 1.2 then showed what
+// that costs in the GUI: on any chamfer/fillet/draft/organic taper below a painted flat cap the
+// absorb fires on EVERY descent layer, pushing the painted colour onto the exterior perimeter
+// for the whole shell depth. That is the user's reported exterior paint bleed, and the absorb
+// is what made it fire on real (non-prismatic) models.
+//
+// F1 enforces the same invariant from the other side: the full-width term is intersected with
+// offset_ex(input_expolygons[last_idx], -wall_stack), so the claim is held one wall stack clear
+// of the descent layer's own contour and the base ring is at least one wall stack wide BY
+// CONSTRUCTION. The I1 absorb is removed as part of the same change (with F1 in place its
+// base_rest is one wall stack wide by construction, so opening_ex leaves it intact and the
+// absorb's diff is empty - it is dead code that could only ever misfire on the Clipper
+// arc-approximation knife-edge it now sits exactly on). Same invariant, one mechanism, and the
+// exterior stays base-coloured. This test therefore keeps its fixture and its subject and flips
+// the direction of its probes.
+//
 // make_square_frustum(40., 22., 6.) painted on its TOP CAP (facets {2,3}, the flat 22x22 face)
 // instead of its sloped walls - the fixture the anti-smear test's own comment calls out as
 // missing ("the only 'paint reaches the silhouette' fixture is the 40x40 slab, whose vertical
@@ -1356,16 +1449,14 @@ TEST_CASE("multi_material_segmentation_by_painting: a zero-shell region's painte
 // term stays pinned at the cap's fixed 11.000mm footprint at EVERY descent depth, while each
 // layer's own true contour keeps growing underneath it:
 //   depth k contour half-width  = 11.075 + 0.15*k
-//   pre-fix claim edge          = 11.000 (fixed, every k)
-//   base ring width gap(k)      = 0.075 + 0.15*k   (k=1: 0.225mm ... k=5: 0.825mm)
-// matching the general gap(k) ~= (k + 1/2)*r form from the report/review (r = 0.15mm/layer
-// here). Every one of gap(1..5) is a sub-wall-stack sliver (< w+s = extrusion_width +
-// extrusion_spacing = 0.45 + 0.42854 = 0.87854mm at 0.1mm layers / 0.45mm walls) that
-// is_perimeter_compatible (Layer.cpp:184) will never merge into the base region (they differ
-// in wall_filament) and that no downstream cleanup catches (SCALED_EPSILON / 5*EPSILON scale
-// only, MultiMaterialSegmentation.cpp:2150 / PrintObjectSlice.cpp:4585,5033,5151). This is
-// Important 1's failure mode, reached with an already-existing fixture and no new mesh.
-TEST_CASE("multi_material_segmentation_by_painting: a chamfered/tapered painted top leaves no sub-wall-stack base ring on the layers below the cap (taper-bound-review Important 1)", "[paintdepth]")
+//   cap footprint (top_exposed) = 11.000 (fixed, every k)
+//   post-F1 claim edge          = min(11.000, 11.075 + 0.15*k - 0.87854) = 10.19646 + 0.15*k
+// i.e. the claim sits exactly one wall stack (extrusion_width + extrusion_spacing = 0.45 +
+// 0.42854 = 0.87854mm at 0.1mm layers / 0.45mm walls) inside this layer's own contour at every
+// descent depth - never a sliver of base material at the perimeter (the invariant
+// exposed_surface_part()'s comment states), and never painted colour on the exterior wall
+// (the user's reported bleed).
+TEST_CASE("multi_material_segmentation_by_painting: a chamfered/tapered painted top leaves at least one wall stack of base material at the contour of every layer below the cap (F1)", "[paintdepth]")
 {
     Model        model;
     ModelObject *object = model.add_object();
@@ -1417,15 +1508,16 @@ TEST_CASE("multi_material_segmentation_by_painting: a chamfered/tapered painted 
 
     for (size_t depth = 1; depth <= 5; ++depth) {
         const size_t layer_idx = top_index - depth;
-        // 0.1mm inside THIS layer's own true contour sits well inside gap(depth) (0.225mm at
-        // depth 1, growing to 0.825mm at depth 5 - see derivation above), i.e. inside the
-        // sub-wall-stack base ring the early-return leaves behind pre-fix. Per
-        // exposed_surface_part()'s own stated invariant this ring must be absorbed into the
-        // claim, not left as a sliver: CHECK is the post-fix behavior. RED pre-fix - the claim
-        // edge is pinned at the cap's fixed 11.000mm footprint, 0.125mm (depth 1) to 0.725mm
-        // (depth 5) short of this probe at every one of these depths.
+        // 0.1mm inside THIS layer's own true contour: base material, on every sub-surface
+        // layer. RED pre-F1 - the I1 absorb swallowed exactly this ring into the painted claim
+        // at every one of these depths, which is the exterior bleed.
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, layer_idx),
+                                 layer_edge_probe(*out_object, layer_idx, 0.1)));
+        // ...and the claim is nonetheless real and deep: 1.5mm in from the same contour is
+        // still painted at every one of those depths (claim edge is 0.87854mm in), so this is
+        // a boundary that moved, not a claim that vanished.
         CHECK(any_contains(extruder2_claim_for_layer(*out_object, layer_idx),
-                           layer_edge_probe(*out_object, layer_idx, 0.1)));
+                           layer_edge_probe(*out_object, layer_idx, 1.5)));
     }
 
     // No over-claim regression: depth 6 is past the 6-layer effective shell (structurally
@@ -1434,4 +1526,243 @@ TEST_CASE("multi_material_segmentation_by_painting: a chamfered/tapered painted 
     const size_t past_shell = top_index - 6;
     CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, past_shell),
                              layer_edge_probe(*out_object, past_shell, 0.1)));
+}
+
+// ===========================================================================================
+// FIX WAVE: exterior paint bleed (F1), lateral-clamp self-disabling on thin geometry (F2),
+// band arithmetic (F3) and the interlocking notch's wall-loop cost (F4).
+// .superpowers/sdd/2026-08-31-paint-depth/outward-bleed-investigation.md
+// .superpowers/sdd/2026-08-31-paint-depth/wall-count-investigation.md
+// ===========================================================================================
+
+// F1, the plain flat-cap case (outward-bleed-investigation.md section 1.2's worked example).
+// A 40x40x4mm slab with its whole top cap painted: nothing sits above the cap, so
+// exposed_surface_part()'s early return (MultiMaterialSegmentation.cpp:1331-1332) hands the
+// patch back with NO clearance test, and pre-F1 the full-width term
+// `intersection_ex(top_exposed_ex, layer_slices_trimmed)` was bounded only by the layer
+// OUTLINE. On a prism the outline does not change with depth, so the claim reached the
+// silhouette EXACTLY on all six shell layers - i.e. the painted colour owned the exterior
+// perimeter of a 0.7mm-tall ring of side wall the user never painted. That was structurally
+// impossible before 65d17c964f (the legacy descent was inset by k * wall_stack
+// unconditionally; 3448111acd:1570-1578 == f1e9f78696:1388-1396), so it is a regression this
+// branch introduced, and it is what the user validated negatively in the GUI.
+TEST_CASE("multi_material_segmentation_by_painting: a painted flat cap leaves the exterior wall base-coloured on every sub-surface shell layer (F1)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_capped_slab(TOP_CAP_FACE, /*layer_height=*/0.1,
+                                             /*top_shell_layers=*/4, /*top_shell_thickness=*/0.6,
+                                             /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.0,
+                                             print);
+
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 7);
+
+    // The painted SURFACE layer keeps its zero-margin claim out to the silhouette - that is
+    // literally the facet the user painted, appended separately at :1634 and untouched by F1.
+    // Also the fixture's positive control: if this failed, the CHECK_FALSEs below would prove
+    // nothing.
+    CHECK(any_contains(extruder2_claim_for_layer(*object, top_index),
+                       layer_edge_probe(*object, top_index, 0.2)));
+
+    for (size_t depth = 1; depth <= 5; ++depth) {
+        const size_t layer_idx = top_index - depth;
+        // One wall stack here is extrusion_width + extrusion_spacing = 0.45 + 0.42854 =
+        // 0.87854mm (0.45mm outer wall, 0.1mm layers). Both probes sit inside it, so both must
+        // be BASE material: no painted filament anywhere in the perimeter band of a
+        // sub-surface layer. RED pre-F1 at both depths - the claim reached the contour exactly.
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                                 layer_edge_probe(*object, layer_idx, 0.2)));
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                                 layer_edge_probe(*object, layer_idx, 0.8)));
+        // Immediately past the wall stack the claim is still full width, at every shell depth -
+        // F1 holds a CONSTANT one-wall-stack inset, not the legacy k * wall_stack taper (which
+        // would already be 4.39mm in by depth 5).
+        CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                           layer_edge_probe(*object, layer_idx, 1.0)));
+    }
+}
+
+// F1's other half: the approved intent must survive. outward-bleed-investigation.md section 4
+// Option A's central claim is that measuring the inset from the LAYER CONTOUR (not from the
+// painted patch) leaves an interior painted feature completely unclipped - "a raised painted
+// boss well inside the silhouette keeps its ENTIRE footprint at every shell layer, which was
+// the whole point of 65d17c964f". This is that claim as a test, and it must stay GREEN across
+// the fix (it is a guard, not a RED item).
+//
+// Two stacked model-part volumes, the same construction as process_z_interface_cube() above: a
+// 40x40x3.8mm slab with a centred 8x8x0.4mm boss on top, the boss's top cap painted. At 0.1mm
+// layers the boss is only 4 layers tall, so the 6-layer effective shell (top_shell_layers=4 /
+// top_shell_thickness=0.6mm) descends past it into the slab - where the painted claim is 16mm
+// clear of the layer's own silhouette and F1's inset therefore cannot touch it.
+TEST_CASE("multi_material_segmentation_by_painting: an interior painted top feature keeps its FULL footprint through the shell (F1 preserves the approved intent)", "[paintdepth]")
+{
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-interior-boss.stl";
+    ModelVolume *slab     = object->add_volume(make_cube(40., 40., 3.8));
+    slab->name            = "slab";
+    ModelVolume *boss     = object->add_volume(make_cube(8., 8., 0.4));
+    boss->name            = "boss";
+    boss->translate(16., 16., 3.8); // centred on the 40x40 slab, sitting on top of it
+
+    TriangleSelector selector(boss->mesh());
+    for (int facet_idx : TOP_CAP_FACE)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(boss->mmu_segmentation_facets.set(selector));
+
+    object->add_instance();
+    object->ensure_on_bed();
+
+    // pdmUnlimited: only a horizontal cap is painted, so no layer's own cross-section carries a
+    // painted boundary for the Stage-1 lateral clamp to act on - the whole claim comes from the
+    // vertical projection/descent path this test targets (same reasoning as
+    // slice_capped_slab()'s file comment above).
+    DynamicPrintConfig config = paint_depth_test_config(pdmUnlimited, 3);
+    config.option<ConfigOptionFloat>("layer_height")->value               = 0.1;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = 0.1;
+    config.option<ConfigOptionInt>("top_shell_layers")->value             = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value        = 0.6;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value          = 3;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value     = 0.0;
+
+    Print print;
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+
+    const size_t top_index  = out_object->layer_count() - 1;
+    const size_t boss_first = first_layer_above_z(*out_object, 3.8);
+    REQUIRE(top_index >= 7);
+    // The geometry this test depends on, asserted rather than assumed: depths 4 and 5 of the
+    // shell descent land in the SLAB, where the painted footprint is deep inside the silhouette.
+    REQUIRE(top_index - 4 < boss_first);
+    REQUIRE(top_index - 5 < boss_first);
+
+    // Probes in ABSOLUTE coordinates, taken from the boss's own cross-section, so the same
+    // points can be re-probed on the (much wider) slab layers below it.
+    const BoundingBox boss_bb = get_extents(out_object->get_layer(int(boss_first))->lslices);
+    REQUIRE(boss_bb.defined);
+    const coord_t boss_mid_y = (boss_bb.min.y() + boss_bb.max.y()) / 2;
+    const Point   boss_edge_probe(coord_t(boss_bb.max.x() - scale_(0.2)), boss_mid_y);
+    const Point   boss_centre((boss_bb.min.x() + boss_bb.max.x()) / 2, boss_mid_y);
+
+    for (size_t depth = 4; depth <= 5; ++depth) {
+        const size_t layer_idx = top_index - depth;
+        const ExPolygons claim = extruder2_claim_for_layer(*out_object, layer_idx);
+        // FULL width: 0.2mm inside the painted feature's own footprint edge - well inside the
+        // 0.87854mm wall stack, and claimed anyway, because the inset is measured from the
+        // LAYER's contour (16mm away), not from the patch.
+        CHECK(any_contains(claim, boss_edge_probe));
+        CHECK(any_contains(claim, boss_centre));
+        // ...and it still does not bleed to the slab's own exterior wall.
+        CHECK_FALSE(any_contains(claim, layer_edge_probe(*out_object, layer_idx, 0.3)));
+    }
+    // No over-claim past the 6-layer effective shell.
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, top_index - 6), boss_centre));
+}
+
+// F2 (outward-bleed-investigation.md section 2.3): where the local cross-section's half-thickness
+// is less than cut_width, `offset_ex(input_expolygons[layer_idx], -region_cut_width)` comes back
+// EMPTY, diff_ex(claim, {}) == claim, and the lateral clamp is a COMPLETE no-op on that layer -
+// the painted colour keeps the entire local cross-section. At paint_depth_mm = 4-6mm that
+// condition holds across most of a typical organic model, which is why the clamp appeared to
+// stop working (and the paint to "spread outward") exactly in the range the user reported.
+//
+// Fixture: a 1.2mm-thin, 40mm-long wall with EVERY side facet painted, so
+// has_layer_only_one_color hands the whole cross-section to the painted colour and the lateral
+// clamp is the only thing that can take any of it back. paint_depth_mm = 2mm is more than three
+// times the 0.6mm local half-thickness, so pre-F2 the clamp does nothing whatsoever.
+TEST_CASE("multi_material_segmentation_by_painting: the lateral clamp still leaves a base core on geometry thinner than the band (F2)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_box(/*x=*/1.2, /*y=*/40., /*z=*/20., ALL_SIDE_FACE,
+                                             pdmMillimeters, /*walls=*/3, /*paint_depth_mm=*/2.0,
+                                             /*layer_height=*/0.2, print);
+
+    REQUIRE(object->layer_count() >= 10);
+
+    // Both parities: the interlocking notch narrows the band on even layers, and the
+    // degradation has to hold on both.
+    const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+    const size_t odd_layer  = even_layer + 1;
+    REQUIRE(even_layer % 2 == 0);
+    REQUIRE(odd_layer % 2 == 1);
+
+    for (size_t layer_idx : {even_layer, odd_layer}) {
+        CAPTURE(layer_idx);
+        const BoundingBox bb = get_extents(object->get_layer(int(layer_idx))->lslices);
+        REQUIRE(bb.defined);
+        const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+        const Point   near_face(coord_t(bb.max.x() - scale_(0.1)), mid_y);
+        const Point   centre((bb.min.x() + bb.max.x()) / 2, mid_y);
+
+        const ExPolygons claim = extruder2_claim_for_layer(*object, layer_idx);
+        // Positive control: the painted face's own perimeter band is still painted. The fix
+        // makes the clamp degrade, not disappear.
+        CHECK(any_contains(claim, near_face));
+        // F2: the middle of the fin stays BASE material - the claim is proportionate to what
+        // the local geometry can support instead of swallowing the whole cross-section. RED
+        // pre-F2 on both parities (the clamp was a total no-op, so the centre was painted).
+        CHECK_FALSE(any_contains(claim, centre));
+    }
+}
+
+// F3 + F4 as one end-to-end contract: "N walls" must deliver the same wall-loop capacity on
+// BOTH layer parities. Bead counting is not reachable from this harness (these fixtures stop at
+// PrintObject::slice(), which never runs perimeter generation; and the painted region's bead
+// count is decided inside Arachne from the strip thickness), so the assertion is made on the
+// quantity that decides the bead count: the band width actually claimed, measured against the
+// exact N-bead optimum thickness `N * perimeter_spacing + 2 * (ext_w - ext_s)` that
+// paint_depth_band_mm is built around (see its header comment, and wall-count-investigation.md
+// sections 2 and 5 for the Arachne count rule this number comes from).
+//
+// Pre-fix both parities fail: the old band `ext_w + (N-1)*s` is 1.264mm at these settings
+// against a 1.307mm optimum, and the old 0.3mm notch took the even layers down to 0.964mm.
+TEST_CASE("multi_material_segmentation_by_painting: a walls-mode band delivers the full N-bead budget on BOTH layer parities (F3+F4)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_box(/*x=*/40., /*y=*/40., /*z=*/20., PLUS_X_FACE,
+                                             pdmWalls, /*walls=*/3, /*paint_depth_mm=*/1.5,
+                                             /*layer_height=*/0.2, print);
+
+    // Read the real flows off the sliced object rather than hardcoding, exactly as the
+    // segmentation itself does.
+    float ext_w = 0.f, ext_s = 0.f, s = 0.f;
+    for (size_t region_idx = 0; region_idx < object->num_printing_regions(); ++region_idx) {
+        const PrintRegion &region = object->printing_region(region_idx);
+        ext_w = std::max(ext_w, region.flow(*object, frExternalPerimeter, object->config().layer_height).width());
+        ext_s = std::max(ext_s, region.flow(*object, frExternalPerimeter, object->config().layer_height).spacing());
+        s     = std::max(s,     region.flow(*object, frPerimeter,         object->config().layer_height).spacing());
+    }
+    REQUIRE(s > 0.f);
+
+    // The arithmetic half of F4, pinned against this object's own flow: the notch the
+    // segmentation applies is at most a quarter of one perimeter spacing, which is exactly the
+    // count-window margin the band builds in - so it cannot move the strip across a bead-count
+    // boundary. RED pre-F4 (the shipped default was 0.3mm, ~0.70 * spacing).
+    const double interlock_mm = paint_depth_interlocking_depth_mm(object->config().mmu_segmented_region_interlocking_depth.value, s);
+    CHECK(interlock_mm <= 0.25 * double(s) + 1e-6);
+
+    // The geometric half: the N-bead optimum depth is claimed on both parities.
+    const double n_bead_optimum = 3.0 * double(s) + 2.0 * (double(ext_w) - double(ext_s));
+    const double probe_mm       = n_bead_optimum - 0.02;
+    REQUIRE(probe_mm > 0.);
+
+    REQUIRE(object->layer_count() >= 10);
+    const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+    const size_t odd_layer  = even_layer + 1;
+    REQUIRE(even_layer % 2 == 0);
+    REQUIRE(odd_layer % 2 == 1);
+
+    const BoundingBox bb = get_extents(object->get_layer(int(even_layer))->lslices);
+    REQUIRE(bb.defined);
+    const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+    const Point   probe(coord_t(bb.max.x() - scale_(probe_mm)), mid_y);
+
+    CHECK(any_contains(extruder2_claim_for_layer(*object, even_layer), probe));
+    CHECK(any_contains(extruder2_claim_for_layer(*object, odd_layer), probe));
 }

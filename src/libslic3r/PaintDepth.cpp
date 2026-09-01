@@ -5,7 +5,8 @@
 namespace Slic3r {
 
 float paint_depth_band_mm(PaintDepthMode mode, int walls, double mm,
-                           float ext_perimeter_width, float perimeter_spacing)
+                           float ext_perimeter_width, float ext_perimeter_spacing,
+                           float perimeter_spacing)
 {
     switch (mode) {
     case pdmUnlimited:
@@ -14,10 +15,26 @@ float paint_depth_band_mm(PaintDepthMode mode, int walls, double mm,
         return float(mm);
     case pdmWalls:
     default: {
-        int clamped_walls = std::max(walls, 1);
-        return ext_perimeter_width + float(clamped_walls - 1) * perimeter_spacing;
+        // Fix-wave F3 - see the header comment for the derivation of each of the three terms.
+        const int clamped_walls = std::max(walls, 1);
+        const float band = float(clamped_walls) * perimeter_spacing                    // N bead pitches
+                         + 2.f * (ext_perimeter_width - ext_perimeter_spacing)          // Arachne's pre-inset
+                         + 0.25f * perimeter_spacing;                                   // count-window margin
+        // A degenerate flow (all-zero widths, or a spacing that somehow exceeds its own
+        // width) must collapse to "disabled", never to a negative band that would make
+        // offset_ex() grow the keep-core instead of shrinking it.
+        return std::max(0.f, band);
     }
     }
+}
+
+float paint_depth_interlocking_depth_mm(double configured_depth, float perimeter_spacing)
+{
+    // Fix-wave F4 - see the header comment. Nothing to clamp against without a real spacing,
+    // and 0 stays 0 (the option's "disabled" convention).
+    if (configured_depth <= 0. || perimeter_spacing <= 0.f)
+        return float(configured_depth);
+    return std::min(float(configured_depth), 0.25f * perimeter_spacing);
 }
 
 } // namespace Slic3r

@@ -1143,6 +1143,70 @@ static void remove_multiple_edges_in_vertex(const VD::vertex_type &vertex) {
     }
 }
 
+// Fix-wave F2 (.superpowers/sdd/2026-08-31-paint-depth/outward-bleed-investigation.md section
+// 2.3): the "keep base" core that cut_segmented_layers subtracts from every colour's claim.
+//
+// The clamp is `claim \ core` with `core` = the layer eroded by the band, so a painted colour
+// survives only within `band` of the layer contour. Wherever the local half-thickness is LESS
+// than the band that erosion comes back EMPTY, `diff_ex(claim, {})` is the claim itself, and the
+// clamp is a COMPLETE no-op on that geometry - the painted colour keeps the entire local
+// cross-section. It is not a partial weakening; it is an on/off cliff, and nothing anywhere
+// reports it. At paint_depth_mm = 4-6mm the condition holds across most of a typical organic
+// model (anything under 8-12mm thick locally), which is exactly why, past a certain depth
+// setting, increasing it stopped deepening the paint and started revealing the raw Voronoi
+// partition instead.
+//
+// DEGRADATION RULE. Where a full-`band` inset leaves no core, fall back to the widest band from
+// the halving ladder band/4, band/8, ... band/128 that the local geometry can support - where
+// "can support" means the part survives an opening at TWICE that band. A part of local
+// half-thickness t therefore ends up with an effective band b satisfying 2b <= t < 4b, i.e.
+//
+//     t/4 < b <= t/2
+//
+//   - `b <= t/2` is the load-bearing half: the base core left behind is t - b >= t/2, so at
+//     least half of the local cross-section stays base-coloured. The claim becomes proportionate
+//     to the geometry instead of swallowing it whole - which is the whole point, since a band
+//     deeper than the feature is a request the geometry cannot honour.
+//   - `b > t/4` bounds how much paint the degradation gives away.
+// Testing membership at 2b rather than at b is what buys the first bound: at radius b alone a
+// part with t barely above b would keep a vanishing base core, i.e. the no-op all over again.
+//
+// Thick geometry is bit-for-bit untouched: where the full-band erosion is non-empty, `thin` is
+// empty, the ladder never runs, and the core is exactly today's `offset_ex(layer, -band)`.
+//
+// DEGENERATE LIMIT, stated plainly: the ladder is bounded at six steps, so its last membership
+// radius is band/64 and any part thinner than that keeps the old no-op - 0.022mm at a 1.44mm
+// walls-mode band, 0.094mm at a 6mm one. Both are far below a single extrusion, i.e. geometry
+// that cannot carry two colours through its thickness under any clamp.
+//
+// AND WHAT THIS DOES NOT DO, also plainly: it bounds the claim, it does not stop a Voronoi cell
+// from WRAPPING onto an opposite face. The clamp keeps whatever lies within `band` of ANY
+// boundary, so where a painted surface's own cell reaches around a rounded fin tip, the far
+// face's perimeter band still survives for any b > 0. Suppressing that needs a clamp measured
+// from the PAINTED boundary rather than from the layer contour - a different mechanism, out of
+// this fix's scope, and recorded as such in the fix-wave report.
+static ExPolygons paint_depth_clamp_keep_core(const ExPolygons &layer_slices, const float band)
+{
+    ExPolygons core = offset_ex(layer_slices, -band);
+    // `thin` = the parts of the layer a full-band inset leaves no core in, i.e. everything
+    // thinner than 2*band. Built by re-dilating `core` rather than calling opening_ex(), which
+    // would repeat the erosion we already have.
+    ExPolygons thin = core.empty() ? layer_slices : diff_ex(layer_slices, offset_ex(core, band));
+
+    constexpr int max_ladder_steps = 6;
+    float b = 0.25f * band;
+    for (int step = 0; step < max_ladder_steps && ! thin.empty() && b > 0.f; ++step, b *= 0.5f) {
+        // Which of the still-uncored parts are at least 2*b thick?
+        const ExPolygons fits = intersection_ex(thin, opening_ex(layer_slices, 2.f * b));
+        if (fits.empty())
+            continue;
+        append(core, intersection_ex(offset_ex(layer_slices, -b), fits));
+        core = union_ex(core);
+        thin = diff_ex(thin, fits);
+    }
+    return core;
+}
+
 static void cut_segmented_layers(const std::vector<ExPolygons>        &input_expolygons,
                                  std::vector<std::vector<ExPolygons>> &segmented_regions,
                                  const float                           cut_width,
@@ -1169,10 +1233,15 @@ static void cut_segmented_layers(const std::vector<ExPolygons>        &input_exp
             const float  region_cut_width       = ((layer_idx % 2 == 0) && (interlocking_cut_width > 0.f)) ? interlocking_cut_width : cut_width;
             const size_t num_extruders_plus_one = segmented_regions[layer_idx].size();
             if (region_cut_width > 0.f) {
+                // Fix-wave F2: the core no longer collapses to nothing on geometry thinner than
+                // the band (see paint_depth_clamp_keep_core above). Also hoisted out of the
+                // per-extruder loop below, which used to rebuild the identical eroded layer once
+                // per extruder - so the added ladder work is partly paid for already.
+                const ExPolygons keep_core = paint_depth_clamp_keep_core(input_expolygons[layer_idx], region_cut_width);
                 std::vector<ExPolygons> segmented_regions_cuts(num_extruders_plus_one); // Indexed by extruder_id
                 for (size_t extruder_idx = 0; extruder_idx < num_extruders_plus_one; ++extruder_idx)
                     if (const ExPolygons &ex_polygons = segmented_regions[layer_idx][extruder_idx]; !ex_polygons.empty())
-                        segmented_regions_cuts[extruder_idx] = diff_ex(ex_polygons, offset_ex(input_expolygons[layer_idx], -region_cut_width));
+                        segmented_regions_cuts[extruder_idx] = diff_ex(ex_polygons, keep_core);
                 segmented_regions[layer_idx] = std::move(segmented_regions_cuts);
             }
         }
@@ -1651,31 +1720,66 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                 ExPolygons last = intersection_ex(top_ex, offset_ex(layer_slices_trimmed, offset));
                                 if (! top_exposed_ex.empty()) {
                                     // The near-horizontal part of the patch descends at FULL width -
-                                    // trimmed only by the running intersection of the layer outlines
-                                    // (the containment guard), never by `offset`.
-                                    append(last, intersection_ex(top_exposed_ex, layer_slices_trimmed));
-                                    last = union_ex(last);
-                                    // taper-bound-review.md Important 1: exposed_surface_part()'s
-                                    // early return (reference_layer_idx >= num_layers - i.e. every
-                                    // painted flat top face) hands back the whole patch with NO
-                                    // clearance test, so on that path `last` can sit strictly inside
-                                    // this layer's own contour by less than one wall stack - a
-                                    // sub-wall-stack base ring that is_perimeter_compatible
-                                    // (Layer.cpp:184) never merges away (painted/base regions differ
-                                    // in wall_filament) and that no downstream cleanup catches
-                                    // (SCALED_EPSILON / 5*EPSILON scale only). Enforce the invariant
-                                    // the comment above already claims: the base material left at
-                                    // this layer's contour is either nothing or at least one wall
-                                    // stack wide. Absorb anything thinner into the claim. Inert
-                                    // whenever the claim already reaches the contour (base_rest
-                                    // empty) or the remaining ring is already >= one wall stack wide
-                                    // (opening_ex leaves it untouched, so the diff below is empty).
+                                    // trimmed by the running intersection of the layer outlines (the
+                                    // containment guard) and by ONE wall stack of clearance from this
+                                    // descent layer's own contour, never by the growing `offset`.
+                                    //
+                                    // FIX-WAVE F1 (.superpowers/sdd/2026-08-31-paint-depth/
+                                    // outward-bleed-investigation.md, section 4 Option A). Without
+                                    // the offset_ex() below this term is bounded only by a layer
+                                    // OUTLINE, so wherever the painted patch reaches the silhouette -
+                                    // every painted flat or chamfered cap, because
+                                    // exposed_surface_part()'s early return (:1331-1332) hands such a
+                                    // patch back with no clearance test at all - the claim reaches
+                                    // the contour EXACTLY on every sub-surface shell layer. That
+                                    // paints the exterior perimeter of a 0.7-1.0mm ring of side wall
+                                    // the user never painted, on every painted flat-topped object.
+                                    // It is a regression this branch introduced in 65d17c964f:
+                                    // 3448111acd:1570-1578 and the pre-feature merge-base
+                                    // f1e9f78696:1388-1396 are byte-identical to each other and inset
+                                    // the claim by k * wall_stack unconditionally, so an exterior
+                                    // perimeter could never be painted from an INFERRED layer.
+                                    //
+                                    // The inset is measured from input_expolygons[last_idx] - the
+                                    // descent layer's own contour - not from the patch, and it is
+                                    // CONSTANT rather than growing with depth. Three consequences,
+                                    // all wanted:
+                                    //   - an interior painted feature (a raised boss, a flat shelf,
+                                    //     the user's 8mm eye/cheek) sits well inside the silhouette,
+                                    //     so this never clips it: it keeps its ENTIRE footprint at
+                                    //     every shell layer, which is what 65d17c964f was for;
+                                    //   - it is still strictly more generous than legacy, whose inset
+                                    //     grew as k * wall_stack (4.4mm by depth 5 at 0.1mm layers,
+                                    //     against a constant 0.88mm here);
+                                    //   - measuring at last_idx rather than at layer_idx is what
+                                    //     makes it correct for objects that NARROW downward (an
+                                    //     undercut, a waist, an overhang below a painted top), where
+                                    //     a patch clear of the surface layer's contour can still land
+                                    //     on a lower layer's contour.
+                                    //
+                                    // The surface layer itself is untouched: it is appended
+                                    // separately above with zero margin, which is right, because that
+                                    // is the facet the user actually painted.
+                                    //
+                                    // This also RETIRES the I1 sub-wall-stack absorb that used to sit
+                                    // here (and at the bottom twin), which existed to enforce
+                                    // "base material at the contour is either nothing or at least one
+                                    // wall stack wide" by ABSORBING thin base rings into the claim.
+                                    // With this inset that invariant holds by construction - `last`
+                                    // is a subset of the contour eroded by one wall stack on both the
+                                    // legacy term (inset k * wall_stack, k >= 1) and this one - so
+                                    // the absorb's own diff_ex(base_rest, opening_ex(base_rest,
+                                    // 0.5 * wall_stack)) is empty by construction. It is not merely
+                                    // redundant but actively unsafe to keep: it would sit exactly on
+                                    // the knife-edge where Clipper's arc approximation decides
+                                    // whether a precisely-one-wall-stack ring survives its opening,
+                                    // and any residue it found would be appended straight back onto
+                                    // the contour - the very bleed this fix removes. One invariant,
+                                    // one mechanism.
                                     const float wall_stack = stat.extrusion_spacing + stat.extrusion_width;
-                                    ExPolygons base_rest = diff_ex(input_expolygons[last_idx], last);
-                                    if (! base_rest.empty()) {
-                                        append(last, diff_ex(base_rest, opening_ex(base_rest, 0.5f * wall_stack)));
-                                        last = union_ex(last);
-                                    }
+                                    append(last, intersection_ex(intersection_ex(top_exposed_ex, layer_slices_trimmed),
+                                                                 offset_ex(input_expolygons[last_idx], -wall_stack)));
+                                    last = union_ex(last);
                                 }
                                 last = opening_ex(last, stat.small_region_threshold);
                                 if (last.empty())
@@ -1717,17 +1821,15 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                 layer_slices_trimmed = intersection_ex(layer_slices_trimmed, input_expolygons[last_idx]);
                                 ExPolygons last = intersection_ex(bottom_ex, offset_ex(layer_slices_trimmed, offset));
                                 if (! bottom_exposed_ex.empty()) {
-                                    append(last, intersection_ex(bottom_exposed_ex, layer_slices_trimmed));
-                                    last = union_ex(last);
-                                    // taper-bound-review.md Important 1, mirrored - see the top loop's
-                                    // comment above and exposed_surface_part(). Absorb any
-                                    // sub-wall-stack base ring the early return left behind.
+                                    // FIX-WAVE F1, mirrored - see the top loop's comment above for the
+                                    // full reasoning, and note the same site swap: the one-wall-stack
+                                    // clearance from this descent layer's own contour REPLACES the I1
+                                    // absorb that used to follow, which the clearance makes empty by
+                                    // construction.
                                     const float wall_stack = stat.extrusion_spacing + stat.extrusion_width;
-                                    ExPolygons base_rest = diff_ex(input_expolygons[last_idx], last);
-                                    if (! base_rest.empty()) {
-                                        append(last, diff_ex(base_rest, opening_ex(base_rest, 0.5f * wall_stack)));
-                                        last = union_ex(last);
-                                    }
+                                    append(last, intersection_ex(intersection_ex(bottom_exposed_ex, layer_slices_trimmed),
+                                                                 offset_ex(input_expolygons[last_idx], -wall_stack)));
+                                    last = union_ex(last);
                                 }
                                 last = opening_ex(last, stat.small_region_threshold);
                                 if (last.empty())
@@ -2537,11 +2639,20 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     const int            paint_depth_walls = print_object.config().paint_depth_walls.value;
     const double         paint_depth_mm    = print_object.config().paint_depth_mm.value;
     float                max_width         = 0.f;
+    // Fix-wave F4: the interlocking notch is clamped against a perimeter spacing too (see
+    // paint_depth_interlocking_depth_mm), and there the conservative direction is the
+    // OPPOSITE of max_width's: the notch must stay inside the count-window margin of the
+    // NARROWEST-walled region on the object, since that region's margin is the smallest in
+    // absolute millimetres. So track the min spacing alongside the max band.
+    float                min_perimeter_spacing = 0.f;
     for (size_t region_idx = 0; region_idx < print_object.num_printing_regions(); ++region_idx) {
-        const PrintRegion &region               = print_object.printing_region(region_idx);
-        const float         ext_perimeter_width = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).width();
-        const float         perimeter_spacing   = region.flow(print_object, frPerimeter, print_object.config().layer_height).spacing();
-        max_width = std::max(max_width, paint_depth_band_mm(paint_depth_mode, paint_depth_walls, paint_depth_mm, ext_perimeter_width, perimeter_spacing));
+        const PrintRegion &region                 = print_object.printing_region(region_idx);
+        const float         ext_perimeter_width   = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).width();
+        const float         ext_perimeter_spacing = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).spacing();
+        const float         perimeter_spacing     = region.flow(print_object, frPerimeter, print_object.config().layer_height).spacing();
+        max_width = std::max(max_width, paint_depth_band_mm(paint_depth_mode, paint_depth_walls, paint_depth_mm, ext_perimeter_width, ext_perimeter_spacing, perimeter_spacing));
+        if (perimeter_spacing > 0.f)
+            min_perimeter_spacing = min_perimeter_spacing > 0.f ? std::min(min_perimeter_spacing, perimeter_spacing) : perimeter_spacing;
     }
     // Beam-interlocking mutual exclusion (:2169 below) is unchanged, but the interlocking
     // sub-band must only ever be active when depth is actually bounded (spec Stage 1, "Interlocking
@@ -2551,7 +2662,15 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // :2169 - breaking the "unlimited mode = legacy behavior, bit-identical" requirement. Gating
     // it on paint_depth_mode here (rather than editing the :2169 OR itself) keeps that gate's
     // existing shape/semantics untouched, as the plan requires.
-    const float  interlocking_depth = paint_depth_mode != pdmUnlimited ? float(print_object.config().mmu_segmented_region_interlocking_depth.value) : 0.f;
+    //
+    // Fix-wave F4: the configured depth additionally goes through
+    // paint_depth_interlocking_depth_mm, which caps it at a quarter of one perimeter spacing -
+    // the exact count-window margin paint_depth_band_mm builds into the band - so the notch
+    // can never move Arachne's strip thickness across a bead-count boundary and cost the
+    // painted region a wall loop on even layers (the 3/2/3/2 alternation the user reported).
+    const float  interlocking_depth = paint_depth_mode != pdmUnlimited
+                                        ? paint_depth_interlocking_depth_mm(print_object.config().mmu_segmented_region_interlocking_depth.value, min_perimeter_spacing)
+                                        : 0.f;
     const bool   interlocking_beam  = print_object.config().interlocking_beam.value;
 
     size_t max_painted_state = 0;

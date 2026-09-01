@@ -7,7 +7,9 @@
 #   A. UNPAINTED-fixture inertness: the feature must have NO effect on an
 #      unpainted object's toolpath, even though its config defaults changed
 #      behavior for PAINTED objects (paint_depth_mode default WALLS,
-#      mmu_segmented_region_interlocking_depth default flipped 0 -> 0.3).
+#      mmu_segmented_region_interlocking_depth default flipped 0 -> 0.1;
+#      that default was 0.3 until the bleed-and-walls fix wave lowered it,
+#      see fix-wave F4 in PrintConfig.cpp / PaintDepth.hpp).
 #      Checked two ways:
 #        A1. byte-parity (normalized) vs a FROZEN baseline gcode recorded
 #            from a one-time build of this exact worktree at the feature's
@@ -25,7 +27,7 @@
 #      checks use — plus the loader's "no substitutions performed" log line
 #      as supporting evidence the file loaded cleanly):
 #        C1. defaults resolve: paint_depth_mode=walls, paint_depth_walls=3,
-#            paint_depth_mm=1.5, mmu_segmented_region_interlocking_depth=0.3.
+#            paint_depth_mm=1.5, mmu_segmented_region_interlocking_depth=0.1.
 #        C2. legacy NONZERO mmu_segmented_region_max_width (old key, still a
 #            real ConfigOptionDef — legacy-parse-only per Task 1) maps to
 #            paint_depth_mode=millimeters with paint_depth_mm carrying the
@@ -273,7 +275,7 @@ if [ $d1_rc -eq 0 ]; then
         "paint_depth_mode|walls"
         "paint_depth_walls|3"
         "paint_depth_mm|1.5"
-        "mmu_segmented_region_interlocking_depth|0.3"
+        "mmu_segmented_region_interlocking_depth|0.1"
     )
     for c in "${checks[@]}"; do
         key="${c%%|*}"; expected="${c##*|}"

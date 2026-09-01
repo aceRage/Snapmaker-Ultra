@@ -4,42 +4,143 @@
 #include <cmath>
 #include <string>
 
+#include "libslic3r/Flow.hpp"
 #include "libslic3r/PaintDepth.hpp"
 #include "libslic3r/PrintConfig.hpp"
 
 using namespace Slic3r;
 using Catch::Matchers::WithinAbs;
 
+namespace {
+
+// The stock flow the wall-count investigation's arithmetic is quoted against: a 0.45mm line
+// at a 0.1mm layer height. Derived through Flow's own spacing definition (Flow.cpp:182-184,
+// spacing = width - height * (1 - pi/4)) rather than a hardcoded literal, so these pins track
+// the production definition instead of drifting from it.
+constexpr float STOCK_LINE_WIDTH  = 0.45f;
+constexpr float STOCK_LAYER_HEIGHT = 0.1f;
+
+float stock_spacing() { return Flow::rounded_rectangle_extrusion_spacing(STOCK_LINE_WIDTH, STOCK_LAYER_HEIGHT); }
+
+// The band the fix-wave F3 formula is specified to produce - written out here as the SPEC,
+// independent of the production helper, so the pins below actually discriminate.
+double expected_band(int walls, float ext_w, float ext_s, float s)
+{
+    return double(walls) * double(s) + 2.0 * (double(ext_w) - double(ext_s)) + 0.25 * double(s);
+}
+
+} // namespace
+
 TEST_CASE("paint_depth_band_mm: unlimited mode is always 0 (disables the clamp)", "[paintdepth]")
 {
-    CHECK(paint_depth_band_mm(pdmUnlimited, 3, 1.5, 0.45f, 0.42f) == 0.f);
-    CHECK(paint_depth_band_mm(pdmUnlimited, 1, 0.0, 0.f, 0.f) == 0.f);
+    CHECK(paint_depth_band_mm(pdmUnlimited, 3, 1.5, 0.45f, 0.43f, 0.42f) == 0.f);
+    CHECK(paint_depth_band_mm(pdmUnlimited, 1, 0.0, 0.f, 0.f, 0.f) == 0.f);
 }
 
 TEST_CASE("paint_depth_band_mm: millimeters mode returns mm verbatim", "[paintdepth]")
 {
-    CHECK_THAT(paint_depth_band_mm(pdmMillimeters, 3, 1.5, 0.45f, 0.42f), WithinAbs(1.5, 1e-6));
-    CHECK_THAT(paint_depth_band_mm(pdmMillimeters, 99, 0.25, 10.f, 10.f), WithinAbs(0.25, 1e-6));
+    CHECK_THAT(paint_depth_band_mm(pdmMillimeters, 3, 1.5, 0.45f, 0.43f, 0.42f), WithinAbs(1.5, 1e-6));
+    CHECK_THAT(paint_depth_band_mm(pdmMillimeters, 99, 0.25, 10.f, 10.f, 10.f), WithinAbs(0.25, 1e-6));
     // Millimeters mode ignores wall count / flow widths entirely.
-    CHECK_THAT(paint_depth_band_mm(pdmMillimeters, 1, 2.0, 0.f, 0.f), WithinAbs(2.0, 1e-6));
+    CHECK_THAT(paint_depth_band_mm(pdmMillimeters, 1, 2.0, 0.f, 0.f, 0.f), WithinAbs(2.0, 1e-6));
 }
 
-TEST_CASE("paint_depth_band_mm: walls mode = ext_perimeter_width + (walls-1)*perimeter_spacing", "[paintdepth]")
+// Fix-wave F3 (.superpowers/sdd/2026-08-31-paint-depth/wall-count-investigation.md section 5):
+// the band is now sized in whole bead PITCHES plus Arachne's precise_outer_wall pre-inset plus
+// a quarter-spacing count-window margin, replacing `ext_w + (N-1)*s`. See
+// paint_depth_band_mm's header comment for the derivation of each term.
+TEST_CASE("paint_depth_band_mm: walls mode = N*spacing + 2*(ext_w - ext_s) + 0.25*spacing", "[paintdepth]")
 {
-    // fuzzy-skin precedent: first wall is the external perimeter width, every
-    // additional wall adds one perimeter_spacing (MultiMaterialSegmentation.cpp:2237-2253).
-    CHECK_THAT(paint_depth_band_mm(pdmWalls, 3, 999.0, 0.45f, 0.42f), WithinAbs(0.45 + 2 * 0.42, 1e-5));
-    CHECK_THAT(paint_depth_band_mm(pdmWalls, 1, 999.0, 0.45f, 0.42f), WithinAbs(0.45, 1e-5));
+    const float s     = stock_spacing();
+    const float ext_s = s; // outer and inner line widths are equal at stock settings
+    const float ext_w = STOCK_LINE_WIDTH;
+
+    SECTION("matches the specified formula for N = 1, 3, 6") {
+        CHECK_THAT(paint_depth_band_mm(pdmWalls, 1, 999.0, ext_w, ext_s, s), WithinAbs(expected_band(1, ext_w, ext_s, s), 1e-5));
+        CHECK_THAT(paint_depth_band_mm(pdmWalls, 3, 999.0, ext_w, ext_s, s), WithinAbs(expected_band(3, ext_w, ext_s, s), 1e-5));
+        CHECK_THAT(paint_depth_band_mm(pdmWalls, 6, 999.0, ext_w, ext_s, s), WithinAbs(expected_band(6, ext_w, ext_s, s), 1e-5));
+    }
+
+    SECTION("the investigation's quoted absolute values at 0.45mm lines / 0.1mm layers") {
+        // Pinned as literals as well as symbolically: these are the numbers the fix wave was
+        // signed off against (old band(3) was 1.307080, which left only 0.083mm of downward
+        // margin before Arachne dropped from 3 beads to 2).
+        CHECK_THAT(paint_depth_band_mm(pdmWalls, 1, 0.0, ext_w, ext_s, s), WithinAbs(0.578595, 1e-5));
+        CHECK_THAT(paint_depth_band_mm(pdmWalls, 3, 0.0, ext_w, ext_s, s), WithinAbs(1.435675, 1e-5));
+        CHECK_THAT(paint_depth_band_mm(pdmWalls, 6, 0.0, ext_w, ext_s, s), WithinAbs(2.721294, 1e-5));
+    }
+
+    SECTION("every additional wall adds exactly one bead pitch") {
+        const float band_2 = paint_depth_band_mm(pdmWalls, 2, 0.0, ext_w, ext_s, s);
+        const float band_3 = paint_depth_band_mm(pdmWalls, 3, 0.0, ext_w, ext_s, s);
+        const float band_4 = paint_depth_band_mm(pdmWalls, 4, 0.0, ext_w, ext_s, s);
+        CHECK_THAT(band_3 - band_2, WithinAbs(s, 1e-5));
+        CHECK_THAT(band_4 - band_3, WithinAbs(s, 1e-5));
+    }
 }
 
 TEST_CASE("paint_depth_band_mm: walls mode edge cases", "[paintdepth]")
 {
+    const float s     = stock_spacing();
+    const float ext_w = STOCK_LINE_WIDTH;
+
     SECTION("walls clamped to >= 1 for a zero/negative input") {
-        CHECK_THAT(paint_depth_band_mm(pdmWalls, 0, 0.0, 0.45f, 0.42f), WithinAbs(0.45, 1e-5));
-        CHECK_THAT(paint_depth_band_mm(pdmWalls, -5, 0.0, 0.45f, 0.42f), WithinAbs(0.45, 1e-5));
+        CHECK_THAT(paint_depth_band_mm(pdmWalls, 0, 0.0, ext_w, s, s), WithinAbs(expected_band(1, ext_w, s, s), 1e-5));
+        CHECK_THAT(paint_depth_band_mm(pdmWalls, -5, 0.0, ext_w, s, s), WithinAbs(expected_band(1, ext_w, s, s), 1e-5));
     }
     SECTION("zero flow widths collapse the band to 0") {
-        CHECK(paint_depth_band_mm(pdmWalls, 3, 0.0, 0.f, 0.f) == 0.f);
+        CHECK(paint_depth_band_mm(pdmWalls, 3, 0.0, 0.f, 0.f, 0.f) == 0.f);
+    }
+    SECTION("a degenerate flow whose spacing exceeds its width never produces a negative band") {
+        CHECK(paint_depth_band_mm(pdmWalls, 1, 0.0, 0.1f, 0.5f, 0.f) >= 0.f);
+    }
+}
+
+// Fix-wave F4 (.superpowers/sdd/2026-08-31-paint-depth/wall-count-investigation.md section 3):
+// the even-layer interlocking notch must fit INSIDE the band's own count-window margin, or it
+// costs the painted region a wall loop on every even layer (the reported 3/2/3/2 alternation).
+TEST_CASE("paint_depth_interlocking_depth_mm: the notch is capped at a quarter of one perimeter spacing", "[paintdepth]")
+{
+    const float s = stock_spacing(); // 0.428540 at 0.45mm lines / 0.1mm layers
+    const float cap = 0.25f * s;     // 0.107135
+
+    SECTION("the old 0.3mm default is clamped down to the cap") {
+        // 0.3mm is ~0.70 * spacing - 3.6x the 0.083mm of margin the pre-F3 band had.
+        CHECK_THAT(paint_depth_interlocking_depth_mm(0.3, s), WithinAbs(cap, 1e-6));
+    }
+    SECTION("the new 0.1mm default is already under the cap and passes through untouched") {
+        CHECK_THAT(paint_depth_interlocking_depth_mm(0.1, s), WithinAbs(0.1, 1e-6));
+    }
+    SECTION("zero stays zero (the option's own 'disabled' convention)") {
+        CHECK(paint_depth_interlocking_depth_mm(0.0, s) == 0.f);
+    }
+    SECTION("a degenerate (non-positive) spacing carries no information to clamp against") {
+        CHECK_THAT(paint_depth_interlocking_depth_mm(0.3, 0.f), WithinAbs(0.3, 1e-6));
+    }
+}
+
+// The F3 + F4 contract stated as one arithmetic invariant, for every wall count the option
+// allows in practice: after the even-layer notch is subtracted, the band STILL covers the exact
+// N-bead optimum thickness `N*spacing + 2*(ext_w - ext_s)`. That is what makes both layer
+// parities land in the same Arachne bead-count window - "N walls" delivers N loops on every
+// layer, not N on odd and N-1 on even.
+TEST_CASE("paint depth band: the even-layer interlocking notch never eats into the N-bead budget", "[paintdepth]")
+{
+    const float s     = stock_spacing();
+    const float ext_w = STOCK_LINE_WIDTH;
+    const float ext_s = s;
+    // The shipped default AND the pre-fix default, so this holds however the user got here.
+    const double configured_depths[] = {0.1, 0.3, 1.0};
+
+    for (int walls = 1; walls <= 6; ++walls) {
+        for (double configured : configured_depths) {
+            DYNAMIC_SECTION("walls = " << walls << ", configured interlock = " << configured) {
+                const float band       = paint_depth_band_mm(pdmWalls, walls, 0.0, ext_w, ext_s, s);
+                const float interlock  = paint_depth_interlocking_depth_mm(configured, s);
+                const double n_bead_optimum = double(walls) * double(s) + 2.0 * (double(ext_w) - double(ext_s));
+                CHECK(double(band) - double(interlock) >= n_bead_optimum - 1e-6);
+            }
+        }
     }
 }
 
