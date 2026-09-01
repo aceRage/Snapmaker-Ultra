@@ -1447,6 +1447,16 @@ static inline int effective_shell_layers_by_thickness(const ConstLayerPtrsAdapto
 // and extrusion width. It also preserves the erosion's actual invariant rather than a proxy
 // for it: wherever the full-width term contributes, the base material left at that layer's
 // perimeter is either nothing at all or at least one wall stack wide - never a sliver.
+//
+// WAVE B / OPTION N: this is now the LEGACY path only - it runs where the normal-thickness
+// shell is off (unlimited mode, or a depth below one wall stack), and there it is byte-identical
+// to before. Where the shell is on, fix-wave F1's per-step
+// offset_ex(input_expolygons[last_idx], -wall_stack) enforces the same invariant POINTWISE on the
+// deposit layer's own contour, which is strictly better: this function's criterion is measured
+// against the neighbouring layer and rejects a whole patch, while F1's is measured where the
+// claim actually lands and rejects only the part that would sliver. The 6.49-deg (0.1mm layers)
+// on/off cliff that criterion produced is precisely what Option N exists to remove - see
+// segmentation_top_and_bottom_layers's header for the derivation.
 static inline ExPolygons exposed_surface_part(const ExPolygons              &projected_patch,
                                               const std::vector<ExPolygons> &input_expolygons,
                                               size_t                         reference_layer_idx,
@@ -1462,11 +1472,63 @@ static inline ExPolygons exposed_surface_part(const ExPolygons              &pro
     return diff_ex(projected_patch, offset_ex(input_expolygons[reference_layer_idx], wall_stack_width));
 }
 
+// WAVE B / OPTION N (.superpowers/sdd/2026-08-31-paint-depth/curved-gap-design.md): the painted
+// claim is a CONSTANT-THICKNESS SHELL measured NORMAL to the painted surface - "a certain amount
+// of inward taper and normal projection so the coloured section becomes its own object" (the
+// user's own framing). Two edits below deliver it, and the derivation is worth stating once
+// because it is the reason no slope measurement, no pointwise normal and no variable-radius
+// offset is needed anywhere:
+//
+//   On a silhouette of slope theta the layer contours step inward by r = layer_height/tan(theta)
+//   per layer. The descent loop deposits the surface layer j's painted ring onto layer j-m at
+//   lateral inset [m*r, (m+1)*r] measured from THAT layer's own contour (the ring is the annulus
+//   between contour(j) and contour(j+1), and contour(j) is m*r inside contour(j-m)). Union over
+//   the M surface layers that can reach a given layer therefore covers lateral inset [0, M*r],
+//   whose thickness measured along the surface normal is
+//
+//       M * r * sin(theta)  ==  M * layer_height * cos(theta).
+//
+//   So a descent of M = ceil(D / layer_height) layers delivers a normal thickness of D*cos(theta)
+//   for free, at every slope, and the lateral band (cut_segmented_layers) delivers D*sin(theta)
+//   on the same geometry. Their union is D * max(cos, sin) - never below D/sqrt(2).
+//
+// What was in the way was not the mechanism but two bounds on it:
+//   N1  exposed_surface_part() switched the full-width term OFF entirely once the per-layer run
+//       r fell below one wall stack - atan(layer_height/(w+s)) = 6.49 deg at 0.1mm layers. That
+//       gate is a PROXY for "this claim would sliver the perimeter"; fix-wave F1's
+//       offset_ex(input_expolygons[last_idx], -wall_stack) enforces the real invariant pointwise
+//       on the deposit layer's own contour, so the proxy is redundant where F1 runs and its only
+//       remaining effect was to throw away the slope-correct claim the descent had computed.
+//   N2  the descent was bounded by the solid-shell layer count, so the depth was
+//       "top_shell_layers deep" rather than "D thick". It is now
+//       max(effective shell layers, layers within D), keeping the earlier shell-coverage wave's
+//       contract (never leave base-coloured SOLID SHELL under painted skin) when D < shell.
+//
+// GATED on `paint_depth_normal_mm >= wall_stack` (and hence on the depth being bounded at all -
+// unlimited mode passes 0). Below one wall stack the lateral band reaches only D while the
+// F1-inset descent starts at wall_stack, so the base region would be left holding a closed ring
+// of width wall_stack - D on every sub-surface layer: a new sliver class, and the exact defect
+// Wave A's classic band floor closes from the other side. At paint_depth_walls = 1 that floor
+// puts band(1) AT wall_stack on the classic generator (the two meet with zero width between
+// them) while Arachne's unfloored band(1) = 0.578595 stays below it and keeps today's behaviour.
+//
+// SELF-LIMITING at steep slopes, without an angle constant: the full-width term at descent step m
+// is non-empty only where (m+1)*r > wall_stack, so the whole extension is inert when
+// M*r <= wall_stack, i.e. above atan(D/(w+s)) = 58.5 deg at stock flows, independently of layer
+// height. In practice the ring is erased even earlier, by the opening_ex(top_ex,
+// small_region_threshold) thin-projection filter below (a ring narrower than 2*threshold =
+// 0.225mm at a 0.45mm outer wall cannot survive it), which binds first at any layer height under
+// 0.359mm - so the reach of this change is theta < atan(layer_height/0.225) = 23.96 deg at 0.1mm
+// layers. That covers the shallow dead band this exists to close; it does not reach 24-45 deg,
+// where the claim stays the lateral band alone. Widening it would mean lowering the #7104
+// sliver guard, which the design deliberately did not propose.
+//
 // Returns segmentation of top and bottom layers based on painting in segmentation gizmos.
 static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_layers(const PrintObject                                               &print_object,
                                                                                       const std::vector<ExPolygons>                                   &input_expolygons,
                                                                                       const std::function<ModelVolumeFacetsInfo(const ModelVolume &)> &extract_facets_info,
                                                                                       const size_t                                                     num_facets_states,
+                                                                                      const float                                                      paint_depth_normal_mm,
                                                                                       const std::function<void()>                                     &throw_on_cancel_callback)
 {
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - Segmentation of top and bottom layers in parallel - Begin";
@@ -1504,9 +1566,21 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
             return int(num_layers); // Defensive fallback; real layers always have height > 0.
         return std::min(int(num_layers), int(thickness / min_layer_height) + 1);
     };
+    // WAVE B / Option N, hazard 2 (curved-gap-design.md section 6): `granularity` is not a
+    // performance knob, it is the CORRECTNESS margin of the TBB double-buffer parity trick below.
+    // Each thread group writes its descent output into
+    // shell_triangles_by_color_*[last_idx + layer_idx_offset] with layer_idx_offset chosen from
+    // (range.begin() / granularity) & 1, so two groups that are two apart share a buffer; a layer
+    // at the start of a group reaches back `descent depth - 1` layers, and that must stay inside
+    // the immediately preceding group (opposite parity). Sizing granularity from the SHELL count
+    // while the descent is bounded by a normal thickness D that is deeper than the shell (15
+    // layers against 6 at stock defaults / 0.1mm layers) would let a group write into a buffer a
+    // same-parity group is concurrently writing - a data race, not a slowdown. So the sizing and
+    // the descent bound must be computed from the same quantity, which is what *_descent_eff is.
     int max_top_layers = 0;
     int max_bottom_layers = 0;
     int granularity = 1;
+    const int paint_depth_normal_layers = layers_for_thickness(double(paint_depth_normal_mm));
     for (size_t i = 0; i < print_object.num_printing_regions(); ++ i) {
         const PrintRegionConfig &config = print_object.printing_region(i).config();
         // Fix-wave C1: gate on the configured count being nonzero before consulting thickness -
@@ -1516,9 +1590,15 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
             ? std::max(config.top_shell_layers.value, layers_for_thickness(config.top_shell_thickness.value)) : 0;
         const int bottom_layers_eff = config.bottom_shell_layers.value > 0
             ? std::max(config.bottom_shell_layers.value, layers_for_thickness(config.bottom_shell_thickness.value)) : 0;
-        max_top_layers    = std::max(max_top_layers, top_layers_eff);
-        max_bottom_layers = std::max(max_bottom_layers, bottom_layers_eff);
-        granularity       = std::max(granularity, std::max(top_layers_eff, bottom_layers_eff) - 1);
+        // Wave B: the normal-thickness bound deepens an EXISTING shell, it never creates one -
+        // C1's "a zero shell count claims nothing at all" is unchanged, and so is the meaning of
+        // max_top_layers / max_bottom_layers as the gate that decides whether slice_mesh_slabs
+        // runs at all (both stay zero exactly when they were zero before).
+        const int top_descent_eff    = top_layers_eff    > 0 ? std::max(top_layers_eff,    paint_depth_normal_layers) : 0;
+        const int bottom_descent_eff = bottom_layers_eff > 0 ? std::max(bottom_layers_eff, paint_depth_normal_layers) : 0;
+        max_top_layers    = std::max(max_top_layers, top_descent_eff);
+        max_bottom_layers = std::max(max_bottom_layers, bottom_descent_eff);
+        granularity       = std::max(granularity, std::max(top_descent_eff, bottom_descent_eff) - 1);
     }
 
     // Project upwards pointing painted triangles over top surfaces,
@@ -1657,10 +1737,22 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
         int     top_shell_layers        { 0 };
         // Maximum number of bottom layers for a queried color.
         int     bottom_shell_layers     { 0 };
+        // WAVE B / Option N: total depth (surface layer included) the top/bottom descent runs to -
+        // max(the solid shell above, however many layers the normal thickness D spans). Kept
+        // SEPARATE from *_shell_layers, which stays the pure solid-shell answer, because the
+        // "is anything claimed at all" gates below are C1 contracts about the SHELL (a zero shell
+        // count claims nothing, not even the painted surface facet) and must not be deepened.
+        int     top_descent_layers      { 0 };
+        int     bottom_descent_layers   { 0 };
+        // WAVE B / Option N: whether this colour's descent is a normal-thickness shell on this
+        // layer - i.e. it is a PAINTED colour (not the base) and the bounded depth D is at least
+        // one wall stack. False restores legacy behaviour verbatim: the exposed_surface_part()
+        // slope gate, the shell-count depth bound and the eager break.
+        bool    normal_shell            { false };
         //BBS: spacing according to width and layer height
         float   extrusion_spacing{ 0.f };
     };
-    auto layer_color_stat = [&layers = std::as_const(layers), &print_object](const size_t layer_idx, const size_t color_idx) -> LayerColorStat {
+    auto layer_color_stat = [&layers = std::as_const(layers), &print_object, paint_depth_normal_mm](const size_t layer_idx, const size_t color_idx) -> LayerColorStat {
         LayerColorStat out;
         const Layer &layer = *layers[layer_idx];
         for (const LayerRegion *region : layer.regions()) {
@@ -1727,17 +1819,83 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
             }
         }
         assert(out.num_regions > 0);
+        // WAVE B / Option N: deepen the descent from "the solid shell" to "whatever covers a
+        // normal thickness of paint_depth_normal_mm", reusing effective_shell_layers_by_thickness
+        // with a layer count of 1 so the thickness half of its walk runs against this object's
+        // REAL print_z / bottom_z values - variable layer height handled exactly, and the same
+        // "< thickness - EPSILON" boundary the solid-shell generators use, rather than a D /
+        // layer_height division that would silently assume uniform layers (design section 6
+        // hazard 5). max() with the shell count keeps the earlier shell-coverage wave's contract
+        // intact when a user sets D below their solid shell; gating on the shell count being
+        // nonzero keeps C1's "no shell means no claim" intact when they set it to zero.
+        //
+        // PAINTED COLOURS ONLY (color_idx > 0). color_idx 0 is not a paint claim at all - it is
+        // the object's base filament, and its top/bottom claim exists for one reason: to stop a
+        // neighbouring painted colour smearing across the SOLID SHELL under an UNPAINTED top or
+        // bottom face. That contract is written in shell terms (top_shell_layers /
+        // top_shell_thickness) and "how thick is the paint" says nothing about it.
+        //
+        // Deepening it is not merely pointless, it inverts the feature. merge_segmented_layers
+        // trims EVERY extruder's lateral claim by EVERY extruder's top/bottom claim (see its
+        // diff_ex over top_and_bottom_layers), so a base-colour claim that descended D deep would
+        // cut the painted lateral band back to one wall stack on every layer beneath any
+        // unpainted cap. Measured, not reasoned: a 40x40x6mm box with one side painted and
+        // paint_depth_mm = 6 loses its 6mm band down to 0.857mm the moment the unpainted top
+        // cap's base claim is given the same normal thickness. Paint depth bounds paint.
+        //
+        // The same colour test gates N1 and N3 below, for the same reason and with the same
+        // effect: color_idx 0's descent stays byte-identical to legacy, gate and break included.
         out.extrusion_width = scaled<float>(out.extrusion_width);
         out.extrusion_spacing = scaled<float>(out.extrusion_spacing);
+        // The D >= wall_stack gate (design section 5). Below one wall stack the lateral band
+        // reaches only D while the F1-inset descent starts at wall_stack, leaving the base region
+        // a closed ring of width wall_stack - D sandwiched between two painted annuli on every
+        // sub-surface layer: a new sliver class. SCALED_EPSILON of slack because on the CLASSIC
+        // generator Wave A's band floor makes D and wall_stack the SAME quantity by construction
+        // (band(1) is floored at ext_perimeter_width + ext_perimeter_spacing) and the two reach
+        // here down different float paths - a rounding ULP must not decide whether a user gets a
+        // normal-thickness shell. On Arachne band(1) = 0.578595 stays genuinely below the floor
+        // and keeps today's behaviour, which is the intent.
+        out.normal_shell = paint_depth_normal_mm > 0.f && color_idx > 0 &&
+                           scaled<float>(paint_depth_normal_mm) + float(SCALED_EPSILON) >= out.extrusion_spacing + out.extrusion_width;
+        out.top_descent_layers    = out.top_shell_layers;
+        out.bottom_descent_layers = out.bottom_shell_layers;
+        if (out.normal_shell) {
+            if (out.top_shell_layers > 0)
+                out.top_descent_layers    = std::max(out.top_shell_layers,
+                                                     effective_shell_layers_by_thickness(layers, layer_idx, true,  1, double(paint_depth_normal_mm)));
+            if (out.bottom_shell_layers > 0)
+                out.bottom_descent_layers = std::max(out.bottom_shell_layers,
+                                                     effective_shell_layers_by_thickness(layers, layer_idx, false, 1, double(paint_depth_normal_mm)));
+        }
         return out;
     };
 
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers, granularity), [&granularity, &num_layers, &num_facets_states, &layer_color_stat, &top_raw, &triangles_by_color_top,
-                                                                               &throw_on_cancel_callback, &input_expolygons, &bottom_raw, &triangles_by_color_bottom,
-                                                                               &shell_triangles_by_color_top, &shell_triangles_by_color_bottom](const tbb::blocked_range<size_t> &range) {
-        size_t group_idx   = range.begin() / granularity;
+    // WAVE B, hazard 2 completed. Widening `granularity` (above) is necessary for the double-buffer
+    // parity trick but it is NOT sufficient, because the trick also assumes each TBB chunk begins
+    // on a multiple of `granularity` - which blocked_range does not provide. blocked_range splits
+    // at MIDPOINTS until a chunk is no larger than the grainsize, so its chunks are sized in
+    // (granularity/2, granularity] and start wherever the halving lands: blocked_range(0, 32, 14)
+    // yields [0,8) [8,16) [16,24) [24,32), and `range.begin() / granularity` labels the first TWO
+    // of those as group 0. They are ADJACENT and same-parity, so layer 8's descent writes into
+    // slots 0..7 of the very buffer the [0,8) chunk is concurrently writing - a data race, and one
+    // that predates this wave (at the old grainsize of shell-1 = 5 the chunks come out size 4 and
+    // collide the same way). Widening the write-back distance from 5 layers to 15 would have made
+    // it far likelier to bite, so this wave closes it rather than inheriting it.
+    //
+    // Fix: iterate over the GROUPS themselves, so a group's layer range is exactly
+    // [g*granularity, (g+1)*granularity) by construction. TBB may still hand several consecutive
+    // groups to one task - that is sequential within the task and therefore safe - and the
+    // invariant that matters holds unconditionally: a layer's descent reaches back at most
+    // granularity layers, i.e. never past the previous group, which always has the OPPOSITE
+    // parity. Same work, same per-layer body, same partition sizes; only the boundaries move.
+    const size_t num_groups = (num_layers + size_t(granularity) - 1) / size_t(granularity);
+    tbb::parallel_for(size_t(0), num_groups, [&granularity, &num_layers, &num_facets_states, &layer_color_stat, &top_raw, &triangles_by_color_top,
+                                              &throw_on_cancel_callback, &input_expolygons, &bottom_raw, &triangles_by_color_bottom,
+                                              &shell_triangles_by_color_top, &shell_triangles_by_color_bottom](const size_t group_idx) {
         size_t layer_idx_offset = (group_idx & 1) * num_layers;
-        for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+        const size_t group_end  = std::min(num_layers, (group_idx + 1) * size_t(granularity));
+        for (size_t layer_idx = group_idx * size_t(granularity); layer_idx < group_end; ++ layer_idx) {
             for (size_t color_idx = 0; color_idx < num_facets_states; ++color_idx) {
                 throw_on_cancel_callback();
                 LayerColorStat stat = layer_color_stat(layer_idx, color_idx);
@@ -1768,11 +1926,39 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                             // in one line: the erosion is a perimeter-safety margin on INFERRED
                             // claims, and it is only load-bearing where the projected patch hugs its
                             // layer's contour, i.e. where the painted surface is steep.
-                            const ExPolygons top_exposed_ex = exposed_surface_part(top_ex, input_expolygons, layer_idx + 1, num_layers,
-                                                                                   stat.extrusion_spacing + stat.extrusion_width);
+                            //
+                            // WAVE B / Option N (N1): where the claim is a normal-thickness shell,
+                            // that split is retired - the full-width term becomes unconditional and
+                            // F1's inset below is the sole enforcer of the perimeter invariant. See
+                            // the function header for why the two are not both needed: the gate is a
+                            // proxy ("reject steep surfaces") applied to the whole patch, F1 is the
+                            // real invariant applied pointwise on the deposit layer's own contour,
+                            // and F1 is what makes the extension self-suppress on steep geometry
+                            // anyway. Keeping the proxy would only discard the slope-correct claim
+                            // the descent already computes. Legacy behaviour is preserved verbatim
+                            // wherever the extension is off (see normal_shell just below).
+                            const float      wall_stack   = stat.extrusion_spacing + stat.extrusion_width;
+                            const bool       normal_shell = stat.normal_shell;
+                            const ExPolygons top_exposed_ex = normal_shell ? top_ex
+                                                                           : exposed_surface_part(top_ex, input_expolygons, layer_idx + 1, num_layers, wall_stack);
                             float offset = 0.f;
+                            // Option N (N3): on a slope the full-width term is empty for the NEAR
+                            // descent steps - the ring deposited m layers down sits at inset
+                            // [m*r, (m+1)*r] and F1 holds it one wall stack clear, so nothing
+                            // survives until (m+1)*r > wall_stack (m >= 2 at 15 deg / 0.1mm layers).
+                            // The legacy eroded term is empty there too. So the loop's
+                            // `if (last.empty()) break;` would fire at step 1 and this whole change
+                            // would be a silent no-op. Instead: skip empty steps until the descent
+                            // has actually deposited something, then break at the first empty step
+                            // as before. The reach (m+1)*r grows monotonically with m, so "empty
+                            // before, non-empty after" is the only ordering that occurs and no
+                            // productive step is ever skipped; termination is the loop bound either
+                            // way. Deliberately keyed on "deposited" (post-opening) rather than on
+                            // the raw term, so the marginal first surviving strip being eaten by
+                            // opening_ex does not truncate the descent one step early.
+                            bool deposited = false;
                             ExPolygons layer_slices_trimmed = input_expolygons[layer_idx];
-                            for (int last_idx = int(layer_idx) - 1; last_idx > std::max(int(layer_idx - stat.top_shell_layers), int(0)); --last_idx) {
+                            for (int last_idx = int(layer_idx) - 1; last_idx > std::max(int(layer_idx - stat.top_descent_layers), int(0)); --last_idx) {
                                 //BBS: offset width should be 2*spacing to avoid too narrow area which has overlap of wall line
                                 //offset -= stat.extrusion_width ;
                                 offset -= (stat.extrusion_spacing + stat.extrusion_width);
@@ -1836,14 +2022,26 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                     // and any residue it found would be appended straight back onto
                                     // the contour - the very bleed this fix removes. One invariant,
                                     // one mechanism.
-                                    const float wall_stack = stat.extrusion_spacing + stat.extrusion_width;
-                                    append(last, intersection_ex(intersection_ex(top_exposed_ex, layer_slices_trimmed),
-                                                                 offset_ex(input_expolygons[last_idx], -wall_stack)));
+                                    const ExPolygons reachable = intersection_ex(top_exposed_ex, layer_slices_trimmed);
+                                    // Option N: layer_slices_trimmed only ever shrinks, and under
+                                    // the extension top_exposed_ex IS top_ex, so once the patch has
+                                    // no overlap with the running intersection of the layer outlines
+                                    // nothing at this depth or below can be claimed by either term -
+                                    // the one place the relaxed break above can still terminate
+                                    // early, and the reason a tall object does not pay M-1 empty
+                                    // Clipper rounds once the descent has run off its own geometry.
+                                    if (normal_shell && reachable.empty())
+                                        break;
+                                    append(last, intersection_ex(reachable, offset_ex(input_expolygons[last_idx], -wall_stack)));
                                     last = union_ex(last);
                                 }
                                 last = opening_ex(last, stat.small_region_threshold);
-                                if (last.empty())
+                                if (last.empty()) {
+                                    if (normal_shell && ! deposited)
+                                        continue;
                                     break;
+                                }
+                                deposited = true;
                                 append(shell_triangles_by_color_top[color_idx][last_idx + layer_idx_offset], std::move(last));
                             }
                         }
@@ -1870,11 +2068,17 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                             // TAPER BOUND: mirror of the top claim above - see that comment and
                             // exposed_surface_part(). The reference layer is the one BELOW
                             // (layer_idx - 1), the same one the bottom occlusion trim uses.
-                            const ExPolygons bottom_exposed_ex = exposed_surface_part(bottom_ex, input_expolygons, layer_idx - 1, num_layers,
-                                                                                      stat.extrusion_spacing + stat.extrusion_width);
+                            // WAVE B / Option N, mirrored - see the top loop for the reasoning behind
+                            // every one of these (N1's retired gate, the D >= wall_stack condition,
+                            // N3's relaxed break and its `reachable` early-out).
+                            const float      wall_stack   = stat.extrusion_spacing + stat.extrusion_width;
+                            const bool       normal_shell = stat.normal_shell;
+                            const ExPolygons bottom_exposed_ex = normal_shell ? bottom_ex
+                                                                              : exposed_surface_part(bottom_ex, input_expolygons, layer_idx - 1, num_layers, wall_stack);
                             float offset = 0.f;
+                            bool  deposited = false;
                             ExPolygons layer_slices_trimmed = input_expolygons[layer_idx];
-                            for (size_t last_idx = layer_idx + 1; last_idx < std::min(layer_idx + stat.bottom_shell_layers, num_layers); ++last_idx) {
+                            for (size_t last_idx = layer_idx + 1; last_idx < std::min(layer_idx + stat.bottom_descent_layers, num_layers); ++last_idx) {
                                 //BBS: offset width should be 2*spacing to avoid too narrow area which has overlap of wall line
                                 //offset -= stat.extrusion_width;
                                 offset -= (stat.extrusion_spacing + stat.extrusion_width);
@@ -1886,14 +2090,19 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                     // clearance from this descent layer's own contour REPLACES the I1
                                     // absorb that used to follow, which the clearance makes empty by
                                     // construction.
-                                    const float wall_stack = stat.extrusion_spacing + stat.extrusion_width;
-                                    append(last, intersection_ex(intersection_ex(bottom_exposed_ex, layer_slices_trimmed),
-                                                                 offset_ex(input_expolygons[last_idx], -wall_stack)));
+                                    const ExPolygons reachable = intersection_ex(bottom_exposed_ex, layer_slices_trimmed);
+                                    if (normal_shell && reachable.empty())
+                                        break;
+                                    append(last, intersection_ex(reachable, offset_ex(input_expolygons[last_idx], -wall_stack)));
                                     last = union_ex(last);
                                 }
                                 last = opening_ex(last, stat.small_region_threshold);
-                                if (last.empty())
+                                if (last.empty()) {
+                                    if (normal_shell && ! deposited)
+                                        continue;
                                     break;
+                                }
+                                deposited = true;
                                 append(shell_triangles_by_color_bottom[color_idx][last_idx + layer_idx_offset], std::move(last));
                             }
                         }
@@ -2439,6 +2648,7 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               const float                                                      segmentation_max_width,
                                                               const float                                                      segmentation_interlocking_depth,
                                                               const float                                                      segmentation_min_claim_width,
+                                                              const float                                                      segmentation_normal_depth,
                                                               const bool                                                       segmentation_interlocking_beam,
                                                               const IncludeTopAndBottomLayers                                  include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback)
@@ -2657,7 +2867,7 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
     // The first index is extruder number (includes default extruder), and the second one is layer number
     std::vector<std::vector<ExPolygons>> top_and_bottom_layers;
     if (include_top_and_bottom_layers == IncludeTopAndBottomLayers::Yes) {
-        top_and_bottom_layers = segmentation_top_and_bottom_layers(print_object, input_expolygons, extract_facets_info, num_facets_states, throw_on_cancel_callback);
+        top_and_bottom_layers = segmentation_top_and_bottom_layers(print_object, input_expolygons, extract_facets_info, num_facets_states, segmentation_normal_depth, throw_on_cancel_callback);
         throw_on_cancel_callback();
     }
 
@@ -2781,7 +2991,22 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
         return {mv.mmu_segmentation_facets, mv.is_mm_painted(), false};
     };
 
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, max_ext_perimeter_width, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
+    // WAVE B / Option N (.superpowers/sdd/2026-08-31-paint-depth/curved-gap-design.md): the same
+    // band, handed to the top/bottom descent as a NORMAL THICKNESS rather than as a lateral bound.
+    // That is the whole semantic change - "how deep the paint goes measured perpendicular to the
+    // painted surface", one number that degenerates to the lateral band on a vertical wall and to
+    // a layer-count shell on a flat top, and covers everything in between continuously. The band
+    // handed over here is the same max-over-regions (and classic-floored) value the lateral clamp
+    // gets, so the two halves of the claim are bounded by ONE quantity and their union is
+    // D * max(cos, sin) at every slope.
+    //
+    // Zero in unlimited mode: paint_depth_band_mm already returns 0 there and the classic floor
+    // passes a non-positive band through untouched, so max_width is 0 anyway - the explicit mode
+    // test is belt-and-braces for the "unlimited mode is bit-identical to legacy" requirement,
+    // which is a contract worth reading at the call site rather than deriving.
+    const float paint_depth_normal_mm = paint_depth_mode != pdmUnlimited ? max_width : 0.f;
+
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, max_ext_perimeter_width, paint_depth_normal_mm, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
 }
 
 // Returns fuzzy skin segmentation based on painting in fuzzy skin segmentation gizmo
@@ -2803,7 +3028,9 @@ std::vector<std::vector<ExPolygons>> fuzzy_skin_segmentation_by_painting(const P
     // Wave A / C-1: fuzzy skin's own clamp width IS one external perimeter width, so that is also
     // its minimum printable claim - i.e. its ladder never runs, and geometry too thin to carry a
     // full-width fuzzy band keeps the pre-degradation no-op, byte-identical to upstream.
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, max_external_perimeter_width, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
+    // Wave B / Option N: 0 - fuzzy skin has no top/bottom claim at all (IncludeTopAndBottomLayers::No
+    // below), so there is no descent for a normal thickness to bound.
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, max_external_perimeter_width, 0.f, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
 }
 
 } // namespace Slic3r

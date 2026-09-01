@@ -36,6 +36,19 @@ enum PaintDepthMode {
 //   ignored entirely, an explicit user-chosen depth.
 // - pdmWalls: see below.
 //
+// WAVE B / OPTION N (.superpowers/sdd/2026-08-31-paint-depth/curved-gap-design.md): this one
+// number is now the painted claim's THICKNESS MEASURED NORMAL TO THE PAINTED SURFACE, `D`, not
+// merely a lateral distance from the sliced boundary. Nothing about the arithmetic changes - it
+// is the same value, computed the same way - but it now bounds BOTH halves of the claim:
+// cut_segmented_layers keeps material within D of the layer contour (which is D*sin(theta) of
+// normal thickness on a slope of theta) AND segmentation_top_and_bottom_layers descends however
+// many layers span D, which delivers D*cos(theta). Their union is D*max(cos, sin) - the same
+// thickness of colour on a vertical wall, a dome and a flat top, which is what a user means by
+// "2mm of paint". The two used to be independent bounds on different axes, which is why the
+// claim collapsed to D*sin(theta) alone in the 6.5-24 deg band. See that function's header for
+// the derivation and for the honest limit (the thin-projection filter caps the reach of the
+// vertical half at theta < atan(layer_height / 0.225) - 23.96 deg at 0.1mm layers).
+//
 // WALLS MODE (fix-wave F3, .superpowers/sdd/2026-08-31-paint-depth/wall-count-
 // investigation.md section 5). The band is
 //
@@ -78,6 +91,17 @@ enum PaintDepthMode {
 // never exceed 4 loops however wide this band is. Band beyond that ceiling is not lost - it
 // becomes painted solid/sparse infill inside the same painted region - but it is not extra
 // LOOPS. See the fix-wave report.
+//
+// WAVE B: walls mode's NUMBER is unchanged and its PROMISE is narrowed to what is true on both
+// generators - "about N wall widths of material thickness, measured normal to the surface",
+// explicitly not a bead count. F3's formula is shaped for Arachne's count windows and carries no
+// meaning under the CLASSIC generator, where process_classic yields two external-width loops plus
+// one gap-fill line for any band in the 1.3-1.5mm range regardless of N
+// (classic-generator-investigation.md section 2d) - and the user runs classic. The number is kept
+// (rather than switched to the generator-neutral `ext_w + (N-1)*s = 1.30708`) because it preserves
+// F3's real Arachne count-margin win on vertical walls, is only ~10% above that reading, and
+// avoids a second band formula; pdmMillimeters is the mode to reach for when the millimetre value
+// itself is what matters. PrintConfig.cpp's tooltips say exactly this.
 float paint_depth_band_mm(PaintDepthMode mode, int walls, double mm,
                            float ext_perimeter_width, float ext_perimeter_spacing,
                            float perimeter_spacing);

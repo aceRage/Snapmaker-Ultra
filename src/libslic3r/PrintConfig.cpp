@@ -3887,14 +3887,22 @@ void PrintConfigDef::init_fff_params()
 
     def           = this->add("paint_depth_mode", coEnum);
     def->label    = L("Paint depth mode");
-    def->tooltip  = L("Controls how far inward a painted (multi-material/multi-color) claim is "
-                    "allowed to reach before the object reverts to its base filament for walls, "
-                    "solid infill and sparse infill. Without a bound, a small dark painted spot "
-                    "can extrude dark filament all the way to the object's core, showing through "
-                    "light-colored walls/infill above and around it. \"Limited by walls\" bounds "
-                    "the claim to a number of wall widths (recommended); \"Limited by distance\" "
-                    "bounds it to an explicit depth in millimeters; \"Unlimited\" restores the old "
-                    "unbounded behavior (the painted claim reaches the object's medial axis).");
+    // WAVE B / Option N (.superpowers/sdd/2026-08-31-paint-depth/curved-gap-design.md): the depth
+    // is now a THICKNESS MEASURED PERPENDICULAR TO THE PAINTED SURFACE, the same everywhere -
+    // vertical walls, curves and flat tops alike - rather than "a lateral distance from the sliced
+    // boundary" that thinned to nothing on shallow slopes. The tooltips say so, and name
+    // "Limited by distance" as the direct control, because it is the one whose number the user
+    // reads back as millimetres of colour.
+    def->tooltip  = L("Controls how thick a painted (multi-material/multi-color) claim is before "
+                    "the object reverts to its base filament for walls, solid infill and sparse "
+                    "infill. The depth is measured perpendicular to the painted surface, so it is "
+                    "the same on a vertical wall, on a curve and on a flat top. Without a bound, a "
+                    "small dark painted spot can extrude dark filament all the way to the object's "
+                    "core, showing through light-colored walls/infill above and around it. "
+                    "\"Limited by distance\" sets that thickness directly in millimeters and is the "
+                    "control to reach for; \"Limited by walls\" converts a wall count into the same "
+                    "millimeter thickness; \"Unlimited\" restores the old unbounded behavior (the "
+                    "painted claim reaches the object's medial axis).");
     def->enum_keys_map = &ConfigOptionEnum<PaintDepthMode>::get_enum_values();
     def->enum_values.emplace_back("unlimited");
     def->enum_values.emplace_back("walls");
@@ -3910,15 +3918,26 @@ void PrintConfigDef::init_fff_params()
     def->label    = L("Paint depth walls");
     // Fix-wave F3: the tooltip described the old `ext_width + (walls-1)*spacing` band, which
     // is no longer the formula (see paint_depth_band_mm, PaintDepth.hpp).
-    def->tooltip  = L("Number of wall loops a painted claim is allowed to reach inward from the "
-                    "sliced boundary, when \"Paint depth mode\" is \"Limited by walls\". The depth "
-                    "in millimeters is sized so the painted region really does receive this many "
-                    "wall loops: one perimeter spacing per wall, plus the inset the wall "
-                    "generator applies before laying its outer loop, plus a margin so the count "
-                    "does not sit on a rounding boundary. Note that the wall generator will not "
-                    "produce more than twice \"Wall loops\" loops in any region, so a painted "
-                    "depth beyond that prints as painted solid/sparse infill rather than as "
-                    "further loops.");
+    //
+    // WAVE B: the number is UNCHANGED, its promise is not. F3 sized it against Arachne's bead-count
+    // windows, and on a vertical wall Arachne does deliver N loops across it - but the user runs
+    // the CLASSIC generator, where process_classic tiles the band with two external-width loops
+    // plus at most one gap-fill line for anything in the 1.3-1.5mm range regardless of this
+    // setting (classic-generator-investigation.md section 2d). Promising "N wall loops" to every
+    // user was therefore false for half of them. It is honest as a THICKNESS - "about N wall
+    // widths of material" - so that is what it now says, with "Paint depth distance" named as the
+    // control that means exactly what it says on either generator.
+    def->tooltip  = L("Thickness of a painted claim, expressed as a number of wall widths, when "
+                    "\"Paint depth mode\" is \"Limited by walls\". This is converted to about that "
+                    "many wall widths of material measured perpendicular to the painted surface: "
+                    "one perimeter spacing per wall, plus the inset the wall generator applies "
+                    "before laying its outer loop, plus a margin so the thickness does not sit on "
+                    "a rounding boundary. It is a thickness, not a promise of a loop count - how "
+                    "many loops fit inside it is decided by \"Wall generator\" (the classic "
+                    "generator tiles a band with an even number of loops plus a gap-fill line, and "
+                    "Arachne will not produce more than twice \"Wall loops\" loops in any region, "
+                    "so depth beyond that prints as painted solid/sparse infill). If you want an "
+                    "exact thickness in millimeters, use \"Limited by distance\" instead.");
     def->sidetext = "walls";
     def->min      = 1;
     def->category = L("Advanced");
@@ -3927,9 +3946,19 @@ void PrintConfigDef::init_fff_params()
 
     def           = this->add("paint_depth_mm", coFloat);
     def->label    = L("Paint depth distance");
-    def->tooltip  = L("Depth a painted claim is allowed to reach inward from the sliced boundary, "
-                    "when \"Paint depth mode\" is \"Limited by distance\". Zero behaves the same "
-                    "as \"Paint depth mode\" = \"Unlimited\": no clamp is applied on any layer.");
+    // WAVE B / Option N: this is now the headline control, and it means one thing - how thick the
+    // colour is, measured perpendicular to the surface the user painted. Value unchanged at 1.5mm
+    // (standing decision: no default VALUES move in this wave); only the meaning is stated
+    // correctly. On a flat top the claim is now that thickness deep rather than
+    // "top_shell_layers" deep, which is the honest consequence of a constant thickness and costs
+    // one tool change per newly-painted layer - see the Wave B report.
+    def->tooltip  = L("How thick a painted claim is, measured perpendicular to the painted "
+                    "surface, when \"Paint depth mode\" is \"Limited by distance\". The same "
+                    "everywhere: a vertical wall gets this much colour measured horizontally, a "
+                    "flat top gets it measured vertically, and a slope gets it measured along its "
+                    "own normal - so a painted region behaves like a shell of the color rather "
+                    "than thinning out on shallow curves. Zero behaves the same as \"Paint depth "
+                    "mode\" = \"Unlimited\": no clamp is applied on any layer.");
     def->sidetext = "mm";	// milimeters, don't need translation
     // Fix-wave F4: min stays 0 rather than being raised, because 0 is coherent here - see
     // cut_segmented_layers's fix-wave F1 comment (MultiMaterialSegmentation.cpp): a zero

@@ -48,6 +48,14 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               // than cutting a sub-extrusion strip no toolpath can honour. See
                                                               // paint_depth_clamp_keep_core in the .cpp.
                                                               float                                                            segmentation_min_claim_width,
+                                                              // WAVE B / Option N (.superpowers/sdd/2026-08-31-paint-depth/
+                                                              // curved-gap-design.md): the painted claim's thickness measured
+                                                              // NORMAL to the painted surface (mm), which bounds the top/bottom
+                                                              // descent instead of top_shell_layers / bottom_shell_layers. 0
+                                                              // means "no normal-thickness shell" - unlimited mode, and the fuzzy
+                                                              // skin path, which has no top/bottom claim at all. See
+                                                              // segmentation_top_and_bottom_layers in the .cpp.
+                                                              float                                                            segmentation_normal_depth,
                                                               bool                                                             segmentation_interlocking_beam,
                                                               IncludeTopAndBottomLayers                                        include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback);

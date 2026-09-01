@@ -2290,3 +2290,380 @@ TEST_CASE("multi_material_segmentation_by_painting: on the arachne generator the
     // that would pin Arachne's corner behaviour, not this feature's. The captures above record it.
     CHECK(loops > 2);
 }
+
+// ===========================================================================================
+// WAVE B - OPTION N: the painted claim is a CONSTANT-THICKNESS SHELL measured NORMAL to the
+// painted surface. .superpowers/sdd/2026-08-31-paint-depth/curved-gap-design.md
+//
+// Before this wave the claim was max(lateral band, layer-count shell), and the vertical half
+// was switched off entirely on any slope steeper than atan(layer_height / wall_stack) (6.49 deg
+// at 0.1mm layers) by exposed_surface_part(). Between there and ~24 deg the paint was therefore
+// the lateral band alone - normal thickness band*sin(theta), i.e. 0.25mm at 10 deg against
+// 0.60mm on a flat top: the dead band the user's domed features (eyes, cheeks) live in.
+//
+// Option N removes that gate and bounds the descent by NORMAL DEPTH D (the same band value,
+// re-read as a thickness) instead of by top/bottom_shell_layers. The descent was ALREADY
+// slope-correct - a claim deposited m layers below its painted surface layer lands at lateral
+// inset [m*r, (m+1)*r] from the deposit layer's own contour, where r = layer_height/tan(theta)
+// is the staircase run - so a descent of M = ceil(D/layer_height) layers reaches lateral inset
+// M*r, i.e. normal thickness M*r*sin(theta) = M*layer_height*cos(theta) ~= D*cos(theta). The
+// lateral band supplies D*sin(theta) on the same geometry, so the union is D*max(cos, sin).
+//
+// Arithmetic used by every fixture below (0.45mm outer AND inner wall, 0.4 nozzle, 0.1mm
+// layers): ext_perimeter_spacing = perimeter_spacing = 0.45 - 0.1*(1 - pi/4) = 0.428540,
+// wall_stack = 0.45 + 0.428540 = 0.878540, band(3) = 3*0.428540 + 2*(0.45 - 0.428540) +
+// 0.25*0.428540 = 1.435675, band(1) = 0.578595 (Arachne) / 0.878540 (classic, Wave A's floor).
+// M = ceil(1.435675 / 0.1) = 15 at walls = 3, ceil(0.878540 / 0.1) = 9 at the classic walls = 1.
+//
+// HONEST BOUND, recorded here because it is not in the design doc's headline table: the
+// staircase ring top_ex is itself passed through opening_ex(top_ex, small_region_threshold)
+// (= 0.1125mm radius at a 0.45mm outer wall with gap fill on) before the descent ever starts,
+// so a ring narrower than 0.225mm is erased and there is NO vertical claim to deepen. That
+// bounds Option N's reach at theta < atan(layer_height / 0.225) = 23.96 deg at 0.1mm layers
+// (41.6 deg at 0.2mm) - well above the 6.49 deg cliff it replaces and covering the user's
+// shallow features, but short of the 58.5 deg F1 self-suppression the design derives. At every
+// practical layer height the opening filter binds strictly before F1 does (F1 needs
+// r < 0.627*layer_height, the opening needs r < 0.225, and 0.627*h < 0.225 for h < 0.359mm).
+// The steep-slope test below therefore pins the SUPPRESSION, and names which guard delivers it.
+// ===========================================================================================
+
+// Same construction as slice_painted_frustum() above, but with the paint depth actually BOUNDED
+// (mode/walls), the layer height and the wall generator as parameters, and the shell settings
+// pinned so the "max(effective shell, normal-depth layers)" descent bound is exact:
+// top_shell_layers = 4 / top_shell_thickness = 0.6 at 0.1mm layers is a 6-layer effective shell,
+// so any descent deeper than 6 layers is unambiguously the normal-depth bound and not the shell.
+// inner_wall_line_width is pinned for the same reason slice_painted_box() pins it: the band is
+// driven by the frPerimeter spacing too, so both widths must be known for the band to be exact.
+PrintObject *slice_bounded_frustum(double bottom, double top, double height,
+                                    const std::vector<int> &painted_facets,
+                                    PaintDepthMode mode, int walls, double layer_height, Print &print,
+                                    PerimeterGeneratorType wall_generator = PerimeterGeneratorType::Arachne)
+{
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-normal-shell.stl";
+    ModelVolume *volume  = object->add_volume(make_square_frustum(bottom, top, height));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : painted_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    DynamicPrintConfig config = paint_depth_test_config(mode, walls);
+    config.option<ConfigOptionFloat>("layer_height")->value                     = layer_height;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value       = layer_height;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
+    config.option<ConfigOptionInt>("top_shell_layers")->value                   = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value              = 0.6;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value                = 3;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value           = 0.0;
+    config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = wall_generator;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// T1, the headline. make_square_frustum(40.392, 18, 3): the half-width runs 20.196 -> 9.0 over
+// 3mm, so tan(theta) = 3/11.196 and theta = 15.000 deg exactly; at 0.1mm layers the staircase
+// run is r = 0.37320mm per layer (comfortably above the 0.225mm opening filter). 30 layers.
+//
+// With walls = 3 the descent depth is max(6-layer shell, ceil(1.435675/0.1) = 15) = 15, so a
+// mid layer collects the surface bands of the 15 layers at and above it and the claim reaches
+// lateral inset 15 * 0.37320 = 5.598mm from its own contour - normal thickness
+// 5.598 * sin(15) = 1.4489mm (the design's ideal D*cos(15) = 1.3868 rounded up by the one-layer
+// quantisation of M). Today it reaches the band alone, 1.435675mm laterally = 0.372mm normal.
+//
+// The probe layer is 12, not the geometric middle: contributions come from layers 12..26, all
+// interior. The topmost layer's slab is only half a layer tall (there is no zs[30] to bound it),
+// so its ring is 0.187mm rather than 0.373mm wide and the reach from a layer within 14 of the
+// top would be short by that amount - a needless 0.19mm of slack in the negative probe.
+TEST_CASE("multi_material_segmentation_by_painting: a shallow painted slope is claimed to the full NORMAL depth, not to the lateral band (Wave B / Option N)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_bounded_frustum(40.392, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                 pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    REQUIRE(object->layer_count() >= 27);
+
+    const size_t     probe_layer = 12;
+    const ExPolygons claim       = extruder2_claim_for_layer(*object, probe_layer);
+
+    // RED today: the claim stops at the 1.435675mm lateral band, so 3.0mm in is base.
+    CHECK(any_contains(claim, layer_edge_probe(*object, probe_layer, 3.0)));
+    // ...and it really does reach the full normal depth, not merely "more than the band":
+    // 5.0mm is inside the 5.598mm reach (margin 0.60mm).
+    CHECK(any_contains(claim, layer_edge_probe(*object, probe_layer, 5.0)));
+    // The upper bound, which is what makes this a test of a DEPTH rather than of "more paint":
+    // 6.0mm is past the 5.598mm reach (margin 0.40mm). Bracketing the reach in [5.0, 6.0]
+    // brackets the normal thickness in [1.294, 1.553]mm around D = 1.436 / M*h*cos = 1.449.
+    CHECK_FALSE(any_contains(claim, layer_edge_probe(*object, probe_layer, 6.0)));
+}
+
+// The break-placement pin the design doc calls out as the difference between Option N and a
+// silent no-op (curved-gap-design.md section 6 hazard 1). On a slope the full-width term is
+// EMPTY for the near descent steps - the ring deposited m layers down sits at inset
+// [m*r, (m+1)*r] and F1 holds it one wall_stack (0.878540mm) clear of the deposit layer's
+// contour, so nothing survives until (m+1)*r > 0.878540, i.e. m >= 2 at 15 deg. The legacy
+// eroded term is empty there too (it insets by m*wall_stack, and the ring is only 0.373mm
+// wide). An `if (last.empty()) break;` at the bottom of the loop therefore fires at m = 1 and
+// the whole change evaporates with a green T1... except that T1's 3.0mm probe needs m = 8.
+//
+// This case makes that explicit and graded: each probe below can only be satisfied by the
+// descent step that owns its slot, so the ladder fails at the FIRST step the break truncates
+// rather than all at once, and the failure message names the depth.
+TEST_CASE("multi_material_segmentation_by_painting: the normal-depth descent is not terminated by its empty near steps (break placement, Wave B)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_bounded_frustum(40.392, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                 pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    REQUIRE(object->layer_count() >= 27);
+
+    const size_t     probe_layer = 12;
+    const ExPolygons claim       = extruder2_claim_for_layer(*object, probe_layer);
+
+    // inset -> the descent step that supplies it (slot m spans [m*0.37320, (m+1)*0.37320]):
+    //   1.6 -> m=4    2.5 -> m=6    3.5 -> m=9    4.5 -> m=12    5.0 -> m=13
+    // All are beyond the 1.435675mm lateral band, so none can be satisfied any other way.
+    for (double inset_mm : {1.6, 2.5, 3.5, 4.5, 5.0}) {
+        CAPTURE(inset_mm);
+        CHECK(any_contains(claim, layer_edge_probe(*object, probe_layer, inset_mm)));
+    }
+}
+
+// T2 - F1's no-exterior-bleed invariant, re-pinned at the NEW depth. GREEN before and after:
+// the point is that deleting exposed_surface_part() and descending 15 layers instead of 6 must
+// not let a painted CAP own the exterior perimeter of the unpainted sloped wall below it.
+//
+// Same frustum, cap only. The sloped walls carry no painted boundary on any layer's contour, so
+// the entire claim is the cap's descent - there is no lateral band anywhere to mask a regression.
+// Cap half-width 9.0; contour half-width at depth m below the cap layer H_m = 9.1866 + 0.37320m;
+// F1 holds the claim at min(9.0, H_m - 0.878540). So:
+//   negative probe 0.3mm in: claim edge is at least 0.878540mm in at m = 1..2 and 0.933mm or
+//     more from m = 3 on - base at every depth, margin >= 0.58mm;
+//   positive probe 1.5mm in: inside the claim for m = 1..3 (margins 0.62 / 0.57 / 0.19mm); at
+//     m = 4 the layer has grown past the fixed 9.0mm cap footprint and 1.5mm in is legitimately
+//     outside it, which is geometry, not a regression - hence the shorter positive range.
+TEST_CASE("multi_material_segmentation_by_painting: a painted cap's deepened descent still leaves the unpainted sloped exterior base-coloured (F1 pin, Wave B)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_bounded_frustum(40.392, 18., 3., TOP_CAP_FACE,
+                                                 pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 10);
+
+    for (size_t depth = 1; depth <= 5; ++depth) {
+        CAPTURE(depth);
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, top_index - depth),
+                                 layer_edge_probe(*object, top_index - depth, 0.3)));
+    }
+    // ...and the invariant is not satisfied by claiming nothing: the shell under the painted cap
+    // IS claimed at the same depths.
+    for (size_t depth = 1; depth <= 3; ++depth) {
+        CAPTURE(depth);
+        CHECK(any_contains(extruder2_claim_for_layer(*object, top_index - depth),
+                           layer_edge_probe(*object, top_index - depth, 1.5)));
+    }
+}
+
+// T3 - steep-slope suppression. make_square_frustum(40, 34, 6): half-width 20 -> 17 over 6mm, so
+// tan(theta) = 2 and theta = 63.435 deg, above the design's derived F1 self-suppression angle
+// atan(D / wall_stack) = 58.5 deg. r = 0.05mm per 0.1mm layer.
+//
+// Which guard actually fires, stated honestly (see the section header): at 0.05mm the staircase
+// ring is erased by opening_ex(top_ex, 0.1125) before the descent starts, so there is no vertical
+// claim at all - the F1 reach test (M*r = 0.75mm < 0.878540mm) would also suppress it, but the
+// opening gets there first and does so at every layer height below 0.359mm. Either way the claim
+// on a steep painted wall is the lateral band alone, which is the property that matters and the
+// one a future widening must not quietly break.
+TEST_CASE("multi_material_segmentation_by_painting: a 63-degree painted slope gains no normal-depth descent (steep suppression, Wave B)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_bounded_frustum(40., 34., 6., FRUSTUM_SLOPED_WALLS,
+                                                 pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    REQUIRE(object->layer_count() >= 40);
+
+    const size_t     probe_layer = 20;
+    const ExPolygons claim       = extruder2_claim_for_layer(*object, probe_layer);
+
+    // The lateral band (1.335675mm on this even layer after the 0.1mm interlocking notch) is
+    // present and real...
+    CHECK(any_contains(claim, layer_edge_probe(*object, probe_layer, 1.0)));
+    // ...and nothing deeper is, which is exactly what the anti-smear guard has always demanded.
+    CHECK_FALSE(any_contains(claim, layer_edge_probe(*object, probe_layer, 2.0)));
+}
+
+// How far in from the given layer's own contour the Extruder2 claim reaches, scanned outward in
+// 0.05mm steps. The claim is contiguous from the contour on every fixture that uses this (the
+// lateral band starts at 0 and overlaps the first surviving descent slot), so the last claimed
+// step is the outer edge, to within the step.
+//
+// Deliberately builds its own probe points rather than calling layer_edge_probe() per step: that
+// helper carries a REQUIRE, and a couple of hundred of them per scan would make the suite's
+// assertion COUNT a function of the measured geometry - a gate baseline that moves whenever the
+// claim does. One REQUIRE here, then arithmetic.
+double claim_reach_mm(const PrintObject &object, size_t layer_idx, double max_scan_mm = 12.0)
+{
+    const BoundingBox bb = get_extents(object.get_layer(int(layer_idx))->lslices);
+    REQUIRE(bb.defined);
+    const coord_t    mid_y        = (bb.min.y() + bb.max.y()) / 2;
+    const ExPolygons claim        = extruder2_claim_for_layer(object, layer_idx);
+    double           last_claimed = 0.;
+    for (double inset = 0.05; inset <= max_scan_mm; inset += 0.05)
+        if (any_contains(claim, Point(coord_t(bb.max.x() - scale_(inset)), mid_y)))
+            last_claimed = inset;
+        else
+            break;
+    return last_claimed;
+}
+
+// The design's headline table, executable. curved-gap-design.md section 3 predicts a normal
+// thickness of D*cos(theta) once Option N lands, against band*sin(theta) before it:
+//
+//   theta      10 deg   15 deg   20 deg   25 deg
+//   before      0.249    0.372    0.491    0.607     (= 1.435675 * sin theta)
+//   design      1.414    1.387    1.349    1.301     (= 1.435675 * cos theta)
+//
+// What this build actually delivers, and why it differs at each end:
+//   * the descent depth is a whole number of layers, M = ceil(D / layer_height) = 15, so the
+//     realised thickness is M*layer_height*cos(theta) = 1.5*cos(theta), i.e. 1.477 / 1.449 /
+//     1.410 - the design's figure rounded UP by the layer quantisation, never down;
+//   * 25 deg is NOT reached, and this is the one place the design's table is optimistic. The
+//     staircase ring is r = layer_height/tan(theta) = 0.2145mm wide there, and top_ex is passed
+//     through opening_ex(top_ex, small_region_threshold = 0.1125) before the descent starts, so a
+//     ring under 0.225mm is erased and there is no vertical claim left to deepen. That puts a
+//     hard ceiling on Option N at theta < atan(layer_height / 0.225) = 23.96 deg at 0.1mm layers
+//     (41.6 deg at 0.2mm). Lifting it means lowering the #7104 sliver guard, which the design
+//     considered as its Option B and rejected; 25 deg therefore still gets band*sin(theta).
+//
+// All four frustums taper to an 18mm top over 3mm of height, so the slope is set purely by the
+// base width: half-width delta = 3/tan(theta), bottom = 2*(9 + delta).
+TEST_CASE("multi_material_segmentation_by_painting: normal thickness across slopes (Wave B / Option N headline numbers)", "[paintdepth]")
+{
+    constexpr double kPi = 3.14159265358979323846;
+    struct SlopeCase { double degrees; double bottom; bool normal_shell; };
+    // bottom = 2*(9 + 3/tan(theta)): 10 deg -> 52.0276, 15 -> 40.392, 20 -> 34.4848, 25 -> 30.8670.
+    const SlopeCase cases[] = {
+        {10., 52.0276, true},
+        {15., 40.3920, true},
+        {20., 34.4848, true},
+        {25., 30.8670, false}, // ring 0.2145mm < 0.225mm: erased by the thin-projection filter.
+    };
+
+    for (const SlopeCase &c : cases) {
+        DYNAMIC_SECTION("slope " << c.degrees << " deg") {
+            Print        print;
+            PrintObject *object = slice_bounded_frustum(c.bottom, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                         pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+            REQUIRE(object->layer_count() >= 27);
+
+            const double theta      = c.degrees * kPi / 180.;
+            const double reach      = claim_reach_mm(*object, /*layer_idx=*/12);
+            const double normal_mm  = reach * std::sin(theta);
+            CAPTURE(c.degrees);
+            CAPTURE(reach);
+            CAPTURE(normal_mm);
+
+            if (c.normal_shell) {
+                // D = 1.435675mm; realised M*h*cos(theta) = 1.5*cos(theta). The window admits the
+                // layer quantisation above and the 0.05mm scan step below, and excludes both the
+                // old band*sin(theta) (0.249 / 0.372 / 0.491) and an unbounded claim.
+                CHECK(normal_mm > 1.36);
+                CHECK(normal_mm < 1.58);
+            } else {
+                // The lateral band alone on this even layer: 1.435675 - 0.1 notch = 1.335675mm of
+                // reach, 0.5645mm of normal thickness. Bounded well below the 3.217mm reach a
+                // normal-thickness descent would give here, so this fails loudly - and tells the
+                // next reader why - if the thin-projection filter ever changes.
+                CHECK(reach > 1.0);
+                CHECK(reach < 2.0);
+            }
+        }
+    }
+}
+
+// "Paint depth bounds PAINT." The base filament (color_idx 0) is not a paint claim: its
+// top/bottom claim exists only to stop a neighbouring painted colour smearing across the solid
+// shell under an UNPAINTED cap, and that contract is written in shell terms. Giving it the same
+// normal thickness inverts the feature, because merge_segmented_layers trims every extruder's
+// LATERAL claim by every extruder's TOP/BOTTOM claim - so a base claim descending D deep cuts the
+// painted band back to one wall stack on every layer under any unpainted top or bottom face.
+//
+// This is not hypothetical: it is what the first Wave B build did, and the "millimetres mode
+// honours the configured interlocking notch verbatim (I-3)" case above caught it (its 6.0mm band
+// collapsed to 0.857mm). This case pins the rule by name so the next person to read a failure
+// gets the reason rather than a puzzle. 40x40x6mm box, one side painted, 0.2mm layers, band 4.0mm:
+// the base's own top shell is 4 layers (26..29) and cannot reach layer 15, while a base claim
+// deepened to 4.0mm would span 20 layers (10..29) and would.
+TEST_CASE("multi_material_segmentation_by_painting: the base filament's top/bottom claim is NOT given the paint's normal thickness (Wave B)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_box(/*x=*/40., /*y=*/40., /*z=*/6., PLUS_X_FACE,
+                                             pdmMillimeters, /*walls=*/3, /*paint_depth_mm=*/4.0,
+                                             /*layer_height=*/0.2, print);
+    REQUIRE(object->layer_count() >= 20);
+
+    const size_t      probe_layer = 15;
+    const BoundingBox bb          = get_extents(object->get_layer(int(probe_layer))->lslices);
+    REQUIRE(bb.defined);
+    const coord_t    mid_y = (bb.min.y() + bb.max.y()) / 2;
+    const ExPolygons claim = extruder2_claim_for_layer(*object, probe_layer);
+
+    // The full 4.0mm band survives on a layer sitting under an unpainted top cap (the even-layer
+    // notch is the stock 0.1mm, so the band here is 3.9mm - hence the 3.85mm probe).
+    CHECK(any_contains(claim, Point(coord_t(bb.max.x() - scale_(3.85)), mid_y)));
+    // ...and it is still the band, not an unbounded claim.
+    CHECK_FALSE(any_contains(claim, Point(coord_t(bb.max.x() - scale_(4.1)), mid_y)));
+}
+
+// The D >= wall_stack gate (curved-gap-design.md section 5), and its one real interaction with
+// Wave A. Below one wall stack the lateral band reaches only D while the F1-inset descent starts
+// at wall_stack, so the base region would keep a sandwiched ring of width wall_stack - D on every
+// sub-surface layer - a new sliver class. Hence the gate.
+//
+// At paint_depth_walls = 1 the two generators land on opposite sides of it, and it is Wave A's
+// classic floor that puts them there:
+//   classic  band(1) = max(0.578595, ext_w + ext_s) = 0.878540 == wall_stack exactly, so the
+//            gate opens with the sandwiched ring at ZERO width by construction. M = 9, reach
+//            9 * 0.37320 = 3.3588mm.
+//   arachne  band(1) = 0.578595 < 0.878540, so the descent stays off and the claim is the band.
+// A float ULP must not decide the classic case, which is why the production gate carries a
+// SCALED_EPSILON slack; this pair is what would catch it if that slack were dropped.
+TEST_CASE("multi_material_segmentation_by_painting: the normal-shell descent is gated on D >= one wall stack, which Wave A's classic floor is what opens at walls = 1", "[paintdepth]")
+{
+    SECTION("classic: the floored band(1) equals one wall stack, so the descent runs") {
+        Print        print;
+        PrintObject *object = slice_bounded_frustum(40.392, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                     pdmWalls, /*walls=*/1, /*layer_height=*/0.1, print,
+                                                     PerimeterGeneratorType::Classic);
+        REQUIRE(object->layer_count() >= 27);
+
+        const size_t     probe_layer = 12;
+        const ExPolygons claim       = extruder2_claim_for_layer(*object, probe_layer);
+        // Inside the 3.3588mm reach (margin 0.36mm), far outside the 0.878540mm band.
+        CHECK(any_contains(claim, layer_edge_probe(*object, probe_layer, 3.0)));
+        // ...and bounded by it: D is a depth, not a licence.
+        CHECK_FALSE(any_contains(claim, layer_edge_probe(*object, probe_layer, 4.0)));
+    }
+
+    SECTION("arachne: the unfloored band(1) is below one wall stack, so the descent stays off") {
+        Print        print;
+        PrintObject *object = slice_bounded_frustum(40.392, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                     pdmWalls, /*walls=*/1, /*layer_height=*/0.1, print,
+                                                     PerimeterGeneratorType::Arachne);
+        REQUIRE(object->layer_count() >= 27);
+
+        const size_t     probe_layer = 12;
+        const ExPolygons claim       = extruder2_claim_for_layer(*object, probe_layer);
+        // The band alone: 0.478595mm on this even layer, 0.578595mm on odd ones.
+        CHECK(any_contains(claim, layer_edge_probe(*object, probe_layer, 0.3)));
+        CHECK_FALSE(any_contains(claim, layer_edge_probe(*object, probe_layer, 3.0)));
+    }
+}
