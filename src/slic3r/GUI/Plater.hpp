@@ -542,6 +542,9 @@ public:
     void on_change_color_mode(SimpleEvent& evt);
 	void eject_drive();
 
+    // Ultra: auto-assemble selected objects (largest = fixed target, rest mate into it).
+    void ultra_auto_assemble();
+
     void take_snapshot(const std::string &snapshot_name);
     //void take_snapshot(const wxString &snapshot_name);
     void take_snapshot(const std::string &snapshot_name, UndoRedo::SnapshotType snapshot_type);

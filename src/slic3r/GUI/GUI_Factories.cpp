@@ -1952,6 +1952,11 @@ wxMenu* MenuFactory::multi_selection_menu()
         int index = 0;
         if (obj_list()->can_merge_to_multipart_object()) {
             append_menu_item_merge_to_multipart_object(menu);
+            // Ultra: auto-assemble by best-fit faces/holes (largest = fixed target), then merge to one part.
+            append_menu_item(menu, wxID_ANY, _L("Auto-Fit Assembly"),
+                _L("Auto-assemble the selected objects: the largest stays fixed as the target, the rest mate into it by best-fit faces/holes, then merge into one multi-part object"),
+                [](wxCommandEvent&) { plater()->ultra_auto_assemble(); }, "", menu,
+                []() { return true; }, m_parent);
             index++;
         }
         append_menu_item_center(menu);

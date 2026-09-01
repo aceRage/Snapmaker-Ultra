@@ -86,6 +86,10 @@
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/Measure.hpp"
+#include "libslic3r/Geometry.hpp"
+#include "libslic3r/TriangleMesh.hpp"
+#include <Eigen/Eigenvalues>
 #include "libslic3r/SLA/Hollowing.hpp"
 #include "libslic3r/SLA/SupportPoint.hpp"
 #include "libslic3r/SLA/ReprojectPointsOnMesh.hpp"
@@ -13788,6 +13792,322 @@ static std::vector<std::vector<DynamicPrintConfig>> ultra_build_extruder_filamen
         }
     }
     return infos;
+}
+
+// ===== Ultra Auto-Fit Assembly (Stage 3) =====================================
+// Auto-assemble: keep the largest selected object fixed as the TARGET, and rigidly
+// mate every other selected object (ATTACHMENT) so its best complementary feature
+// (peg-in-hole circle pairs, else flat face pairs) coincides anti-parallel with the
+// target's. Pure geometry on the print transform -> "physically reassembled for
+// printing", scoped to the selection, and fully undoable. Never touches unselected
+// objects or other plates.
+namespace {
+struct UltraFitFeat {
+    int    kind;   // 0 = plane, 1 = circle, 2 = cylinder, 3 = sphere
+    Vec3d  dir;    // world unit normal (plane) / axis (circle, cylinder); unused for sphere
+    Vec3d  pt;     // world centroid (plane) / center (circle, sphere) / point-on-axis (cylinder)
+    double radius; // world radius (circle/cylinder/sphere); 0 for plane
+    double area;   // world plane area; 0 for round features
+};
+
+static double ultra_tri_area(const indexed_triangle_set& its, int tri)
+{
+    if (tri < 0 || tri >= (int) its.indices.size()) return 0.0;
+    const auto& f = its.indices[tri];
+    const Vec3d a = its.vertices[f[0]].cast<double>();
+    const Vec3d b = its.vertices[f[1]].cast<double>();
+    const Vec3d c = its.vertices[f[2]].cast<double>();
+    return 0.5 * ((b - a).cross(c - a)).norm();
+}
+
+static Vec3d ultra_face_normal(const indexed_triangle_set& its, int tri)
+{
+    const auto& f = its.indices[tri];
+    const Vec3d a = its.vertices[f[0]].cast<double>();
+    const Vec3d b = its.vertices[f[1]].cast<double>();
+    const Vec3d c = its.vertices[f[2]].cast<double>();
+    Vec3d n = (b - a).cross(c - a);
+    double l = n.norm();
+    return l > 1e-12 ? Vec3d(n / l) : Vec3d(0, 0, 1);
+}
+
+static Vec3d ultra_tri_centroid(const indexed_triangle_set& its, int tri)
+{
+    const auto& f = its.indices[tri];
+    return (its.vertices[f[0]].cast<double>() + its.vertices[f[1]].cast<double>() + its.vertices[f[2]].cast<double>()) / 3.0;
+}
+
+// Region-grow triangles into low-curvature patches: an 8 deg per-step tolerance (so a gently
+// curved-but-near-flat face grows across its curvature instead of shattering the way Measure's
+// exact 0.001 seed test does), CAPPED at 20 deg total spread vs the seed (so a full cylinder is
+// NOT swallowed into a bogus plane -- the cylinder fitter handles those). Emits world planes.
+static void ultra_soft_planes(const indexed_triangle_set& its, const Transform3d& world,
+                              double min_area_world, std::vector<UltraFitFeat>& out)
+{
+    const int F = (int) its.indices.size();
+    if (F == 0) return;
+    const std::vector<Vec3i32> nb = its_face_neighbors(its);
+    std::vector<Vec3d> fn(F); std::vector<double> fa(F);
+    for (int t = 0; t < F; ++t) { fn[t] = ultra_face_normal(its, t); fa[t] = ultra_tri_area(its, t); }
+    const Matrix3d lin   = world.linear();
+    const double   scale = (lin * Vec3d::UnitX()).norm();
+    const double   cos_step = std::cos(8.0  * M_PI / 180.0);
+    const double   cos_cap  = std::cos(20.0 * M_PI / 180.0);
+    std::vector<char> seen(F, 0);
+    std::vector<int>  stack;
+    for (int s = 0; s < F; ++s) {
+        if (seen[s]) continue;
+        const Vec3d nseed = fn[s];
+        stack.clear(); stack.push_back(s); seen[s] = 1;
+        Vec3d nsum = Vec3d::Zero(), csum = Vec3d::Zero(); double area = 0.0;
+        while (!stack.empty()) {
+            int t = stack.back(); stack.pop_back();
+            nsum += fn[t] * fa[t]; csum += ultra_tri_centroid(its, t) * fa[t]; area += fa[t];
+            const Vec3i32& adj = nb[t];
+            for (int k = 0; k < 3; ++k) {
+                int u = adj[k];
+                if (u < 0 || seen[u]) continue;
+                if (fn[u].dot(fn[t]) > cos_step && fn[u].dot(nseed) > cos_cap) { seen[u] = 1; stack.push_back(u); }
+            }
+        }
+        if (area <= 0 || nsum.norm() < 1e-9) continue;
+        double area_world = area * scale * scale;
+        if (area_world < min_area_world) continue;
+        out.push_back({0, (lin * nsum.normalized()).normalized(), world * (csum / area), 0.0, area_world});
+    }
+}
+
+// Fit a single cylinder/sphere to the WHOLE mesh via the area-weighted normal covariance spectrum
+// (plane: e1~e2~0; cylinder: e0~0<e1~e2; sphere: isotropic). Results are in mesh space.
+static bool ultra_fit_cylinder(const indexed_triangle_set& its, const Vec3d& p0, const Vec3d& ev,
+                               const Matrix3d& evec, Vec3d& axis, Vec3d& pt, double& radius)
+{
+    if (ev[1] < 8.0 * std::max(ev[0], 1e-9)) return false; // need one clearly-small eigenvalue (the axis)
+    axis = evec.col(0).normalized();
+    const Vec3d u = axis.unitOrthogonal();
+    const Vec3d v = axis.cross(u).normalized();
+    const auto& V = its.vertices;
+    const int N = (int) V.size();
+    const int stride = std::max(1, N / 2000);
+    Matrix3d M = Matrix3d::Zero(); Vec3d rhs = Vec3d::Zero(); int cnt = 0;
+    for (int i = 0; i < N; i += stride) {
+        Vec3d d = V[i].cast<double>() - p0; double x = d.dot(u), y = d.dot(v), z = x*x + y*y;
+        M(0,0)+=x*x; M(0,1)+=x*y; M(0,2)+=x; M(1,1)+=y*y; M(1,2)+=y; M(2,2)+=1;
+        rhs[0]+=x*z; rhs[1]+=y*z; rhs[2]+=z; ++cnt;
+    }
+    if (cnt < 8) return false;
+    M(1,0)=M(0,1); M(2,0)=M(0,2); M(2,1)=M(1,2);
+    Vec3d sol = M.ldlt().solve(rhs);            // circle x^2+y^2 = A x + B y + C
+    double cu = sol[0]/2.0, cv = sol[1]/2.0;
+    radius = std::sqrt(std::max(0.0, sol[2] + cu*cu + cv*cv));
+    if (radius < 0.2) return false;
+    double maxdev = 0.0; std::vector<double> ang; ang.reserve(2048);
+    for (int i = 0; i < N; i += stride) {
+        Vec3d d = V[i].cast<double>() - p0; double x = d.dot(u)-cu, y = d.dot(v)-cv;
+        double r = std::sqrt(x*x + y*y); maxdev = std::max(maxdev, std::abs(r - radius));
+        ang.push_back(std::atan2(y, x));
+    }
+    if (maxdev > 0.05 * radius + 0.05) return false;
+    std::sort(ang.begin(), ang.end());
+    double maxgap = ang.front() + 2*M_PI - ang.back();
+    for (size_t i = 1; i < ang.size(); ++i) maxgap = std::max(maxgap, ang[i] - ang[i-1]);
+    if (2*M_PI - maxgap < 120.0 * M_PI / 180.0) return false; // reject shallow bowed sheets
+    pt = p0 + cu*u + cv*v;
+    return true;
+}
+
+static bool ultra_fit_sphere(const indexed_triangle_set& its, const Vec3d& ev, Vec3d& center, double& radius)
+{
+    if (ev[0] < 0.3 * ev[2]) return false; // need isotropic normal distribution
+    const auto& V = its.vertices;
+    const int N = (int) V.size();
+    const int stride = std::max(1, N / 2000);
+    Eigen::Matrix4d M = Eigen::Matrix4d::Zero(); Eigen::Vector4d rhs = Eigen::Vector4d::Zero(); int cnt = 0;
+    for (int i = 0; i < N; i += stride) {
+        Vec3d q = V[i].cast<double>();
+        Eigen::Vector4d row(2*q.x(), 2*q.y(), 2*q.z(), 1.0);
+        M += row * row.transpose(); rhs += row * q.squaredNorm(); ++cnt;
+    }
+    if (cnt < 8) return false;
+    Eigen::Vector4d sol = M.ldlt().solve(rhs);
+    center = sol.head<3>();
+    radius = std::sqrt(std::max(0.0, sol[3] + center.squaredNorm()));
+    if (radius < 0.2) return false;
+    double maxdev = 0.0;
+    for (int i = 0; i < N; i += stride) maxdev = std::max(maxdev, std::abs((V[i].cast<double>() - center).norm() - radius));
+    return maxdev <= 0.05 * radius + 0.05;
+}
+
+// Extract planes (soft region-grow), circles (Measure), and fitted cylinder/sphere, in world space.
+static std::vector<UltraFitFeat> ultra_extract_features(const indexed_triangle_set& its, const Transform3d& world)
+{
+    std::vector<UltraFitFeat> out;
+    if (its.indices.empty() || its.vertices.empty()) return out;
+    const Matrix3d lin   = world.linear();
+    const double   scale = (lin * Vec3d::UnitX()).norm(); // ~uniform-scale factor for radius
+
+    // Planes: tolerance region-grow (handles gently-curved near-flat faces Measure would shatter).
+    ultra_soft_planes(its, world, 1.0, out);
+
+    // Circles (bore/boss rims) still come from Measure -- these are correct and needed as the bridge
+    // to fitted cylinders. Keep only its Circle features (planes are replaced by the soft grow above).
+    Measure::Measuring measuring(its);
+    const int nplanes = measuring.get_num_of_planes();
+    if (nplanes > 0 && nplanes <= 4000) {
+        for (int i = 0; i < nplanes; ++i)
+            for (const Measure::SurfaceFeature& f : measuring.get_plane_features((unsigned) i))
+                if (f.get_type() == Measure::SurfaceFeatureType::Circle) {
+                    const auto [c, r, ax] = f.get_circle();
+                    out.push_back({1, (lin * ax).normalized(), world * c, r * scale, 0.0});
+                }
+    }
+
+    // Cylinder / sphere: one global fit gated by the normal-covariance spectrum. Covers pins/shafts
+    // and balls (mixed objects with a sub-region curved feature are not yet segmented -- deferred).
+    Matrix3d C = Matrix3d::Zero(); Vec3d csum = Vec3d::Zero(); double A = 0.0;
+    const int F = (int) its.indices.size();
+    for (int t = 0; t < F; ++t) {
+        Vec3d n = ultra_face_normal(its, t); double a = ultra_tri_area(its, t);
+        C += a * (n * n.transpose()); csum += a * ultra_tri_centroid(its, t); A += a;
+    }
+    if (A > 0) {
+        C /= A; Vec3d p0 = csum / A;
+        Eigen::SelfAdjointEigenSolver<Matrix3d> es(C);
+        const Vec3d ev = es.eigenvalues();      // ascending
+        const Matrix3d evec = es.eigenvectors();
+        Vec3d axis, pt, center; double radius;
+        if (ultra_fit_cylinder(its, p0, ev, evec, axis, pt, radius))
+            out.push_back({2, (lin * axis).normalized(), world * pt, radius * scale, 0.0});
+        else if (ultra_fit_sphere(its, ev, center, radius))
+            out.push_back({3, Vec3d::UnitZ(), world * center, radius * scale, 0.0});
+    }
+    return out;
+}
+
+// Score a target/attachment feature pair; higher is a better mate. <=0 == not mateable.
+static double ultra_pair_score(const UltraFitFeat& t, const UltraFitFeat& a)
+{
+    // Radius match by matching center/axis (peg-in-hole). Circle (rim) and cylinder (shaft/bore
+    // wall) are interchangeable here, so a fitted pin mates to an already-detected bore rim.
+    auto is_round = [](int k){ return k == 1 || k == 2; };
+    if ((is_round(t.kind) && is_round(a.kind)) || (t.kind == 3 && a.kind == 3)) {
+        const double rmin = std::min(t.radius, a.radius);
+        const double dr   = std::abs(t.radius - a.radius);
+        const double tol  = std::max(0.6, 0.15 * rmin);
+        if (rmin < 0.2 || dr > tol) return 0.0;
+        return 1.0e6 + rmin * 10.0 - dr * 100.0; // prefer larger, tighter matches
+    }
+    if (t.kind == 0 && a.kind == 0) { // flat face <- flat face
+        const double amin = std::min(t.area, a.area), amax = std::max(t.area, a.area);
+        if (amin < 1.0 || amax <= 0.0) return 0.0;
+        // Prefer SIMILAR-sized faces (a lid on a box, a cube in its slot) over merely-large
+        // contact: a same-size pair is almost always the intended specific fit, whereas the
+        // biggest face on a blob is not. Size-match dominates raw area. (Still below the round
+        // tier, so a real peg/hole/shaft always wins.)
+        const double ratio = amin / amax; // 1 = same size
+        return amin * ratio * ratio;
+    }
+    return 0.0; // mixed kinds (e.g. hole vs flat face, sphere vs cylinder) don't mate
+}
+
+// Rigid world delta M mapping attachment feature (d2,p2) onto target feature (d1,p1)
+// anti-parallel and coincident: M = T(p1) * R * T(-p2), R rotates d2 -> -d1.
+static Transform3d ultra_mate_delta(const Vec3d& d1, const Vec3d& p1, const Vec3d& d2, const Vec3d& p2)
+{
+    Vec3d axis; double phi; Matrix3d R;
+    Geometry::rotation_from_two_vectors(d2, -d1, axis, phi, &R);
+    Transform3d rot = Transform3d::Identity();
+    rot.linear() = R;
+    return Eigen::Translation3d(p1) * rot * Eigen::Translation3d(-p2);
+}
+
+// Feature-aware mate: spheres have no meaningful axis, so concentric = pure translation; everything
+// else uses the anti-parallel axis/normal align above.
+static Transform3d ultra_mate_delta_feat(const UltraFitFeat& t, const UltraFitFeat& a)
+{
+    if (t.kind == 3 || a.kind == 3) {
+        Transform3d M = Transform3d::Identity();
+        M.translation() = t.pt - a.pt;
+        return M;
+    }
+    return ultra_mate_delta(t.dir, t.pt, a.dir, a.pt);
+}
+} // anonymous namespace
+
+void Plater::ultra_auto_assemble()
+{
+    Model& model = p->model;
+    auto notify = [&](NotificationManager::NotificationLevel lvl, const std::string& t) {
+        get_notification_manager()->push_notification(NotificationType::CustomNotification, lvl, t);
+    };
+
+    // Collect the DISTINCT selected objects (mate + merge both act per object, on its first
+    // instance -- ObjectList::merge bakes from instances[0]). Need >= 2 to have a target + attachment.
+    std::vector<int> objs;
+    for (const auto& oi : p->get_selection().get_content())
+        if (oi.first >= 0 && oi.first < (int) model.objects.size() &&
+            !model.objects[oi.first]->instances.empty())
+            objs.push_back(oi.first);
+    std::sort(objs.begin(), objs.end());
+    objs.erase(std::unique(objs.begin(), objs.end()), objs.end());
+    if (objs.size() < 2) {
+        notify(NotificationManager::NotificationLevel::WarningNotificationLevel,
+               _u8L("Auto-Fit: select the target object plus one or more attachments first."));
+        return;
+    }
+
+    // Target = the physically largest selected object (typically the base/body). It stays fixed.
+    int tgt_obj = -1; double tgt_vol = -1.0;
+    for (int o : objs) {
+        Vec3d s = model.objects[o]->instance_bounding_box(0).size();
+        double v = s.x() * s.y() * s.z();
+        if (v > tgt_vol) { tgt_vol = v; tgt_obj = o; }
+    }
+    ModelObject* tobj = model.objects[tgt_obj];
+    const std::string tname = tobj->name;
+    Transform3d  tW = tobj->instances[0]->get_transformation().get_matrix();
+    std::vector<UltraFitFeat> tfeat = ultra_extract_features(tobj->raw_indexed_triangle_set(), tW);
+    if (tfeat.empty()) {
+        notify(NotificationManager::NotificationLevel::WarningNotificationLevel,
+               _u8L("Auto-Fit: no matable faces, holes, or curved surfaces found on the target object."));
+        return;
+    }
+
+    // Snapshot #1: the mate (separate from merge's own "Assemble" snapshot, so the user can
+    // undo just the merge -- keeping the mated-but-separate objects -- or undo again to revert all).
+    take_snapshot("Auto-Fit Assembly");
+    int fitted = 0, skipped = 0;
+    for (int o : objs) {
+        if (o == tgt_obj) continue;
+        ModelObject*   aobj  = model.objects[o];
+        ModelInstance* ainst = aobj->instances[0];
+        Transform3d    aW    = ainst->get_transformation().get_matrix();
+        std::vector<UltraFitFeat> afeat = ultra_extract_features(aobj->raw_indexed_triangle_set(), aW);
+
+        double best = 0.0; const UltraFitFeat* bt = nullptr; const UltraFitFeat* ba = nullptr;
+        for (const auto& tf : tfeat)
+            for (const auto& af : afeat) {
+                double s = ultra_pair_score(tf, af);
+                if (s > best) { best = s; bt = &tf; ba = &af; }
+            }
+        if (!bt || !ba) { ++skipped; continue; }
+        Transform3d M = ultra_mate_delta_feat(*bt, *ba);
+        ainst->set_transformation(Geometry::Transformation(M * aW));  // mate onto the fixed target
+        ++fitted;
+    }
+
+    // Merge the mated objects into one rigid multi-part object so the assembly drops/moves/prints
+    // as a unit (the mate survives later edits). Reuses the proven Assemble path, which bakes each
+    // object's instance[0] world pose into volumes, then grounds + centres the merged object.
+    // Selection (canvas <-> object tree are synced) still holds the picked objects.
+    if (fitted > 0)
+        wxGetApp().obj_list()->merge(true);
+    else
+        p->update();
+
+    std::string msg = (boost::format(_u8L("Auto-Fit: %1% attachment(s) merged into \"%2%\"")) % fitted % tname).str();
+    if (skipped) msg += (boost::format(_u8L(", %1% skipped (no matching feature)")) % skipped).str();
+    notify(NotificationManager::NotificationLevel::RegularNotificationLevel, msg);
 }
 
 // Restart background processing thread based on a bitmask of UpdateBackgroundProcessReturnState.

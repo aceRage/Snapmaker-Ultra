@@ -103,6 +103,24 @@ void GLGizmoAssembly::on_render_input_window(float x, float y, float bottom_limi
     show_face_face_assembly_common();
     ImGui::Separator();
     show_face_face_assembly_senior();
+    // Ultra guided Auto-Fit: always shown in Face/Face mode so it is discoverable; enabled once two
+    // features are picked. Mates the two picks on the PRINT transform, then merges into one part.
+    if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY && m_assembly_mode == AssemblyMode::FACE_FACE) {
+        ImGui::Separator();
+        const bool ready = m_hit_different_volumes.size() == 2 &&
+                           m_selected_features.first.feature.has_value() &&
+                           m_selected_features.second.feature.has_value();
+        m_imgui->disabled_begin(!ready);
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4( 33 / 255.0f, 150 / 255.0f, 243 / 255.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4( 66 / 255.0f, 165 / 255.0f, 245 / 255.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4( 30 / 255.0f, 136 / 255.0f, 229 / 255.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(254 / 255.0f, 254 / 255.0f, 254 / 255.0f, 1.0f));
+        if (m_imgui->button(_L("Fit for Print & Merge"))) {
+            ultra_fit_for_print_and_merge();
+        }
+        ImGui::PopStyleColor(4);
+        m_imgui->disabled_end();
+    }
     show_distance_xyz_ui();
     render_input_window_warning(m_same_model_object);
     ImGui::Separator();

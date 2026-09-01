@@ -2,6 +2,10 @@
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/Plater.hpp"
+#include "slic3r/GUI/GUI_ObjectList.hpp"
+#include "slic3r/GUI/NotificationManager.hpp"
+#include <boost/log/trivial.hpp>
+#include <boost/format.hpp>
 #include "slic3r/GUI/Gizmos/GizmoObjectManipulation.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 
@@ -680,7 +684,10 @@ void GLGizmoMeasure::on_render()
             }
             if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY) {
                 if (m_assembly_mode == AssemblyMode::FACE_FACE) {
-                    if (curr_feature->get_type() != Measure::SurfaceFeatureType::Plane) {
+                    // Ultra (Stage 2): allow Circle rims (peg/hole/shaft) as mate features, not just flat faces.
+                    if (curr_feature.has_value() &&
+                        curr_feature->get_type() != Measure::SurfaceFeatureType::Plane &&
+                        curr_feature->get_type() != Measure::SurfaceFeatureType::Circle) {
                         curr_feature.reset();
                     }
                 } else if (m_assembly_mode == AssemblyMode::POINT_POINT) {
@@ -1834,7 +1841,9 @@ void GLGizmoMeasure::show_selection_ui()
         const float feature_first_text_length = ImGui::CalcTextSize((_u8L(feature_first_text)).c_str()).x;
         ImGui::AlignTextToFramePadding();
         if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY) {
-            m_only_select_plane = m_assembly_mode == AssemblyMode::FACE_FACE ? true : false;
+            // Ultra (Stage 2): detect circles too in Face/Face mode (not planes-only) so curved rims are
+            // pickable for mating; the hover filter above keeps only Plane/Circle features.
+            m_only_select_plane = false;
             if (m_assembly_mode == AssemblyMode::FACE_FACE) {
                 m_imgui->text(_u8L("Select 2 faces on objects and \n make objects assemble together.")); // tip
             } else if (m_assembly_mode == AssemblyMode::POINT_POINT) {
@@ -2049,9 +2058,14 @@ void GLGizmoMeasure::show_distance_xyz_ui()
 //}
 
 void GLGizmoMeasure::show_face_face_assembly_common() {
+    // Ultra: accept Plane OR Circle picks (Stage 2 lets peg/hole rims mate, not just flat faces).
+    auto feat_ok = [](const SelectedFeatures::Item& it) {
+        return it.feature.has_value() &&
+               (it.feature->get_type() == Measure::SurfaceFeatureType::Plane ||
+                it.feature->get_type() == Measure::SurfaceFeatureType::Circle);
+    };
     if (m_measure_mode == EMeasureMode::ONLY_ASSEMBLY && m_hit_different_volumes.size() == 2 &&
-        m_selected_features.first.feature->get_type() == Measure::SurfaceFeatureType::Plane &&
-        m_selected_features.second.feature->get_type() == Measure::SurfaceFeatureType::Plane) {
+        feat_ok(m_selected_features.first) && feat_ok(m_selected_features.second)) {
         auto &action                         = m_assembly_action;
         auto  set_to_parallel_size           = m_imgui->calc_button_size(_L("Parallel")).x;
         auto  set_to_center_coincidence_size = m_imgui->calc_button_size(_L("Center coincidence")).x;
@@ -2491,6 +2505,18 @@ void GLGizmoMeasure::set_distance(bool same_model_object, const Vec3d &displacem
     }
 }
 
+// Ultra (Stage 2: curved mates): return a mating DIRECTION + POINT for a feature. A Plane gives (normal,
+// centroid); a Circle gives (axis, center). This lets the plane-based mate ops (parallel / center-coincidence)
+// also mate cylindrical/circular features (pegs, pins, shafts, bosses) that have no single flat face.
+static bool ultra_feature_dir_point(const Measure::SurfaceFeature& f, Vec3d& dir, Vec3d& pt)
+{
+    switch (f.get_type()) {
+    case Measure::SurfaceFeatureType::Plane:  { const auto [i, n, p]  = f.get_plane();  dir = n;  pt = p; return true; }
+    case Measure::SurfaceFeatureType::Circle: { const auto [c, r, ax] = f.get_circle(); dir = ax; pt = c; return true; }
+    default: return false;
+    }
+}
+
 void GLGizmoMeasure::set_to_parallel(bool same_model_object, bool take_shot, bool is_anti_parallel)
 {
     if (m_hit_different_volumes.size() == 2) {
@@ -2502,8 +2528,10 @@ void GLGizmoMeasure::set_to_parallel(bool same_model_object, bool take_shot, boo
             wxGetApp().plater()->take_snapshot("RotateInMeasure", UndoRedo::SnapshotType::GizmoAction); // avoid storing another snapshot
         }
         selection->set_mode(same_model_object ? Selection::Volume : Selection::Instance);
-        const auto [idx1, normal1, pt1] = m_selected_features.first.feature->get_plane();
-        const auto [idx2, normal2, pt2] = m_selected_features.second.feature->get_plane();
+        Vec3d normal1, pt1, normal2, pt2;
+        if (!ultra_feature_dir_point(*m_selected_features.first.feature, normal1, pt1) ||
+            !ultra_feature_dir_point(*m_selected_features.second.feature, normal2, pt2))
+            return;
         if ((is_anti_parallel && normal1.dot(normal2) > -1 + 1e-3) ||
             (is_anti_parallel == false && (normal1.dot(normal2) < 1 - 1e-3))) {
             m_pending_scale ++;
@@ -2630,10 +2658,243 @@ void GLGizmoMeasure::set_to_center_coincidence(bool same_model_object) {
     wxGetApp().plater()->take_snapshot("RotateThenMoveInMeasure", UndoRedo::SnapshotType::GizmoAction);
     set_to_parallel(same_model_object, false,true);
 
-    const auto [idx1, normal1, pt1] = m_selected_features.first.feature->get_plane();
-    const auto [idx2, normal2, pt2] = m_selected_features.second.feature->get_plane();
+    Vec3d normal1, pt1, normal2, pt2;
+    if (!ultra_feature_dir_point(*m_selected_features.first.feature, normal1, pt1) ||
+        !ultra_feature_dir_point(*m_selected_features.second.feature, normal2, pt2))
+        return;
     set_distance(same_model_object, pt1 - pt2, false);
     m_set_center_coincidence = true;
+}
+
+// In-plane reference direction (world, in the feature's world_tran frame) from a picked Plane's
+// LONGEST BOUNDARY EDGE. Aligning these across the two faces pins the free roll DOF that a normal-only
+// mate leaves open (e.g. a square peg landing diagonal in a square slot). Returns false for non-planes.
+bool GLGizmoMeasure::ultra_plane_axis_world(GLVolume* v, const Measure::SurfaceFeature& f, Vec3d& axis_world, double& aspect,
+                                            std::vector<Vec3d>* boundary_world)
+{
+    if (!v || f.get_type() != Measure::SurfaceFeatureType::Plane || !f.plane_indices) return false;
+    auto it = m_mesh_measure_map.find(v);
+    if (it == m_mesh_measure_map.end() || !it->second) return false;
+    const indexed_triangle_set& its = it->second->get_its();
+    const Transform3d& W  = f.world_tran;
+    // Feature coords are already WORLD (baked via world_tran), so the normal is used as-is; only the
+    // raw mesh vertices below need W applied.
+    const auto [pi, n, p] = f.get_plane();
+    const Vec3d nw = n.normalized();
+    const Vec3d bu = nw.unitOrthogonal();
+    const Vec3d bw = nw.cross(bu).normalized();
+    // Boundary edges = edges used by exactly one of the plane's triangles.
+    std::map<std::pair<int,int>, int> ecount;
+    auto ekey = [](int a, int b){ return a < b ? std::make_pair(a,b) : std::make_pair(b,a); };
+    for (int t : *f.plane_indices) {
+        if (t < 0 || t >= (int) its.indices.size()) continue;
+        const auto& tri = its.indices[t];
+        ecount[ekey(tri[0], tri[1])]++; ecount[ekey(tri[1], tri[2])]++; ecount[ekey(tri[2], tri[0])]++;
+    }
+    // Project boundary vertices into the plane. A single "longest edge" is unreliable on filleted /
+    // tessellated boundaries, so instead fit the MIN-AREA oriented bounding rectangle (its optimum is
+    // always aligned with some boundary edge, so boundary edge angles are the candidate set).
+    std::vector<Eigen::Vector2d> pts; std::vector<double> cand; std::map<int, Eigen::Vector2d> proj;
+    std::vector<Vec3d> wpts; // boundary vertices in world, for the caller's containment test
+    auto P2 = [&](int vi) -> Eigen::Vector2d {
+        auto pit = proj.find(vi);
+        if (pit != proj.end()) return pit->second;
+        const Vec3d Pw = W * its.vertices[vi].cast<double>();
+        Eigen::Vector2d q(Pw.dot(bu), Pw.dot(bw));
+        proj.emplace(vi, q); pts.push_back(q); wpts.push_back(Pw); return q;
+    };
+    for (const auto& kv : ecount) {
+        if (kv.second != 1) continue;
+        const Eigen::Vector2d e = P2(kv.first.second) - P2(kv.first.first);
+        if (e.norm() > 1e-6) cand.push_back(std::atan2(e.y(), e.x()));
+    }
+    if (pts.size() < 3 || cand.empty()) return false;
+    const double inf = std::numeric_limits<double>::infinity();
+    double best_area = inf, best_ang = 0.0, best_asp = 1.0; bool long_is_x = true;
+    for (double ang : cand) {
+        const double c = std::cos(ang), s = std::sin(ang);
+        double minx = inf, maxx = -inf, miny = inf, maxy = -inf;
+        for (const auto& q : pts) {
+            const double x = q.x() * c + q.y() * s, y = -q.x() * s + q.y() * c;
+            minx = std::min(minx, x); maxx = std::max(maxx, x); miny = std::min(miny, y); maxy = std::max(maxy, y);
+        }
+        const double dx = maxx - minx, dy = maxy - miny, area = dx * dy;
+        if (area < best_area) {
+            best_area = area; best_ang = ang; long_is_x = dx >= dy;
+            best_asp = std::max(dx, dy) / std::max(std::min(dx, dy), 1e-9);
+        }
+    }
+    const double a = long_is_x ? best_ang : best_ang + M_PI / 2; // direction of the rectangle's LONG side
+    axis_world = (bu * std::cos(a) + bw * std::sin(a)).normalized();
+    aspect = best_asp;
+    if (boundary_world) *boundary_world = wpts;
+    return true;
+}
+
+// Ultra guided Auto-Fit: take the two picked features (target = volume[0], attachment = volume[1]),
+// mate them on the PRINT transform (converting each feature from its bake-time view world into its
+// object's print world, so it is correct even when picking happened in the exploded assembly view),
+// then merge the two objects into one multi-part object that reassembles for printing.
+void GLGizmoMeasure::ultra_fit_for_print_and_merge()
+{
+    auto notify = [](const std::string& t) {
+        wxGetApp().plater()->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel, t);
+    };
+    if (m_hit_different_volumes.size() != 2) return;
+    if (!m_selected_features.first.feature.has_value() || !m_selected_features.second.feature.has_value()) return;
+    GLVolume* vt = m_hit_different_volumes[0]; // target -- stays fixed
+    GLVolume* va = m_hit_different_volumes[1]; // attachment -- moves onto target
+    if (!vt || !va) return;
+    if (vt->object_idx() == va->object_idx()) {
+        // Two PARTS of one object: no merge needed (already one printable object). Mate the attachment
+        // part's volume via the proven same-object path, which moves the ModelVolume transform used by
+        // slicing, so it assembles for printing too.
+        if (vt->volume_idx() == va->volume_idx()) {
+            notify(_u8L("Fit for Print: pick two different parts."));
+            return;
+        }
+        set_to_center_coincidence(true);
+        reset_all_feature();
+        notify(_u8L("Fit for Print: parts mated for assembly."));
+        return;
+    }
+
+    Vec3d d1, p1, d2, p2;
+    if (!ultra_feature_dir_point(*m_selected_features.first.feature,  d1, p1)) return;
+    if (!ultra_feature_dir_point(*m_selected_features.second.feature, d2, p2)) return;
+    // Face boundary outlines (world) for roll-by-containment; absent for circular features (symmetric).
+    Vec3d a1 = Vec3d::Zero(), a2 = Vec3d::Zero(); double asp1 = 1.0, asp2 = 1.0;
+    std::vector<Vec3d> b1, b2;
+    const bool have_b1 = ultra_plane_axis_world(vt, *m_selected_features.first.feature,  a1, asp1, &b1);
+    const bool have_b2 = ultra_plane_axis_world(va, *m_selected_features.second.feature, a2, asp2, &b2);
+
+    Model& model = wxGetApp().plater()->model();
+    // world(bake frame) -> PRINT world for a picked volume, via instance[0] (which ObjectList::merge
+    // bakes). world_tran is the exact transform the feature coords were baked with, so the volume +
+    // picked-instance view transform cancel.
+    auto w2p_of = [&model](GLVolume* v, const Measure::SurfaceFeature& f, Transform3d& out) -> bool {
+        int oi = v->object_idx(), vi = v->volume_idx();
+        if (oi < 0 || oi >= (int) model.objects.size()) return false;
+        ModelObject* mo = model.objects[oi];
+        if (mo->instances.empty() || vi < 0 || vi >= (int) mo->volumes.size()) return false;
+        const Transform3d printW = mo->instances[0]->get_transformation().get_matrix()
+                                 * mo->volumes[vi]->get_transformation().get_matrix();
+        out = printW * f.world_tran.inverse();
+        return true;
+    };
+    Transform3d W1, W2;
+    if (!w2p_of(vt, *m_selected_features.first.feature,  W1)) return;
+    if (!w2p_of(va, *m_selected_features.second.feature, W2)) return;
+    p1 = W1 * p1; d1 = (W1.linear() * d1).normalized(); for (auto& P : b1) P = W1 * P;
+    p2 = W2 * p2; d2 = (W2.linear() * d2).normalized(); for (auto& P : b2) P = W2 * P;
+
+    // Normal alignment: rotate the attachment so its face normal is anti-parallel to the target's.
+    Vec3d axis; double phi; Matrix3d R;
+    Geometry::rotation_from_two_vectors(d2, -d1, axis, phi, &R);
+
+    // Roll alignment BY CONTAINMENT. A face-pair mate leaves spin about the shared normal free; edge /
+    // bounding-box heuristics proved fragile on filleted faces (landed 45 deg). So sweep the spin and
+    // keep the angle where the SMALLER face's outline protrudes LEAST outside the LARGER face's outline
+    // -- the pose with no side contact ("parts touch, never intersect"). Ties -> least rotation.
+    double roll_deg = 0.0, roll_res = -1.0, roll_clear = 0.0; // reported in the notification
+    if (have_b1 && have_b2 && b1.size() >= 3 && b2.size() >= 3) {
+        const Vec3d n  = d1.normalized();
+        const Vec3d bu = n.unitOrthogonal();
+        const Vec3d bw = n.cross(bu).normalized(); // (bu,bw,n) right-handed: 2D CCW == AngleAxis(+t, n)
+        auto to2 = [&](const Vec3d& P) { const Vec3d d = P - p1; return Eigen::Vector2d(d.dot(bu), d.dot(bw)); };
+        std::vector<Eigen::Vector2d> T2, A2;
+        for (const auto& P : b1) T2.push_back(to2(P));
+        for (const auto& P : b2) A2.push_back(to2(p1 + R * (P - p2))); // attachment outline after the mate
+        // 2D convex hull (Andrew monotone chain), CCW.
+        auto hull = [](std::vector<Eigen::Vector2d> q) {
+            std::sort(q.begin(), q.end(), [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+                return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y()); });
+            auto cr = [](const Eigen::Vector2d& o, const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+                return (a.x() - o.x()) * (b.y() - o.y()) - (a.y() - o.y()) * (b.x() - o.x()); };
+            std::vector<Eigen::Vector2d> h(2 * q.size()); size_t k = 0;
+            for (size_t i = 0; i < q.size(); ++i) { while (k >= 2 && cr(h[k-2], h[k-1], q[i]) <= 0) --k; h[k++] = q[i]; }
+            for (size_t i = q.size() - 1, lo = k + 1; i > 0; --i) { while (k >= lo && cr(h[k-2], h[k-1], q[i-1]) <= 0) --k; h[k++] = q[i-1]; }
+            h.resize(k > 1 ? k - 1 : k);
+            return h;
+        };
+        auto area = [](const std::vector<Eigen::Vector2d>& h) {
+            double s = 0.0;
+            for (size_t i = 0, m = h.size(); i < m; ++i) { const auto& a = h[i]; const auto& b = h[(i + 1) % m]; s += a.x() * b.y() - b.x() * a.y(); }
+            return std::abs(s) * 0.5;
+        };
+        // Signed distance of a point to a CCW convex hull: >0 outside (protrusion), <0 inside (clearance).
+        auto sdist = [](const Eigen::Vector2d& p, const std::vector<Eigen::Vector2d>& h) {
+            double worst = -std::numeric_limits<double>::infinity();
+            for (size_t i = 0, m = h.size(); i < m; ++i) {
+                const Eigen::Vector2d a = h[i], e = h[(i + 1) % m] - a; const double L = e.norm(); if (L < 1e-12) continue;
+                worst = std::max(worst, -(e.x() * (p.y() - a.y()) - e.y() * (p.x() - a.x())) / L); // >0 = right of edge = outside
+            }
+            return worst;
+        };
+        const auto hT = hull(T2), hA = hull(A2);
+        if (hT.size() >= 3 && hA.size() >= 3) {
+            const bool att_is_small = area(hA) <= area(hT);
+            auto rot2 = [](const Eigen::Vector2d& q, double t) { const double c = std::cos(t), s = std::sin(t); return Eigen::Vector2d(c * q.x() - s * q.y(), s * q.x() + c * q.y()); };
+            // For a spin t: protrusion = sum of squared outside distances of the smaller outline beyond the
+            // larger hull; clearance = the smallest inside margin (negative if anything pokes out).
+            auto eval = [&](double t, double& prot, double& clear) {
+                prot = 0.0; clear = std::numeric_limits<double>::infinity();
+                auto acc = [&](double sd) { if (sd > 0) prot += sd * sd; clear = std::min(clear, -sd); };
+                if (att_is_small) {
+                    for (const auto& q : A2) acc(sdist(rot2(q, t), hT));
+                } else {
+                    std::vector<Eigen::Vector2d> hAr; hAr.reserve(hA.size());
+                    for (const auto& q : hA) hAr.push_back(rot2(q, t));
+                    for (const auto& q : T2) acc(sdist(q, hAr));
+                }
+            };
+            // Primary: least protrusion. Secondary: a peg with slack fits at MANY angles, so MAXIMISE the
+            // minimum wall clearance -> the centred, side-aligned pose instead of an arbitrary in-band spin.
+            double best = std::numeric_limits<double>::infinity(), best_t = 0.0, best_clear = -std::numeric_limits<double>::infinity();
+            auto consider = [&](double t) {
+                double m, c; eval(t, m, c);
+                const bool better = m < best - 1e-3 ||
+                    (std::abs(m - best) <= 1e-3 && (c > best_clear + 1e-6 ||
+                        (std::abs(c - best_clear) <= 1e-6 && std::abs(t) < std::abs(best_t))));
+                if (better) { best = m; best_t = t; best_clear = c; }
+            };
+            for (int deg = -180; deg < 180; ++deg) consider(deg * M_PI / 180.0);
+            const double coarse_t = best_t;                                      // refine +/-1 deg at 0.05 deg
+            for (int k = -20; k <= 20; ++k) consider(coarse_t + k * (0.05 * M_PI / 180.0));
+            if (std::abs(best_t) > 1e-9)
+                R = Eigen::AngleAxisd(best_t, n).toRotationMatrix() * R;
+            roll_deg = best_t * 180.0 / M_PI; roll_res = best; roll_clear = best_clear;
+            BOOST_LOG_TRIVIAL(warning) << "[UltraFit] roll by containment: " << roll_deg << " deg, residual=" << best
+                                       << " clearance=" << best_clear << " att_small=" << att_is_small << " asp1=" << asp1 << " asp2=" << asp2;
+        }
+    }
+    Transform3d rot = Transform3d::Identity(); rot.linear() = R;
+    const Transform3d M = Eigen::Translation3d(p1) * rot * Eigen::Translation3d(-p2);
+
+    ModelObject* tmo = model.objects[vt->object_idx()];
+    ModelObject* amo = model.objects[va->object_idx()];
+
+    const Vec3d mv = M.translation();
+    BOOST_LOG_TRIVIAL(warning) << "[UltraFit] mate objs t=" << vt->object_idx() << " a=" << va->object_idx()
+        << " move=(" << mv.x() << "," << mv.y() << "," << mv.z() << ") d1=(" << d1.transpose()
+        << ") d2=(" << d2.transpose() << ")";
+
+    const size_t before = model.objects.size();
+    wxGetApp().plater()->take_snapshot("Fit for Print");
+    amo->instances[0]->set_transformation(Geometry::Transformation(M * amo->instances[0]->get_transformation().get_matrix()));
+
+    // Merge exactly these two objects (regardless of the current tree selection) into one rigid part.
+    ObjectList* ol = wxGetApp().obj_list();
+    ol->select_items(std::vector<ObjectVolumeID>{ ObjectVolumeID{ tmo, nullptr }, ObjectVolumeID{ amo, nullptr } });
+    ol->merge(true);
+    const size_t after = model.objects.size();
+    BOOST_LOG_TRIVIAL(warning) << "[UltraFit] merge objects " << before << " -> " << after;
+
+    // merge() deleted the two source objects -> our picked GLVolume* are now dangling. Clear them.
+    reset_all_feature();
+    notify((boost::format(_u8L("Fit for Print: moved %.1fmm, roll %.2f deg (protrusion %.3f, clearance %.2fmm); objects %d -> %d. Check the Prepare view."))
+            % mv.norm() % roll_deg % roll_res % roll_clear % (int) before % (int) after).str());
 }
 
 void GLGizmoMeasure::set_parallel_distance(bool same_model_object, float dist)

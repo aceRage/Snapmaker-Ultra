@@ -1312,38 +1312,53 @@ bool can_set_xyz_distance(const SurfaceFeature &a, const SurfaceFeature &b) {
     return false;
 }
 
+// Ultra (Stage 2: curved mates): a feature's mating DIRECTION + POINT. Plane -> (normal, centroid);
+// Circle -> (axis, center). Lets curved circular features (pegs/pins/shafts/bosses) drive assembly like flat
+// faces do, instead of being un-mateable because a curved surface has no single planar face to pick.
+static bool assembly_feature_dir_point(const SurfaceFeature& f, Vec3d& dir, Vec3d& pt)
+{
+    switch (f.get_type()) {
+    case SurfaceFeatureType::Plane:  { const auto [i, n, p]  = f.get_plane();  dir = n;  pt = p; return true; }
+    case SurfaceFeatureType::Circle: { const auto [c, r, ax] = f.get_circle(); dir = ax; pt = c; return true; }
+    default: return false;
+    }
+}
+
 AssemblyAction get_assembly_action(const SurfaceFeature& a, const SurfaceFeature& b)
 {
-    AssemblyAction        action;
-    const SurfaceFeature &f1   = a;
-    const SurfaceFeature &f2   = b;
-    if (f1.get_type() == SurfaceFeatureType::Plane) {
-        action.can_set_feature_1_reverse_rotation = true;
-        if (f2.get_type() == SurfaceFeatureType::Plane) {
-            const auto [idx1, normal1, pt1] = f1.get_plane();
-            const auto [idx2, normal2, pt2] = f2.get_plane();
-            action.can_set_to_center_coincidence = true;
-            action.can_set_feature_2_reverse_rotation = true;
-            if (are_parallel(normal1, normal2)) {
-                action.can_set_to_parallel = false;
-                action.has_parallel_distance = true;
-                action.can_around_center_of_faces = true;
-                Vec3d proj_pt2;
-                Measure::get_point_projection_to_plane(pt2, pt1, normal1, proj_pt2);
-                action.parallel_distance = (pt2 - proj_pt2).norm();
-                if ((pt2 - proj_pt2).dot(normal1) < 0) {
-                    action.parallel_distance = -action.parallel_distance;
-                }
-                action.angle_radian          = 0;
+    AssemblyAction action;
+    Vec3d normal1, pt1, normal2, pt2;
+    // Both features must expose a direction+point (Plane or Circle). Otherwise no assembly action.
+    if (!assembly_feature_dir_point(a, normal1, pt1) || !assembly_feature_dir_point(b, normal2, pt2))
+        return action;
 
-            } else {
-                action.can_set_to_parallel = true;
-                action.has_parallel_distance = false;
-                action.can_around_center_of_faces = false;
-                action.parallel_distance     = 0;
-                action.angle_radian = std::acos(std::clamp(normal2.dot(-normal1), -1.0, 1.0));
-            }
+    // Plane-specific extras (parallel-distance handle, rotate-around-center-of-faces) only make sense when
+    // BOTH picks are flat faces; circle mates use only coaxial-align + concentric center coincidence.
+    const bool both_planes = (a.get_type() == SurfaceFeatureType::Plane && b.get_type() == SurfaceFeatureType::Plane);
+
+    action.can_set_feature_1_reverse_rotation = true;
+    action.can_set_feature_2_reverse_rotation = true;
+    action.can_set_to_center_coincidence      = true;
+
+    if (are_parallel(normal1, normal2)) {
+        action.can_set_to_parallel        = false;
+        action.has_parallel_distance      = both_planes;
+        action.can_around_center_of_faces = both_planes;
+        action.angle_radian               = 0;
+        action.parallel_distance          = 0;
+        if (both_planes) {
+            Vec3d proj_pt2;
+            Measure::get_point_projection_to_plane(pt2, pt1, normal1, proj_pt2);
+            action.parallel_distance = (pt2 - proj_pt2).norm();
+            if ((pt2 - proj_pt2).dot(normal1) < 0)
+                action.parallel_distance = -action.parallel_distance;
         }
+    } else {
+        action.can_set_to_parallel        = true;
+        action.has_parallel_distance      = false;
+        action.can_around_center_of_faces = false;
+        action.parallel_distance          = 0;
+        action.angle_radian               = std::acos(std::clamp(normal2.dot(-normal1), -1.0, 1.0));
     }
     return action;
 }

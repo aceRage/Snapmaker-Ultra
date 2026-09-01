@@ -300,6 +300,13 @@ protected:
     void set_to_around_center_of_faces(bool same_model_object,float rotate_degree);
     void set_to_center_coincidence(bool same_model_object);
     void set_parallel_distance(bool same_model_object,float dist);
+    // Ultra (guided Auto-Fit): mate the two picked features on the PRINT transform (view-independent),
+    // then merge the two objects into one multi-part object. Reassembles for printing, deterministically.
+    void ultra_fit_for_print_and_merge();
+    // Ultra: in-plane reference axis (world, in the feature's world_tran frame) for a picked Plane,
+    // from its longest boundary edge. Lets the mate align faces' EDGES (roll), not just their normals.
+    bool ultra_plane_axis_world(GLVolume* v, const Measure::SurfaceFeature& f, Vec3d& axis_world, double& aspect,
+                                std::vector<Vec3d>* boundary_world = nullptr);
 
     bool is_pick_meet_assembly_mode(const SelectedFeatures::Item& item);
  protected:
