@@ -1175,9 +1175,11 @@ static void remove_multiple_edges_in_vertex(const VD::vertex_type &vertex) {
 // empty, the ladder never runs, and the core is exactly today's `offset_ex(layer, -band)`.
 //
 // DEGENERATE LIMIT, stated plainly: the ladder is bounded at six steps, so its last membership
-// radius is band/64 and any part thinner than that keeps the old no-op - 0.022mm at a 1.44mm
-// walls-mode band, 0.094mm at a 6mm one. Both are far below a single extrusion, i.e. geometry
-// that cannot carry two colours through its thickness under any clamp.
+// radius is band/64 - i.e. any part whose local HALF-thickness is under band/64 keeps the old
+// no-op (0.022mm of half-thickness, 0.045mm of material, at a 1.44mm walls-mode band; 0.094mm at
+// a 6mm one). Both are far below a single extrusion, i.e. geometry that cannot carry two colours
+// through its thickness under any clamp. Wave A's `min_claim_width` floor below normally stops
+// the ladder well before this bound is reached and is now the binding limit.
 //
 // AND WHAT THIS DOES NOT DO, also plainly: it bounds the claim, it does not stop a Voronoi cell
 // from WRAPPING onto an opposite face. The clamp keeps whatever lies within `band` of ANY
@@ -1185,7 +1187,47 @@ static void remove_multiple_edges_in_vertex(const VD::vertex_type &vertex) {
 // face's perimeter band still survives for any b > 0. Suppressing that needs a clamp measured
 // from the PAINTED boundary rather than from the layer contour - a different mechanism, out of
 // this fix's scope, and recorded as such in the fix-wave report.
-static ExPolygons paint_depth_clamp_keep_core(const ExPolygons &layer_slices, const float band)
+//
+// WAVE A / C-1 (.superpowers/sdd/2026-08-31-paint-depth/bleed-and-walls-fixwave-review.md):
+// THE LADDER IS FLOORED AT ONE PRINTABLE EXTRUSION. As shipped it had no lower bound, and its
+// FIRST and widest step is `b = band/4` - so the widest lateral claim the degradation could ever
+// produce was a quarter of the band. In the default walls mode that is unconditionally narrower
+// than one external extrusion: band/4 = (N*s + 2h(1-pi/4) + 0.25s)/4 only reaches 0.45mm at
+// N >= 3.9 walls, so at the shipped default (walls = 3, 0.45mm lines, 0.1mm layers,
+// band = 1.4357) EVERY activation of the ladder produced a claim of at most 0.359mm - 0.80 of a
+// bead at step 0, 0.40 at step 1, 0.20 at step 2.
+//
+// What that costs downstream: the claim is a separate PrintRegion whose perimeters are generated
+// on the strip alone (Layer.cpp:184, :257-260). At b = 0.25mm Arachne sees
+// T = 0.25 - 2h(1-pi/4) = 0.207mm, above min_feature_size (0.1) and below min_bead_width (0.34),
+// so WideningBeadingStrategy::getOptimalBeadCount returns one bead and compute() widens it to
+// 0.34mm - a 0.34mm bead extruded into a 0.207mm gap, ~64% local over-extrusion, on both faces of
+// every thin wall in the model on every painted layer. One step further down (b = 0.0897,
+// T = 0.047 < min_feature_size) the strip produces NO TOOLPATH AT ALL while the base region has
+// already been cut back by it - a 47um unfilled band. Before F2 those geometries hit the (ugly
+// but printable) no-op and got a single correctly-beaded painted region, so this was a new
+// regression, in the default mode, on exactly the thin-organic geometry F2 was written for.
+//
+// `min_claim_width` is the max external perimeter width across the object's regions (plumbed from
+// the call site, where it is already computed next to the band). Below it the ladder STOPS and
+// the old no-op stands: a part that cannot carry a printable painted skin keeps its whole
+// cross-section, as it did before F2, rather than getting an unprintable one. This costs F2
+// nothing where it actually helps - in millimetres mode at 4-6mm, band/4 is 1.0-1.5mm, well above
+// one bead for steps 0-1 - and removes the entire sub-bead regime.
+//
+// WAVE A / I-2: THE LADDER'S THRESHOLDS COME FROM THE UN-NOTCHED BAND (`ladder_band`), while the
+// full-band core erosion still uses the notched one (`band`). cut_segmented_layers narrows the
+// band by the interlocking notch on even layers; feeding that notched value to the ladder moved
+// its membership thresholds (2b = band/2, band/4, ...) by the notch, so a part whose local
+// half-thickness sat between the two selected step 0 on one parity and step 1 on the other - the
+// painted skin HALVING AND DOUBLING on alternating layers (0.18mm at stock settings), a smaller
+// cousin of the 3/2/3/2 wall alternation F4 exists to remove. Choosing the step from the
+// un-notched band makes `b` parity-independent by construction. The notch is thereby not applied
+// to degraded (thin-geometry) claims at all, which is deliberate: on geometry too thin to carry
+// the full band, a mechanical interlocking tooth is not the priority and an alternating skin is
+// strictly worse than none.
+static ExPolygons paint_depth_clamp_keep_core(const ExPolygons &layer_slices, const float band,
+                                              const float ladder_band, const float min_claim_width)
 {
     ExPolygons core = offset_ex(layer_slices, -band);
     // `thin` = the parts of the layer a full-band inset leaves no core in, i.e. everything
@@ -1194,8 +1236,8 @@ static ExPolygons paint_depth_clamp_keep_core(const ExPolygons &layer_slices, co
     ExPolygons thin = core.empty() ? layer_slices : diff_ex(layer_slices, offset_ex(core, band));
 
     constexpr int max_ladder_steps = 6;
-    float b = 0.25f * band;
-    for (int step = 0; step < max_ladder_steps && ! thin.empty() && b > 0.f; ++step, b *= 0.5f) {
+    float b = 0.25f * ladder_band;
+    for (int step = 0; step < max_ladder_steps && ! thin.empty() && b >= min_claim_width && b > 0.f; ++step, b *= 0.5f) {
         // Which of the still-uncored parts are at least 2*b thick?
         const ExPolygons fits = intersection_ex(thin, opening_ex(layer_slices, 2.f * b));
         if (fits.empty())
@@ -1211,6 +1253,10 @@ static void cut_segmented_layers(const std::vector<ExPolygons>        &input_exp
                                  std::vector<std::vector<ExPolygons>> &segmented_regions,
                                  const float                           cut_width,
                                  const float                           interlocking_depth,
+                                 // Wave A / C-1: the narrowest painted claim the degradation ladder may
+                                 // emit, in scaled units - one external extrusion. See
+                                 // paint_depth_clamp_keep_core above.
+                                 const float                           min_claim_width,
                                  const std::function<void()>          &throw_on_cancel_callback)
 {
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - cutting segmented layers in parallel - begin";
@@ -1227,17 +1273,31 @@ static void cut_segmented_layers(const std::vector<ExPolygons>        &input_exp
     // separate zero-band special case is needed at the call site.
     const float interlocking_cut_width = interlocking_depth > 0.f ? std::max(cut_width - interlocking_depth, 0.f) : 0.f;
     tbb::parallel_for(tbb::blocked_range<size_t>(0, segmented_regions.size()),
-    [&segmented_regions, &input_expolygons, &cut_width, &interlocking_cut_width, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
+    [&segmented_regions, &input_expolygons, &cut_width, &interlocking_cut_width, &min_claim_width, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
         for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
             throw_on_cancel_callback();
             const float  region_cut_width       = ((layer_idx % 2 == 0) && (interlocking_cut_width > 0.f)) ? interlocking_cut_width : cut_width;
             const size_t num_extruders_plus_one = segmented_regions[layer_idx].size();
             if (region_cut_width > 0.f) {
+                // Wave A / I-1: nothing to cut back means nothing to build a keep-core for. F2
+                // hoisted keep_core out of the per-extruder loop below (correctly - it used to
+                // rebuild the identical eroded layer once per extruder), but it landed ABOVE the
+                // "claim is empty" guard, so a layer with no painted claim at all started paying a
+                // whole-layer offset_ex plus, wherever any part of that layer is thinner than
+                // 2*band, up to six ladder steps - each a whole-layer opening (two offsets) plus an
+                // intersection, a diff and a union - and then discarding all of it. On a tall object
+                // with paint on a small area that is every layer; in millimetres mode at 4-6mm,
+                // where 2*band is 8-12mm, essentially every layer of an organic model reports a
+                // non-empty `thin` and enters the ladder. The ladder's cost is proportional to the
+                // whole layer's polygon complexity, not to its thin parts.
+                if (std::all_of(segmented_regions[layer_idx].begin(), segmented_regions[layer_idx].end(),
+                                [](const ExPolygons &ex_polygons) { return ex_polygons.empty(); }))
+                    continue;
                 // Fix-wave F2: the core no longer collapses to nothing on geometry thinner than
-                // the band (see paint_depth_clamp_keep_core above). Also hoisted out of the
-                // per-extruder loop below, which used to rebuild the identical eroded layer once
-                // per extruder - so the added ladder work is partly paid for already.
-                const ExPolygons keep_core = paint_depth_clamp_keep_core(input_expolygons[layer_idx], region_cut_width);
+                // the band (see paint_depth_clamp_keep_core above). Wave A: the ladder's step is
+                // chosen against the UN-NOTCHED cut_width (I-2) and floored at one external
+                // extrusion (C-1); only the full-band erosion uses the notched region_cut_width.
+                const ExPolygons keep_core = paint_depth_clamp_keep_core(input_expolygons[layer_idx], region_cut_width, cut_width, min_claim_width);
                 std::vector<ExPolygons> segmented_regions_cuts(num_extruders_plus_one); // Indexed by extruder_id
                 for (size_t extruder_idx = 0; extruder_idx < num_extruders_plus_one; ++extruder_idx)
                     if (const ExPolygons &ex_polygons = segmented_regions[layer_idx][extruder_idx]; !ex_polygons.empty())
@@ -2378,6 +2438,7 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               const size_t                                                     num_facets_states,
                                                               const float                                                      segmentation_max_width,
                                                               const float                                                      segmentation_interlocking_depth,
+                                                              const float                                                      segmentation_min_claim_width,
                                                               const bool                                                       segmentation_interlocking_beam,
                                                               const IncludeTopAndBottomLayers                                  include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback)
@@ -2588,7 +2649,8 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
     throw_on_cancel_callback();
 
     if ((segmentation_max_width > 0.f || segmentation_interlocking_depth > 0.f) && !segmentation_interlocking_beam) {
-        cut_segmented_layers(input_expolygons, segmented_regions, float(scale_(segmentation_max_width)), float(scale_(segmentation_interlocking_depth)), throw_on_cancel_callback);
+        cut_segmented_layers(input_expolygons, segmented_regions, float(scale_(segmentation_max_width)), float(scale_(segmentation_interlocking_depth)),
+                             float(scale_(segmentation_min_claim_width)), throw_on_cancel_callback);
         throw_on_cancel_callback();
     }
 
@@ -2645,19 +2707,35 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // NARROWEST-walled region on the object, since that region's margin is the smallest in
     // absolute millimetres. So track the min spacing alongside the max band.
     float                min_perimeter_spacing = 0.f;
+    // Wave A / C-1: the widest external extrusion on the object, which is the narrowest painted
+    // claim the band clamp's degradation ladder is allowed to emit. MAX (not min) across regions
+    // is the conservative direction here: a strip that is printable in the object's narrowest
+    // region but not in its widest one must still be refused, because segmentation cannot tell
+    // which region the strip will land in.
+    float                max_ext_perimeter_width = 0.f;
+    // Wave A / item 8: the classic wall generator cannot render a painted band narrower than two
+    // properly-spaced lines - offset_ex() on a strip always returns both of its boundaries - so
+    // the narrowest honest classic band is ext_perimeter_width + ext_perimeter_spacing, i.e. one
+    // `wall_stack`, the same quantity F1 insets its top/bottom claim by. See
+    // paint_depth_band_classic_floor_mm for the three defects that floor closes.
+    const bool           wall_generator_classic = print_object.config().wall_generator.value == PerimeterGeneratorType::Classic;
     for (size_t region_idx = 0; region_idx < print_object.num_printing_regions(); ++region_idx) {
         const PrintRegion &region                 = print_object.printing_region(region_idx);
         const float         ext_perimeter_width   = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).width();
         const float         ext_perimeter_spacing = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).spacing();
         const float         perimeter_spacing     = region.flow(print_object, frPerimeter, print_object.config().layer_height).spacing();
-        max_width = std::max(max_width, paint_depth_band_mm(paint_depth_mode, paint_depth_walls, paint_depth_mm, ext_perimeter_width, ext_perimeter_spacing, perimeter_spacing));
+        float               region_band           = paint_depth_band_mm(paint_depth_mode, paint_depth_walls, paint_depth_mm, ext_perimeter_width, ext_perimeter_spacing, perimeter_spacing);
+        if (wall_generator_classic)
+            region_band = paint_depth_band_classic_floor_mm(region_band, ext_perimeter_width, ext_perimeter_spacing);
+        max_width = std::max(max_width, region_band);
+        max_ext_perimeter_width = std::max(max_ext_perimeter_width, ext_perimeter_width);
         if (perimeter_spacing > 0.f)
             min_perimeter_spacing = min_perimeter_spacing > 0.f ? std::min(min_perimeter_spacing, perimeter_spacing) : perimeter_spacing;
     }
     // Beam-interlocking mutual exclusion (:2169 below) is unchanged, but the interlocking
     // sub-band must only ever be active when depth is actually bounded (spec Stage 1, "Interlocking
     // ... only active when depth bounded, as upstream"): mmu_segmented_region_interlocking_depth's
-    // default is now 0.3 (Task 1), so without this mode gate, pdmUnlimited would still cut a
+    // default is 0.1 (lowered from 0.3 by fix-wave F4), so without this mode gate, pdmUnlimited would still cut a
     // 0.3mm interlocking band via the `segmentation_interlocking_depth > 0.f` half of the OR at
     // :2169 - breaking the "unlimited mode = legacy behavior, bit-identical" requirement. Gating
     // it on paint_depth_mode here (rather than editing the :2169 OR itself) keeps that gate's
@@ -2668,8 +2746,10 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // the exact count-window margin paint_depth_band_mm builds into the band - so the notch
     // can never move Arachne's strip thickness across a bead-count boundary and cost the
     // painted region a wall loop on even layers (the 3/2/3/2 alternation the user reported).
+    // Wave A / I-3: that cap is walls-mode-only, which is why the mode is passed in - see
+    // paint_depth_interlocking_depth_mm's header comment.
     const float  interlocking_depth = paint_depth_mode != pdmUnlimited
-                                        ? paint_depth_interlocking_depth_mm(print_object.config().mmu_segmented_region_interlocking_depth.value, min_perimeter_spacing)
+                                        ? paint_depth_interlocking_depth_mm(paint_depth_mode, print_object.config().mmu_segmented_region_interlocking_depth.value, min_perimeter_spacing)
                                         : 0.f;
     const bool   interlocking_beam  = print_object.config().interlocking_beam.value;
 
@@ -2701,7 +2781,7 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
         return {mv.mmu_segmentation_facets, mv.is_mm_painted(), false};
     };
 
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, max_ext_perimeter_width, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
 }
 
 // Returns fuzzy skin segmentation based on painting in fuzzy skin segmentation gizmo
@@ -2720,7 +2800,10 @@ std::vector<std::vector<ExPolygons>> fuzzy_skin_segmentation_by_painting(const P
         max_external_perimeter_width = std::max<float>(max_external_perimeter_width, region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).width());
     }
 
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
+    // Wave A / C-1: fuzzy skin's own clamp width IS one external perimeter width, so that is also
+    // its minimum printable claim - i.e. its ladder never runs, and geometry too thin to carry a
+    // full-width fuzzy band keeps the pre-degradation no-op, byte-identical to upstream.
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, max_external_perimeter_width, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
 }
 
 } // namespace Slic3r

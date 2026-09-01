@@ -42,6 +42,12 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               size_t                                                           num_facets_states,
                                                               float                                                            segmentation_max_width,
                                                               float                                                            segmentation_interlocking_depth,
+                                                              // Wave A / C-1: the narrowest painted claim the band clamp's
+                                                              // degradation ladder may emit (mm) - one external extrusion.
+                                                              // Below it the clamp reverts to its pre-degradation no-op rather
+                                                              // than cutting a sub-extrusion strip no toolpath can honour. See
+                                                              // paint_depth_clamp_keep_core in the .cpp.
+                                                              float                                                            segmentation_min_claim_width,
                                                               bool                                                             segmentation_interlocking_beam,
                                                               IncludeTopAndBottomLayers                                        include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback);

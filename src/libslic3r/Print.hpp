@@ -133,6 +133,25 @@ enum PrintObjectStep {
     posCount,
 };
 
+// Which of a PrintRegion's three configured filaments an extrusion that lives in a
+// LayerRegion's *fills* collection has to follow.
+//
+// The fills collection is not homogeneous: besides real infill it also carries the
+// perimeter generator's GAP FILL, which Fill::make_fill() copies over from
+// LayerRegion::thin_fills (Fill/Fill.cpp, "add thin fill regions"). Deciding the filament
+// from the collection's BUCKET ("this came out of layerm->fills, so it is infill") is
+// therefore wrong for gap fill; it has to be decided from the extrusion ROLE. This helper
+// is that decision, shared by GCode::process_layer's two extruder-id lambdas so the rule
+// exists once.
+enum class FillFilamentSource {
+    Wall,
+    SolidInfill,
+    SparseInfill,
+};
+
+// `role` is the role of the collection's leading entity, as GCode::process_layer reads it.
+FillFilamentSource fill_filament_source(const PrintRegionConfig &config, ExtrusionRole role);
+
 // A PrintRegion object represents a group of volumes to print
 // sharing the same config (including the same assigned extruder(s))
 class PrintRegion

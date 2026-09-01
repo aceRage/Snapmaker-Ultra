@@ -122,9 +122,19 @@ PrintObject *slice_painted_cube(const std::vector<int> &painted_facets, PaintDep
 // wall width, but the band formula (paint_depth_band_mm) is driven by the frPerimeter spacing
 // too, so pinning both makes the band arithmetic in these tests exact rather than dependent on
 // whatever inner_wall_line_width resolves to from the bare option registry.
+//
+// WAVE A: two extra parameters, both DEFAULTED so every pre-existing caller is byte-identical.
+//   - interlocking_depth < 0 means "leave mmu_segmented_region_interlocking_depth at its config
+//     default" (the I-3 / I-2 tests below need to raise it by hand, which is exactly the user
+//     situation I-3 is about: the cap only ever bites on a hand-raised notch).
+//   - wall_generator defaults to Arachne, which is also what full_print_config() resolves to
+//     (PrintConfig.cpp), so passing it explicitly changes nothing for existing callers; the
+//     classic-generator tests below pass Classic.
 PrintObject *slice_painted_box(double x, double y, double z, const std::vector<int> &painted_facets,
                                 PaintDepthMode mode, int walls, double paint_depth_mm,
-                                double layer_height, Print &print)
+                                double layer_height, Print &print,
+                                double interlocking_depth = -1.,
+                                PerimeterGeneratorType wall_generator = PerimeterGeneratorType::Arachne)
 {
     Model model;
     ModelObject *object = model.add_object();
@@ -144,6 +154,9 @@ PrintObject *slice_painted_box(double x, double y, double z, const std::vector<i
     config.option<ConfigOptionFloat>("initial_layer_print_height")->value  = layer_height;
     config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
     config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
+    if (interlocking_depth >= 0.)
+        config.option<ConfigOptionFloat>("mmu_segmented_region_interlocking_depth")->value = interlocking_depth;
+    config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = wall_generator;
 
     print.set_status_silent();
     print.apply(model, config);
@@ -377,7 +390,7 @@ TEST_CASE("multi_material_segmentation_by_painting: walls-mode band width is pin
 
     // Fix-wave F4: the notch the segmentation actually applies is the CLAMPED one, not the
     // raw config value, so read it the same way production does.
-    const double interlock_mm = paint_depth_interlocking_depth_mm(object->config().mmu_segmented_region_interlocking_depth.value,
+    const double interlock_mm = paint_depth_interlocking_depth_mm(pdmWalls, object->config().mmu_segmented_region_interlocking_depth.value,
                                                                   min_perimeter_spacing);
     // Test assumption (true of today's defaults - mmu_segmented_region_interlocking_depth
     // default 0.1, walls=3 band well over 1mm): fails loudly, not silently, if that ever
@@ -1513,6 +1526,19 @@ TEST_CASE("multi_material_segmentation_by_painting: a chamfered/tapered painted 
         // at every one of these depths, which is the exterior bleed.
         CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, layer_idx),
                                  layer_edge_probe(*out_object, layer_idx, 0.1)));
+        // I-5 (bleed-and-walls-fixwave-review.md): and the base ring is at least one WALL STACK
+        // wide, not merely non-zero. The 0.1/1.5 pair alone only pinned the ring to the open
+        // interval (0.1, 1.5)mm, so a 0.3mm sub-wall-stack sliver - the exact class the review
+        // that demanded the I1 absorb cited - passed unchanged. The whole "the absorb is
+        // redundant because the F1 inset guarantees >= one wall stack" argument rests on this
+        // number, and on TAPERED geometry it was argued rather than enforced (the tight
+        // magnitude probe existed only on a prism, where input_expolygons[last_idx] ==
+        // input_expolygons[layer_idx] and the taper is not exercised at all).
+        // Post-F1 the claim edge sits at exactly extrusion_width + extrusion_spacing =
+        // 0.87854mm from each descent layer's own contour here, so 0.8 is a valid negative
+        // probe with 0.078mm of clearance.
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, layer_idx),
+                                 layer_edge_probe(*out_object, layer_idx, 0.8)));
         // ...and the claim is nonetheless real and deep: 1.5mm in from the same contour is
         // still painted at every one of those depths (claim edge is 0.87854mm in), so this is
         // a boundary that moved, not a claim that vanished.
@@ -1676,7 +1702,28 @@ TEST_CASE("multi_material_segmentation_by_painting: an interior painted top feat
 // has_layer_only_one_color hands the whole cross-section to the painted colour and the lateral
 // clamp is the only thing that can take any of it back. paint_depth_mm = 2mm is more than three
 // times the 0.6mm local half-thickness, so pre-F2 the clamp does nothing whatsoever.
-TEST_CASE("multi_material_segmentation_by_painting: the lateral clamp still leaves a base core on geometry thinner than the band (F2)", "[paintdepth]")
+//
+// WAVE A / C-1 (.superpowers/sdd/2026-08-31-paint-depth/bleed-and-walls-fixwave-review.md):
+// this fixture's EXPECTED RESULT is now the no-op, and that is the fix, not a regression.
+// F2's ladder starts at `b = band/4` and halves; with no lower bound the widest claim it can
+// ever produce is band/4, and on this fixture it landed on step 1, b = 0.25mm. A 0.25mm-wide
+// painted strip is a separate PrintRegion whose perimeters are generated on the strip alone
+// (Layer.cpp:184, :257-260): Arachne sees T = 0.25 - 2h(1-pi/4) = 0.207mm, above
+// min_feature_size and below min_bead_width, so WideningBeadingStrategy widens it to a 0.34mm
+// bead in a 0.207mm gap - ~64% local over-extrusion on both faces of every thin wall, on every
+// painted layer (one ladder step further down it produces no toolpath at all while the base
+// region has already been cut back by it). The ladder is now floored at one external extrusion
+// (ext_perimeter_width, 0.45mm here): geometry that cannot carry a printable painted skin keeps
+// its whole cross-section, exactly as it did before F2, instead of getting an unprintable one.
+//
+// Hand-walk of this fixture at the floor: offset_ex(L, -2.0) is empty so `thin` = L; step 0's
+// b = 0.5 >= 0.45 runs but its membership test opening_ex(L, 2b = 1.0) is empty on a 1.2mm wall
+// (half-thickness 0.6); step 1's b = 0.25 < 0.45 stops the ladder. Result: the keep-core is
+// empty, diff_ex(claim, {}) == claim, and the whole cross-section stays painted.
+//
+// The ladder is NOT dead - the "degrades to a printable band" test below exercises it on
+// geometry thick enough to carry one.
+TEST_CASE("multi_material_segmentation_by_painting: a fin too thin to carry one extrusion of paint keeps its whole cross-section rather than a sub-extrusion skin (C-1)", "[paintdepth]")
 {
     Print        print;
     PrintObject *object = slice_painted_box(/*x=*/1.2, /*y=*/40., /*z=*/20., ALL_SIDE_FACE,
@@ -1685,8 +1732,8 @@ TEST_CASE("multi_material_segmentation_by_painting: the lateral clamp still leav
 
     REQUIRE(object->layer_count() >= 10);
 
-    // Both parities: the interlocking notch narrows the band on even layers, and the
-    // degradation has to hold on both.
+    // Both parities: the interlocking notch narrows the band on even layers, and the floor has
+    // to hold on both.
     const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
     const size_t odd_layer  = even_layer + 1;
     REQUIRE(even_layer % 2 == 0);
@@ -1701,14 +1748,103 @@ TEST_CASE("multi_material_segmentation_by_painting: the lateral clamp still leav
         const Point   centre((bb.min.x() + bb.max.x()) / 2, mid_y);
 
         const ExPolygons claim = extruder2_claim_for_layer(*object, layer_idx);
-        // Positive control: the painted face's own perimeter band is still painted. The fix
-        // makes the clamp degrade, not disappear.
+        // The painted face's own perimeter band is painted (it always was).
         CHECK(any_contains(claim, near_face));
-        // F2: the middle of the fin stays BASE material - the claim is proportionate to what
-        // the local geometry can support instead of swallowing the whole cross-section. RED
-        // pre-F2 on both parities (the clamp was a total no-op, so the centre was painted).
+        // C-1: and so is the centre - the clamp is a clean no-op here, NOT a 0.25mm strip on
+        // each face with a 0.7mm base core between them. RED pre-C-1 on both parities.
+        CHECK(any_contains(claim, centre));
+    }
+}
+
+// C-1's other half, and F2's: on geometry that CAN carry a printable painted skin the ladder
+// still degrades the band instead of swallowing the cross-section whole.
+//
+// Fixture: a 5.8mm-wide fin (local half-thickness t = 2.9mm) at paint_depth_mm = 6.0, every
+// side facet painted. offset_ex(L, -6.0) is empty so the full-band inset is a no-op and the
+// ladder runs. Step 0 (b = 1.5, membership at 2b = 3.0 > t = 2.9) misses; step 1 (b = 0.75,
+// membership at 1.5 <= 2.9) takes it, and 0.75mm is comfortably above the 0.45mm external
+// extrusion floor. So each face gets a 0.75mm painted skin and the middle 4.3mm stays base -
+// the `t/4 < b <= t/2` proportionality F2 exists to deliver.
+//
+// It is also the I-2 pin. The ladder's STEP is now chosen from the un-notched band on every
+// layer, not from the notched one: with the interlocking notch raised to 0.4mm the even-layer
+// band would be 5.6, whose step 0 (2b = 2.8 <= 2.9) DOES fit, so pre-I-2 this fin got a 1.4mm
+// skin on even layers and a 0.75mm skin on odd ones - the claim halving and doubling on
+// alternating layers, a smaller cousin of the 3/2/3/2 wall alternation F4 removed. Probing at
+// 1.0mm catches exactly that: base on both parities post-I-2, painted on the even ones before.
+TEST_CASE("multi_material_segmentation_by_painting: the lateral clamp degrades to a printable painted skin, identical on both parities, on geometry thinner than the band (F2 + I-2)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_box(/*x=*/5.8, /*y=*/40., /*z=*/6., ALL_SIDE_FACE,
+                                             pdmMillimeters, /*walls=*/3, /*paint_depth_mm=*/6.0,
+                                             /*layer_height=*/0.2, print, /*interlocking_depth=*/0.4);
+
+    REQUIRE(object->layer_count() >= 10);
+
+    const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+    const size_t odd_layer  = even_layer + 1;
+    REQUIRE(even_layer % 2 == 0);
+    REQUIRE(odd_layer % 2 == 1);
+
+    for (size_t layer_idx : {even_layer, odd_layer}) {
+        CAPTURE(layer_idx);
+        const BoundingBox bb = get_extents(object->get_layer(int(layer_idx))->lslices);
+        REQUIRE(bb.defined);
+        const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+        const Point   centre((bb.min.x() + bb.max.x()) / 2, mid_y);
+
+        const ExPolygons claim = extruder2_claim_for_layer(*object, layer_idx);
+        // The skin is real and at least one external extrusion (0.45mm) wide - the C-1 floor is
+        // a floor, not an off switch.
+        CHECK(any_contains(claim, Point(coord_t(bb.max.x() - scale_(0.5)), mid_y)));
+        // ...and it stops at 0.75mm, the same on both parities (I-2).
+        CHECK_FALSE(any_contains(claim, Point(coord_t(bb.max.x() - scale_(1.0)), mid_y)));
+        // ...leaving the middle of the fin base-coloured (F2's whole point).
         CHECK_FALSE(any_contains(claim, centre));
     }
+}
+
+// I-3 (.superpowers/sdd/2026-08-31-paint-depth/bleed-and-walls-fixwave-review.md): F4's
+// quarter-spacing cap on the interlocking notch exists to keep the notch inside the
+// count-window margin `paint_depth_band_mm` builds into the WALLS-mode band, so Arachne still
+// delivers N loops on both parities. In MILLIMETRES mode there is no N: the band is the user's
+// literal paint_depth_mm (PaintDepth.cpp), it is not sized to a bead count, and no wall-count
+// contract is being protected - the cap there just silently shrinks a notch the user asked for
+// (0.4mm -> 0.107mm at stock flows, 3.7x less) for a reason that does not apply to them. The
+// tooltip already justifies the cap by "Paint depth walls" alone.
+//
+// Fixture: a 40x40 box (half-thickness 20mm, far thicker than the 6mm band, so F2's ladder
+// never runs and the band is the plain clamp) with paint_depth_mm = 6.0 and the notch raised to
+// 0.4mm by hand. The even-layer band is band - notch; the odd-layer band is the band itself.
+TEST_CASE("multi_material_segmentation_by_painting: millimetres mode honours the configured interlocking notch verbatim (I-3)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_box(/*x=*/40., /*y=*/40., /*z=*/6., PLUS_X_FACE,
+                                             pdmMillimeters, /*walls=*/3, /*paint_depth_mm=*/6.0,
+                                             /*layer_height=*/0.2, print, /*interlocking_depth=*/0.4);
+
+    REQUIRE(object->layer_count() >= 10);
+    const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+    const size_t odd_layer  = even_layer + 1;
+    REQUIRE(even_layer % 2 == 0);
+    REQUIRE(odd_layer % 2 == 1);
+
+    const BoundingBox bb = get_extents(object->get_layer(int(even_layer))->lslices);
+    REQUIRE(bb.defined);
+    const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+    auto probe = [&](double inset_mm) { return Point(coord_t(bb.max.x() - scale_(inset_mm)), mid_y); };
+
+    const ExPolygons claim_even = extruder2_claim_for_layer(*object, even_layer);
+    const ExPolygons claim_odd  = extruder2_claim_for_layer(*object, odd_layer);
+
+    // Odd layers: the band is paint_depth_mm verbatim, 6.0mm. (Pins millimetres mode itself.)
+    CHECK(any_contains(claim_odd, probe(5.9)));
+    CHECK_FALSE(any_contains(claim_odd, probe(6.1)));
+    // Even layers: 6.0 - 0.4 = 5.6mm. RED pre-I-3, where the notch was capped at 0.25*spacing
+    // (0.1018mm at 0.45mm lines / 0.2mm layers) and the even band was therefore 5.898mm, so
+    // 5.7mm in was still painted.
+    CHECK(any_contains(claim_even, probe(5.4)));
+    CHECK_FALSE(any_contains(claim_even, probe(5.7)));
 }
 
 // F3 + F4 as one end-to-end contract: "N walls" must deliver the same wall-loop capacity on
@@ -1744,13 +1880,22 @@ TEST_CASE("multi_material_segmentation_by_painting: a walls-mode band delivers t
     // segmentation applies is at most a quarter of one perimeter spacing, which is exactly the
     // count-window margin the band builds in - so it cannot move the strip across a bead-count
     // boundary. RED pre-F4 (the shipped default was 0.3mm, ~0.70 * spacing).
-    const double interlock_mm = paint_depth_interlocking_depth_mm(object->config().mmu_segmented_region_interlocking_depth.value, s);
+    const double interlock_mm = paint_depth_interlocking_depth_mm(pdmWalls, object->config().mmu_segmented_region_interlocking_depth.value, s);
     CHECK(interlock_mm <= 0.25 * double(s) + 1e-6);
 
     // The geometric half: the N-bead optimum depth is claimed on both parities.
     const double n_bead_optimum = 3.0 * double(s) + 2.0 * (double(ext_w) - double(ext_s));
     const double probe_mm       = n_bead_optimum - 0.02;
     REQUIRE(probe_mm > 0.);
+    // I-4: ...and NOT MORE than the spec band. "N beads fit" is a two-sided condition (see the
+    // margin table in test_paint_depth.cpp's F3+F4 invariant test); the tightest number in the
+    // whole design is a 0.1119mm UPWARD margin at odd N, and nothing used to bound that side at
+    // all - a band 0.12mm wider would silently turn "3 walls" into 4 with every assertion here
+    // still green. The over-probe is measured against the SPEC band (optimum + one quarter
+    // spacing), deliberately not against paint_depth_band_mm's own output, so it stays
+    // discriminating if the production formula drifts.
+    const double band_spec      = n_bead_optimum + 0.25 * double(s);
+    const double over_probe_mm  = band_spec + 0.05;
 
     REQUIRE(object->layer_count() >= 10);
     const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
@@ -1762,7 +1907,386 @@ TEST_CASE("multi_material_segmentation_by_painting: a walls-mode band delivers t
     REQUIRE(bb.defined);
     const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
     const Point   probe(coord_t(bb.max.x() - scale_(probe_mm)), mid_y);
+    const Point   over_probe(coord_t(bb.max.x() - scale_(over_probe_mm)), mid_y);
 
     CHECK(any_contains(extruder2_claim_for_layer(*object, even_layer), probe));
     CHECK(any_contains(extruder2_claim_for_layer(*object, odd_layer), probe));
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, even_layer), over_probe));
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, odd_layer), over_probe));
+}
+
+// ===========================================================================================
+// WAVE A: the F1 inset's reference layer (I-6), the classic wall generator's band floor and
+// its gap-fill filament (classic-generator-investigation.md).
+// .superpowers/sdd/2026-08-31-paint-depth/bleed-and-walls-fixwave-review.md
+// .superpowers/sdd/2026-08-31-paint-depth/classic-generator-investigation.md
+// ===========================================================================================
+
+// Builds and slices a square frustum with the given cap facets painted. pdmUnlimited for the
+// same reason slice_capped_slab() uses it: only a horizontal cap is painted, so no layer's own
+// cross-section carries a painted boundary and the entire claim comes from the vertical
+// projection/descent path these tests target.
+PrintObject *slice_painted_frustum(double bottom, double top, double height,
+                                    const std::vector<int> &painted_cap_facets,
+                                    int top_shell_layers, int bottom_shell_layers, Print &print)
+{
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-frustum-taper.stl";
+    ModelVolume *volume  = object->add_volume(make_square_frustum(bottom, top, height));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : painted_cap_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    DynamicPrintConfig config = paint_depth_test_config(pdmUnlimited, 3);
+    config.option<ConfigOptionFloat>("layer_height")->value               = 0.1;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = 0.1;
+    config.option<ConfigOptionInt>("top_shell_layers")->value             = top_shell_layers;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value        = 0.0;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value          = bottom_shell_layers;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value     = 0.0;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// I-6 (.superpowers/sdd/2026-08-31-paint-depth/bleed-and-walls-fixwave-review.md): F1's central
+// design choice is that its one-wall-stack inset is taken at `input_expolygons[last_idx]` - the
+// layer the claim is DEPOSITED on - not at `input_expolygons[layer_idx]`, the painted surface
+// layer. The outward-bleed investigation rejected the layer_idx variant specifically because it
+// measures clearance on the wrong cross-section for objects that NARROW AWAY from the painted
+// face (an undercut, a waist, an overhang below a painted top).
+//
+// Every fixture in this suite was either a prism (where the two are literally the same
+// ExPolygons) or make_square_frustum(40, 22, 6) painted on its TOP cap - which WIDENS downward,
+// where an inset taken at layer_idx is strictly MORE conservative than one taken at last_idx,
+// so the frustum test passes under both. Nothing anywhere distinguished them, in either
+// direction: someone "simplifying" last_idx to layer_idx would read as a cleanup and bring the
+// exterior bleed back on every undercut with a green suite.
+//
+// Both directions are covered here, and both narrow in the direction of descent:
+//   TOP    make_square_frustum(22, 40, 6) painted on its top cap - going DOWN from the cap the
+//          cross-section shrinks 40 -> 22.
+//   BOTTOM make_square_frustum(40, 22, 6) painted on its bottom cap - going UP from the cap the
+//          cross-section shrinks 40 -> 22. (No new mesh; it is the existing F1 fixture flipped.)
+//
+// Arithmetic, identical for both (0.1mm layers, 0.15mm of taper per layer, wall stack =
+// extrusion_width + extrusion_spacing = 0.87854mm). Writing H_k for the contour half-width at
+// descent depth k and H_0 for the painted surface layer's own:
+//   correct (last_idx): claim edge = H_k - 0.87854          => always 0.87854mm in
+//   wrong   (layer_idx): claim edge = min(H_k, H_0 - 0.87854) => only 0.87854 - 0.15k in
+// so a probe 0.3mm inside the layer's own contour is base under the correct inset at every
+// depth, and painted under the wrong one from depth 4 on (0.87854 - 0.15*4 = 0.279 < 0.3). At
+// depth 5 the margin is 0.17mm on the RED side and 0.58mm on the green side.
+TEST_CASE("multi_material_segmentation_by_painting: on geometry that narrows away from the painted cap the F1 inset is measured on the DEPOSIT layer, not the painted one (I-6)", "[paintdepth]")
+{
+    SECTION("top cap, cross-section narrowing downward") {
+        Print        print;
+        // 22mm at z=0 widening to 40mm at z=6: descending from the painted top cap, every layer
+        // is narrower than the one above it.
+        PrintObject *object = slice_painted_frustum(22., 40., 6., TOP_CAP_FACE,
+                                                     /*top_shell_layers=*/8, /*bottom_shell_layers=*/3, print);
+
+        const size_t top_index = object->layer_count() - 1;
+        REQUIRE(top_index >= 8);
+
+        // Positive control: the painted surface layer itself is claimed out to its silhouette.
+        CHECK(any_contains(extruder2_claim_for_layer(*object, top_index),
+                           layer_edge_probe(*object, top_index, 0.2)));
+
+        for (size_t depth = 4; depth <= 5; ++depth) {
+            const size_t layer_idx = top_index - depth;
+            CAPTURE(depth);
+            // RED with the inset taken at layer_idx: the claim reaches to within
+            // 0.87854 - 0.15*depth mm of this layer's own contour, i.e. 0.28/0.13mm.
+            CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                                     layer_edge_probe(*object, layer_idx, 0.3)));
+            // ...and the claim is still real and deep at the same depths.
+            CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                               layer_edge_probe(*object, layer_idx, 1.5)));
+        }
+    }
+
+    SECTION("bottom cap, cross-section narrowing upward") {
+        Print        print;
+        // The existing F1 fixture, painted on its BOTTOM cap instead: 40mm at z=0 tapering to
+        // 22mm at z=6, so ascending from the painted cap every layer is narrower than the one
+        // below it. Exercises the bottom descent loop's own copy of the F1 inset.
+        PrintObject *object = slice_painted_frustum(40., 22., 6., BOTTOM_CAP_FACE,
+                                                     /*top_shell_layers=*/3, /*bottom_shell_layers=*/8, print);
+
+        REQUIRE(object->layer_count() >= 8);
+
+        // Positive control on the painted surface layer (layer 0).
+        CHECK(any_contains(extruder2_claim_for_layer(*object, 0), layer_edge_probe(*object, 0, 0.2)));
+
+        for (size_t depth = 4; depth <= 5; ++depth) {
+            CAPTURE(depth);
+            CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, depth),
+                                     layer_edge_probe(*object, depth, 0.3)));
+            CHECK(any_contains(extruder2_claim_for_layer(*object, depth),
+                               layer_edge_probe(*object, depth, 1.5)));
+        }
+    }
+}
+
+// Item 8, classic-generator-investigation.md sections 2b/2c/3/6: the classic wall generator
+// cannot render a painted band narrower than TWO properly-spaced lines. offset_ex() on a strip
+// always returns both of its boundaries, so a band of width W emits an even number of
+// external-width loops or nothing at all, and the narrowest honest classic band is
+// ext_perimeter_width + ext_perimeter_spacing = 0.85708mm at 0.45mm lines / 0.2mm layers -
+// which is exactly one `wall_stack`, the same quantity F1 insets its top/bottom claim by.
+//
+// At paint_depth_walls = 1 the Arachne-shaped band is 0.59469mm, and on classic that produces
+// three separate real defects:
+//   - the two depth-0 loops sit 0.14mm apart centre-to-centre while each is 0.45mm wide:
+//     +48% over-extrusion along the whole painted boundary, knowingly uncompensated
+//     (PerimeterGenerator.cpp:1419 "FIXME evaluate the overlaps");
+//   - on any profile with outer_wall_line_width > 1.25*s + 2h(1-pi/4) the band drops below
+//     ext_perimeter_width and the N=1 painted region produces ZERO extrusions on every layer;
+//   - worse, F1's top/bottom claim is inset by one wall_stack while the lateral band is not
+//     band-clamped against it, so whenever band < wall_stack the union leaves the BASE region
+//     holding a closed ring of width wall_stack - band (0.26mm here) on every sub-surface shell
+//     layer - and classic prints that ring as NOTHING (offset_ex returns empty at i = 0, last is
+//     cleared, gaps are only collected from i >= 1). A genuine void ring under every painted cap.
+// Flooring the band at wall_stack closes all three, and closes the last one BY CONSTRUCTION:
+// band(1) and the F1 inset become the same number, so the lateral band and the top/bottom claim
+// meet exactly.
+//
+// It must NOT be unconditional. Arachne's 1 -> 2 bead boundary is T > (1 + split_thr)*ext_s =
+// 0.6476mm (RedistributeBeadingStrategy.cpp:42-48); today's band(1) gives T = 0.5357 -> 1 bead,
+// while a floored band(1) would give T = 0.8356 -> 2 beads, breaking the "1 wall means 1 loop"
+// contract F3 established. The Arachne half of this test is that pin.
+TEST_CASE("multi_material_segmentation_by_painting: the walls-mode band is floored at one wall stack on the classic generator only (classic floor)", "[paintdepth]")
+{
+    // 0.45mm lines / 0.2mm layers => spacing 0.40708, band(1) = 0.59469,
+    // floor = ext_w + ext_s = 0.85708, notch (walls mode) = 0.25*spacing = 0.10177.
+    //   classic: 0.85708 odd / 0.75531 even      arachne: 0.59469 odd / 0.49292 even
+    SECTION("classic: the band is at least one wall stack deep on both parities") {
+        Print        print;
+        PrintObject *object = slice_painted_box(/*x=*/40., /*y=*/40., /*z=*/6., PLUS_X_FACE,
+                                                 pdmWalls, /*walls=*/1, /*paint_depth_mm=*/1.5,
+                                                 /*layer_height=*/0.2, print, /*interlocking_depth=*/-1.,
+                                                 PerimeterGeneratorType::Classic);
+        REQUIRE(object->layer_count() >= 10);
+        const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+        const size_t odd_layer  = even_layer + 1;
+        REQUIRE(even_layer % 2 == 0);
+
+        const BoundingBox bb = get_extents(object->get_layer(int(even_layer))->lslices);
+        REQUIRE(bb.defined);
+        const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+        auto probe = [&](double inset_mm) { return Point(coord_t(bb.max.x() - scale_(inset_mm)), mid_y); };
+
+        for (size_t layer_idx : {even_layer, odd_layer}) {
+            CAPTURE(layer_idx);
+            const ExPolygons claim = extruder2_claim_for_layer(*object, layer_idx);
+            // RED pre-fix on both parities: the unfloored band is 0.595 / 0.493mm.
+            CHECK(any_contains(claim, probe(0.65)));
+            // ...and the floor is a floor, not "as deep as you like".
+            CHECK_FALSE(any_contains(claim, probe(0.95)));
+        }
+    }
+
+    SECTION("arachne: the same band is NOT floored - one wall still means one bead") {
+        Print        print;
+        PrintObject *object = slice_painted_box(/*x=*/40., /*y=*/40., /*z=*/6., PLUS_X_FACE,
+                                                 pdmWalls, /*walls=*/1, /*paint_depth_mm=*/1.5,
+                                                 /*layer_height=*/0.2, print, /*interlocking_depth=*/-1.,
+                                                 PerimeterGeneratorType::Arachne);
+        REQUIRE(object->layer_count() >= 10);
+        const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+        const size_t odd_layer  = even_layer + 1;
+        REQUIRE(even_layer % 2 == 0);
+
+        const BoundingBox bb = get_extents(object->get_layer(int(even_layer))->lslices);
+        REQUIRE(bb.defined);
+        const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+        auto probe = [&](double inset_mm) { return Point(coord_t(bb.max.x() - scale_(inset_mm)), mid_y); };
+
+        for (size_t layer_idx : {even_layer, odd_layer}) {
+            CAPTURE(layer_idx);
+            const ExPolygons claim = extruder2_claim_for_layer(*object, layer_idx);
+            CHECK(any_contains(claim, probe(0.40)));
+            // Would FAIL if the floor were applied unconditionally (0.65 < 0.85708).
+            CHECK_FALSE(any_contains(claim, probe(0.65)));
+        }
+    }
+}
+
+// Recursive extrusion counters. The perimeter/fill collections are trees of collections, and
+// the quantities the classic-generator investigation derives (2k loops plus one gap-fill line
+// across a painted band) are counts of leaf extrusions, not of top-level entries.
+size_t count_loops_recursive(const ExtrusionEntity *entity)
+{
+    if (entity->is_collection()) {
+        size_t n = 0;
+        for (const ExtrusionEntity *child : static_cast<const ExtrusionEntityCollection *>(entity)->entities)
+            n += count_loops_recursive(child);
+        return n;
+    }
+    return entity->is_loop() ? 1 : 0;
+}
+
+size_t count_role_recursive(const ExtrusionEntity *entity, ExtrusionRole role)
+{
+    if (entity->is_collection()) {
+        size_t n = 0;
+        for (const ExtrusionEntity *child : static_cast<const ExtrusionEntityCollection *>(entity)->entities)
+            n += count_role_recursive(child, role);
+        return n;
+    }
+    return entity->role() == role ? 1 : 0;
+}
+
+// The LayerRegion apply_mm_segmentation carved out for the Extruder2 paint claim, or nullptr.
+const LayerRegion *extruder2_layer_region(const PrintObject &object, size_t layer_idx)
+{
+    const int local_id = extruder2_local_region_id(object);
+    if (local_id < 0)
+        return nullptr;
+    const Layer *layer = object.get_layer(int(layer_idx));
+    if (local_id >= layer->region_count())
+        return nullptr;
+    return layer->get_region(local_id);
+}
+
+// Same construction as process_z_interface_cube() above (Print::process(), not
+// PrintObject::slice(), because perimeter generation and fill only run inside process()), but a
+// single painted cube with the wall generator and paint_infill_override as parameters.
+PrintObject *process_painted_cube(double xy_size, double height, const std::vector<int> &painted_facets,
+                                   PaintDepthMode mode, int walls, bool paint_infill_override,
+                                   PerimeterGeneratorType wall_generator, Print &print)
+{
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-generator.stl";
+    ModelVolume *volume  = object->add_volume(make_cube(xy_size, xy_size, height));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : painted_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    DynamicPrintConfig config = paint_depth_test_config(mode, walls, paint_infill_override);
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
+    config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = wall_generator;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    print.process();
+    PrintObject *out_object = print.objects_mutable().front();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// Items 9 + 10, classic-generator-investigation.md section 0 and section 4. Two things nothing
+// in this suite covered before: the CLASSIC wall generator (every test here has run Arachne,
+// the harness default, and none has ever asserted on extrusions at all), and the filament the
+// painted band's GAP FILL prints in.
+//
+// The band tiling (section 0's table): across a 1.40885mm band at N=3 with wall_loops = 2,
+// classic lays one onion iteration - which on an ANNULUS emits two loops, the expolygon's
+// contour and its hole, both at depth 0 hence both erExternalPerimeter - plus one gap-fill line
+// down the middle whose medial-axis width is 0.50885mm. That middle line is 36% of the painted
+// depth. Arachne, on the same band, fits three beads and emits NO gap fill at all
+// (process_arachne never calls this->gap_fill), which is exactly why the leak below was never
+// observable from an Arachne slice.
+//
+// The leak: gap fill is stored in LayerRegion::thin_fills and copied into layerm->fills by
+// Fill::make_fill(), so GCode::process_layer used to read it out of the INFILL bucket and hand
+// it sparse_infill_filament(region). The painted PrintRegion sets wall_filament and
+// solid_infill_filament to the painted extruder unconditionally but sparse_infill_filament only
+// when paint_sparse_infill is on (PrintApply.cpp), so with "Paint sparse infill" unchecked the
+// middle 36% of the painted band - sitting directly behind the single painted outer loop -
+// silently flipped to the BASE filament, while the option's own tooltip promises that "walls
+// and solid infill still print in the painted filament". Deciding from the ROLE instead
+// (is_infill(erGapFill) is false) routes it to wall_filament, which is what LayerTools::extruder
+// (ToolOrdering.cpp) has always said this collection needs - the two used to disagree.
+TEST_CASE("multi_material_segmentation_by_painting: on the classic generator the painted band's gap fill follows the painted filament while sparse infill stays base", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = process_painted_cube(/*xy_size=*/20., /*height=*/4., ALL_SIDE_FACE,
+                                                pdmWalls, /*walls=*/3, /*paint_infill_override=*/false,
+                                                PerimeterGeneratorType::Classic, print);
+    REQUIRE(object->layer_count() >= 12);
+
+    const PrintRegionConfig &cfg = extruder2_region_config(*object);
+    // The precondition the leak needs: walls painted, sparse infill deliberately left base.
+    REQUIRE(cfg.wall_filament.value == 2);
+    REQUIRE(cfg.solid_infill_filament.value == 2);
+    REQUIRE(cfg.sparse_infill_filament.value == 1);
+
+    // The fix, at the rule GCode::process_layer now shares with PrintRegion.cpp. RED pre-fix:
+    // gap fill resolved to SparseInfill, i.e. filament 1 - the base colour.
+    CHECK(int(fill_filament_source(cfg, erGapFill))       == int(FillFilamentSource::Wall));
+    // ...and the option still does what it says for real infill.
+    CHECK(int(fill_filament_source(cfg, erInternalInfill)) == int(FillFilamentSource::SparseInfill));
+    CHECK(int(fill_filament_source(cfg, erSolidInfill))    == int(FillFilamentSource::SolidInfill));
+
+    // The leak is reachable, not hypothetical: on classic the painted band really does carry
+    // gap fill on a mid (non-shell) layer. 4mm at 0.2mm layers = 20 layers; layer 10 is past the
+    // bottom shell and below the top shell.
+    const size_t       mid_layer = 10;
+    const LayerRegion *painted   = extruder2_layer_region(*object, mid_layer);
+    REQUIRE(painted != nullptr);
+    const size_t gap_fills = count_role_recursive(&painted->thin_fills, erGapFill);
+    const size_t loops     = count_loops_recursive(&painted->perimeters);
+    CAPTURE(gap_fills);
+    CAPTURE(loops);
+    // Band tiling on classic (section 0's table): one onion iteration on an annulus = 2 loops,
+    // plus the single gap-fill line down the middle of the band.
+    CHECK(loops == 2);
+    CHECK(gap_fills >= 1);
+}
+
+// The Arachne half of the same statement, and the reason the leak above was invisible: the
+// painted band is tiled with three real beads and no gap fill whatsoever, so
+// sparse_infill_filament never got a chance to claim any of it.
+TEST_CASE("multi_material_segmentation_by_painting: on the arachne generator the same painted band is tiled with beads and emits no gap fill", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = process_painted_cube(/*xy_size=*/20., /*height=*/4., ALL_SIDE_FACE,
+                                                pdmWalls, /*walls=*/3, /*paint_infill_override=*/false,
+                                                PerimeterGeneratorType::Arachne, print);
+    REQUIRE(object->layer_count() >= 12);
+
+    const size_t       mid_layer = 10;
+    const LayerRegion *painted   = extruder2_layer_region(*object, mid_layer);
+    REQUIRE(painted != nullptr);
+    const size_t gap_fills = count_role_recursive(&painted->thin_fills, erGapFill);
+    const size_t loops     = count_loops_recursive(&painted->perimeters);
+    const size_t surfaces  = painted->slices.surfaces.size();
+    const size_t ext_loops = count_role_recursive(&painted->perimeters, erExternalPerimeter);
+    const size_t int_loops = count_role_recursive(&painted->perimeters, erPerimeter);
+    CAPTURE(gap_fills);
+    CAPTURE(loops);
+    CAPTURE(surfaces);
+    CAPTURE(ext_loops);
+    CAPTURE(int_loops);
+    // The load-bearing difference, and the reason the classic-only filament leak was never
+    // observable from an Arachne slice: process_arachne never calls this->gap_fill.
+    CHECK(gap_fills == 0);
+    // ...and the band is tiled with real, counted beads rather than classic's two loops plus one
+    // variable-width gap-fill line. The EXACT count is deliberately not pinned: this fixture is a
+    // square annulus, and at each of its four corners the local width across the band is band*sqrt(2)
+    // (~2.0mm against 1.41mm along the flats), so Arachne's variable-width beading correctly adds
+    // short extra beads there - measured 6 loops plus 4 open paths, 2 of them external. Pinning
+    // that would pin Arachne's corner behaviour, not this feature's. The captures above record it.
+    CHECK(loops > 2);
 }

@@ -96,6 +96,45 @@ TEST_CASE("paint_depth_band_mm: walls mode edge cases", "[paintdepth]")
     }
 }
 
+// Wave A / item 8 (classic-generator-investigation.md sections 2b/2c/3/6): the classic wall
+// generator's floor for the band. See paint_depth_band_classic_floor_mm's header comment for the
+// three defects it closes at paint_depth_walls = 1 and for why it must stay classic-only.
+TEST_CASE("paint_depth_band_classic_floor_mm: the classic band is floored at one wall stack", "[paintdepth]")
+{
+    const float s     = stock_spacing(); // 0.428540 at 0.45mm lines / 0.1mm layers
+    const float ext_w = STOCK_LINE_WIDTH;
+    const float ext_s = s;
+    const float wall_stack = ext_w + ext_s; // 0.878540
+
+    SECTION("N=1 is the band the floor exists for") {
+        const float band = paint_depth_band_mm(pdmWalls, 1, 0.0, ext_w, ext_s, s);
+        CHECK_THAT(double(band), WithinAbs(0.578595, 1e-5));
+        CHECK_THAT(double(paint_depth_band_classic_floor_mm(band, ext_w, ext_s)), WithinAbs(double(wall_stack), 1e-5));
+        // The floor equals F1's own top/bottom inset exactly, which is the point: the lateral band
+        // and the projected top/bottom claim then meet, instead of leaving a 0.299945mm base ring
+        // that classic prints as nothing.
+        CHECK_THAT(double(wall_stack), WithinAbs(0.878540, 1e-5));
+    }
+    SECTION("every band at N >= 2 is already above the floor and passes through untouched") {
+        for (int walls = 2; walls <= 6; ++walls) {
+            const float band = paint_depth_band_mm(pdmWalls, walls, 0.0, ext_w, ext_s, s);
+            CHECK(band > wall_stack);
+            CHECK_THAT(double(paint_depth_band_classic_floor_mm(band, ext_w, ext_s)), WithinAbs(double(band), 1e-6));
+        }
+    }
+    SECTION("a millimetres-mode band is floored the same way (classic's limitation is geometric, not modal)") {
+        CHECK_THAT(double(paint_depth_band_classic_floor_mm(0.4f, ext_w, ext_s)), WithinAbs(double(wall_stack), 1e-5));
+        CHECK_THAT(double(paint_depth_band_classic_floor_mm(2.0f, ext_w, ext_s)), WithinAbs(2.0, 1e-6));
+    }
+    SECTION("'disabled' stays disabled - flooring a zero band would switch the clamp back on") {
+        CHECK(paint_depth_band_classic_floor_mm(0.f, ext_w, ext_s) == 0.f);
+        CHECK(paint_depth_band_classic_floor_mm(paint_depth_band_mm(pdmUnlimited, 3, 1.5, ext_w, ext_s, s), ext_w, ext_s) == 0.f);
+    }
+    SECTION("a degenerate (all-zero) flow offers no floor") {
+        CHECK_THAT(double(paint_depth_band_classic_floor_mm(1.5f, 0.f, 0.f)), WithinAbs(1.5, 1e-6));
+    }
+}
+
 // Fix-wave F4 (.superpowers/sdd/2026-08-31-paint-depth/wall-count-investigation.md section 3):
 // the even-layer interlocking notch must fit INSIDE the band's own count-window margin, or it
 // costs the painted region a wall loop on every even layer (the reported 3/2/3/2 alternation).
@@ -106,16 +145,28 @@ TEST_CASE("paint_depth_interlocking_depth_mm: the notch is capped at a quarter o
 
     SECTION("the old 0.3mm default is clamped down to the cap") {
         // 0.3mm is ~0.70 * spacing - 3.6x the 0.083mm of margin the pre-F3 band had.
-        CHECK_THAT(paint_depth_interlocking_depth_mm(0.3, s), WithinAbs(cap, 1e-6));
+        CHECK_THAT(paint_depth_interlocking_depth_mm(pdmWalls, 0.3, s), WithinAbs(cap, 1e-6));
     }
     SECTION("the new 0.1mm default is already under the cap and passes through untouched") {
-        CHECK_THAT(paint_depth_interlocking_depth_mm(0.1, s), WithinAbs(0.1, 1e-6));
+        CHECK_THAT(paint_depth_interlocking_depth_mm(pdmWalls, 0.1, s), WithinAbs(0.1, 1e-6));
     }
     SECTION("zero stays zero (the option's own 'disabled' convention)") {
-        CHECK(paint_depth_interlocking_depth_mm(0.0, s) == 0.f);
+        CHECK(paint_depth_interlocking_depth_mm(pdmWalls, 0.0, s) == 0.f);
     }
     SECTION("a degenerate (non-positive) spacing carries no information to clamp against") {
-        CHECK_THAT(paint_depth_interlocking_depth_mm(0.3, 0.f), WithinAbs(0.3, 1e-6));
+        CHECK_THAT(paint_depth_interlocking_depth_mm(pdmWalls, 0.3, 0.f), WithinAbs(0.3, 1e-6));
+    }
+    // Wave A / I-3: the cap's entire justification is the WALLS-mode bead-count window. In
+    // millimetres mode the band is the user's literal depth, no count contract exists, and a
+    // hand-set mechanical key must not be silently cut to a quarter spacing (0.5 -> 0.107mm,
+    // 4.7x less, for a reason that does not apply). Pinned as the arithmetic twin of the
+    // end-to-end RED in test_paint_depth_clamp.cpp.
+    SECTION("millimetres mode is not capped - there is no bead-count window to protect") {
+        CHECK_THAT(paint_depth_interlocking_depth_mm(pdmMillimeters, 0.5, s), WithinAbs(0.5, 1e-6));
+        CHECK_THAT(paint_depth_interlocking_depth_mm(pdmMillimeters, 0.3, s), WithinAbs(0.3, 1e-6));
+        // ...and the sub-cap default still passes through, identically in both modes.
+        CHECK_THAT(paint_depth_interlocking_depth_mm(pdmMillimeters, 0.1, s), WithinAbs(0.1, 1e-6));
+        CHECK(paint_depth_interlocking_depth_mm(pdmMillimeters, 0.0, s) == 0.f);
     }
 }
 
@@ -124,6 +175,22 @@ TEST_CASE("paint_depth_interlocking_depth_mm: the notch is capped at a quarter o
 // N-bead optimum thickness `N*spacing + 2*(ext_w - ext_s)`. That is what makes both layer
 // parities land in the same Arachne bead-count window - "N walls" delivers N loops on every
 // layer, not N on odd and N-1 on even.
+//
+// I-4 (.superpowers/sdd/2026-08-31-paint-depth/bleed-and-walls-fixwave-review.md): "N beads fit
+// on both parities" is a TWO-sided condition. Arachne gives exactly N beads iff
+// `x = T - 2*s_ext` lies in `[(N-3+thr(N-3))*s, (N-2+thr(N-2))*s)`
+// (RedistributeBeadingStrategy.cpp:42-49, DistributedBeadingStrategy.cpp:92-98, thresholds at
+// WallToolPaths.cpp:510-511). F3 puts `x` at `(N-1.75)*s`, whose margins are
+//
+//     odd  N (N=3):  0.4944*s = 0.2119mm down,  0.2611*s = 0.1119mm UP
+//     even N (N=4):  0.7389*s = 0.3167mm down,  0.5056*s = 0.2167mm UP
+//
+// so the SMALLEST number anywhere in the design is the 0.1119mm upward margin at odd N - the
+// direction the original assertion did not bound at all. A future change that widened the band
+// by 0.12mm (a different flow model, a min_bead_width profile change, an extra safety term)
+// would silently turn "3 walls" into 4 with the whole suite still green. The upper bounds below
+// close that: the band is pinned to EXACTLY one quarter-spacing above the N-bead optimum, and
+// the notch is pinned to only ever eat INTO that quarter-spacing, never to widen past it.
 TEST_CASE("paint depth band: the even-layer interlocking notch never eats into the N-bead budget", "[paintdepth]")
 {
     const float s     = stock_spacing();
@@ -136,9 +203,17 @@ TEST_CASE("paint depth band: the even-layer interlocking notch never eats into t
         for (double configured : configured_depths) {
             DYNAMIC_SECTION("walls = " << walls << ", configured interlock = " << configured) {
                 const float band       = paint_depth_band_mm(pdmWalls, walls, 0.0, ext_w, ext_s, s);
-                const float interlock  = paint_depth_interlocking_depth_mm(configured, s);
+                const float interlock  = paint_depth_interlocking_depth_mm(pdmWalls, configured, s);
                 const double n_bead_optimum = double(walls) * double(s) + 2.0 * (double(ext_w) - double(ext_s));
+                const double margin         = 0.25 * double(s);
+                // Lower bound (unchanged): the notch never eats into the N-bead budget itself.
                 CHECK(double(band) - double(interlock) >= n_bead_optimum - 1e-6);
+                // I-4 upper bound A: the band's count-window margin is EXACTLY 0.25*spacing -
+                // not "at least". This is what a widened band trips.
+                CHECK_THAT(double(band) - n_bead_optimum, WithinAbs(margin, 1e-5));
+                // I-4 upper bound B: the notch is subtractive only, so the claimed depth on
+                // EITHER parity stays inside the same count window on the high side too.
+                CHECK(double(band) - double(interlock) <= n_bead_optimum + margin + 1e-6);
             }
         }
     }
