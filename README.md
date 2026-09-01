@@ -1,120 +1,144 @@
+# Snapmaker-Ultra
 
-<h1> <p "font-size:200px;"> Snapmaker Orca</p> </h1>
+**Bleeding edge featureset, pulled from all slicing worlds. Camera streams, filament manager, expanded printer profiles, expanded assembly and multicolor toolsets.**
 
-[![Build all](https://github.com/Snapmaker/OrcaSlicer/actions/workflows/build_all.yml/badge.svg?branch=main)](https://github.com/Snapmaker/OrcaSlicer/actions/workflows/build_all.yml)
-<br>Snapmaker Orca is an open source slicer for FDM printers based on OrcaSlicer.
- 
+[Releases](https://github.com/aceRage/Snapmaker-Ultra/releases) · Windows installer & portable · Linux AppImage · macOS (unsigned) · Based on [Snapmaker Orca](https://github.com/Snapmaker/OrcaSlicer) 2.3.6 (the app still reports itself as Snapmaker Orca 2.3.6.x) · AGPL-3.0
 
+![Prepare view with a multi-part assembly, the eye column in the object list and the Assemble tool open](docs/images/hero-prepare-view.png)
 
-# Download
+Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Artisan / A-series support and the full OrcaSlicer printer library — and adds features pulled from Bambu Studio, OrcaSlicer pull requests and our own work.
 
-### Stable Release
-📥 **[Download the Latest Stable Release](https://github.com/Snapmaker/OrcaSlicer/releases/latest)**  
-Visit our GitHub Releases page for the latest stable version of Snapmaker Slicer, recommended for most users.
+---
 
-# How to install
-**Windows**: 
-1.  Download the installer for your preferred version from the [releases page](https://github.com/Snapmaker/OrcaSlicer/releases).
-    - *For convenience there is also a portable build available.*
-    - *If you have troubles to run the build, you might need to install following runtimes:*
-      - [MicrosoftEdgeWebView2RuntimeInstallerX64](https://github.com/SoftFever/OrcaSlicer/releases/download/v1.0.10-sf2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe)
-          - [Details of this runtime](https://aka.ms/webview2)
-          - [Alternative Download Link Hosted by Microsoft](https://go.microsoft.com/fwlink/p/?LinkId=2124703)
-      - [vcredist2019_x64](https://github.com/SoftFever/OrcaSlicer/releases/download/v1.0.10-sf2/vcredist2019_x64.exe)
-          -  [Alternative Download Link Hosted by Microsoft](https://aka.ms/vs/17/release/vc_redist.x64.exe)
-          -  This file may already be available on your computer if you've installed visual studio.  Check the following location: `%VCINSTALLDIR%Redist\MSVC\v142`
+## Highlights
 
-**Mac**:
-1. Download the DMG for your computer: `arm64` version for Apple Silicon and `x86_64` for Intel CPU.  
-2. Drag Snapmaker_Orca.app to Application folder. 
-3. *If you want to run a build from a PR, you also need to follow the instructions below:*  
-    <details quarantine>
-    - Option 1 (You only need to do this once. After that the app can be opened normally.):
-      - Step 1: Hold _cmd_ and right click the app, from the context menu choose **Open**.
-      - Step 2: A warning window will pop up, click _Open_  
-      
-    - Option 2:  
-      Execute this command in terminal: `xattr -dr com.apple.quarantine /Applications/Snapmaker_Orca.app`
-      ```console
-          softfever@mac:~$ xattr -dr com.apple.quarantine /Applications/Snapmaker_Orca.app
-      ```
-    - Option 3:  
-        - Step 1: open the app, a warning window will pop up  
-            ![image](./SoftFever_doc/mac_cant_open.png)  
-        - Step 2: in `System Settings` -> `Privacy & Security`, click `Open Anyway`:  
-            ![image](./SoftFever_doc/mac_security_setting.png)  
-    </details>
-    
-**Linux (Ubuntu)**:
- 1. If you run into trouble executing it, try this command in the terminal:  
-    `chmod +x /path_to_appimage/Snapmaker_Orca_Linux.AppImage`
-    
-# How to compile
-- Windows 64-bit  
-  - Tools needed: Visual Studio 2019, Cmake, git, git-lfs, Strawberry Perl.
-      - You will require cmake version 3.14 or later, which is available [on their website](https://cmake.org/download/).
-      - Strawberry Perl is [available on their GitHub repository](https://github.com/StrawberryPerl/Perl-Dist-Strawberry/releases/).
-  - Run `build_release.bat` in `x64 Native Tools Command Prompt for VS 2019`
-  - Note: Don't forget to run `git lfs pull` after cloning the repository to download tools on Windows
+### Bambu Lab, including dual-nozzle — in progress
 
-- Mac 64-bit  
-  - Tools needed: Xcode, Cmake, git, gettext, libtool, automake, autoconf, texinfo
-      - You can install most of them by running `brew install cmake gettext libtool automake autoconf texinfo`
-  - run `build_release_macos.sh`
-  - To build and debug in Xcode:
-      - run `Xcode.app`
-      - open ``build_`arch`/Snapmaker_Orca.Xcodeproj``
-      - menu bar: Product => Scheme => Snapmaker_Orca
-      - menu bar: Product => Scheme => Edit Scheme...
-          - Run => Info tab => Build Configuration: `RelWithDebInfo`
-          - Run => Options tab => Document Versions: uncheck `Allow debugging when browsing versions`
-      - menu bar: Product => Run
+- **Profiles** for H2D, H2D Pro, H2C and X2D (dual-nozzle) plus P2S, A2L and H2S, with the full official Polymaker filament catalogue.
+- **Dual-nozzle slicing** — filaments are grouped onto nozzles automatically (from the connected printer's AMS layout when one is attached), cross-nozzle changes skip the purge, and the grouping is saved in the project 3MF.
+- **Nozzle flow type** (Standard / High Flow) is declared in sliced files and matched to the installed nozzle at send time.
+- **Import Bambu Studio user presets** — one-way mirror of your custom print / filament / machine presets, at startup or via *Sync now*.
+- **Printer connectivity** — an optional network / printer-connectivity plugin, developed separately and not part of this repository, adds live status, camera and send-to-printer for supported Bambu Lab machines (Preferences → Ultra → Bambu Network).
+- **Status:** slicing is verified; physical validation on Bambu hardware is still in progress — treat this group as beta.
 
-- Ubuntu 
-  - Dependencies **Will be auto-installed with the shell script**: `libmspack-dev libgstreamerd-3-dev libsecret-1-dev libwebkit2gtk-4.0-dev libosmesa6-dev libssl-dev libcurl4-openssl-dev eglexternalplatform-dev libudev-dev libdbus-1-dev extra-cmake-modules libgtk2.0-dev libglew-dev libudev-dev libdbus-1-dev cmake git texinfo`
-  - run 'sudo ./BuildLinux.sh -u'
-  - run './BuildLinux.sh -dsir'
+![H2D slice with filaments split across the two nozzles](docs/images/dual-nozzle-grouping.png)
 
+### Multicolor and materials
 
-# Note: 
-If you're running Klipper, it's recommended to add the following configuration to your `printer.cfg` file.
+- **Support Filament Matching** (opt-in) — supports, interfaces, ironing and brims print in the colour of the surface they touch; **Brim filament → Nearest wall** for brims alone.
+- **Outer wall filament** separate from inner walls.
+- **Filament colours and count survive printer switches**; **Apply All** sets every filament slot in one click; **per-filament Z offset**.
+- **Spool Manager** — [Spoolman](https://github.com/Donkie/Spoolman) inventory, spool-to-slot bindings, automatic usage deduction when a job is sent.
+
+![Two-colour model with supports and brim matching the colour they touch](docs/images/support-filament-matching.png)
+
+### Assembly and fitting
+
+- **Auto-Fit Assembly** — right-click a multi-selection: the largest part stays fixed, the rest mate to it by matching faces, holes and pegs, and everything merges into one print-ready object.
+- **Assemble tool → Auto-fit** — pick one feature on each part (flat face, circular rim, a single triangle or a curved patch), press *Auto-fit*, nudge with the live **Rotate / Offset** sliders, then **Merge parts**. Rotation is chosen by outline fit *and* a whole-mesh collision check, so pegs seat square without intersecting.
+- New assembly modes **Triangle and triangle** and **Curve and curve**; **Point and point** snaps to vertices at any zoom and has one-click **Coincide points**.
+
+![Loose parts, then the same parts mated and merged](docs/images/auto-fit-before-after.png)
+![Assemble tool with two picked features, the Auto-fit button and the adjust sliders](docs/images/assemble-fit-for-print.png)
+
+### Modeling and Prepare view
+
+- **Mesh booleans** on the Manifold backend (automatic fallback) with a part picker; **Repair/Remesh** rebuilds any part watertight.
+- **Visibility** — Normal / Ghost (X-ray) / Hidden per object or part, with an eye column in the object list.
+- **Move panel align & distribute**, **bottom-referenced Z**, **keep imported Z** (drop-to-bed toggle), double-click to select a part.
+- **Assemble Separately / Separate** parts out of an assembly in place; **Merge into Single Part** keeps paint and seam annotations.
+
+![Object list eye icons with a ghosted object](docs/images/visibility-eye-column.png)
+
+### Print quality
+
+- **Offset layers** (experimental), **Print unsupported walls last**, **Undertop surface pattern**, **Z overrides X/Y** support option, **machine prepare time** in estimates, deterministic toolpaths.
+
+### Workflow and UX (Preferences → Ultra)
+
+- **Auto-Save project**, **Keep my printer when opening project files**, **Skip Settings Mapping Warnings**, **Prefer Last Used Print Profile**, **Seamless System Filament Edits**.
+- **Compare Slices** (View menu) — settings, time and filament diff plus per-layer toolpath comparison of any two slices or sliced files.
+- **Import Config from G-code**, `orcaslicer://` links, silent exit.
+- **Stream tab** — live camera wall up to 4×4 for Snapmaker U1, Moonraker and Bambu Lab (LAN liveview) cameras; bundles the open-source [go2rtc](https://github.com/AlexxIT/go2rtc) helper.
+
+![Preferences on the Ultra tab](docs/images/ultra-preferences.png)
+![Compare Slices side-by-side with a changed layer highlighted](docs/images/compare-slices.png)
+![Stream tab 2x2 camera wall](docs/images/stream-tab.png)
+
+### Fixes to upstream issues
+
+Plate deletion during a slice no longer crashes; fuzzy skin no longer leaves dots or seam blobs; JSON profiles with unquoted numbers/booleans keep their settings; Repair no longer produces inside-out meshes; forced preset and U1 → U1 device switches no longer pop the transfer/discard dialog; the false nozzle-mismatch nag on Bambu sends is gone.
+
+---
+
+## Supported printers
+
+| Family | Status |
+|---|---|
+| **Snapmaker** U1, J1, Artisan, A250 / A350 (Dual, Quick Swap, Bracing Kit variants) | Inherited from Snapmaker Orca; **physically validated on the U1** |
+| **Bambu Lab** A1 mini, A1, A2L, P1P, P1S, P2S, X1, X1 Carbon, X1E, H2S, H2D, H2D Pro, H2C, X2D | **In progress** — slicing verified, physical validation pending |
+| **Flashforge** Creator 5, Creator 5 Pro | Profiles only |
+| OrcaSlicer vendor library (Creality, Prusa, Voron, QIDI, Anycubic, Elegoo, Sovol, …) | Unchanged from upstream (QIDI / Anycubic refreshed) |
+
+---
+
+## Download and install
+
+All builds are on the [Releases](https://github.com/aceRage/Snapmaker-Ultra/releases) page.
+
+- **Windows (64-bit) installer** — `Snapmaker-Ultra_Windows_Installer_V<version>.exe`. Installs **side by side** with the official Snapmaker Orca (own folder, Start-menu entry and Add/Remove entry) and upgrades a previous Snapmaker-Ultra install. The splash screen shows *Ultra version* so the two are easy to tell apart.
+- **Windows portable** — `Snapmaker-Ultra_Windows_V<version>_portable.zip`: unzip and run `snapmaker-orca.exe` (needs the Edge WebView2 runtime and the VC++ redistributable, usually already present).
+- **Linux (x86_64)** — `Snapmaker_Orca_Linux_V<version>.AppImage`: `chmod +x` and run. The host must provide WebKitGTK 4.1 and libOpenGL (Ubuntu: `libwebkit2gtk-4.1-0 libopengl0`); they are not bundled.
+- **macOS (Apple silicon)** — the `.dmg` is **unsigned** (no Apple Developer account yet), so macOS refuses it the first time: right-click the app → *Open* → *Open*, or run `xattr -dr com.apple.quarantine "/Applications/Snapmaker Orca.app"` once.
+
+The Windows packages include the connectivity plugin; the Linux and macOS builds currently do not.
+
+---
+
+## Build from source
+
+Same toolchain as Snapmaker Orca / OrcaSlicer (CMake, C++17, wxWidgets); deps build into `deps/build/`, the slicer into `build/`.
+
+```bash
+build_release_vs2022.bat            # Windows: VS 2022, CMake <= 3.31, git-lfs, Strawberry Perl (deps | slicer | debug)
+./build_release_macos.sh            # macOS: -d deps, -s slicer, -a arm64|x86_64|universal
+./build_linux.sh -u && ./build_linux.sh -dsi   # Linux: system deps, then deps + slicer + AppImage
+./build_flatpak.sh                  # Flatpak
+cd build && ctest --output-on-failure          # tests (Catch2)
 ```
-# Enable object exclusion
-[exclude_object]
 
-# Enable arcs support
-[gcode_arcs]
-resolution: 0.1
-```
+Windows packaging: `cpack -G NSIS` in `build/` produces the installer (needs NSIS); zip `build/Snapmaker_Orca/` for the portable build. The optional connectivity plugin lives outside this tree and is only built when `src/ultranet/CMakeLists.txt` exists, so the repository builds without it. Run `git lfs pull` after cloning on Windows. See [`CLAUDE.md`](CLAUDE.md) and [`AGENTS.md`](AGENTS.md) for details.
 
+---
 
-## Some background
-Snapmaker Orca is originally forked from Snapmaker_Orca.
+## Status and roadmap
 
-Snapmaker_Orca is originally forked from Bambu Studio, it was previously known as BambuStudio-SoftFever.
-Bambu Studio is forked from [PrusaSlicer](https://github.com/prusa3d/PrusaSlicer) by Prusa Research, which is from [Slic3r](https://github.com/Slic3r/Slic3r) by Alessandro Ranellucci and the RepRap community. 
-Orca Slicer incorporates a lot of features from SuperSlicer by @supermerill
-Orca Slicer's logo is designed by community member Justin Levine(@freejstnalxndr)  
+| Release | Date | Highlights |
+|---|---|---|
+| [v2.3.6.4-ultra](https://github.com/aceRage/Snapmaker-Ultra/releases/tag/v2.3.6.4-ultra) | 2026-09-01 | Windows installer (side by side), Linux AppImage, unsigned macOS build; assembly tools (Auto-Fit, Assemble-tool Auto-fit with live sliders, triangle/curve/point modes); dual-nozzle grouping; H2D/H2C/X2D/P2S/A2L/H2S profiles + Polymaker catalogue; Support Filament Matching; Bambu Studio preset import |
+| [v2.3.6.3-ultra](https://github.com/aceRage/Snapmaker-Ultra/releases/tag/v2.3.6.3-ultra) | 2026-08-30 | Connectivity-plugin update, Compare Slices, go2rtc cleanup on exit |
+| [v2.3.6.2-ultra](https://github.com/aceRage/Snapmaker-Ultra/releases/tag/v2.3.6.2-ultra) | 2026-08-29 | Bambu LAN connectivity (optional plugin), nozzle flow type, QIDI refresh |
+| [v2.3.6.1-ultra](https://github.com/aceRage/Snapmaker-Ultra/releases/tag/v2.3.6.1-ultra) | 2026-08-28 | Outer wall filament, Spool Manager, Offset layers, Visibility modes, Manifold booleans, Repair/Remesh |
+| [v2.3.6-ultra](https://github.com/aceRage/Snapmaker-Ultra/releases/tag/v2.3.6-ultra) | 2026-08-27 | Stream tab, Keep my printer, Auto-Save, Apply All, Assemble Separately, align helpers |
 
+**In progress (separate branches):** `feat/paint-depth` — bounded embedding depth for multi-material paint. Flashforge device tab — experimental; the send flow is incomplete and it needs the vendor's own network library, which is **not** distributed with this fork. Dual-nozzle follow-ups — nozzle-aware tool ordering and per-nozzle AMS slot mapping in the send dialog. Next: the Ultra splash and side-by-side identity on the Linux and macOS builds.
 
-# License
-Snapmaker Orca is licensed under the GNU Affero General Public License, version 3. Orca Slicer is based on Snapmaker_Orca by SoftFever
+---
 
-Orca Slicer is licensed under the GNU Affero General Public License, version 3. Orca Slicer is based on Bambu Studio by BambuLab.
+## Lineage and licence
 
-Bambu Studio is licensed under the GNU Affero General Public License, version 3. Bambu Studio is based on PrusaSlicer by PrusaResearch.
+Snapmaker-Ultra is licensed under the **GNU Affero General Public License, version 3** ([`LICENSE.txt`](LICENSE.txt)). It is a fork of [Snapmaker Orca](https://github.com/Snapmaker/OrcaSlicer) (Snapmaker), based on [OrcaSlicer](https://github.com/SoftFever/OrcaSlicer) by SoftFever, based on [Bambu Studio](https://github.com/bambulab/BambuStudio) by Bambu Lab, based on [PrusaSlicer](https://github.com/prusa3d/PrusaSlicer) by Prusa Research, based on [Slic3r](https://github.com/Slic3r/Slic3r) by Alessandro Ranellucci and the RepRap community; OrcaSlicer also incorporates features from SuperSlicer by @supermerill. All are AGPL-3.0: if you use any part of this software in any way, even behind a web server, your software must be released under the same licence.
 
-PrusaSlicer is licensed under the GNU Affero General Public License, version 3. PrusaSlicer is owned by Prusa Research. PrusaSlicer is originally based on Slic3r by Alessandro Ranellucci.
+Ported features: align/distribute helpers, "Sub merge" (our *Assemble Separately*) and *Z overrides X/Y* from Bambu Studio; *Print unsupported walls last* (#15411), *Merge into Single Part* (#15413), *Undertop surface pattern* (#15389), the JSON-config fix (#15370), per-filament Z offset (#4660), drop-to-bed / bottom-referenced Z (#8194, #5315), machine prepare time (#5796) and the Flashforge Creator 5 profiles (#13259) from OrcaSlicer; the Flashforge device stack from the Orca-Flashforge project.
 
-Slic3r is licensed under the GNU Affero General Public License, version 3. Slic3r was created by Alessandro Ranellucci with the help of many other contributors.
+Third-party components added by this fork: [Manifold](https://github.com/elalish/manifold) (Apache-2.0); [go2rtc](https://github.com/AlexxIT/go2rtc) v1.9.14 (MIT, bundled unmodified in `resources/tools/go2rtc`); Polymaker presets from [Polymaker3D/Polymaker-Preset](https://github.com/Polymaker3D/Polymaker-Preset) (MIT, notice in `resources/profiles/BBL/filament/PANCHROMA_POLYMAKER_LICENSE.txt`); the pressure-advance calibration pattern adapted from Andrew Ellis' generator (GPL-3.0), itself adapted from Sineos' Marlin generator (GPL-3.0). No proprietary printer-vendor network libraries are included in this repository.
 
-The GNU Affero General Public License, version 3 ensures that if you use any part of this software in any way (even behind a web server), your software must be released under the same license.
+Snapmaker, Bambu Lab, Flashforge and other printer brands are trademarks of their respective owners; this project is not affiliated with or endorsed by any of them.
 
-Orca Slicer includes a pressure advance calibration pattern test adapted from Andrew Ellis' generator, which is licensed under GNU General Public License, version 3. Ellis' generator is itself adapted from a generator developed by Sineos for Marlin, which is licensed under GNU General Public License, version 3.
+---
 
-The Bambu networking plugin is based on non-free libraries from BambuLab. It is optional to the Orca Slicer and provides extended functionalities for Bambulab printer users.
+## Contributing
 
-# Feedback & Contribution
-We greatly value feedback and contributions from our users. Your feedback will help us to further develop Snapmaker Orca for our community.
-- To submit a bug or feature request, file an issue in GitHub Issues or email us at support@snapmaker.com.
-- To contribute some code, make sure you have read and followed our guidelines for contributing.
+Bug reports and feature requests go to [GitHub Issues](https://github.com/aceRage/Snapmaker-Ultra/issues) — include the release version, printer and a project `.3mf` where possible. Pull requests target **`main`**; read [`AGENTS.md`](AGENTS.md) for layout and conventions, keep fork-specific settings on the Ultra preferences tab, and prefer porting from upstream with attribution over re-implementing.
+
+Security issues: please use a [private security advisory](https://github.com/aceRage/Snapmaker-Ultra/security/advisories/new) on GitHub rather than a public issue.
