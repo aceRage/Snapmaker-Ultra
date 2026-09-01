@@ -545,6 +545,15 @@ std::string WipeTowerIntegration::append_tcr(GCode& gcodegen, const WipeTower::T
 
             float purge_volume  = tcr.purge_volume < EPSILON ? 0 : std::max(tcr.purge_volume, g_min_purge_volume);
             float filament_area = float((M_PI / 4.f) * pow(full_config.filament_diameter.get_at(new_extruder_id), 2));
+            // Ultra (Phase 7): a change between two filaments on DIFFERENT physical nozzles (per the grouping's
+            // filament_map) is a nozzle switch, not a color purge — the next filament already sits in its own
+            // nozzle, so no flush is needed. Zero the purge for cross-nozzle transitions (over-purge fix).
+            {
+                const auto& fm = full_config.filament_map.values; // 1-based nozzle per filament; empty on classic machines
+                if (previous_extruder_id >= 0 && (size_t)previous_extruder_id < fm.size() && (size_t)new_extruder_id < fm.size()
+                    && fm[previous_extruder_id] != fm[new_extruder_id])
+                    purge_volume = 0.f;
+            }
             float purge_length  = purge_volume / filament_area;
 
             int old_filament_e_feedrate = gcode_writer.extruder() != nullptr ?
@@ -9023,6 +9032,13 @@ std::string GCode::set_extruder(unsigned int extruder_id, double print_z, bool b
         // ERCF_v2 with a filament cutter or Filametrix can take advantage of it)
         wipe_volume = flush_matrix[previous_extruder_id * number_of_extruders + extruder_id];
         wipe_volume *= m_config.flush_multiplier;
+        // Ultra (Phase 7): cross-nozzle change (filament_map differs) is a nozzle switch, not a color purge -> no flush.
+        {
+            const auto& fm = m_config.filament_map.values;
+            if (previous_extruder_id >= 0 && (size_t)previous_extruder_id < fm.size() && (size_t)extruder_id < fm.size()
+                && fm[previous_extruder_id] != fm[extruder_id])
+                wipe_volume = 0.f;
+        }
 
         old_filament_e_feedrate = (int) (60.0 * m_config.filament_max_volumetric_speed.get_at(previous_extruder_id) / filament_area);
         old_filament_e_feedrate = old_filament_e_feedrate == 0 ? 100 : old_filament_e_feedrate;
