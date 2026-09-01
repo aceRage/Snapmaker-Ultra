@@ -825,3 +825,154 @@ TEST_CASE("multi_material_segmentation_by_painting: bottom claim depth follows t
     // real walk against actual bottom_z (first gap 0.2, not 0.1) stops one layer short of that.
     CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, 5), probe));
 }
+
+// ===========================================================================================
+// Fix-wave re-review (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-fixwave-
+// rereview.md): N1 (Critical), N2 (Minor), N3 (Minor) - findings against 530e2f52d2, the
+// commit that landed the C1/I1/I2/I3 fixes above.
+// ===========================================================================================
+
+// N1 (Critical): the I2 guard `if (region->slices.empty()) continue;` sat above BOTH the
+// shell-depth max (out.top_shell_layers / out.bottom_shell_layers) AND the per-colour
+// extrusion-stat block (extrusion_width / extrusion_spacing / small_region_threshold /
+// num_regions), not just the former as I2 intended. For any painted colour, the ONLY region
+// with `wall_filament == color_idx` is the auto-created painted region (PrintApply.cpp:
+// 1088-1090) - and that region's slices stay EMPTY at layer_color_stat time on EVERY layer,
+// because apply_mm_segmentation (PrintObjectSlice.cpp:5275, which actually populates them)
+// runs AFTER segmentation (:5267). So the per-colour block was skipped unconditionally for
+// every painted colour, on every layer: extrusion_width/spacing/small_region_threshold all
+// stayed 0.f and num_regions stayed 0 (re-arming assert(out.num_regions > 0), masked in
+// Release by /DNDEBUG). Two consequences, both invisible to every other test in this file
+// because they all probe dead-center on a uniform-cross-section slab:
+//   - The lateral inward taper the descent loop applies per depth step
+//     (offset -= extrusion_spacing + extrusion_width, :1542/:1562) goes to zero, so a
+//     painted shell claim stops narrowing as it descends and instead stays the full
+//     surface-layer silhouette all the way down - a full-width prism instead of the
+//     intended truncated pyramid.
+//   - small_region_threshold == 0 also disables the opening_ex() thin-projection filter
+//     that exists to fix #7104.
+// This is the re-review's suggested discriminating test: probe a point ~2mm in from the
+// painted face's silhouette edge (well outside any wall/skin band, so "unclaimed" here can
+// only come from the *inward taper*, never from being genuinely outside the object) at the
+// deepest layer the shell reaches. Numbers (0.45mm outer wall, 0.1mm layers): each descent
+// step narrows the claim by extrusion_spacing + extrusion_width =
+// (0.45 - 0.1*(1-pi/4)) + 0.45 ~= 0.8785mm. At depth 5 (the deepest layer still inside the
+// "thin layers...full shell depth" test's 6-layer effective shell above) that is ~4.39mm of
+// accumulated inward erosion on a 20mm half-width - well past a 2mm-from-edge probe, so a
+// tapered claim must NOT reach it. Pre-fix (taper == 0 every step), the untapered claim still
+// reaches the full silhouette at every depth, so the same probe is WRONGLY claimed.
+TEST_CASE("multi_material_segmentation_by_painting: the painted top claim's lateral inward taper survives at the deepest claimed layer (not a full-width prism)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_capped_slab(TOP_CAP_FACE, /*layer_height=*/0.1,
+                                             /*top_shell_layers=*/4, /*top_shell_thickness=*/0.6,
+                                             /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.0,
+                                             print);
+
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 6);
+    // Deepest layer still inside the effective 6-layer shell (matches the "thin layers..."
+    // test above): 5 inward-taper steps have accumulated here.
+    const size_t deepest_claimed_layer = top_index - 5;
+
+    const BoundingBox bb = get_extents(object->get_layer(int(deepest_claimed_layer))->lslices);
+    REQUIRE(bb.defined);
+    const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
+    // 2mm in from the edge of the 40x40 slab (20mm half-width): outside the ~15.6mm tapered
+    // boundary at depth 5, but well inside the untapered full silhouette.
+    const Point near_edge_probe(coord_t(bb.max.x() - scale_(2.0)), mid_y);
+
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, deepest_claimed_layer), near_edge_probe));
+}
+
+// N2 (Minor) - C1 residual: the surface-layer `append` at :1536 is not gated on
+// `stat.top_shell_layers > 0`. In a mixed-region object, `max_top_layers` (the OBJECT-WIDE
+// gate at :1311-1326 that decides whether top_raw gets populated at all) can be > 0 purely
+// because of ANOTHER region elsewhere on the object, even on a layer where the only region
+// actually present (non-empty slices) has top_shell_layers == 0 - i.e. layer_color_stat's
+// per-LAYER stat.top_shell_layers legitimately comes back 0 there. C1's contract (see the
+// "top_shell_layers=0..." TEST_CASE above) is that a zero-shell region claims nothing, not
+// even its own surface layer (LayerRegion.cpp:1025-1036 demotes that surface to
+// stInternal/stInternalVoid). Pre-fix, the surface layer still gets claimed anyway, because
+// the append that puts it in triangles_by_color_top only checks that top_raw has geometry
+// there, never stat.top_shell_layers itself.
+//
+// Two Z-stacked model-part volumes, same construction as the I2 test above: "lower" (z
+// 0-4mm) keeps the stock top_shell_layers/top_shell_thickness defaults (4 / 0.6mm) purely so
+// the object-wide max_top_layers gate is nonzero and top_raw gets populated at all; "upper"
+// (z 4-20mm) explicitly sets top_shell_layers=0 with a NONZERO top_shell_thickness=0.6 (so
+// this also discriminates the helper's own zero-count early return - a thickness-driven
+// resurrection there would independently unmask this bug too, N3's "Site A") and has its top
+// cap painted. "lower" has no geometry anywhere near the object's top layer, so per-layer
+// stat.top_shell_layers there comes back 0 - purely from "upper", the only region present.
+//
+// Bottom-direction counterpart deliberately not added here: :1556 has the identical residual
+// gate gap, but it is out of this fix-wave's cited anchor (:1536 only) and is left as a noted,
+// deferred asymmetry rather than folded in unrequested - see the fix-wave report.
+TEST_CASE("multi_material_segmentation_by_painting: a zero-shell region's painted top is not claimed even when another region makes the object-wide gate nonzero", "[paintdepth]")
+{
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-n2-zero-shell-mixed.stl";
+    ModelVolume *lower    = object->add_volume(make_cube(40., 40., 4.));
+    lower->name           = "lower";
+    // Stock top_shell_layers/top_shell_thickness defaults (4 / 0.6mm) left untouched: this
+    // volume's only job is to keep the object-wide max_top_layers gate (:1311-1326) open so
+    // top_raw is populated at all, exactly like the I2 test above.
+
+    ModelVolume *upper = object->add_volume(make_cube(40., 40., 16.));
+    upper->name         = "upper";
+    upper->translate(0., 0., 4.);
+    upper->config.set_key_value("top_shell_layers", new ConfigOptionInt(0));
+    upper->config.set_key_value("top_shell_thickness", new ConfigOptionFloat(0.6));
+
+    TriangleSelector selector(upper->mesh());
+    for (int facet_idx : TOP_CAP_FACE)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(upper->mmu_segmentation_facets.set(selector));
+
+    object->add_instance();
+    object->ensure_on_bed();
+
+    DynamicPrintConfig config = paint_depth_test_config(pdmUnlimited, 3);
+    config.option<ConfigOptionFloat>("layer_height")->value               = 1.0;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = 1.0;
+
+    Print print;
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+
+    const Point  probe     = slab_center_point(*out_object);
+    const size_t top_index = out_object->layer_count() - 1;
+    REQUIRE(top_index >= 4);
+
+    // "upper"'s own top_shell_layers=0: the C1 contract says NO claim at all for this
+    // region's colour, not even the immediately-painted surface layer itself.
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, top_index), probe));
+}
+
+// N3 (Minor): the C1 inverted test above ("top_shell_layers=0 with nonzero
+// top_shell_thickness claims NO painted depth...") pins only the top_layers_eff gate
+// (:1319-1322); there is no bottom-direction (bottom_shell_layers=0) counterpart, even
+// though :1321-1322 gates bottom identically to top and LayerRegion.cpp:1025-1036 demotes
+// stBottom the same way it demotes stTop. Exact bottom mirror of that test: bottom cap
+// painted, bottom_shell_layers=0, bottom_shell_thickness=0.6 (nonzero, so a reversion of the
+// bottom_layers_eff gate alone would resurrect a claim here) - must claim NOTHING, not even
+// the immediately-painted bottom surface facet. Already-correct behavior (Site B is already
+// top/bottom symmetric); this is coverage, not a fix.
+TEST_CASE("multi_material_segmentation_by_painting: bottom_shell_layers=0 with nonzero bottom_shell_thickness claims NO painted depth (bottom-direction mirror of the top C1 test above)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_capped_slab(BOTTOM_CAP_FACE, /*layer_height=*/0.2,
+                                             /*top_shell_layers=*/3, /*top_shell_thickness=*/0.0,
+                                             /*bottom_shell_layers=*/0, /*bottom_shell_thickness=*/0.6,
+                                             print);
+
+    const Point probe = slab_center_point(*object);
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, 0), probe));
+}

@@ -1468,6 +1468,7 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
         LayerColorStat out;
         const Layer &layer = *layers[layer_idx];
         for (const LayerRegion *region : layer.regions()) {
+            const PrintRegionConfig &config = region->region().config();
             // Fix-wave I2 (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-fix-review.md):
             // PrintObjectSlice.cpp:5199-5208 gives every layer a LayerRegion for EVERY
             // PrintRegion on the object, whether or not that region has any geometry on this
@@ -1476,26 +1477,42 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
             // to the max below, inflating the claim depth on layers it never actually touches.
             // region->slices is populated per-layer at PrintObjectSlice.cpp:5229-5235, before
             // segmentation runs at :5267, so this is valid and free.
-            if (region->slices.empty())
-                continue;
-            const PrintRegionConfig &config = region->region().config();
-            // Vertical paint-depth alignment fix, shell-coverage-investigation.md fix (2): the
-            // solid shell a painted claim must cover is whichever region reaches deepest on
-            // THIS layer, not only the region(s) that happen to carry this paint color right
-            // now - a painted patch can span regions with different shell settings (e.g. a
-            // modifier with its own top_shell_layers), and the shell the base material builds
-            // underneath does not care which color is painted above it. So these two are
-            // maxed over ALL regions on the layer, unconditionally - unlike extrusion_width /
-            // small_region_threshold / extrusion_spacing below, which stay scoped to color_idx
-            // (they size the lateral taper of THIS color's own claim, untouched by this fix).
-            // Effective count = max(configured layer count, however many layers this object's
-            // REAL layer heights need to cover the configured thickness) - see
-            // effective_shell_layers_by_thickness() above, which mirrors discover_vertical_
-            // shells / discover_horizontal_shells exactly, including variable layer height.
-            out.top_shell_layers    = std::max(out.top_shell_layers,
-                                                effective_shell_layers_by_thickness(layers, layer_idx, true,  config.top_shell_layers.value,    config.top_shell_thickness.value));
-            out.bottom_shell_layers = std::max(out.bottom_shell_layers,
-                                                effective_shell_layers_by_thickness(layers, layer_idx, false, config.bottom_shell_layers.value, config.bottom_shell_thickness.value));
+            //
+            // Fix-wave N1 (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-fixwave-
+            // rereview.md): this guard must scope ONLY the shell-depth max just below, never
+            // the per-colour extrusion-stat block that follows. The auto-created painted
+            // region (the ONLY region with wall_filament == a painted color_idx,
+            // PrintApply.cpp:1088-1090) has empty slices on EVERY layer at this point in the
+            // pipeline - its geometry isn't written until apply_mm_segmentation() runs, AFTER
+            // this segmentation (PrintObjectSlice.cpp:5230 -> :5267 -> :5275). Skipping it
+            // unconditionally (i.e. gating the per-colour block on it too) would zero
+            // num_regions/extrusion_width/extrusion_spacing/small_region_threshold for EVERY
+            // painted colour on EVERY layer, silently disabling the lateral inward taper
+            // (:1542/:1562 below) and the #7104 thin-projection filter, and re-arming
+            // assert(out.num_regions > 0) below. The shell-depth max loses nothing by keeping
+            // the guard scoped to just this block: a painted region always shares its parent
+            // volume region's top/bottom_shell_layers/thickness (PrintApply.cpp:1088-1090
+            // only overrides the filament ids), and the parent DOES have slices on every layer
+            // it occupies, so the max already sees that depth via the parent.
+            if (! region->slices.empty()) {
+                // Vertical paint-depth alignment fix, shell-coverage-investigation.md fix (2): the
+                // solid shell a painted claim must cover is whichever region reaches deepest on
+                // THIS layer, not only the region(s) that happen to carry this paint color right
+                // now - a painted patch can span regions with different shell settings (e.g. a
+                // modifier with its own top_shell_layers), and the shell the base material builds
+                // underneath does not care which color is painted above it. So these two are
+                // maxed over ALL regions on the layer, unconditionally - unlike extrusion_width /
+                // small_region_threshold / extrusion_spacing below, which stay scoped to color_idx
+                // (they size the lateral taper of THIS color's own claim, untouched by this fix).
+                // Effective count = max(configured layer count, however many layers this object's
+                // REAL layer heights need to cover the configured thickness) - see
+                // effective_shell_layers_by_thickness() above, which mirrors discover_vertical_
+                // shells / discover_horizontal_shells exactly, including variable layer height.
+                out.top_shell_layers    = std::max(out.top_shell_layers,
+                                                    effective_shell_layers_by_thickness(layers, layer_idx, true,  config.top_shell_layers.value,    config.top_shell_thickness.value));
+                out.bottom_shell_layers = std::max(out.bottom_shell_layers,
+                                                    effective_shell_layers_by_thickness(layers, layer_idx, false, config.bottom_shell_layers.value, config.bottom_shell_thickness.value));
+            }
             if (// color_idx == 0 means "don't know" extruder aka the underlying extruder.
                 // As this region may split existing regions, we collect statistics over all regions for color_idx == 0.
                 color_idx == 0 || config.wall_filament == int(color_idx)) {
@@ -1532,7 +1549,21 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                     if (ExPolygons top_ex = union_ex(top[layer_idx]); ! top_ex.empty()) {
                         // Clean up thin projections. They are not printable anyways.
                         top_ex = opening_ex(top_ex, stat.small_region_threshold);
-                        if (! top_ex.empty()) {
+                        // Fix-wave N2 (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-
+                        // fixwave-rereview.md): top_raw having geometry here only proves SOME
+                        // region on the object has a nonzero top shell (the object-wide
+                        // max_top_layers gate above that decides whether to run
+                        // slice_mesh_slabs at all) - not that the region(s) actually present
+                        // on THIS layer do. stat.top_shell_layers is the correct, layer-local
+                        // answer (computed above from exactly the regions with real geometry
+                        // on this layer); C1's contract is that a zero shell count claims
+                        // nothing at all, not even the immediately-painted surface facet
+                        // itself (LayerRegion.cpp:1025-1036 demotes it away from stTop). The
+                        // descent loop below was already a no-op whenever
+                        // stat.top_shell_layers == 0 (its own bound collapses to
+                        // last_idx > layer_idx); this gate makes the surface claim just above
+                        // it consistent with that same zero.
+                        if (! top_ex.empty() && stat.top_shell_layers > 0) {
                             append(triangles_by_color_top[color_idx][layer_idx + layer_idx_offset], top_ex);
                             float offset = 0.f;
                             ExPolygons layer_slices_trimmed = input_expolygons[layer_idx];
