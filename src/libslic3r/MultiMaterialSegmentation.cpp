@@ -2010,6 +2010,39 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                             const bool       normal_shell = stat.normal_shell;
                             const ExPolygons top_exposed_ex = normal_shell ? top_ex
                                                                            : exposed_surface_part(top_ex, input_expolygons, layer_idx + 1, num_layers, wall_stack);
+                            // FLAT-TOP CAP (user decision 2026-09-01, .superpowers/sdd/
+                            // 2026-08-31-paint-depth/flat-top-cap-report.md): on a FLAT (or
+                            // near-flat) painted top the normal-thickness shell claims D deep
+                            // (15 layers at stock defaults / 0.1mm layers) but only the solid
+                            // top shell (stat.top_shell_layers, 6 layers at stock defaults) is
+                            // ever VISIBLE - everything past it is hidden sparse infill of the
+                            // SAME colour either way (paint_infill_override). Cap the FLAT part
+                            // of the claim there; SLOPES AND WALLS MUST KEEP THE FULL D BOUND.
+                            //
+                            // Discriminator: reuse exposed_surface_part()'s own wall-stack
+                            // yardstick - "is this part of the patch farther than one wall stack
+                            // from the neighbouring layer's own contour" - the SAME test that
+                            // used to gate top_exposed_ex before N1 retired it, computed fresh
+                            // here UNCONDITIONALLY of normal_shell so it never touches
+                            // top_exposed_ex itself (which N1 deliberately made unconditional so
+                            // slopes still reach D). Where the local staircase run r is below one
+                            // wall stack (the classic slope gate, ~6.49deg at 0.1mm layers - see
+                            // the self-limiting note above), the patch is genuinely near-flat and
+                            // top_flat_cap_ex is non-empty there; above it (every slope this
+                            // wave's T1/T2/T3 pin, 10-63deg) top_flat_cap_ex is EMPTY and the cap
+                            // below is a no-op by construction - no new angle constant. On a
+                            // patch that is flat in the middle and rolls over to steep at its rim
+                            // (a dome crown), the split is POINTWISE, exactly like
+                            // exposed_surface_part's own documented behaviour: the crown is
+                            // capped, the rim (rolling into the flank) is not.
+                            //
+                            // Only worth computing when D actually reaches deeper than the shell
+                            // - if it doesn't, there is nothing beyond stat.top_shell_layers to
+                            // cap and this would be wasted Clipper work.
+                            const bool       top_cap_active = normal_shell && stat.top_descent_layers > stat.top_shell_layers;
+                            const ExPolygons top_flat_cap_ex = top_cap_active
+                                ? exposed_surface_part(top_ex, input_expolygons, layer_idx + 1, num_layers, wall_stack)
+                                : ExPolygons{};
                             float offset = 0.f;
                             // Option N (N3): on a slope the full-width term is empty for the NEAR
                             // descent steps - the ring deposited m layers down sits at inset
@@ -2104,6 +2137,17 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                     append(last, intersection_ex(reachable, offset_ex(input_expolygons[last_idx], -wall_stack)));
                                     last = union_ex(last);
                                 }
+                                // FLAT-TOP CAP: once this descent step is deeper than the legacy
+                                // solid-shell bound, the FLAT portion of the whole deposit (both
+                                // the eroded term above and the exposed/full-width term just
+                                // appended - subtracting from `last` as a whole, not merely from
+                                // the full-width contribution, is what stops a WIDE flat cap's
+                                // eroded term from continuing to shrink-and-deposit all the way to
+                                // the D-driven depth) is removed. The sloped remainder (if any - a
+                                // rolled-over rim) is untouched and keeps descending to the full D
+                                // bound below, exactly like today.
+                                if (top_cap_active && ! top_flat_cap_ex.empty() && int(layer_idx) - last_idx >= stat.top_shell_layers)
+                                    last = diff_ex(last, top_flat_cap_ex);
                                 // ITEM 2 (interclaim-absorb-report.md / interclaim-sliver-
                                 // investigation.md section 5, Option 2): legacy behaviour
                                 // (normal_shell == false, which is EVERY layer/colour in unlimited
@@ -2168,6 +2212,12 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                             const bool       normal_shell = stat.normal_shell;
                             const ExPolygons bottom_exposed_ex = normal_shell ? bottom_ex
                                                                               : exposed_surface_part(bottom_ex, input_expolygons, layer_idx - 1, num_layers, wall_stack);
+                            // FLAT-TOP CAP, mirrored - see the top loop's comment above for the
+                            // full reasoning.
+                            const bool       bottom_cap_active = normal_shell && stat.bottom_descent_layers > stat.bottom_shell_layers;
+                            const ExPolygons bottom_flat_cap_ex = bottom_cap_active
+                                ? exposed_surface_part(bottom_ex, input_expolygons, layer_idx - 1, num_layers, wall_stack)
+                                : ExPolygons{};
                             float offset = 0.f;
                             bool  deposited = false;
                             ExPolygons layer_slices_trimmed = input_expolygons[layer_idx];
@@ -2189,6 +2239,9 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                     append(last, intersection_ex(reachable, offset_ex(input_expolygons[last_idx], -wall_stack)));
                                     last = union_ex(last);
                                 }
+                                // FLAT-TOP CAP, mirrored - see the top loop's comment above.
+                                if (bottom_cap_active && ! bottom_flat_cap_ex.empty() && last_idx - layer_idx >= size_t(stat.bottom_shell_layers))
+                                    last = diff_ex(last, bottom_flat_cap_ex);
                                 // ITEM 2, mirrored - see the top loop's comment above.
                                 if (! normal_shell)
                                     last = opening_ex(last, stat.small_region_threshold);

@@ -4184,3 +4184,209 @@ TEST_CASE("multi_material_segmentation_by_painting: a genuine base region wider 
     CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder2*/ 2), centre_probe));
     CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder3*/ 3), centre_probe));
 }
+// ===========================================================================================
+// FLAT-TOP CAP (user decision 2026-09-01, .superpowers/sdd/2026-08-31-paint-depth/
+// flat-top-cap-report.md): on a FLAT painted top the normal-thickness shell (Wave B / Option N)
+// claims D deep (15 layers at stock defaults / 0.1mm layers, walls = 3), but only the solid top
+// shell (6 layers at stock defaults: top_shell_layers = 4, top_shell_thickness = 0.6) is ever
+// VISIBLE - the rest is hidden sparse infill of the SAME colour either way
+// (paint_infill_override). Capping the flat portion of the claim at the shell depth removes 9
+// tool changes and ~2.5cm3 of purge per painted flat cap at stock defaults, with NO visible
+// change. SLOPES AND WALLS KEEP THE FULL D BOUND - every Wave B test above (T1/T2/T3, the
+// break-placement pin, the normal-thickness-across-slopes table, the D >= wall_stack gate, the
+// base-filament-not-deepened pin, Important 1/2) is untouched by this section and must stay
+// green, unmodified.
+// ===========================================================================================
+
+TEST_CASE("multi_material_segmentation_by_painting: a flat painted top is capped at the solid-shell depth, not the full normal thickness (flat-top cap)", "[paintdepth]")
+{
+    // slice_bounded_frustum(bottom, top, ...) with bottom == top degenerates the frustum to a
+    // plain vertical-walled prism (see make_square_frustum's own facet-table comment) - reused
+    // rather than adding a new fixture, and it already pins top_shell_layers = 4 /
+    // top_shell_thickness = 0.6 (a 6-layer effective shell at 0.1mm layers) and walls = 3
+    // (D = 1.435675mm, M = ceil(D/0.1) = 15).
+    Print        print;
+    PrintObject *object = slice_bounded_frustum(40., 40., 4., TOP_CAP_FACE,
+                                                 pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 16);
+
+    const Point probe = slab_center_point(*object);
+
+    // Surface facet + shell depths 1-5 (6 layers total, matching the effective 6-layer solid
+    // shell) stay claimed exactly as Wave B already delivered - the cap never touches anything
+    // within the shell.
+    for (size_t depth = 0; depth <= 5; ++depth) {
+        CAPTURE(depth);
+        CHECK(any_contains(extruder2_claim_for_layer(*object, top_index - depth), probe));
+    }
+    // RED on HEAD: without the cap a flat top's claim continues to the full D-driven depth (15
+    // layers total), so depths 6-14 are STILL claimed today. A 40x40mm cap is far wider than the
+    // ~0.88mm/layer erosion accumulates by depth 14 (~12.3mm from each edge, leaving >15mm still
+    // solid at the centre), so this is not a fixture artefact - the centre really is claimed
+    // pre-fix. The cap must stop it dead at the shell boundary instead.
+    for (size_t depth = 6; depth <= 14; ++depth) {
+        CAPTURE(depth);
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, top_index - depth), probe));
+    }
+}
+
+// Pins the exact MEASURED numbers from wave-b-report.md section 1 (also reproduced, with a
+// looser [1.36, 1.58] window, by "normal thickness across slopes" above) - this cap must leave
+// every sloped-origin descent byte-identical, so these figures must not move by more than
+// claim_reach_mm()'s own 0.05mm scan step (scaled by sin(theta)).
+TEST_CASE("multi_material_segmentation_by_painting: the flat-top cap leaves the measured 10/15/20 degree normal thickness untouched (regression pin)", "[paintdepth]")
+{
+    constexpr double kPi = 3.14159265358979323846;
+    struct SlopeCase { double degrees; double bottom; double normal_mm_expected; };
+    // Same four-frustum family as "normal thickness across slopes" above (18mm top over 3mm),
+    // walls = 3, 0.1mm layers, probe layer 12. Expected values from wave-b-report.md section 1's
+    // "measured now" column (M = 15, so the realised thickness is M*h*cos(theta), the design's
+    // D*cos(theta) rounded UP by the one-layer quantisation of M, never down).
+    const SlopeCase cases[] = {
+        {10., 52.0276, 1.476},
+        {15., 40.3920, 1.436},
+        {20., 34.4848, 1.402},
+    };
+
+    for (const SlopeCase &c : cases) {
+        DYNAMIC_SECTION("slope " << c.degrees << " deg") {
+            Print        print;
+            PrintObject *object = slice_bounded_frustum(c.bottom, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                         pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+            REQUIRE(object->layer_count() >= 27);
+
+            const double theta     = c.degrees * kPi / 180.;
+            const double reach     = claim_reach_mm(*object, /*layer_idx=*/12);
+            const double normal_mm = reach * std::sin(theta);
+            CAPTURE(c.degrees);
+            CAPTURE(reach);
+            CAPTURE(normal_mm);
+
+            CHECK_THAT(normal_mm, Catch::Matchers::WithinAbs(c.normal_mm_expected, 0.03));
+        }
+    }
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: a flat crown with sloped flanks is capped at the crown, not at the flanks (dome/frustum mix)", "[paintdepth]")
+{
+    // Same 15-degree frustum as T1 (40.392 -> 18mm top over 3mm, 30 layers at 0.1mm), but paint
+    // BOTH the flat top cap (the "crown") AND the sloped walls (the "flanks") together - a
+    // dome's flat-crown/sloped-flank shape without needing a new mesh helper.
+    std::vector<int> crown_and_flanks = TOP_CAP_FACE;
+    crown_and_flanks.insert(crown_and_flanks.end(), FRUSTUM_SLOPED_WALLS.begin(), FRUSTUM_SLOPED_WALLS.end());
+
+    Print        print;
+    PrintObject *object = slice_bounded_frustum(40.392, 18., 3., crown_and_flanks,
+                                                 pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    REQUIRE(object->layer_count() >= 27);
+    const size_t top_index = object->layer_count() - 1;
+
+    // The CROWN. The flat cap's own descent, even uncapped, reaches at most M = 15 layers from
+    // its own origin (layer top_index = 29 on this 30-layer fixture) - down to layer 15, short
+    // of probe layer 12 by 3 layers regardless of this change. The object's XY centre is
+    // likewise unreachable by the FLANKS at any depth (their own deepest reach is ~5.6mm from
+    // the CONTOUR, per T1, nowhere near the centre of an 18x18mm cap) - so probing the centre at
+    // the crown's own depths isolates its behaviour cleanly from the flanks. Same numbers as the
+    // plain flat-cap test above: depths 0-5 claimed, 6-14 capped away.
+    const Point centre = slab_center_point(*object);
+    for (size_t depth = 0; depth <= 5; ++depth) {
+        CAPTURE(depth);
+        CHECK(any_contains(extruder2_claim_for_layer(*object, top_index - depth), centre));
+    }
+    for (size_t depth = 6; depth <= 14; ++depth) {
+        CAPTURE(depth);
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, top_index - depth), centre));
+    }
+
+    // The FLANKS. Layer 12's claim is built entirely from nearby sloped-wall origins (layers
+    // 12..26, per T1's own comment) - the crown at layer 29 is too deep to reach it (as above),
+    // so this is an untouched reproduction of T1 itself, now with the crown painted too. Must be
+    // byte-identical to T1: full D depth, not the lateral band alone.
+    const ExPolygons claim = extruder2_claim_for_layer(*object, 12);
+    CHECK(any_contains(claim, layer_edge_probe(*object, 12, 3.0)));
+    CHECK(any_contains(claim, layer_edge_probe(*object, 12, 5.0)));
+    CHECK_FALSE(any_contains(claim, layer_edge_probe(*object, 12, 6.0)));
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: a flat painted bottom is capped at the solid-shell depth (flat-top cap, bottom mirror)", "[paintdepth]")
+{
+    // Mirror of the flat-cap test above. slice_bounded_frustum() pins bottom_shell_layers = 3 /
+    // bottom_shell_thickness = 0.0 (thickness disabled, so the effective bottom shell is the
+    // plain layer count, 3 - a different number from the top's 6, which is fine: the point being
+    // pinned is "capped at the shell depth, not the D-driven depth", and 3 vs 15 demonstrates
+    // that exactly as clearly as 6 vs 15 does).
+    Print        print;
+    PrintObject *object = slice_bounded_frustum(40., 40., 4., BOTTOM_CAP_FACE,
+                                                 pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    REQUIRE(object->layer_count() >= 16);
+
+    const Point probe = slab_center_point(*object);
+
+    for (size_t depth = 0; depth <= 2; ++depth) {
+        CAPTURE(depth);
+        CHECK(any_contains(extruder2_claim_for_layer(*object, depth), probe));
+    }
+    // RED on HEAD: depths 3-14 are still claimed today (the D-driven 15-layer descent, unbounded
+    // by the effective 3-layer bottom shell); capped, they must not be.
+    for (size_t depth = 3; depth <= 14; ++depth) {
+        CAPTURE(depth);
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, depth), probe));
+    }
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: the interior absorb does not annex a flat cap's capped floor into a neighbouring painted colour", "[paintdepth]")
+{
+    // Same construction as the "Important 2" cross-colour-clip test above: TOP_CAP_FACE painted
+    // Extruder2 (colour A, the flat cap), the full-height +X wall painted Extruder3 (colour B,
+    // right up to the shared top edge) - a genuinely ACTIVE painted neighbour at every layer,
+    // which is exactly the precondition the interior inter-claim absorb needs to have a "winner"
+    // candidate at all.
+    Print        print;
+    PrintObject *object = slice_two_painted_colours(/*x=*/40., /*y=*/40., /*z=*/6.,
+                                                      TOP_CAP_FACE, PLUS_X_FACE,
+                                                      pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 20);
+
+    // Depth 8: past colour A's capped floor (shell depth 6) and far past colour B's own lateral
+    // reach (~1.44mm from the +X wall) - the box centre is 20mm from every edge. Pre-fix, colour
+    // A's (uncapped) claim reaches the centre here (RED, same mechanism as the plain flat-cap
+    // test above). The genuine risk this pins is the SECOND check: if the now-empty capped floor
+    // were ever mistaken for an absorbable inter-claim sliver, colour B - the only active
+    // painted neighbour at this layer - is exactly who it would be annexed into. It must stay
+    // base instead.
+    const size_t probe_layer = top_index - 8;
+    const Point  centre      = slab_center_point(*object);
+    CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder2, colour A, the capped flat top*/ 2), centre));
+    CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder3, colour B, the side stripe*/ 3), centre));
+}
+
+// Cost evidence (the whole point of this change - spec's "Cost note",
+// docs/superpowers/specs/2026-08-31-paint-depth-design.md, and wave-b-report.md section 6):
+// counts how many layers of the SAME flat-cap fixture as the RED test above actually carry
+// painted material - each one costs one tool change and its purge (~280mm3 stock flush default,
+// PrintConfig.cpp) on a real multi-material printer. Run against the pre-fix binary and it
+// reports 15 (the D-driven depth); post-fix it must report 6 (the effective solid-shell depth) -
+// 9 fewer tool changes / painted layers per painted flat cap, ~2.5cm3 of purge recovered, with NO
+// visible change (everything past the solid shell was hidden sparse infill either way).
+TEST_CASE("multi_material_segmentation_by_painting: cost evidence - painted-layer count on the flat-cap fixture drops from the D-driven depth to the shell depth", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_bounded_frustum(40., 40., 4., TOP_CAP_FACE,
+                                                 pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 16);
+
+    const Point probe          = slab_center_point(*object);
+    size_t      painted_layers = 0;
+    for (size_t depth = 0; depth <= 20 && depth <= top_index; ++depth) {
+        if (! any_contains(extruder2_claim_for_layer(*object, top_index - depth), probe))
+            break; // contiguous from the surface on this fixture (a wide flat cap).
+        ++painted_layers;
+    }
+
+    INFO("painted layers on the flat-cap fixture (== tool changes saved versus the pre-cap "
+         "D-driven depth of 15): " << painted_layers);
+    CHECK(painted_layers == 6);
+}

@@ -93,3 +93,20 @@ recorded here since this is the doc future changes to the feature should be chec
 - Positive, and provable independent of slope purity: the painted claim is a strict superset of
   the pre-Option-N claim at every slope, so nothing the feature already delivered is degraded
   anywhere by the deepened shell.
+
+**FLAT-TOP CAP (user decision 2026-09-01, `.superpowers/sdd/2026-08-31-paint-depth/
+flat-top-cap-report.md`) — the 9 extra tool changes above are now recovered.** The claim above
+holds material-for-material, but only the SOLID top/bottom shell depth (6 layers at stock
+defaults: `top_shell_layers = 4` / `top_shell_thickness = 0.6` at 0.1 mm layers) is ever visible —
+everything past it, up to the D-driven depth (15 layers), was hidden sparse infill of the same
+painted colour either way (`paint_infill_override`). On a genuinely FLAT (or near-flat, below the
+~6.49° classic slope-gate angle at 0.1 mm layers) painted top or bottom, the claim beyond the
+solid-shell depth is now capped away — measured on the flat-cap fixture (40×40 mm cap, `walls = 3`
+⇒ D = 1.435675 mm, 0.1 mm layers): **15 → 6 painted layers, i.e. the 9 tool changes / ≈2.5 cm³ of
+purge above are recovered, with NO visible change** (the material removed was always beneath the
+solid shell). SLOPES AND WALLS ARE UNAFFECTED: the cap discriminates flat from sloped using the
+existing `exposed_surface_part()` wall-stack yardstick (the same one N1 retired as a gate), applied
+pointwise to each origin layer's own patch rather than as a hard angle cutoff — a dome's crown is
+capped while its flanks keep the full D bound, verified by a dedicated test. The measured 10/15/20°
+normal-thickness figures above (1.476 / 1.436 / 1.402 mm) are byte-identical before and after this
+change, confirmed to 10 decimal places by a before/after digit comparison, not merely asserted.
