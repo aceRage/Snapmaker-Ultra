@@ -1266,6 +1266,73 @@ static inline int effective_shell_layers_by_thickness(const ConstLayerPtrsAdapto
     return effective;
 }
 
+// TAPER BOUND (approved user decision, .superpowers/sdd/2026-08-31-paint-depth/
+// taper-bound-report.md): "painted top/bottom claims keep FULL WIDTH for the solid-shell
+// depth; taper only below that". Since the vertical-depth fix wave the claim depth IS the
+// solid-shell depth, so within the claim there must be no width loss at all.
+//
+// WHAT THE EROSION IS FOR (established before changing it; the descent loops below do
+// `offset -= (stat.extrusion_spacing + stat.extrusion_width)` and apply that shrink to the
+// LAYER OUTLINE, not to the painted patch). It is a PERIMETER-SAFETY MARGIN ON INFERRED
+// CLAIMS. The surface layer's claim is what the user actually painted and is appended with no
+// margin at all; every layer below it is an INFERENCE - "the shell under this painted face
+// should be painted too" - and BBS keeps those inferred claims at least one wall stack clear
+// of the layer's own contour. Its own comment says so: "offset width should be 2*spacing to
+// avoid too narrow area which has overlap of wall line". Land a colour boundary inside a
+// perimeter band and that perimeter loop is split into a painted arc and a base arc with a
+// sub-wall-width sliver between them - the unprintable-sliver / exterior-dimple class of
+// upstream PrusaSlicer #7104 ("polygons < 0.1mm^2 ... causing dimples on outer primers",
+// the filter_out_small_polygons() call in segmentation_top_and_bottom_layers below) and #7235
+// ("MMU Painting still creating dimples in exterior perimeter", whose fix is the offset2_ex
+// clean-up in merge_segmented_layers below).
+//
+// Its most important consequence, and the reason it cannot simply be deleted: a STEEP
+// (near-vertical) painted surface projects, at each layer, a thin staircase band of width
+// layer_height / tan(slope) that by construction HUGS that layer's contour - it is exactly
+// the annulus between this layer's outline and the next one up, which is all that the
+// occlusion trim below leaves. Propagating such a band at full width would leave a base strip only
+// `layer_height / tan(slope)` wide at the perimeter of each layer below - narrower than one
+// wall - and would smear the painted colour top_shell_layers deep down the whole wall.
+// Today's erosion annihilates that band at the very first descent step and the descent then
+// breaks. That protection must survive, and it does: see the "[paintdepth] a steep painted
+// surface gains no deep full-width claim (anti-smear guard)" test.
+//
+// THE SPLIT. The dangerous case and the user's case are separated by exactly one quantity -
+// how far the projected patch extends away from the object that sits above it (below it, for
+// bottom claims). This function returns the part of `projected_patch` that is more than one
+// wall stack clear of `input_expolygons[reference_layer_idx]`, i.e. the part that belongs to
+// a genuinely EXPOSED, near-horizontal surface; the descent loop propagates that part at full
+// width and leaves everything else to the untouched legacy eroded term.
+//   - A flat top face (a prism cap, the user's 8mm painted feature, an interior island): the
+//     layer above is empty or far away, so the whole patch is returned and descends at full
+//     width. No footprint is lost, and no base strip exists to be slivered - the claim either
+//     covers the cross-section out to its contour or is bounded by its own interior edge.
+//   - A steep surface: the whole band lies within one wall stack of the layer above, so this
+//     returns EMPTY and the descent is byte-identical to before the taper bound.
+//   - A patch that is flat in the middle and rolls over to steep at its rim (an organic
+//     model - the actual user scenario): split pointwise, correctly, with no threshold to
+//     tune.
+// Expressed as a slope, the criterion is `layer_height / tan(slope) >= wall + spacing`, i.e.
+// the same wall-stack yardstick the erosion itself uses, derived from the quantities already
+// in hand instead of an invented angle constant, and adapting automatically to layer height
+// and extrusion width. It also preserves the erosion's actual invariant rather than a proxy
+// for it: wherever the full-width term contributes, the base material left at that layer's
+// perimeter is either nothing at all or at least one wall stack wide - never a sliver.
+static inline ExPolygons exposed_surface_part(const ExPolygons              &projected_patch,
+                                              const std::vector<ExPolygons> &input_expolygons,
+                                              size_t                         reference_layer_idx,
+                                              size_t                         num_layers,
+                                              float                          wall_stack_width)
+{
+    // reference_layer_idx is layer_idx + 1 for top claims and layer_idx - 1 for bottom claims
+    // (the same neighbours the occlusion trim above uses). Both can run off the object - and
+    // layer_idx - 1 wraps to SIZE_MAX at layer 0 - which is precisely the "nothing above/below
+    // this surface" case: the whole patch is exposed.
+    if (reference_layer_idx >= num_layers || input_expolygons[reference_layer_idx].empty() || wall_stack_width <= 0.f)
+        return projected_patch;
+    return diff_ex(projected_patch, offset_ex(input_expolygons[reference_layer_idx], wall_stack_width));
+}
+
 // Returns segmentation of top and bottom layers based on painting in segmentation gizmos.
 static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_layers(const PrintObject                                               &print_object,
                                                                                       const std::vector<ExPolygons>                                   &input_expolygons,
@@ -1565,6 +1632,15 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                         // it consistent with that same zero.
                         if (! top_ex.empty() && stat.top_shell_layers > 0) {
                             append(triangles_by_color_top[color_idx][layer_idx + layer_idx_offset], top_ex);
+                            // TAPER BOUND (user decision; .superpowers/sdd/2026-08-31-paint-depth/
+                            // taper-bound-report.md): "painted top/bottom claims keep FULL WIDTH for
+                            // the solid-shell depth". See the exposed_surface_part() comment above
+                            // for the erosion's verified purpose and why this split preserves it -
+                            // in one line: the erosion is a perimeter-safety margin on INFERRED
+                            // claims, and it is only load-bearing where the projected patch hugs its
+                            // layer's contour, i.e. where the painted surface is steep.
+                            const ExPolygons top_exposed_ex = exposed_surface_part(top_ex, input_expolygons, layer_idx + 1, num_layers,
+                                                                                   stat.extrusion_spacing + stat.extrusion_width);
                             float offset = 0.f;
                             ExPolygons layer_slices_trimmed = input_expolygons[layer_idx];
                             for (int last_idx = int(layer_idx) - 1; last_idx > std::max(int(layer_idx - stat.top_shell_layers), int(0)); --last_idx) {
@@ -1572,7 +1648,15 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                 //offset -= stat.extrusion_width ;
                                 offset -= (stat.extrusion_spacing + stat.extrusion_width);
                                 layer_slices_trimmed = intersection_ex(layer_slices_trimmed, input_expolygons[last_idx]);
-                                ExPolygons last = opening_ex(intersection_ex(top_ex, offset_ex(layer_slices_trimmed, offset)), stat.small_region_threshold);
+                                ExPolygons last = intersection_ex(top_ex, offset_ex(layer_slices_trimmed, offset));
+                                if (! top_exposed_ex.empty()) {
+                                    // The near-horizontal part of the patch descends at FULL width -
+                                    // trimmed only by the running intersection of the layer outlines
+                                    // (the containment guard), never by `offset`.
+                                    append(last, intersection_ex(top_exposed_ex, layer_slices_trimmed));
+                                    last = union_ex(last);
+                                }
+                                last = opening_ex(last, stat.small_region_threshold);
                                 if (last.empty())
                                     break;
                                 append(shell_triangles_by_color_top[color_idx][last_idx + layer_idx_offset], std::move(last));
@@ -1583,8 +1667,26 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                     if (ExPolygons bottom_ex = union_ex(bottom[layer_idx]); ! bottom_ex.empty()) {
                         // Clean up thin projections. They are not printable anyways.
                         bottom_ex = opening_ex(bottom_ex, stat.small_region_threshold);
-                        if (! bottom_ex.empty()) {
+                        // TAPER BOUND, symmetry fix: the vertical-depth fix wave gated the TOP
+                        // surface claim on stat.top_shell_layers > 0 (fix-wave N2, see its comment
+                        // above) but deliberately left this, the symmetric BOTTOM site, ungated and
+                        // recorded it as a known residual. The reasoning is identical in every
+                        // respect - bottom_raw having geometry here only proves SOME region on the
+                        // object has a nonzero bottom shell (the object-wide max_bottom_layers gate),
+                        // not that the region(s) actually present on THIS layer do;
+                        // stat.bottom_shell_layers is the layer-local answer, and C1's contract is
+                        // that a zero shell count claims nothing at all, not even the
+                        // immediately-painted surface facet (LayerRegion.cpp:1025-1036 demotes
+                        // stBottom to stInternal/stInternalVoid exactly as it demotes stTop). The
+                        // descent loop below was likewise already a no-op at zero (its bound
+                        // collapses to last_idx < layer_idx). Top and bottom are now symmetric.
+                        if (! bottom_ex.empty() && stat.bottom_shell_layers > 0) {
                             append(triangles_by_color_bottom[color_idx][layer_idx + layer_idx_offset], bottom_ex);
+                            // TAPER BOUND: mirror of the top claim above - see that comment and
+                            // exposed_surface_part(). The reference layer is the one BELOW
+                            // (layer_idx - 1), the same one the bottom occlusion trim uses.
+                            const ExPolygons bottom_exposed_ex = exposed_surface_part(bottom_ex, input_expolygons, layer_idx - 1, num_layers,
+                                                                                      stat.extrusion_spacing + stat.extrusion_width);
                             float offset = 0.f;
                             ExPolygons layer_slices_trimmed = input_expolygons[layer_idx];
                             for (size_t last_idx = layer_idx + 1; last_idx < std::min(layer_idx + stat.bottom_shell_layers, num_layers); ++last_idx) {
@@ -1592,7 +1694,12 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                 //offset -= stat.extrusion_width;
                                 offset -= (stat.extrusion_spacing + stat.extrusion_width);
                                 layer_slices_trimmed = intersection_ex(layer_slices_trimmed, input_expolygons[last_idx]);
-                                ExPolygons last = opening_ex(intersection_ex(bottom_ex, offset_ex(layer_slices_trimmed, offset)), stat.small_region_threshold);
+                                ExPolygons last = intersection_ex(bottom_ex, offset_ex(layer_slices_trimmed, offset));
+                                if (! bottom_exposed_ex.empty()) {
+                                    append(last, intersection_ex(bottom_exposed_ex, layer_slices_trimmed));
+                                    last = union_ex(last);
+                                }
+                                last = opening_ex(last, stat.small_region_threshold);
                                 if (last.empty())
                                     break;
                                 append(shell_triangles_by_color_bottom[color_idx][last_idx + layer_idx_offset], std::move(last));

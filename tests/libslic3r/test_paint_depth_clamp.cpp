@@ -577,6 +577,100 @@ Point slab_center_point(const PrintObject &object)
     return Point((bb.min.x() + bb.max.x()) / 2, (bb.min.y() + bb.max.y()) / 2);
 }
 
+// Taper bound (.superpowers/sdd/2026-08-31-paint-depth/taper-bound-report.md): a point
+// `inset_mm` inside the +X edge of the given layer's own cross-section, at mid-Y. The
+// descent loop's inward erosion is measured from the layer silhouette, so "how far in from
+// the edge" - not "how far from the center" - is the coordinate every taper assertion below
+// actually cares about, and it is the only one that stays meaningful on a fixture whose
+// cross-section changes with height (the frustum further down).
+Point layer_edge_probe(const PrintObject &object, size_t layer_idx, double inset_mm)
+{
+    const BoundingBox bb = get_extents(object.get_layer(int(layer_idx))->lslices);
+    REQUIRE(bb.defined);
+    return Point(coord_t(bb.max.x() - scale_(inset_mm)), (bb.min.y() + bb.max.y()) / 2);
+}
+
+// Taper bound: same construction as slice_capped_slab() above, but with the prism's XY
+// footprint and height as parameters so a SMALL painted feature can be built - one whose
+// entire cross-section is narrower than the erosion the descent loop accumulates
+// (extrusion_spacing + extrusion_width ~= 0.8785mm per layer of descent at a 0.45mm outer
+// wall and 0.1mm layers). slice_capped_slab()'s fixed 40x40 footprint cannot express that:
+// at a 20mm half-width the accumulated erosion never reaches its center probe, which is
+// exactly why every pre-existing vertical-depth test was blind to the taper. Deliberately a
+// separate function rather than a new parameter on slice_capped_slab(), so every existing
+// vertical-depth fixture stays byte-identical.
+PrintObject *slice_capped_prism(const std::vector<int> &painted_cap_facets, double xy_size, double height,
+                                 double layer_height,
+                                 int top_shell_layers, double top_shell_thickness,
+                                 int bottom_shell_layers, double bottom_shell_thickness,
+                                 Print &print)
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name        = "paint-depth-small-feature.stl";
+    ModelVolume *volume  = object->add_volume(make_cube(xy_size, xy_size, height));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : painted_cap_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    DynamicPrintConfig config = paint_depth_test_config(pdmUnlimited, 3);
+    config.option<ConfigOptionFloat>("layer_height")->value               = layer_height;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = layer_height;
+    config.option<ConfigOptionInt>("top_shell_layers")->value             = top_shell_layers;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value        = top_shell_thickness;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value          = bottom_shell_layers;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value     = bottom_shell_thickness;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// Taper bound: a square frustum (truncated pyramid), `bottom` x `bottom` at z=0 tapering to
+// `top` x `top` at z=`height`, centered on XY. Its four side walls are genuinely SLOPED
+// (not vertical), which matters because TriangleMeshSlicer.cpp classifies slab facets by the
+// SIGN of the XY-projected cross product: an exactly-vertical facet is "Vertical" and
+// produces no slab at all, so a plain cube's painted side face cannot exercise the
+// projection path this fixture needs to probe. Every side facet here has a positive normal-Z
+// (hand-verified winding, see the facet table below), so all four walls are Up-facing and
+// project into top_raw exactly like a shallow painted top face would - just as a thin
+// staircase band hugging each layer's own contour instead of a wide patch.
+//
+// Facet indices (needed for painting; there is no its_make_* helper for a frustum, and
+// its_make_pyramid()'s base facets are wound normal-UP, i.e. inverted):
+//   0,1   = bottom cap (z=0, normal -Z)      2,3   = top cap (z=height, normal +Z)
+//   4,5   = -Y sloped wall                    6,7   = +X sloped wall
+//   8,9   = +Y sloped wall                   10,11  = -X sloped wall
+TriangleMesh make_square_frustum(double bottom, double top, double height)
+{
+    const float b = float(bottom * 0.5), t = float(top * 0.5), h = float(height);
+    std::vector<stl_vertex> vertices = {
+        {-b, -b, 0.f}, { b, -b, 0.f}, { b,  b, 0.f}, {-b,  b, 0.f},
+        {-t, -t, h  }, { t, -t, h  }, { t,  t, h  }, {-t,  t, h  },
+    };
+    std::vector<stl_triangle_vertex_indices> indices = {
+        {0, 2, 1}, {0, 3, 2},
+        {4, 5, 6}, {4, 6, 7},
+        {0, 1, 5}, {0, 5, 4},
+        {1, 2, 6}, {1, 6, 5},
+        {2, 3, 7}, {2, 7, 6},
+        {3, 0, 4}, {3, 4, 7},
+    };
+    return TriangleMesh(indexed_triangle_set(indices, vertices));
+}
+
+// The four sloped walls of make_square_frustum() (see its facet table above).
+const std::vector<int> FRUSTUM_SLOPED_WALLS = {4, 5, 6, 7, 8, 9, 10, 11};
+
 TEST_CASE("multi_material_segmentation_by_painting: thin layers make the painted top claim reach the full (thickness-driven) shell depth", "[paintdepth]")
 {
     // Defaults: top_shell_layers=4, top_shell_thickness=0.6mm (PrintConfig.cpp). At 0.1mm
@@ -851,38 +945,98 @@ TEST_CASE("multi_material_segmentation_by_painting: bottom claim depth follows t
 //     intended truncated pyramid.
 //   - small_region_threshold == 0 also disables the opening_ex() thin-projection filter
 //     that exists to fix #7104.
-// This is the re-review's suggested discriminating test: probe a point ~2mm in from the
-// painted face's silhouette edge (well outside any wall/skin band, so "unclaimed" here can
-// only come from the *inward taper*, never from being genuinely outside the object) at the
-// deepest layer the shell reaches. Numbers (0.45mm outer wall, 0.1mm layers): each descent
-// step narrows the claim by extrusion_spacing + extrusion_width =
-// (0.45 - 0.1*(1-pi/4)) + 0.45 ~= 0.8785mm. At depth 5 (the deepest layer still inside the
-// "thin layers...full shell depth" test's 6-layer effective shell above) that is ~4.39mm of
-// accumulated inward erosion on a 20mm half-width - well past a 2mm-from-edge probe, so a
-// tapered claim must NOT reach it. Pre-fix (taper == 0 every step), the untapered claim still
-// reaches the full silhouette at every depth, so the same probe is WRONGLY claimed.
-TEST_CASE("multi_material_segmentation_by_painting: the painted top claim's lateral inward taper survives at the deepest claimed layer (not a full-width prism)", "[paintdepth]")
+// N1's original discriminating fixture was a FLAT 40x40 painted top cap probed 2mm in from
+// the silhouette at the deepest claimed layer. That fixture can no longer express the taper:
+// the user-approved taper bound (.superpowers/sdd/2026-08-31-paint-depth/taper-bound-report.md)
+// deliberately gives a genuinely near-horizontal painted face its FULL width through the whole
+// solid-shell depth, so a flat cap is claimed edge-to-edge at every shell layer by design.
+// The taper (and therefore N1's non-zero-extrusion-stat pin) now lives exactly where the
+// erosion's verified purpose lives - on a STEEP painted surface - so N1's pin is carried by
+// the anti-smear test immediately below, which fails in the identical way if extrusion_width /
+// extrusion_spacing ever go back to 0.f (offset stays 0 => the steep bands propagate at full
+// width => the probe is wrongly claimed). See that test's comment for the arithmetic.
+
+// TAPER BOUND, anti-smear guard (.superpowers/sdd/2026-08-31-paint-depth/taper-bound-report.md).
+// THE proof that the erosion's real job is preserved. Verified purpose of the erosion
+// (MultiMaterialSegmentation.cpp descent loops, `offset -= extrusion_spacing +
+// extrusion_width` applied to the LAYER OUTLINE, BBS comment "offset width should be
+// 2*spacing to avoid too narrow area which has overlap of wall line"): it is a perimeter
+// safety margin on INFERRED (propagated) claims. A painted patch projected onto a layer where
+// the paint is not actually on the surface must stay clear of that layer's perimeter loops,
+// or it splits a wall line and leaves a sub-wall-width base sliver - the exterior-dimple class
+// of upstream #7104 / #7235. Its most important consequence is that a STEEP painted surface,
+// whose slab projection is by construction a thin staircase band hugging its layer's own
+// contour, is annihilated at the first descent step (and the descent then breaks), instead of
+// being smeared `top_shell_layers` deep as a full-width prism.
+//
+// The fixture is built to regress loudly if the erosion were simply deleted. A 40->22mm square
+// frustum over 6mm (make_square_frustum above) at 0.3mm layers: the four painted walls slope
+// 9mm horizontally over 6mm of height, so each layer's painted band is
+// 0.3 * 9/6 = 0.45mm wide, measured inward from that layer's own contour. That width is
+// deliberately in the danger window: comfortably ABOVE the opening_ex() thin-projection filter
+// (small_region_threshold = 0.5*0.45mm outer wall, halved => 0.1125mm radius, i.e. anything
+// narrower than 0.225mm is erased before the descent even starts) and comfortably BELOW one
+// erosion step (extrusion_spacing + extrusion_width = (0.45 - 0.3*(1-pi/4)) + 0.45 ~= 0.836mm).
+// So the band survives to the descent loop and the descent must then kill it:
+//   - WITH the erosion (and with the taper bound's guard): step 1 intersects the band with the
+//     layer outline eroded by ~0.836mm. The band lies within 0.45mm of that outline, so the
+//     result is empty and the loop breaks. Layer 10's Extruder2 area is its OWN surface band
+//     ([0, ~0.45mm] in from its contour) plus the Stage-1 lateral band (pdmWalls/1 wall =>
+//     <= ~0.45mm in from the contour, cut_segmented_layers) - nothing else.
+//   - WITHOUT the erosion (offset stays 0, whether by deleting the term or by regressing N1's
+//     extrusion stats to 0.f): band(L) propagates to L-1, L-2, L-3 at full width, so layer 10
+//     collects bands 11, 12 and 13 - the annulus from 0.45mm to 1.8mm in from its contour.
+// The probe therefore sits 1.0mm in from layer 10's own contour: outside the surface band and
+// the lateral band by more than a full band width, and squarely inside band(12)'s
+// [0.9mm, 1.35mm] slot. It is claimed if and only if the deep full-width smear happened.
+// (Hand-verified as genuinely discriminating, and confirmed empirically by a scratch build
+// with the erosion term deleted - see the report.)
+TEST_CASE("multi_material_segmentation_by_painting: a steep painted surface gains no deep full-width claim (anti-smear guard)", "[paintdepth]")
 {
-    Print        print;
-    PrintObject *object = slice_capped_slab(TOP_CAP_FACE, /*layer_height=*/0.1,
-                                             /*top_shell_layers=*/4, /*top_shell_thickness=*/0.6,
-                                             /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.0,
-                                             print);
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-steep-frustum.stl";
+    ModelVolume *volume  = object->add_volume(make_square_frustum(40., 22., 6.));
+    object->add_instance();
+    object->ensure_on_bed();
 
-    const size_t top_index = object->layer_count() - 1;
-    REQUIRE(top_index >= 6);
-    // Deepest layer still inside the effective 6-layer shell (matches the "thin layers..."
-    // test above): 5 inward-taper steps have accumulated here.
-    const size_t deepest_claimed_layer = top_index - 5;
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : FRUSTUM_SLOPED_WALLS)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
 
-    const BoundingBox bb = get_extents(object->get_layer(int(deepest_claimed_layer))->lslices);
-    REQUIRE(bb.defined);
-    const coord_t mid_y = (bb.min.y() + bb.max.y()) / 2;
-    // 2mm in from the edge of the 40x40 slab (20mm half-width): outside the ~15.6mm tapered
-    // boundary at depth 5, but well inside the untapered full silhouette.
-    const Point near_edge_probe(coord_t(bb.max.x() - scale_(2.0)), mid_y);
+    // pdmWalls with a single wall (unlike every other vertical-depth fixture, which uses
+    // pdmUnlimited): the painted walls DO cross every layer's contour, so the Stage-1 lateral
+    // path claims the whole layer for Extruder2 via the has_layer_only_one_color
+    // short-circuit. Clamping it to a one-wall band (~0.45mm in from the contour, pinned by
+    // the "fully-painted boundary still clamps to the band" test above) keeps that claim well
+    // clear of the 1.0mm probe, so this test reads the vertical projection alone.
+    DynamicPrintConfig config = paint_depth_test_config(pdmWalls, 1);
+    config.option<ConfigOptionFloat>("layer_height")->value               = 0.3;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = 0.3;
+    config.option<ConfigOptionInt>("top_shell_layers")->value             = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value        = 0.0;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value          = 3;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value     = 0.0;
 
-    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, deepest_claimed_layer), near_edge_probe));
+    Print print;
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    // 6mm / 0.3mm = 20 layers; the probe layer needs 3 surface layers above it to descend from.
+    REQUIRE(out_object->layer_count() >= 16);
+
+    const size_t probe_layer = 10;
+    // Two-sided on purpose. Extruder2 IS present on this layer - its own surface band, and the
+    // Stage-1 lateral band, both hug the contour - so the CHECK_FALSE below is about HOW FAR IN
+    // the claim reaches, never about the paint being absent or the fixture failing to slice.
+    CHECK(any_contains(extruder2_claim_for_layer(*out_object, probe_layer),
+                       layer_edge_probe(*out_object, probe_layer, 0.2)));
+    const Point probe = layer_edge_probe(*out_object, probe_layer, 1.0);
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, probe_layer), probe));
 }
 
 // N2 (Minor) - C1 residual: the surface-layer `append` at :1536 is not gated on
@@ -975,4 +1129,171 @@ TEST_CASE("multi_material_segmentation_by_painting: bottom_shell_layers=0 with n
 
     const Point probe = slab_center_point(*object);
     CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, 0), probe));
+}
+
+// ===========================================================================================
+// TAPER BOUND - user decision: "Painted top/bottom claims keep FULL WIDTH for the solid-shell
+// depth; taper only below that." Report:
+// .superpowers/sdd/2026-08-31-paint-depth/taper-bound-report.md
+//
+// The descent loops erode the LAYER OUTLINE by (extrusion_spacing + extrusion_width) per layer
+// of descent before intersecting it with the painted projection, so a painted claim that
+// reaches the object silhouette retreats inward as it descends - a truncated pyramid, not a
+// prism. Because the claim depth IS the solid-shell depth
+// (effective_shell_layers_by_thickness, landed in the vertical-depth fix wave), that erosion
+// leaves base-coloured SOLID SHELL under the painted skin all round its rim, and a painted
+// feature narrower than 2 * 0.8785 * depth (~10mm at a 6-layer shell / 0.1mm layers) loses its
+// deeper layers entirely. That is the user-reported bug.
+//
+// The bound: full width for genuinely near-horizontal painted faces, erosion retained where
+// the projected patch belongs to a steep surface (proved by the anti-smear test above).
+// ===========================================================================================
+
+// The user's actual bug, stated as a test. An 8mm painted feature (an eye, a cheek) on a top
+// face must keep its FULL footprint at every layer of the solid shell it caps. 8x8x4mm prism,
+// whole top cap painted, 0.1mm layers, top_shell_layers=4 / top_shell_thickness=0.6mm => a
+// 6-layer effective shell (same arithmetic as the "thin layers..." test above). Pre-change the
+// erosion accumulates 0.8785mm per descent step on a 4mm half-width, so:
+//   - depth 0 (the painted surface layer itself, offset 0) claims the full 8mm - passes both
+//     before and after, which is what makes the 0.5mm-from-edge probe below trustworthy: if it
+//     were too close to the silhouette for the geometry to resolve, depth 0 would fail too;
+//   - depths 1..4 claim only 8 - 2*k*0.8785 mm, so the 0.5mm-from-edge probe is unclaimed
+//     from depth 1 on (the claim's edge is already 0.8785mm in);
+//   - depth 5 needs 8.785mm of a 8mm cross-section, so the claim is empty and the descent
+//     breaks - even the CENTER of the feature is unpainted there.
+// Post-change all six layers claim the whole 8x8 footprint: no base-coloured solid anywhere
+// under the painted skin.
+TEST_CASE("multi_material_segmentation_by_painting: a small painted top feature keeps its full footprint at every solid-shell layer", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_capped_prism(TOP_CAP_FACE, /*xy_size=*/8., /*height=*/4.,
+                                              /*layer_height=*/0.1,
+                                              /*top_shell_layers=*/4, /*top_shell_thickness=*/0.6,
+                                              /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.0,
+                                              print);
+
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 7);
+
+    for (size_t depth = 0; depth <= 5; ++depth) {
+        const size_t layer_idx = top_index - depth;
+        // Full width: 0.5mm in from this layer's own silhouette, i.e. inside the 0.8785mm the
+        // first erosion step alone would have removed.
+        CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                           layer_edge_probe(*object, layer_idx, 0.5)));
+        // ...and the feature's center, which the erosion erases outright at depth 5.
+        CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx), slab_center_point(*object)));
+    }
+    // No over-claim past the shell: depth 6 is outside the 6-layer effective shell.
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, top_index - 6), slab_center_point(*object)));
+}
+
+// Bottom-direction mirror of the case above. bottom_shell_layers=3 /
+// bottom_shell_thickness=0.6mm at 0.1mm layers: the thickness walk over real bottom_z values
+// reaches layer 6 (bottom_z 0.6 >= 0.6 - EPSILON) => a 6-layer effective shell, layers 0..5,
+// with layer 6 outside it. The bottom descent applies the identical per-step erosion
+// (offset -= extrusion_spacing + extrusion_width), so pre-change this fails at exactly the
+// same depths, in the same two ways, as the top case.
+TEST_CASE("multi_material_segmentation_by_painting: a small painted bottom feature keeps its full footprint at every solid-shell layer", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_capped_prism(BOTTOM_CAP_FACE, /*xy_size=*/8., /*height=*/4.,
+                                              /*layer_height=*/0.1,
+                                              /*top_shell_layers=*/3, /*top_shell_thickness=*/0.0,
+                                              /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.6,
+                                              print);
+
+    REQUIRE(object->layer_count() >= 8);
+
+    for (size_t layer_idx = 0; layer_idx <= 5; ++layer_idx) {
+        CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                           layer_edge_probe(*object, layer_idx, 0.5)));
+        CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx), slab_center_point(*object)));
+    }
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, 6), slab_center_point(*object)));
+}
+
+// No over-claim regression on a WIDE painted face. Same 40x40 slab and 6-layer effective shell
+// as the "thin layers..." test above. Two things are pinned:
+//   - the claim now reaches the silhouette at EVERY shell layer (the taper bound's intended
+//     behaviour change; pre-change the 2mm-from-edge probe is lost from depth 3 on, where the
+//     accumulated erosion 3 * 0.8785 = 2.64mm passes it), and
+//   - the claim still stops dead at the shell boundary: depth 6 is unclaimed at the center AND
+//     at the edge, so widening the claim did not also deepen it. That second half is the
+//     regression guard the taper bound most needs, since removing a per-layer `break` source
+//     is exactly the kind of change that could let a descent run past its bound.
+TEST_CASE("multi_material_segmentation_by_painting: a wide painted top face claims full width within the shell and nothing past it", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_capped_slab(TOP_CAP_FACE, /*layer_height=*/0.1,
+                                             /*top_shell_layers=*/4, /*top_shell_thickness=*/0.6,
+                                             /*bottom_shell_layers=*/3, /*bottom_shell_thickness=*/0.0,
+                                             print);
+
+    const size_t top_index = object->layer_count() - 1;
+    REQUIRE(top_index >= 7);
+
+    for (size_t depth = 0; depth <= 5; ++depth) {
+        const size_t layer_idx = top_index - depth;
+        CHECK(any_contains(extruder2_claim_for_layer(*object, layer_idx),
+                           layer_edge_probe(*object, layer_idx, 2.0)));
+    }
+    const size_t past_shell = top_index - 6;
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, past_shell), slab_center_point(*object)));
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, past_shell),
+                             layer_edge_probe(*object, past_shell, 2.0)));
+}
+
+// Taper bound, required engineering item 3: the vertical-depth fix wave gated the TOP
+// surface-layer claim on `stat.top_shell_layers > 0` (N2) but deliberately left the symmetric
+// BOTTOM site ungated, recording it as a known residual. This is that residual's RED test -
+// the exact bottom mirror of N2's "a zero-shell region's painted top is not claimed even when
+// another region makes the object-wide gate nonzero" above.
+//
+// Two Z-stacked model-part volumes. "lower" (z 0-4mm) sets bottom_shell_layers=0 with a
+// NONZERO bottom_shell_thickness=0.6 (so the helper's zero-count early return is exercised
+// too) and has its BOTTOM cap painted; "upper" (z 4-20mm) keeps the stock bottom_shell_layers
+// default purely so the object-wide max_bottom_layers gate stays open and bottom_raw is
+// populated at all. At layer 0 the only region with geometry is "lower"'s, so the per-layer
+// stat.bottom_shell_layers is 0 - and C1's contract is that a zero shell count claims nothing,
+// not even the immediately-painted bottom surface facet (LayerRegion.cpp demotes stBottom to
+// stInternal/stInternalVoid there, so there is no solid skin for the colour to land on).
+TEST_CASE("multi_material_segmentation_by_painting: a zero-shell region's painted bottom is not claimed even when another region makes the object-wide gate nonzero", "[paintdepth]")
+{
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-zero-shell-mixed-bottom.stl";
+    ModelVolume *lower    = object->add_volume(make_cube(40., 40., 4.));
+    lower->name           = "lower";
+    lower->config.set_key_value("bottom_shell_layers", new ConfigOptionInt(0));
+    lower->config.set_key_value("bottom_shell_thickness", new ConfigOptionFloat(0.6));
+
+    ModelVolume *upper = object->add_volume(make_cube(40., 40., 16.));
+    upper->name         = "upper";
+    upper->translate(0., 0., 4.);
+    // Stock bottom_shell_layers default (3) left untouched: this volume's only job is to keep
+    // the object-wide max_bottom_layers gate open so bottom_raw is populated at all.
+
+    TriangleSelector selector(lower->mesh());
+    for (int facet_idx : BOTTOM_CAP_FACE)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(lower->mmu_segmentation_facets.set(selector));
+
+    object->add_instance();
+    object->ensure_on_bed();
+
+    DynamicPrintConfig config = paint_depth_test_config(pdmUnlimited, 3);
+    config.option<ConfigOptionFloat>("layer_height")->value               = 1.0;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = 1.0;
+
+    Print print;
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 4);
+
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*out_object, 0), slab_center_point(*out_object)));
 }
