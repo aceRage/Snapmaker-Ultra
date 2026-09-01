@@ -145,6 +145,13 @@ def main():
                [panel(load("supportmatch-option.png"), "Print settings → Support → Support Filament Matching")]]),
          "support-matching.png")
 
+    # --- brim match -------------------------------------------------------------------------
+    save(grid([[panel(fit_h(load("features-brim-match-example.png"), 600),
+                      "Each brim takes the colour of the wall it touches"),
+                panel(load("features-brim-match.png"), "Print settings → Others → Brim → Brim filament: Nearest wall")]],
+               valign="center"),
+         "brim-match.png")
+
     # --- materials --------------------------------------------------------------------------
     save(grid([[panel(load("filament-applyall.png"), "Apply All: set every filament slot at once"),
                 panel(load("features-outerwallfilament.png"), "Filament for Features → Outer wall")],

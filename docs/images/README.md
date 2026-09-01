@@ -12,6 +12,7 @@ python docs/images/make_collages.py
 | `hero.jpg` | `menu-stream.jpg`, `supportmatch-normal.png`, `compare-ui.png`, `assembly-menuupdate.png`, `assembly-newtypes.png` |
 | `assembly.png` | `assembly-newtypes.png`, `assembly-menuupdate.png` |
 | `support-matching.png` | `supportmatch-normal.png`, `supportmatch-tree.png`, `supportmatch-option.png` |
+| `brim-match.png` | `features-brim-match-example.png`, `features-brim-match.png` |
 | `materials.png` | `filament-applyall.png`, `features-outerwallfilament.png`, `options-spoolman.png` |
 | `print-quality.png` | `features-offsetwall.png`, `features-zoverridexy.png` |
 | `compare-slices.png` | `compare-menu.png`, `compare-ui.png` |

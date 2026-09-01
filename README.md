@@ -29,6 +29,7 @@ Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Art
 - **Spool Manager** — [Spoolman](https://github.com/Donkie/Spoolman) inventory, spool-to-slot bindings, automatic usage deduction when a job is sent.
 
 ![Normal and tree supports printing in the colour of the surface they touch, and the Support Filament Matching option](docs/images/support-matching.png)
+![Four brims each printed in the colour of the wall they touch, and the Brim filament: Nearest wall setting](docs/images/brim-match.png)
 ![Apply All, the Outer wall filament setting and the Spool Manager preferences](docs/images/materials.png)
 
 ### Assembly and fitting
