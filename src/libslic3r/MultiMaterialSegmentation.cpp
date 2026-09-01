@@ -1702,7 +1702,11 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                         remove_small(raw_surfaces[extruder_idx][layer_idx], min_area);
     };
 
-    // Filter out polygons less than 0.1mm^2, because they are unprintable and causing dimples on outer primers (#7104)
+    // Filter out polygons less than 0.01mm^2, because they are unprintable and causing dimples on outer primers (#7104).
+    // (Loose end 1, .superpowers/sdd/2026-08-31-paint-depth/interclaim-sliver-investigation.md
+    // section 7: this comment previously said "0.1mm^2" - off by 100x. The argument below is
+    // sqr(scale_(0.1f)), i.e. the square of a 0.1mm LENGTH, which is 0.01mm^2 of AREA. Harmless,
+    // was misleading.)
     filter_out_small_polygons(top_raw, Slic3r::sqr(scale_(0.1f)));
     filter_out_small_polygons(bottom_raw, Slic3r::sqr(scale_(0.1f)));
 
@@ -1896,7 +1900,17 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
         // here down different float paths - a rounding ULP must not decide whether a user gets a
         // normal-thickness shell. On Arachne band(1) = 0.578595 stays genuinely below the floor
         // and keeps today's behaviour, which is the intent.
+        // Loose end 2 (interclaim-sliver-investigation.md section 7): guard against the
+        // degenerate layer_color_stat path where no region on this layer carries wall_filament
+        // == color_idx (out.num_regions == 0, assert-only in debug - see the N1 comment above).
+        // extrusion_width/extrusion_spacing then stay 0, so wall_stack == 0 and F1's
+        // offset_ex(contour, -0) below is a no-op - but without this term normal_shell still
+        // evaluated true (scaled(D) + eps >= 0 always holds), which would let the claim reach
+        // the contour with no F1 clearance at all, exactly the exterior bleed F1 exists to stop.
+        // Unreachable for a real object per N1, but cheap to close and free of any behavior
+        // change on the reachable path (wall_stack > 0 there always).
         out.normal_shell = paint_depth_normal_mm > 0.f && color_idx > 0 &&
+                           (out.extrusion_spacing + out.extrusion_width) > 0.f &&
                            scaled<float>(paint_depth_normal_mm) + float(SCALED_EPSILON) >= out.extrusion_spacing + out.extrusion_width;
         out.top_descent_layers    = out.top_shell_layers;
         out.bottom_descent_layers = out.bottom_shell_layers;
@@ -2076,7 +2090,25 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                     append(last, intersection_ex(reachable, offset_ex(input_expolygons[last_idx], -wall_stack)));
                                     last = union_ex(last);
                                 }
-                                last = opening_ex(last, stat.small_region_threshold);
+                                // ITEM 2 (interclaim-absorb-report.md / interclaim-sliver-
+                                // investigation.md section 5, Option 2): legacy behaviour
+                                // (normal_shell == false, which is EVERY layer/colour in unlimited
+                                // mode - paint_depth_normal_mm == 0 there - and any layer/colour
+                                // below the D >= wall_stack gate even in bounded mode) keeps the
+                                // PER-STEP opening here, byte-identical to before. Under the WAVE B
+                                // extension (normal_shell == true) the opening moves to the
+                                // ACCUMULATED band in the merge loop below (shell_triangles_by_
+                                // color_top's consumer, the ITEM 2 site there) instead: rings
+                                // deposited by DIFFERENT originating surface layers can land in the
+                                // SAME destination slot at adjacent insets and form a contiguous
+                                // band that is never actually thin, even where any one ring alone
+                                // is - opening each ring here individually would punch holes in
+                                // that band before it ever gets to overlap. Termination re-keys onto
+                                // the RAW (un-opened) term below in this branch - deliberately, see
+                                // the investigation's "why ranked second" - `deposited` still guards
+                                // the initial F1 warm-up region exactly as before either way.
+                                if (! normal_shell)
+                                    last = opening_ex(last, stat.small_region_threshold);
                                 if (last.empty()) {
                                     if (normal_shell && ! deposited)
                                         continue;
@@ -2143,7 +2175,9 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                     append(last, intersection_ex(reachable, offset_ex(input_expolygons[last_idx], -wall_stack)));
                                     last = union_ex(last);
                                 }
-                                last = opening_ex(last, stat.small_region_threshold);
+                                // ITEM 2, mirrored - see the top loop's comment above.
+                                if (! normal_shell)
+                                    last = opening_ex(last, stat.small_region_threshold);
                                 if (last.empty()) {
                                     if (normal_shell && ! deposited)
                                         continue;
@@ -2171,7 +2205,7 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
     tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&triangles_by_color_merged, &triangles_by_color_bottom, &triangles_by_color_top, &num_layers, &throw_on_cancel_callback,
                                                                   &shell_triangles_by_color_top, &shell_triangles_by_color_bottom,
                                                                   &legacy_shell_triangles_by_color_top, &legacy_shell_triangles_by_color_bottom,
-                                                                  &legacy_top_and_bottom_layers_out](const tbb::blocked_range<size_t> &range) {
+                                                                  &legacy_top_and_bottom_layers_out, &layer_color_stat](const tbb::blocked_range<size_t> &range) {
         for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
             throw_on_cancel_callback();
             // Fix-wave (wave-b-review.md Important 2): capture the legacy-bounded reach BEFORE the
@@ -2210,13 +2244,33 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
             for (size_t color_idx = 0; color_idx < triangles_by_color_merged.size(); ++color_idx) {
                 auto &self = triangles_by_color_merged[color_idx][layer_idx];
 
-                auto top_area = diff_ex(union_ex(shell_triangles_by_color_top[color_idx][layer_idx],
-                                                 shell_triangles_by_color_top[color_idx][layer_idx + num_layers]),
-                                        painted_exploys);
+                ExPolygons top_band    = union_ex(shell_triangles_by_color_top[color_idx][layer_idx],
+                                                  shell_triangles_by_color_top[color_idx][layer_idx + num_layers]);
+                ExPolygons bottom_band = union_ex(shell_triangles_by_color_bottom[color_idx][layer_idx],
+                                                  shell_triangles_by_color_bottom[color_idx][layer_idx + num_layers]);
 
-                auto bottom_area = diff_ex(union_ex(shell_triangles_by_color_bottom[color_idx][layer_idx],
-                                                    shell_triangles_by_color_bottom[color_idx][layer_idx + num_layers]),
-                                          painted_exploys);
+                // ITEM 2 (interclaim-absorb-report.md / interclaim-sliver-investigation.md
+                // section 5, Option 2): this destination layer's accumulated band, unioned across
+                // every originating surface layer that deposited into it - the counterpart to the
+                // descent loops above skipping their PER-STEP opening whenever normal_shell is
+                // true. Recomputed here (not carried down from the descent loops) because
+                // small_region_threshold/normal_shell are per LAYER *and* per COLOUR, and this is
+                // the destination layer, generally a different layer than any one contribution's
+                // origin. Gated on the SAME normal_shell condition the rest of Wave B/Option N
+                // uses (paint_depth_normal_mm > 0 && color_idx > 0 && D >= wall_stack): false for
+                // EVERY layer/colour in unlimited mode (paint_depth_normal_mm == 0), so this is a
+                // no-op there and the legacy per-step-opened contributions pass through unchanged,
+                // exactly byte-identical to before. Where it IS true, the per-step opening was
+                // skipped above, so this is the only point these contributions are filtered at
+                // all - band-level, once, instead of once per contributing origin layer.
+                const LayerColorStat stat = layer_color_stat(layer_idx, color_idx);
+                if (stat.normal_shell) {
+                    top_band    = opening_ex(top_band, stat.small_region_threshold);
+                    bottom_band = opening_ex(bottom_band, stat.small_region_threshold);
+                }
+
+                auto top_area    = diff_ex(top_band, painted_exploys);
+                auto bottom_area = diff_ex(bottom_band, painted_exploys);
 
                 append(self, top_area);
                 append(self, bottom_area);
@@ -2588,10 +2642,60 @@ static void remove_multiple_edges_in_vertices(MMU_Graph &graph, const std::vecto
     }
 }
 
+// ITEM 1 (interclaim-absorb-report.md / interclaim-sliver-investigation.md section 5,
+// Option 1): given a thin, fully-interior base island and the final per-colour claims on its
+// layer, returns the 1-based colour index that should absorb the island - the painted claim
+// (index >= 1; index 0, the base colour, is never a candidate) with the LARGEST shared area
+// against the island dilated by `eps`, ties broken by the LOWEST colour index. Returns 0 if no
+// painted claim touches the (dilated) island at all - the caller must not orphan the island onto
+// an arbitrary colour when that happens.
+//
+// Determinism (this codebase has been bitten by this before): ExPolygon::area() is the shoelace
+// sum over scaled-integer coordinates, so two candidate areas compare exactly the same way on
+// every run - no iteration-order or float-ordering ambiguity - and the ascending scan with a
+// STRICT `>` below is what makes the LOWEST colour index win a genuine tie, matching the
+// precedence already established at the painted-colour trim loop below (colour 1 beats colour 2
+// beats ...).
+size_t interclaim_absorb_winner(const ExPolygons &island, const std::vector<ExPolygons> &painted_claims, float eps)
+{
+    const ExPolygons dilated = offset_ex(island, eps);
+    size_t           best_color = 0;
+    double           best_area  = 0.;
+    for (size_t color_idx = 1; color_idx < painted_claims.size(); ++color_idx) {
+        if (painted_claims[color_idx].empty())
+            continue;
+        const ExPolygons shared = intersection_ex(dilated, painted_claims[color_idx]);
+        if (shared.empty())
+            continue;
+        double area = 0.;
+        for (const ExPolygon &e : shared)
+            area += e.area();
+        if (best_color == 0 || area > best_area) {
+            best_area  = area;
+            best_color = color_idx;
+        }
+    }
+    return best_color;
+}
+
 static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::vector<std::vector<ExPolygons>> &segmented_regions,
                                                                    std::vector<std::vector<ExPolygons>>      &&top_and_bottom_layers,
                                                                    std::vector<std::vector<ExPolygons>>      &&legacy_top_and_bottom_layers,
                                                                    const size_t                                num_facets_states,
+                                                                   // ITEM 1 plumbing (interclaim-absorb-report.md): the pre-segmentation layer
+                                                                   // contour (needed to compute the base residue against the FINAL claims,
+                                                                   // not the lateral-only lslices), the narrowest painted claim width
+                                                                   // (halved it becomes the absorb's opening delta, so the absorb's KILL
+                                                                   // WIDTH is min_claim_width itself - see the threshold comment at the
+                                                                   // absorb site), the F1 wall-stack band width (the interior guard), and
+                                                                   // whether depth is bounded at all (segmentation_normal_depth > 0.f at
+                                                                   // the call site - the SAME condition the rest of the feature gates on,
+                                                                   // so paint_depth_mode == unlimited stays byte-identical: the entire
+                                                                   // absorb stage is skipped, not merely a no-op inside it).
+                                                                   const std::vector<ExPolygons>              &input_expolygons,
+                                                                   const float                                  min_claim_width,
+                                                                   const float                                  wall_stack,
+                                                                   const bool                                   bounded_mode,
                                                                    const std::function<void()>                &throw_on_cancel_callback)
 {
     const size_t                         num_layers = segmented_regions.size();
@@ -2673,6 +2777,104 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
         }
     }); // end of parallel_for
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - Merging segmented layers in parallel - End";
+
+    // ITEM 1 (interclaim-absorb-report.md / interclaim-sliver-investigation.md section 5,
+    // Option 1): interior inter-claim absorb, a third stage after the merge above. This is the
+    // only place every colour's FINAL lateral+top/bottom claim and the layer contour are all in
+    // hand simultaneously. Reclaims what each colour's own private thin-projection filter
+    // (opening_ex(., small_region_threshold) in segmentation_top_and_bottom_layers) eroded off
+    // ITS OWN claim and handed to nobody: the claims are never re-unioned or re-partitioned
+    // across colours, so the strip left between two independently-eroded neighbouring claims
+    // falls through to the base residue and prints as base wall_filament between two painted
+    // features - the round-3 GUI defect this fix targets. See the threshold comment below for
+    // how wide that strip actually gets (measured, not assumed).
+    if (bounded_mode && min_claim_width > 0.f && wall_stack > 0.f) {
+        BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - Interior inter-claim absorb - Begin";
+        // Threshold. `t` is an opening_ex DELTA, so the width it annihilates is 2t, not t:
+        // t = min_claim_width / 2 = 0.225mm at stock flows kills components narrower than
+        // 2t = min_claim_width = 0.45mm. That is the correct quantity to key on, and it is not
+        // the same number as "what the per-colour filter deleted":
+        //   * min_claim_width is already this codebase's "narrowest painted claim that may be
+        //     emitted" (Wave A / C-1, plumbed and unit-tested). An interior base island narrower
+        //     than ONE bead cannot be printed as base in any useful way - Classic emits nothing
+        //     for it, Arachne widens it into an over-extruded bead of the WRONG colour - so
+        //     handing it to a printable neighbouring claim is strictly better than keeping it.
+        //   * interclaim-sliver-investigation.md section 2 bounds the sliver population at
+        //     2 * small_region_threshold = 0.225mm, reasoning from ONE colour's opening deleting
+        //     one strip. That bound is too tight on curved geometry and is corrected here by
+        //     measurement: on the sphere fixture (test_paint_depth_clamp.cpp, the Item 1
+        //     RED/GREEN pin) the real inter-claim annuli are ~0.34mm wide, because BOTH
+        //     neighbouring colours' claims are eroded independently and the miter-join corner
+        //     truncation adds to the gap. A t of small_region_threshold (kill width 0.225mm)
+        //     would leave every one of them behind; t = min_claim_width / 2 catches them.
+        const float t                 = scaled<float>(min_claim_width * 0.5f);
+        const float wall_stack_scaled = scaled<float>(wall_stack);
+        // eps = 2*SCALED_EPSILON (the investigation's own choice): just enough to make a
+        // zero-area touch (shared boundary only) register as an overlap for
+        // interclaim_absorb_winner, without meaningfully changing which neighbour has the larger
+        // share.
+        const float eps = float(2 * SCALED_EPSILON);
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&segmented_regions_merged, &input_expolygons, t, wall_stack_scaled, eps, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
+            for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
+                throw_on_cancel_callback();
+                if (layer_idx >= input_expolygons.size() || input_expolygons[layer_idx].empty())
+                    continue;
+                std::vector<ExPolygons> &merged = segmented_regions_merged[layer_idx];
+
+                ExPolygons painted;
+                for (size_t color_idx = 1; color_idx < merged.size(); ++color_idx)
+                    append(painted, merged[color_idx]);
+                painted = union_ex(painted);
+                if (painted.empty())
+                    continue; // nothing painted on this layer - no inter-claim boundary can exist
+
+                const ExPolygons base_area = diff_ex(input_expolygons[layer_idx], painted);
+                if (base_area.empty())
+                    continue;
+                // F1 guard (interior): the wall-stack band at the contour is F1's own territory -
+                // never a candidate here, so the exterior bleed F1 closed cannot return through
+                // this stage.
+                const ExPolygons interior = offset_ex(input_expolygons[layer_idx], -wall_stack_scaled);
+
+                // Batched per colour and applied once after the scan below, so which component is
+                // decided first never changes another component's own (independent) decision.
+                std::vector<ExPolygons> absorbed_into(merged.size());
+                ExPolygons               absorbed_from_base;
+
+                // PER CONNECTED COMPONENT - base_area is already exactly that (diff_ex/union_ex
+                // output never merges disjoint regions into one ExPolygon, and always splits
+                // disjoint pieces into separate ones), so iterating its elements directly IS the
+                // per-component decomposition this absorb requires. Never
+                // diff_ex(base_area, opening_ex(base_area, t)) as a single whole-area operation -
+                // that would strip the interlocking notch tooth (and any other thin finger still
+                // attached to a genuine base core) right along with real slivers, because a tooth
+                // attached to a wide core reads as "thin" only in isolation, never as part of its
+                // own component.
+                for (const ExPolygon &island : base_area) {
+                    const ExPolygons single{island};
+                    if (! opening_ex(single, t).empty())
+                        continue; // has a printable core of its own -> genuine base, leave it
+                    if (! diff_ex(single, interior).empty())
+                        continue; // touches/extends into the F1 wall-stack band -> F1 owns it
+                    const size_t winner = interclaim_absorb_winner(single, merged, eps);
+                    if (winner == 0)
+                        continue; // no painted neighbour touches it -> never orphan it
+                    append(absorbed_into[winner], single);
+                    absorbed_from_base.push_back(island);
+                }
+
+                if (! absorbed_from_base.empty()) {
+                    for (size_t color_idx = 1; color_idx < merged.size(); ++color_idx)
+                        if (! absorbed_into[color_idx].empty()) {
+                            append(merged[color_idx], std::move(absorbed_into[color_idx]));
+                            merged[color_idx] = union_ex(merged[color_idx]);
+                        }
+                    merged[0] = diff_ex(merged[0], absorbed_from_base);
+                }
+            }
+        });
+        BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - Interior inter-claim absorb - End";
+    }
 
     return segmented_regions_merged;
 }
@@ -2768,6 +2970,14 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               const float                                                      segmentation_interlocking_depth,
                                                               const float                                                      segmentation_min_claim_width,
                                                               const float                                                      segmentation_normal_depth,
+                                                              // ITEM 1 (interclaim-absorb-report.md): the F1 wall-stack band width
+                                                              // (ext_perimeter_width + ext_perimeter_spacing, mm, max across the
+                                                              // object's printing regions - the SAME conservative direction
+                                                              // segmentation_min_claim_width already takes), plumbed through to
+                                                              // merge_segmented_layers's interior inter-claim absorb. 0.f (the fuzzy
+                                                              // skin caller's value) disables the absorb, matching its 0.f
+                                                              // segmentation_normal_depth.
+                                                              const float                                                      segmentation_wall_stack,
                                                               const bool                                                       segmentation_interlocking_beam,
                                                               const IncludeTopAndBottomLayers                                  include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback)
@@ -2993,7 +3203,8 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
         throw_on_cancel_callback();
     }
 
-    std::vector<std::vector<ExPolygons>> segmented_regions_merged = merge_segmented_layers(segmented_regions, std::move(top_and_bottom_layers), std::move(legacy_top_and_bottom_layers), num_facets_states, throw_on_cancel_callback);
+    std::vector<std::vector<ExPolygons>> segmented_regions_merged = merge_segmented_layers(segmented_regions, std::move(top_and_bottom_layers), std::move(legacy_top_and_bottom_layers), num_facets_states,
+                                                                                            input_expolygons, segmentation_min_claim_width, segmentation_wall_stack, segmentation_normal_depth > 0.f, throw_on_cancel_callback);
     throw_on_cancel_callback();
 
 #ifdef MM_SEGMENTATION_DEBUG_REGIONS
@@ -3055,6 +3266,15 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // regions, tracked alongside the per-region floor above so it is available once
     // interlocking_depth is known below - see paint_depth_classic_notch_cap_mm.
     float                max_wall_stack = 0.f;
+    // ITEM 1 (interclaim-absorb-report.md): F1's OWN wall_stack quantity
+    // (ext_perimeter_width + ext_perimeter_spacing), tracked UNCONDITIONALLY - unlike
+    // max_wall_stack above, which only accumulates on the classic generator - because F1's inset
+    // in segmentation_top_and_bottom_layers applies on every generator, so the absorb's interior
+    // guard must match it there too. MAX across regions is the same conservative direction
+    // max_ext_perimeter_width already takes: a larger wall_stack erodes the interior guard
+    // MORE, so it can only make the absorb LESS willing to touch a component near the contour,
+    // never more.
+    float                max_wall_stack_absorb = 0.f;
     for (size_t region_idx = 0; region_idx < print_object.num_printing_regions(); ++region_idx) {
         const PrintRegion &region                 = print_object.printing_region(region_idx);
         const float         ext_perimeter_width   = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).width();
@@ -3065,6 +3285,7 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
             region_band    = paint_depth_band_classic_floor_mm(region_band, ext_perimeter_width, ext_perimeter_spacing);
             max_wall_stack = std::max(max_wall_stack, ext_perimeter_width + ext_perimeter_spacing);
         }
+        max_wall_stack_absorb   = std::max(max_wall_stack_absorb, ext_perimeter_width + ext_perimeter_spacing);
         max_width = std::max(max_width, region_band);
         max_ext_perimeter_width = std::max(max_ext_perimeter_width, ext_perimeter_width);
         if (perimeter_spacing > 0.f)
@@ -3150,7 +3371,7 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // which is a contract worth reading at the call site rather than deriving.
     const float paint_depth_normal_mm = paint_depth_mode != pdmUnlimited ? max_width : 0.f;
 
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, max_ext_perimeter_width, paint_depth_normal_mm, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, max_ext_perimeter_width, paint_depth_normal_mm, max_wall_stack_absorb, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
 }
 
 // Returns fuzzy skin segmentation based on painting in fuzzy skin segmentation gizmo
@@ -3174,7 +3395,11 @@ std::vector<std::vector<ExPolygons>> fuzzy_skin_segmentation_by_painting(const P
     // full-width fuzzy band keeps the pre-degradation no-op, byte-identical to upstream.
     // Wave B / Option N: 0 - fuzzy skin has no top/bottom claim at all (IncludeTopAndBottomLayers::No
     // below), so there is no descent for a normal thickness to bound.
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, max_external_perimeter_width, 0.f, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
+    // ITEM 1: 0.f for segmentation_wall_stack too - paired with segmentation_normal_depth = 0.f
+    // just above, this keeps merge_segmented_layers's bounded_mode gate false, so the interior
+    // inter-claim absorb never runs on the fuzzy skin path (which has no notion of "painted
+    // colour claims" for it to absorb between in the first place).
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, max_external_perimeter_width, 0.f, 0.f, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
 }
 
 } // namespace Slic3r

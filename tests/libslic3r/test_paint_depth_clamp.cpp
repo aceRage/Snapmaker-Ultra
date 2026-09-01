@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/MultiMaterialSegmentation.hpp"
 #include "libslic3r/PaintDepth.hpp"
@@ -3178,4 +3179,410 @@ TEST_CASE("multi_material_segmentation_by_painting: a painted cap does not eat a
         CHECK(any_contains(claim_for_layer(*object, probe_layer, /*Extruder3, colour B*/ 3), probe));
         CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder2, colour A*/ 2), probe));
     }
+}
+
+// ===========================================================================================
+// ITEM 1 / ITEM 2 (.superpowers/sdd/2026-08-31-paint-depth/interclaim-absorb-report.md,
+// interclaim-sliver-investigation.md): the interior inter-claim absorb (a third stage in
+// merge_segmented_layers) and the band-level opening (segmentation_top_and_bottom_layers).
+// ===========================================================================================
+
+// Pure-geometry helper: an axis-aligned CCW rectangle. Coordinates are plain scaled-unit
+// integers with no mm meaning - used only by the interclaim_absorb_winner unit test below,
+// which is deliberately independent of any mesh/Clipper-driven slicing geometry so its tie-break
+// case is provable by construction (exact mirror symmetry) rather than hoped for from a slicer
+// run.
+ExPolygon absorb_test_rect(coord_t x0, coord_t y0, coord_t x1, coord_t y1)
+{
+    return ExPolygon({Point(x0, y0), Point(x1, y0), Point(x1, y1), Point(x0, y1)});
+}
+
+TEST_CASE("interclaim_absorb_winner: largest shared area wins, and a genuine tie is broken by the lowest colour index", "[paintdepth]")
+{
+    const ExPolygons island{absorb_test_rect(0, 0, 1000, 1000)};
+    const float       eps = 10.f;
+
+    SECTION("clear winner: colour 2's overlap is far larger than colour 1's") {
+        std::vector<ExPolygons> claims(4);
+        claims[1] = {absorb_test_rect(-50, 400, 50, 600)};     // thin strip: small overlap
+        claims[2] = {absorb_test_rect(500, -500, 1500, 1500)}; // whole right half: large overlap
+        // claims[3] left empty - must be skipped cleanly, not crash.
+        CHECK(interclaim_absorb_winner(island, claims, eps) == 2);
+    }
+
+    SECTION("genuine tie: mirror-symmetric overlaps -> the LOWEST colour index (1) wins over 3") {
+        std::vector<ExPolygons> claims(4);
+        // claims[1] and claims[3] are EXACT mirror images of each other about x=500 (the
+        // island's own midline: island spans x in [0,1000]), so intersection_ex(dilated_island,
+        // claims[1]) and intersection_ex(dilated_island, claims[3]) are exact mirror images too
+        // - their areas are therefore bit-for-bit equal, a genuine tie by construction, not by
+        // luck. claims[2] is deliberately given zero overlap, to pin that a colour with NO
+        // overlap can never "win" a tie merely by being scanned - only genuine candidates
+        // (non-empty intersection) participate.
+        claims[1] = {absorb_test_rect(-500, -500, 500, 1500)}; // left half, generous overlap
+        claims[2] = {};                                        // empty: zero overlap, must not win
+        claims[3] = {absorb_test_rect(500, -500, 1500, 1500)}; // mirror of claims[1] about x=500
+        CHECK(interclaim_absorb_winner(island, claims, eps) == 1);
+    }
+
+    SECTION("no painted claim touches the island -> 0, never orphan it") {
+        std::vector<ExPolygons> claims(4);
+        claims[1] = {absorb_test_rect(5000, 5000, 6000, 6000)}; // far away: no overlap at all
+        CHECK(interclaim_absorb_winner(island, claims, eps) == 0);
+    }
+}
+
+// ITEM 1 fixture: same construction as slice_bounded_frustum() above, but with a THIRD physical
+// extruder and the sloped walls split into TWO painted colours on ADJACENT walls
+// (colour_a_facets / colour_b_facets) instead of one colour on all four - the two-colour
+// analogue of slice_two_painted_colours(), needed because slice_bounded_frustum() /
+// paint_depth_test_config() only ever paint a single colour. New helper rather than extending
+// either of those (which stay untouched), matching this file's established precedent - see
+// slice_two_painted_colours's own comment above.
+PrintObject *slice_bounded_frustum_two_colours(double bottom, double top, double height,
+                                                const std::vector<int> &colour_a_facets, const std::vector<int> &colour_b_facets,
+                                                PaintDepthMode mode, int walls, double layer_height, Print &print,
+                                                PerimeterGeneratorType wall_generator = PerimeterGeneratorType::Arachne)
+{
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name         = "paint-depth-two-colour-frustum.stl";
+    ModelVolume *volume  = object->add_volume(make_square_frustum(bottom, top, height));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    TriangleSelector selector(volume->mesh());
+    for (int facet_idx : colour_a_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    for (int facet_idx : colour_b_facets)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder3);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    DynamicPrintConfig config = paint_depth_test_config(mode, walls);
+    config.set_num_extruders(3);
+    config.set_num_filaments(3);
+    config.option<ConfigOptionFloats>("filament_diameter")->values = {1.75, 1.75, 1.75};
+    config.option<ConfigOptionStrings>("filament_colour")->values  = {"#FFFFFF", "#804020", "#2040A0"};
+    config.option<ConfigOptionFloats>("nozzle_diameter")->values   = {0.4, 0.4, 0.4};
+    config.option<ConfigOptionFloat>("layer_height")->value                     = layer_height;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value       = layer_height;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
+    config.option<ConfigOptionInt>("top_shell_layers")->value                   = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value              = 0.6;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value                = 3;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value           = 0.0;
+    config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = wall_generator;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// The -Y and +X sloped walls of make_square_frustum() (see its facet table comment above) -
+// ADJACENT walls, sharing the corner at X=+half, Y=-half.
+const std::vector<int> FRUSTUM_WALL_NEG_Y = {4, 5};
+const std::vector<int> FRUSTUM_WALL_POS_X = {6, 7};
+const std::vector<int> FRUSTUM_WALL_POS_Y = {8, 9};
+
+// ITEM 1 regression pin - the investigation's own suggested assertion (interclaim-sliver-
+// investigation.md section 5, Option 1, "Testability"): true if ANY layer of `object` has a
+// base-coloured component that is simultaneously (a) narrower than 2*small_region_threshold
+// (0.225mm at stock flows) - i.e. it has no printable core of its own, exactly what each
+// colour's private opening_ex deletes - and (b) entirely clear of the F1 wall-stack band at the
+// contour - i.e. NOT F1's own territory. Such a component can only be a base sliver trapped
+// between painted claims: genuine base always either touches the contour (F1's territory) or is
+// wide enough to have a printable core, so a THIN, INTERIOR base component has nothing but
+// painted neighbours around it.
+bool has_interclaim_sliver(const PrintObject &object, double wall_stack_mm = 0.878540)
+{
+    const float t          = float(scale_(0.225));
+    const float wall_stack = float(scale_(wall_stack_mm));
+    for (size_t layer_idx = 0; layer_idx < object.layer_count(); ++layer_idx) {
+        const Layer *layer = object.get_layer(int(layer_idx));
+        ExPolygons   painted;
+        append(painted, claim_for_layer(object, layer_idx, /*Extruder2*/ 2));
+        append(painted, claim_for_layer(object, layer_idx, /*Extruder3*/ 3));
+        if (painted.empty())
+            continue;
+        painted = union_ex(painted);
+        const ExPolygons base_area = diff_ex(layer->lslices, painted);
+        if (base_area.empty())
+            continue;
+        const ExPolygons interior = offset_ex(layer->lslices, -wall_stack);
+        for (const ExPolygon &island : base_area) {
+            const ExPolygons single{island};
+            if (! opening_ex(single, t).empty())
+                continue;
+            if (! diff_ex(single, interior).empty())
+                continue;
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: two adjacent painted claims on FLAT facets stay sliver-free on both sides of the fix (Item 1 sanity/no-false-positive)", "[paintdepth]")
+{
+    // T1's exact 15 deg fixture (well inside the <24 deg band Item 2 is about), split into two
+    // colours on adjacent walls instead of one colour on all four. Their shared corner
+    // (X=+half, Y=-half) was the FIRST hypothesis for where a sliver would appear, but measured
+    // (not asserted) against pre-fix code, it does not: has_interclaim_sliver finds nothing here
+    // either before or after the fix. Root cause, worked out by hand-tracing the descent loop
+    // (interclaim-absorb-report.md): on a FLAT facet every originating layer's own top_ex has the
+    // SAME ring width r, so the per-colour opening_ex is an all-or-nothing gate per colour (either
+    // the whole wall survives it, at 15deg here, or none of it does) - never a locally varying
+    // one, so there is nothing for a neighbouring colour to inherit. Genuine curvature is required
+    // (see the sphere-based fixture further below, which DOES reproduce the defect and is this
+    // fix's real RED/GREEN pin). Kept as a deliberate negative control: a flat-faceted, in-band
+    // two-colour claim boundary must stay sliver-free on BOTH sides of the fix, i.e. the absorb
+    // must not manufacture a false positive out of ordinary flat geometry.
+    //
+    // Run on both generators (the process explicitly calls for this: Arachne is the worse case -
+    // it prints every survivor as a widened bead - but the underlying geometry defect, and this
+    // fix, are generator-independent, so the same invariant must hold on Classic too).
+    for (PerimeterGeneratorType generator : {PerimeterGeneratorType::Arachne, PerimeterGeneratorType::Classic}) {
+        DYNAMIC_SECTION("generator " << (generator == PerimeterGeneratorType::Arachne ? "arachne" : "classic")) {
+            Print        print;
+            PrintObject *object = slice_bounded_frustum_two_colours(40.392, 18., 3., FRUSTUM_WALL_NEG_Y, FRUSTUM_WALL_POS_X,
+                                                                     pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print, generator);
+            REQUIRE(object->layer_count() >= 27);
+            CHECK_FALSE(has_interclaim_sliver(*object));
+
+            // ...and the absorbed area is not double-claimed: an absorbed island is appended to
+            // exactly one winning colour and removed from base, never left claimed by both.
+            for (size_t layer_idx = 0; layer_idx < object->layer_count(); ++layer_idx) {
+                CAPTURE(layer_idx);
+                const ExPolygons claim_a = claim_for_layer(*object, layer_idx, /*Extruder2*/ 2);
+                const ExPolygons claim_b = claim_for_layer(*object, layer_idx, /*Extruder3*/ 3);
+                CHECK(intersection_ex(claim_a, claim_b).empty());
+            }
+        }
+    }
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: a genuine base region wider than the threshold between two painted claims stays base (Item 1 does not over-absorb)", "[paintdepth]")
+{
+    // OPPOSITE-ish walls painted (not adjacent): -Y and +Y, leaving the +X and -X sides of the
+    // frustum as genuine, many-mm-wide unpainted base - nowhere near either colour's claim and
+    // nowhere near thin. If the absorb ever ate real base area instead of only thin interior
+    // slivers, this is what it would touch.
+    Print        print;
+    PrintObject *object = slice_bounded_frustum_two_colours(40.392, 18., 3., FRUSTUM_WALL_NEG_Y, FRUSTUM_WALL_POS_Y,
+                                                             pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+    REQUIRE(object->layer_count() >= 27);
+
+    const size_t       probe_layer = 12;
+    const BoundingBox bb = get_extents(object->get_layer(int(probe_layer))->lslices);
+    REQUIRE(bb.defined);
+    // Dead centre of the +X side, far (multiple mm) from both painted walls and from the
+    // frustum's own contour - unambiguously genuine base on any reasonable claim width.
+    const Point centre_probe(coord_t(bb.max.x() - scale_(1.0)), (bb.min.y() + bb.max.y()) / 2);
+
+    CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder2*/ 2), centre_probe));
+    CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder3*/ 3), centre_probe));
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: the interior inter-claim absorb respects the F1 guard - the interlocking notch tooth is not absorbed (Item 1)", "[paintdepth]")
+{
+    // Reuses the walls-mode interlock-notch fixture/math from the band-width test earlier in
+    // this file. A single painted colour is enough here: the notch is CONNECTED to the wide base
+    // core behind it, so it is exactly the "thin tooth attached to a real base component" case
+    // the per-connected-component guard exists to protect - a NAIVE implementation that ran
+    // diff_ex(base_area, opening_ex(base_area, t)) on the WHOLE base area at once (instead of
+    // component-by-component) would strip this tooth right along with genuine slivers, because
+    // the tooth reads as "thin" only in isolation, never as part of its own (wide) connected
+    // component. Independent of how many colours are painted.
+    Print        print;
+    PrintObject *object = slice_painted_cube(PLUS_X_FACE, pdmWalls, 3, print);
+
+    float band_mm = 0.f;
+    float min_perimeter_spacing = 0.f;
+    for (size_t region_idx = 0; region_idx < object->num_printing_regions(); ++region_idx) {
+        const PrintRegion &region                 = object->printing_region(region_idx);
+        const float         ext_perimeter_width   = region.flow(*object, frExternalPerimeter, object->config().layer_height).width();
+        const float         ext_perimeter_spacing = region.flow(*object, frExternalPerimeter, object->config().layer_height).spacing();
+        const float         perimeter_spacing     = region.flow(*object, frPerimeter, object->config().layer_height).spacing();
+        band_mm = std::max(band_mm, paint_depth_band_mm(pdmWalls, 3, 0.0, ext_perimeter_width, ext_perimeter_spacing, perimeter_spacing));
+        if (perimeter_spacing > 0.f)
+            min_perimeter_spacing = min_perimeter_spacing > 0.f ? std::min(min_perimeter_spacing, perimeter_spacing) : perimeter_spacing;
+    }
+    REQUIRE(band_mm > 0.f);
+    const double interlock_mm = paint_depth_interlocking_depth_mm(pdmWalls, object->config().mmu_segmented_region_interlocking_depth.value, min_perimeter_spacing);
+    REQUIRE(interlock_mm > 0.);
+    REQUIRE(interlock_mm < 0.225); // the notch (default 0.1mm) really is narrower than the absorb threshold
+
+    REQUIRE(object->layer_count() >= 10);
+    const size_t even_layer = (object->layer_count() / 2) - (object->layer_count() / 2) % 2;
+    REQUIRE(even_layer % 2 == 0);
+
+    // Inside the interlock "tooth" (between band-interlock and band) on the even (notched)
+    // layer: still base, not absorbed - even though it is narrower than the absorb threshold and
+    // directly adjacent to the painted claim on one side.
+    const double interlock_notch_mm = band_mm - interlock_mm / 2.0;
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, even_layer), layer_edge_probe(*object, even_layer, interlock_notch_mm)));
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: Item 2's band-level opening does not change unlimited mode (legacy parity)", "[paintdepth]")
+{
+    // paint_depth_normal_mm - which Item 1's bounded_mode gate (merge_segmented_layers) and
+    // Item 2's normal_shell gate (segmentation_top_and_bottom_layers) both trace back to - is
+    // forced to exactly 0.f whenever paint_depth_mode == pdmUnlimited, unconditionally
+    // (MultiMaterialSegmentation.cpp, multi_material_segmentation_by_painting: "paint_depth_
+    // normal_mm = paint_depth_mode != pdmUnlimited ? max_width : 0.f"). That is a config-only
+    // gate, not a geometric one, so this pins it the same way the file's other legacy-parity
+    // pairs do (e.g. "unlimited mode leaves the same painted face unbounded" above): the SAME
+    // two-colour fixture the Item 1 RED/GREEN test above uses is sliced TWICE, independently, in
+    // pdmUnlimited, and both runs must agree exactly - neither fix's new code executes anything
+    // that could make an unlimited-mode result depend on run ordering (the absorb's own
+    // determinism guard, re-affirmed at the level this file can actually observe).
+    Print        print1, print2;
+    PrintObject *object1 = slice_bounded_frustum_two_colours(40.392, 18., 3., FRUSTUM_WALL_NEG_Y, FRUSTUM_WALL_POS_X,
+                                                              pdmUnlimited, /*walls=*/3, /*layer_height=*/0.1, print1);
+    PrintObject *object2 = slice_bounded_frustum_two_colours(40.392, 18., 3., FRUSTUM_WALL_NEG_Y, FRUSTUM_WALL_POS_X,
+                                                              pdmUnlimited, /*walls=*/3, /*layer_height=*/0.1, print2);
+    REQUIRE(object1->layer_count() == object2->layer_count());
+    for (size_t layer_idx = 0; layer_idx < object1->layer_count(); ++layer_idx) {
+        CAPTURE(layer_idx);
+        for (int extruder_id : {2, 3}) {
+            CAPTURE(extruder_id);
+            const ExPolygons a = claim_for_layer(*object1, layer_idx, extruder_id);
+            const ExPolygons b = claim_for_layer(*object2, layer_idx, extruder_id);
+            CHECK(diff_ex(a, b).empty());
+            CHECK(diff_ex(b, a).empty());
+        }
+    }
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: Item 2 (band-level opening) and the true ceiling on a uniform-slope surface", "[paintdepth]")
+{
+    // Item 2 (interclaim-absorb-report.md / interclaim-sliver-investigation.md section 5 Option
+    // 2, section 6): moves the per-STEP opening_ex (segmentation_top_and_bottom_layers's
+    // :2079/:2146 sites) to the ACCUMULATED band (the merge loop consuming shell_triangles_by_
+    // color_top/bottom), so overlapping contributions from DIFFERENT originating surface layers
+    // landing in the same destination slot are opened together rather than each filtered alone.
+    //
+    // On a SINGLE UNIFORM-angle frustum wall that mechanism has nothing to bite: every
+    // originating layer's OWN top_ex has the SAME ring width r = layer_height/tan(theta) (the
+    // staircase tread of a constant slope), so past the ceiling every layer's SURFACE opening
+    // (opening_ex(top_ex, small_region_threshold), the :1946 site - which Item 2 explicitly does
+    // NOT touch) already empties top_ex before any originating layer descends at all. There is
+    // then nothing left for the moved :2079/:2146 opening to have been over-filtering.
+    //
+    // Measured here, not asserted analytically, per the report's own instruction to verify and
+    // report the TRUE number rather than claim one.
+    struct SlopeCase { double degrees; double bottom; };
+    // bottom = 2*(9 + 3/tan(theta)), same construction as the existing "headline numbers" test.
+    const SlopeCase cases[] = {
+        {24., 31.4765},
+        {25., 30.8670}, // the existing headline test's own value at this angle
+        {28., 29.2845},
+        {30., 28.3923},
+    };
+    for (const SlopeCase &c : cases) {
+        DYNAMIC_SECTION("slope " << c.degrees << " deg") {
+            Print        print;
+            PrintObject *object = slice_bounded_frustum(c.bottom, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                         pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
+            REQUIRE(object->layer_count() >= 27);
+
+            const double reach = claim_reach_mm(*object, /*layer_idx=*/12);
+            CAPTURE(c.degrees);
+            CAPTURE(reach);
+            // The lateral band alone on this even layer is ~1.34mm (1.435675mm floored by the
+            // 0.1mm interlock notch); a deepened normal-thickness descent reaches several mm
+            // further (T1's 15deg case reaches 5.6mm). This range distinguishes the two; see the
+            // report for the measured value at each angle and the ceiling conclusion.
+            CHECK(reach > 1.0);
+            CHECK(reach < 2.0);
+        }
+    }
+}
+
+// ITEM 1, second (curved) fixture. The frustum-based test above turns out NOT to reproduce the
+// defect: every originating layer's own top_ex has the SAME ring width r on a FLAT facet, so the
+// per-colour opening is an all-or-nothing gate per colour (either the whole wall survives it or
+// the whole wall does not) - never a locally varying one, so there is nothing for a neighbouring
+// colour to inherit. The investigation's own mechanism needs r to vary from originating layer to
+// originating layer, so that SOME descent-step contributions survive their own opening_ex while
+// adjacent ones (from a nearby, slightly steeper originating layer) do not - which needs genuine
+// surface CURVATURE, not a flat facet.
+//
+// A sphere gives exactly that: local slope-from-horizontal at polar angle beta from the equator
+// is (90-beta) degrees, continuously varying, so painting two colours split at beta=66deg (slope
+// 24deg, the #7104 ceiling) puts the transition interclaim-sliver-investigation.md analyses right
+// at the colour boundary, with genuine curvature on both sides of it - much closer to the
+// reported defect (a curved painted face) than any flat-faceted primitive in this file.
+TEST_CASE("multi_material_segmentation_by_painting: two adjacent painted claims on a curved (sphere) surface leave NO base-coloured sliver at their shared boundary (Item 1)", "[paintdepth]")
+{
+    constexpr double kPi    = 3.14159265358979323846;
+    const double     radius = 8.0;
+
+    Model        model;
+    ModelObject *object = model.add_object();
+    object->name        = "paint-depth-sphere-two-colour.stl";
+    ModelVolume *volume  = object->add_volume(make_sphere(radius, kPi / 12.));
+
+    // Colour split by each facet's own LOCAL slope-from-horizontal, computed from its face
+    // normal (its_face_normal) rather than a hard-coded facet index list, so this does not
+    // depend on its_make_sphere's internal vertex/facet ordering. nz = the normal's Z component
+    // = sin(beta), beta = polar angle from the equator; slope-from-horizontal = (90-beta) deg.
+    //   colour2 (shallow cap):   nz > sin(66deg) = 0.9135  -> slope < 24deg
+    //   colour3 (steeper band):  0.3 < nz <= 0.9135         -> 24deg <= slope < 72deg
+    //   left unpainted (base):   nz <= 0.3 (near/below the equator, and the whole lower
+    //                            hemisphere) - comfortably clear of both painted claims.
+    // mesh() returns TriangleMesh BY VALUE - keep a named local so `its` below does not
+    // reference a member of an already-destroyed temporary.
+    const TriangleMesh sphere_mesh = volume->mesh();
+    TriangleSelector    selector(sphere_mesh);
+    for (size_t facet_idx = 0; facet_idx < sphere_mesh.its.indices.size(); ++facet_idx) {
+        const float nz = its_face_normal(sphere_mesh.its, int(facet_idx)).z();
+        if (nz > 0.9135f)
+            selector.set_facet(int(facet_idx), EnforcerBlockerType::Extruder2);
+        else if (nz > 0.3f)
+            selector.set_facet(int(facet_idx), EnforcerBlockerType::Extruder3);
+    }
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+
+    object->add_instance();
+    object->ensure_on_bed();
+
+    DynamicPrintConfig config = paint_depth_test_config(pdmWalls, 3);
+    config.set_num_extruders(3);
+    config.set_num_filaments(3);
+    config.option<ConfigOptionFloats>("filament_diameter")->values = {1.75, 1.75, 1.75};
+    config.option<ConfigOptionStrings>("filament_colour")->values  = {"#FFFFFF", "#804020", "#2040A0"};
+    config.option<ConfigOptionFloats>("nozzle_diameter")->values   = {0.4, 0.4, 0.4};
+    config.option<ConfigOptionFloat>("layer_height")->value                     = 0.1;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value       = 0.1;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
+    config.option<ConfigOptionInt>("top_shell_layers")->value                   = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value              = 0.6;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value                = 3;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value           = 0.0;
+
+    Print print;
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+
+    // RED/GREEN, measured on this exact fixture with the absorb toggled off and on
+    // (interclaim-absorb-report.md "Diagnosis"): with the absorb OFF, has_interclaim_sliver
+    // finds FOUR genuine base annuli - 9.43, 8.79, 3.49 and 2.75 mm2, each ~0.34mm wide - on
+    // layers 135-138, exactly at the colour2/colour3 boundary near z = 13.6-13.9mm, plus ~430
+    // sub-0.00002 mm2 Clipper fragments along their rims. With it ON, the count is ZERO at any
+    // area: every one of those components is thin, fully interior and painted-neighboured, so
+    // the absorb hands each to a painted claim (colour 3 for the annuli) and the rim fragments
+    // go with them. This assertion is therefore NOT satisfied by an area floor - it holds
+    // exactly, which is why none is used.
+    CHECK_FALSE(has_interclaim_sliver(*out_object));
 }

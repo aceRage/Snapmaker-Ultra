@@ -56,9 +56,27 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               // skin path, which has no top/bottom claim at all. See
                                                               // segmentation_top_and_bottom_layers in the .cpp.
                                                               float                                                            segmentation_normal_depth,
+                                                              // ITEM 1 (.superpowers/sdd/2026-08-31-paint-depth/interclaim-absorb-
+                                                              // report.md, interclaim-sliver-investigation.md section 5 Option 1):
+                                                              // the F1 wall-stack band width (mm, ext_perimeter_width +
+                                                              // ext_perimeter_spacing, max across the object's printing regions),
+                                                              // plumbed through to merge_segmented_layers's interior inter-claim
+                                                              // absorb as its F1 guard. 0.f (paired with segmentation_normal_depth
+                                                              // == 0.f) disables the absorb entirely.
+                                                              float                                                            segmentation_wall_stack,
                                                               bool                                                             segmentation_interlocking_beam,
                                                               IncludeTopAndBottomLayers                                        include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback);
+
+// ITEM 1 (.superpowers/sdd/2026-08-31-paint-depth/interclaim-absorb-report.md): given a thin,
+// fully-interior base island and the final per-colour claims on its layer (index 0 = base,
+// ignored; index >= 1 = painted colours, the only eligible neighbours), returns the 1-based
+// colour index of the claim with the largest shared area against the island dilated by `eps` -
+// ties broken by the LOWEST colour index. Returns 0 if no painted claim touches the (dilated)
+// island at all. Exposed (not static) so it is directly unit-testable: the tie-break rule is
+// exact-integer-area-based and must be pinned deterministically, independent of mesh/Clipper
+// floating-point geometry.
+size_t interclaim_absorb_winner(const ExPolygons &island, const std::vector<ExPolygons> &painted_claims, float eps);
 
 // Returns multi-material segmentation based on painting in multi-material segmentation gizmo
 std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(const PrintObject &print_object, const std::function<void()> &throw_on_cancel_callback);
