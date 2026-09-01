@@ -960,6 +960,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "paint_depth_walls"
             || opt_key == "paint_depth_mm"
             || opt_key == "paint_infill_override"
+            || opt_key == "paint_depth_solid_interfaces"
             // Vertical paint-depth alignment fix (.superpowers/sdd/2026-08-31-paint-depth/
             // vertical-depth-investigation.md section 4 "Invalidation"): segmentation_top_and_
             // bottom_layers (MultiMaterialSegmentation.cpp) now consults top_shell_thickness /
@@ -1330,7 +1331,11 @@ void PrintObject::detect_surfaces_type()
     // color Z-interfaces (bleed path (c)) exactly the way interface_shells already provides
     // for any region boundary - see PrintObject::has_bounded_paint_depth()'s comment (Print.hpp)
     // for why this ORs into the existing flag instead of a scoped reclassification.
-    bool interface_shells = ! spiral_mode && (m_config.interface_shells.value || this->has_bounded_paint_depth());
+    // Follow-up (item 1, shell-setting-and-gapfill-report.md): gated on paint_depth_solid_
+    // interfaces (default true = today's behavior) so the user can trade the bleed guarantee
+    // for less solid material/time when the forced solid shells cost more than they're worth.
+    bool interface_shells = ! spiral_mode && (m_config.interface_shells.value ||
+        (this->has_bounded_paint_depth() && m_config.paint_depth_solid_interfaces.value));
     size_t num_layers     = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
 
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
@@ -1762,8 +1767,10 @@ void PrintObject::discover_vertical_shells()
     // Paint Depth Stage 2 (Task 3 item 1): mirror detect_surfaces_type()'s effective
     // interface_shells value (see PrintObject::has_bounded_paint_depth()) so vertical shell
     // thickness is computed per-region (not merged across the whole object) whenever a color
-    // Z-interface needs its own solid skin.
-    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! (m_config.interface_shells.value || this->has_bounded_paint_depth());
+    // Z-interface needs its own solid skin. Follow-up (item 1): same paint_depth_solid_
+    // interfaces gate as detect_surfaces_type(), so the two stay consistent.
+    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! (m_config.interface_shells.value ||
+        (this->has_bounded_paint_depth() && m_config.paint_depth_solid_interfaces.value));
 //    static constexpr const float top_bottom_expansion_coeff = 1.05f;
     // Just a tiny fraction of an infill extrusion width to merge neighbor regions reliably.
     static constexpr const float top_bottom_expansion_coeff = 0.05f;

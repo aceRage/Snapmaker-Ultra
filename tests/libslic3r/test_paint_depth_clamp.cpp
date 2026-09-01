@@ -54,9 +54,11 @@ const std::vector<int> ALL_SIDE_FACE = {4, 5, 6, 7, 8, 9, 10, 11};
 const std::vector<int> TOP_CAP_FACE    = {2, 3};
 const std::vector<int> BOTTOM_CAP_FACE = {0, 1};
 
-// paint_infill_override defaults to true (today's behavior, matches the option's own
-// PrintConfig.cpp default) so existing callers that only pass mode/walls are unaffected.
-DynamicPrintConfig paint_depth_test_config(PaintDepthMode mode, int walls, bool paint_infill_override = true)
+// paint_infill_override and paint_depth_solid_interfaces both default to true (today's
+// behavior, matches each option's own PrintConfig.cpp default) so existing callers that
+// only pass mode/walls (or mode/walls/paint_infill_override) are unaffected.
+DynamicPrintConfig paint_depth_test_config(PaintDepthMode mode, int walls, bool paint_infill_override = true,
+                                            bool paint_depth_solid_interfaces = true)
 {
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
     config.set_num_extruders(2);
@@ -85,6 +87,7 @@ DynamicPrintConfig paint_depth_test_config(PaintDepthMode mode, int walls, bool 
     config.option<ConfigOptionEnum<PaintDepthMode>>("paint_depth_mode")->value = mode;
     config.option<ConfigOptionInt>("paint_depth_walls")->value               = walls;
     config.option<ConfigOptionBool>("paint_infill_override")->value          = paint_infill_override;
+    config.option<ConfigOptionBool>("paint_depth_solid_interfaces")->value   = paint_depth_solid_interfaces;
     return config;
 }
 
@@ -231,7 +234,10 @@ bool any_contains(const ExPolygons &polys, const Point &pt)
 // discover_vertical_shells(), PrintObject.cpp) - what has_bounded_paint_depth() actually
 // changes (Print.hpp) - only executes at the private prepare_infill() step (posPrepareInfill),
 // which slice() does not reach; process() is the only public entry point that gets there.
-PrintObject *process_z_interface_cube(PaintDepthMode mode, int walls, Print &print)
+// paint_depth_solid_interfaces defaults to true (today's behavior) so existing callers
+// that only pass mode/walls/print are unaffected.
+PrintObject *process_z_interface_cube(PaintDepthMode mode, int walls, Print &print,
+                                       bool paint_depth_solid_interfaces = true)
 {
     Model model;
     ModelObject *object = model.add_object();
@@ -250,7 +256,7 @@ PrintObject *process_z_interface_cube(PaintDepthMode mode, int walls, Print &pri
     object->ensure_on_bed();
 
     print.set_status_silent();
-    print.apply(model, paint_depth_test_config(mode, walls));
+    print.apply(model, paint_depth_test_config(mode, walls, /*paint_infill_override=*/true, paint_depth_solid_interfaces));
     REQUIRE(print.objects().size() == 1);
 
     print.process();
@@ -550,6 +556,23 @@ TEST_CASE("multi_material_segmentation_by_painting: an unbounded (unlimited mode
     // object's color Z-interface stays plain stInternal, exactly like before Stage 2.
     Print        print;
     PrintObject *object = process_z_interface_cube(pdmUnlimited, 3, print);
+
+    const size_t first_painted_layer = first_layer_above_z(*object, 10.0);
+    CHECK_FALSE(extruder2_layer_has_solid_skin(*object, first_painted_layer));
+}
+
+// Follow-up (item 1, .superpowers/sdd/2026-08-31-paint-depth/interclaim-absorb-report.md
+// "still open" / shell-setting-and-gapfill-report.md, user decision 2026-09-01):
+// paint_depth_solid_interfaces gates the has_bounded_paint_depth() forcing at all four
+// read sites (PrintObject.cpp x2, PerimeterGenerator.cpp x2). With it OFF and
+// interface_shells at its own plain default (false), a BOUNDED (walls-mode, i.e.
+// has_bounded_paint_depth() would otherwise be true) color Z-interface must fall back to
+// exactly the same (no solid skin) result as the interface_shells=false/unbounded case
+// above - the option, not the mode, is what is being pinned here.
+TEST_CASE("multi_material_segmentation_by_painting: paint_depth_solid_interfaces=false falls back to plain interface_shells (no solid skin) at a bounded color Z-interface", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = process_z_interface_cube(pdmWalls, 3, print, /*paint_depth_solid_interfaces=*/false);
 
     const size_t first_painted_layer = first_layer_above_z(*object, 10.0);
     CHECK_FALSE(extruder2_layer_has_solid_skin(*object, first_painted_layer));

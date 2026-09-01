@@ -152,7 +152,7 @@ record() {
 #     back-to-back identical-command slices of THIS fixture differs; the
 #     normalized diff (including this awk pass) is empty (verified directly
 #     while writing this script).
-# PLUS three paint-depth-specific strips, all CONFIG_BLOCK dump lines that
+# PLUS paint-depth-specific strips, all CONFIG_BLOCK dump lines that
 # are new or changed-default as of this feature and therefore legitimately
 # differ from the pre-feature baseline on an UNPAINTED object even though
 # the feature has zero effect on that object's actual toolpath:
@@ -166,6 +166,13 @@ record() {
 #     even on an unpainted object; this is a config-dump-only difference
 #     (interlocking is only ever consumed when is_mm_painted(), confirmed in
 #     Task 2's report) not a toolpath difference.
+#   - "; paint_depth_solid_interfaces = ..." — shell-setting-and-gapfill-
+#     report.md item 1: another new key, same situation as the first four -
+#     absent from the pre-feature baseline CONFIG_BLOCK. It gates
+#     has_bounded_paint_depth()'s effect (PrintObject.cpp/PerimeterGenerator.cpp),
+#     which is itself always false when !is_mm_painted(), so this option is
+#     never even READ for an unpainted object - config-dump-only, same as
+#     the others in this list.
 # Confirmed empirically (see "config surface checks" section below, which
 # asserts each of these lines' RESOLVED values directly) that stripping them
 # here does not mask a real behavioral difference — it is exactly the set of
@@ -180,6 +187,7 @@ normalize() {
         -e '/^; paint_depth_mode/d' \
         -e '/^; paint_depth_walls/d' \
         -e '/^; paint_depth_mm/d' \
+        -e '/^; paint_depth_solid_interfaces/d' \
         -e '/^; paint_infill_override/d' \
         -e '/^; mmu_segmented_region_interlocking_depth/d' \
         -e 's/id:[0-9]\+ copy 0/id:X copy 0/' \

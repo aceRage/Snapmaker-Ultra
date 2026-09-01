@@ -3983,6 +3983,30 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
 
+    // Paint Depth follow-up (item 1, .superpowers/sdd/2026-08-31-paint-depth/interclaim-
+    // absorb-report.md "still open" / shell-setting-and-gapfill-report.md, user decision
+    // 2026-09-01, default ON): has_bounded_paint_depth() (Print.hpp) has always
+    // unconditionally OR'd into interface_shells's effective value at four read sites
+    // (PrintObject.cpp's detect_surfaces_type()/discover_vertical_shells(),
+    // PerimeterGenerator.cpp x2) to stop color bleeding through Z-boundaries - see
+    // Print.hpp's has_bounded_paint_depth() comment. That is also what creates many
+    // narrow internal-solid patches at every color boundary layer, which
+    // detect_narrow_internal_solid_infill (default true) reroutes to ipConcentricInternal
+    // - the "erratic square infill" symptom, costing solid material and time. This option
+    // gates that forcing at all four sites; default true is zero behavior change.
+    def           = this->add("paint_depth_solid_interfaces", coBool);
+    def->label    = L("Paint depth solid interfaces");
+    def->tooltip  = L("Print solid shells at colour boundaries inside the object so the base "
+                    "colour cannot show through painted areas from above/below. Turning this "
+                    "off saves solid material and time but can let the base colour bleed "
+                    "through thin painted skins.");
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    // Greyed out (ConfigManipulation.cpp) whenever paint depth is unbounded (paint_depth_
+    // mode == unlimited), same condition as paint_infill_override, since it has no effect
+    // there either - has_bounded_paint_depth() is false for the whole object in that mode.
+    def->set_default_value(new ConfigOptionBool(true));
+
     def           = this->add("mmu_segmented_region_interlocking_depth", coFloat);
     def->label    = L("Interlocking depth of a segmented region");
     // Fix-wave F5: the old tooltip named mmu_segmented_region_max_width as the gate and as

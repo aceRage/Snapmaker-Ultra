@@ -908,6 +908,17 @@ PRINT_CONFIG_CLASS_DEFINE(
     // in the base filament (PrintApply.cpp's generate_print_object_regions /
     // verify_update_print_object_regions - the region-override site).
     ((ConfigOptionBool,                paint_infill_override))
+    // Paint Depth follow-up (item 1, .superpowers/sdd/2026-08-31-paint-depth/interclaim-
+    // absorb-report.md "still open" / shell-setting-and-gapfill-report.md, user decision
+    // 2026-09-01): default true keeps today's behavior - has_bounded_paint_depth() forces
+    // solid shells at every color Z-interface (PrintObject.cpp detect_surfaces_type() /
+    // discover_vertical_shells(), and PerimeterGenerator.cpp's two mirrors of the same
+    // flag - all four gated on this option, see those call sites). That solid-shell
+    // forcing is what stops color bleeding through Z-boundaries, but it also creates many
+    // narrow internal-solid patches that detect_narrow_internal_solid_infill reroutes to a
+    // concentric pattern ("erratic square infill"), costing solid material and time. false
+    // lets those four sites fall back to the user's plain interface_shells value instead.
+    ((ConfigOptionBool,                paint_depth_solid_interfaces))
     ((ConfigOptionFloat,               raft_contact_distance))
     ((ConfigOptionFloat,               raft_expansion))
     ((ConfigOptionPercent,             raft_first_layer_density))
