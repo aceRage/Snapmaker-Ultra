@@ -1276,9 +1276,20 @@ static void cut_segmented_layers(const std::vector<ExPolygons>        &input_exp
                                  // emit, in scaled units - one external extrusion. See
                                  // paint_depth_clamp_keep_core above.
                                  const float                           min_claim_width,
+                                 // Fix-wave (absorb-tail-review.md Minor 3): out-parameter, one
+                                 // ExPolygons per layer, capturing the SAME keep_core this function
+                                 // already computes below and uses to cut painted claims back - the
+                                 // F2 ladder's own deliberately-preserved base residue. Left empty
+                                 // per-layer wherever this function does not compute one for that
+                                 // layer (region_cut_width <= 0, or the whole-layer all-empty skip),
+                                 // matching the shape merge_segmented_layers's absorb stage expects
+                                 // (see its own new parameter). Resized here so callers do not need
+                                 // to know this function's internal layer count.
+                                 std::vector<ExPolygons>              &keep_core_by_layer_out,
                                  const std::function<void()>          &throw_on_cancel_callback)
 {
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - cutting segmented layers in parallel - begin";
+    keep_core_by_layer_out.assign(segmented_regions.size(), ExPolygons());
     // Fix-wave F1: interlocking_cut_width (cut_width minus the interlock sub-band, clamped
     // to 0) is the Prusa-style even-layer cut width - it carves the interlock "tooth" at the
     // INNER boundary of the clamped claim, not a full replacement of cut_width by the tiny
@@ -1292,7 +1303,7 @@ static void cut_segmented_layers(const std::vector<ExPolygons>        &input_exp
     // separate zero-band special case is needed at the call site.
     const float interlocking_cut_width = interlocking_depth > 0.f ? std::max(cut_width - interlocking_depth, 0.f) : 0.f;
     tbb::parallel_for(tbb::blocked_range<size_t>(0, segmented_regions.size()),
-    [&segmented_regions, &input_expolygons, &cut_width, &interlocking_cut_width, &min_claim_width, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
+    [&segmented_regions, &input_expolygons, &cut_width, &interlocking_cut_width, &min_claim_width, &keep_core_by_layer_out, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
         for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
             throw_on_cancel_callback();
             const float  region_cut_width       = ((layer_idx % 2 == 0) && (interlocking_cut_width > 0.f)) ? interlocking_cut_width : cut_width;
@@ -1317,6 +1328,9 @@ static void cut_segmented_layers(const std::vector<ExPolygons>        &input_exp
                 // chosen against the UN-NOTCHED cut_width (I-2) and floored at one external
                 // extrusion (C-1); only the full-band erosion uses the notched region_cut_width.
                 const ExPolygons keep_core = paint_depth_clamp_keep_core(input_expolygons[layer_idx], region_cut_width, cut_width, min_claim_width);
+                // Fix-wave (absorb-tail-review.md Minor 3): capture it for the absorb stage too -
+                // see this function's header comment and merge_segmented_layers's own use below.
+                keep_core_by_layer_out[layer_idx] = keep_core;
                 std::vector<ExPolygons> segmented_regions_cuts(num_extruders_plus_one); // Indexed by extruder_id
                 for (size_t extruder_idx = 0; extruder_idx < num_extruders_plus_one; ++extruder_idx)
                     if (const ExPolygons &ex_polygons = segmented_regions[layer_idx][extruder_idx]; !ex_polygons.empty())
@@ -2650,12 +2664,30 @@ static void remove_multiple_edges_in_vertices(MMU_Graph &graph, const std::vecto
 // painted claim touches the (dilated) island at all - the caller must not orphan the island onto
 // an arbitrary colour when that happens.
 //
-// Determinism (this codebase has been bitten by this before): ExPolygon::area() is the shoelace
-// sum over scaled-integer coordinates, so two candidate areas compare exactly the same way on
-// every run - no iteration-order or float-ordering ambiguity - and the ascending scan with a
-// STRICT `>` below is what makes the LOWEST colour index win a genuine tie, matching the
-// precedence already established at the painted-colour trim loop below (colour 1 beats colour 2
-// beats ...).
+// Determinism (this codebase has been bitten by this before; corrected by absorb-tail-review.md
+// Minor 1 - this comment previously and WRONGLY called ExPolygon::area() an "exact integer"
+// shoelace sum): ExPolygon::area() is a DOUBLE computation - Polygon::area() (Polygon.cpp)
+// casts each Point to Vec2d and accumulates via cross2(), ExPolygon::area() (ExPolygon.cpp) sums
+// the contour and subtracts each hole, all in double. Individual terms are exact only while
+// |coordinate| stays under ~2^26.5 scaled units (~95mm from the object's own origin - the
+// operands here, island/claim intersections a few mm across, are nowhere near that), and the
+// running sum is order-dependent, so this is NOT bit-for-bit "the same as integer arithmetic";
+// it is deterministic for a REASON one level up: the SAME inputs, summed in the SAME order, by
+// the SAME binary, produce the SAME double every run (no thread/iteration-order ambiguity - the
+// candidate loop below is sequential, not parallel), so `area > best_area` (a plain double `>`)
+// picks the same argmax every time, and the ascending scan with a STRICT `>` is what makes the
+// LOWEST colour index win a genuine tie (two areas that compare bit-identical, e.g. exact
+// mirror-symmetric geometry - the unit test below pins exactly this case), matching the
+// precedence already established at the painted-colour trim loop further down (colour 1 beats
+// colour 2 beats ...). A NEAR-tie on real (non-symmetric) geometry is decided by whichever
+// double compares larger, i.e. by rounding, not by index - a real but Minor distinction from
+// what "ties broken by lowest index" might suggest, since only a GENUINE (bit-exact) tie reaches
+// the index rule at all. (Making this genuinely int64-exact was considered and rejected as not
+// actually cheap: Clipper's own vendored Area(const Path&) - deps_src/clipper/clipper.cpp:167 -
+// is ALSO double, computed the same way, so it is not a drop-in fix; a real fix would mean
+// hand-rolling a new int64 doubled-shoelace accumulator, with its own overflow ceiling on
+// pathological geometry, disproportionate to what is a comment-accuracy finding, not a
+// behavioural one - the double comparison above IS deterministic, just not integer-exact.)
 size_t interclaim_absorb_winner(const ExPolygons &island, const std::vector<ExPolygons> &painted_claims, float eps)
 {
     const ExPolygons dilated = offset_ex(island, eps);
@@ -2678,6 +2710,33 @@ size_t interclaim_absorb_winner(const ExPolygons &island, const std::vector<ExPo
     return best_color;
 }
 
+// Fix-wave (absorb-tail-review.md Minor 4 / M4) - see the header declaration for the full
+// rationale. MAX over only the colours whose (eps-dilated, same adjacency test
+// interclaim_absorb_winner uses) footprint actually touches this specific island; a colour
+// that cannot raise the running max is skipped without paying the geometry test at all.
+float interclaim_absorb_effective_claim_width(const ExPolygons &island, const std::vector<ExPolygons> &painted_claims,
+                                               const std::vector<float> &claim_width_gapfill_off_by_color,
+                                               float min_claim_width, float eps)
+{
+    ExPolygons dilated;
+    bool       have_dilated = false;
+    float      widened      = 0.f;
+    for (size_t color_idx = 1; color_idx < painted_claims.size(); ++color_idx) {
+        if (color_idx >= claim_width_gapfill_off_by_color.size())
+            continue;
+        const float candidate = claim_width_gapfill_off_by_color[color_idx];
+        if (candidate <= widened || painted_claims[color_idx].empty())
+            continue; // cannot raise the max even if it borders -> skip the geometry test
+        if (! have_dilated) {
+            dilated      = offset_ex(island, eps);
+            have_dilated = true;
+        }
+        if (! intersection_ex(dilated, painted_claims[color_idx]).empty())
+            widened = candidate;
+    }
+    return std::max(min_claim_width, widened);
+}
+
 static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::vector<std::vector<ExPolygons>> &segmented_regions,
                                                                    std::vector<std::vector<ExPolygons>>      &&top_and_bottom_layers,
                                                                    std::vector<std::vector<ExPolygons>>      &&legacy_top_and_bottom_layers,
@@ -2692,20 +2751,36 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
                                                                    // the call site - the SAME condition the rest of the feature gates on,
                                                                    // so paint_depth_mode == unlimited stays byte-identical: the entire
                                                                    // absorb stage is skipped, not merely a no-op inside it). ITEM 2
-                                                                   // plumbing added below: min_claim_width_gapfill_off.
+                                                                   // plumbing added below: min_claim_width_gapfill_off_by_color.
                                                                    const std::vector<ExPolygons>              &input_expolygons,
                                                                    const float                                  min_claim_width,
-                                                                   // ITEM 2 (interclaim-sliver-investigation.md loose end 3):
-                                                                   // the wider gap-fill-disabled kill width (mm, 0.f if no
-                                                                   // region has gap fill off), MAX'd against min_claim_width
-                                                                   // at the point of use below rather than folded into
-                                                                   // min_claim_width itself - min_claim_width is ALSO the
-                                                                   // degradation ladder's floor (paint_depth_clamp_keep_core,
-                                                                   // cut_segmented_layers) and widening that floor is a
-                                                                   // different, unrelated change this fix does not make.
-                                                                   const float                                  min_claim_width_gapfill_off,
+                                                                   // Fix-wave (absorb-tail-review.md Minor 4): PER-COLOUR (indexed by
+                                                                   // extruder id, i.e. the SAME indexing as segmented_regions'
+                                                                   // inner vector) gap-fill-disabled kill width (mm, 0.f for a colour
+                                                                   // with no gap-fill-disabled region of its own), replacing the old
+                                                                   // single object-wide MAX. An island's effective widened threshold
+                                                                   // is now resolved from only the colours that actually border IT
+                                                                   // (see the absorb loop below) - an unrelated gap-fill-disabled
+                                                                   // region elsewhere on the object can no longer widen the kill
+                                                                   // width for an island none of whose real neighbours have gap fill
+                                                                   // off. Entry 0 (base) is never consulted - the absorb never hands
+                                                                   // an island to colour 0. Sized generously by the caller; an
+                                                                   // out-of-range colour index (or an empty vector, the fuzzy-skin
+                                                                   // caller's value) is treated as 0.f, matching "no gap-fill-off
+                                                                   // region for that colour" - min_claim_width alone applies, byte-
+                                                                   // identical to an object with gap fill enabled everywhere.
+                                                                   const std::vector<float>                    &min_claim_width_gapfill_off_by_color,
                                                                    const float                                  wall_stack,
                                                                    const bool                                   bounded_mode,
+                                                                   // Fix-wave (absorb-tail-review.md Minor 3): one ExPolygons per
+                                                                   // layer, the F2 ladder's own deliberately-preserved base residue
+                                                                   // (paint_depth_clamp_keep_core, via cut_segmented_layers's new
+                                                                   // out-parameter) - never absorbed below, regardless of the F1
+                                                                   // wall-stack guard's own verdict. Empty (the fuzzy-skin caller's
+                                                                   // value, and any layer cut_segmented_layers did not compute one
+                                                                   // for) is a no-op: this exemption never fires and the absorb is
+                                                                   // byte-identical to before this fix.
+                                                                   const std::vector<ExPolygons>                &keep_core_by_layer,
                                                                    const std::function<void()>                &throw_on_cancel_callback)
 {
     const size_t                         num_layers = segmented_regions.size();
@@ -2747,10 +2822,41 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
                             append(other_painted_laterals, segmented_regions[layer_idx][other_idx]);
                     if (other_painted_laterals.empty())
                         continue;
-                    ExPolygons excess_clipped = diff_ex(excess, other_painted_laterals);
-                    ExPolygons combined       = legacy;
-                    append(combined, std::move(excess_clipped));
-                    full = std::move(combined);
+                    // Fix-wave (absorb-tail-review.md I1): do NOT rebuild `full` from `legacy`
+                    // verbatim (the pre-fix `combined = legacy U excess_clipped` below). `legacy`
+                    // is fed from the descent loop's RAW `last` whenever normal_shell is true
+                    // (segmentation_top_and_bottom_layers :2110/:2179 skip their per-step
+                    // opening_ex exactly then, deferring to the band-level opening at
+                    // :2268-2269 instead - see that site's Item 2 comment), and the shadow-
+                    // building loop above (:2216-2228) never opens it either - so `legacy` can
+                    // carry un-opened, sub-threshold ring fragments that `full`'s own band-level
+                    // opening already filtered out. Unioning `legacy` back in wholesale would
+                    // reintroduce exactly those fragments into the final claim on every layer
+                    // this loop actually modifies (i.e. whenever other_painted_laterals is
+                    // non-empty) - the #7104 filter silently stops applying there, and the
+                    // reintroduced fragments then trim the NEIGHBOUR's own lateral band too (the
+                    // second parallel_for below subtracts every colour's `full` from every OTHER
+                    // colour's lateral claim).
+                    //
+                    // Fix: never reference `legacy`'s contents directly - only ever SUBTRACT from
+                    // the already-correctly-opened `full` computed above, which can never add
+                    // back a fragment `full`'s own opening removed. This is also EXACTLY the same
+                    // value as the old formula whenever `legacy` is a subset of `full` (the
+                    // invariant that held before Item 2's normal_shell branch started feeding
+                    // this shadow raw geometry): `excess := full \ legacy` plus `legacy subset-of
+                    // full` together mean `full = legacy union excess` (a disjoint
+                    // decomposition), so `legacy union (excess \ other) == full \ (excess
+                    // intersect other)` identically - a pure algebraic rewrite, not a behaviour
+                    // change, in the well-formed case; it differs from the old formula ONLY in
+                    // the buggy case, and there it does the right thing by construction, never
+                    // re-manufacturing the per-layer sliver Item 2 moved the filter to stop.
+                    // Considered reopening `reach` at the shadow-building site instead (:2227) -
+                    // rejected: it would re-pay a second small_region_threshold opening on a
+                    // narrower (per-origin-step) union than the band-level one Item 2
+                    // deliberately widened to (:2098-2109's own reasoning against per-step
+                    // opening), and `legacy` has no other reader outside this one site, so
+                    // narrowing the fix to this site alone is the smaller, more targeted change.
+                    full = diff_ex(full, intersection_ex(excess, other_painted_laterals));
                 }
             }
         });
@@ -2824,20 +2930,27 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
         // OWN kill width triples to ~0.75mm at stock flows (the OTHER arm of the same ternary
         // this comment's first bullet already reasons about) - wider than min_claim_width's
         // 0.45mm - so a sliver in that wider range has a "printable core" under a t = min_claim_
-        // width/2 opening and is (wrongly) left as genuine base. min_claim_width_gapfill_off
-        // carries that wider quantity (0.f, hence inert, unless a region actually has gap fill
-        // off - see the call-site comment, multi_material_segmentation_by_painting); MAX against
-        // min_claim_width so an object with gap fill enabled everywhere is byte-identical to
-        // before this fix.
-        const float effective_claim_width = std::max(min_claim_width, min_claim_width_gapfill_off);
-        const float t                 = scaled<float>(effective_claim_width * 0.5f);
+        // width/2 opening and is (wrongly) left as genuine base.
+        //
+        // Fix-wave (absorb-tail-review.md Minor 4 / M4): this USED to be a single object-wide
+        // MAX (min_claim_width_gapfill_off, computed once here, outside the per-island loop),
+        // which meant a gap-fill-disabled region ANYWHERE on the object widened the kill width
+        // for EVERY island, even one whose actual neighbours all have gap fill on - over-
+        // absorbing a genuine 0.45-0.75mm base gap in a gap-fill-ON region purely because some
+        // unrelated region elsewhere on the object has gap fill off. Resolved PER ISLAND now,
+        // inside the loop below, via interclaim_absorb_effective_claim_width() - MAX only over
+        // the colours whose claim actually borders THIS island (min_claim_width_gapfill_off_by_
+        // color[color] is 0.f for any colour with no gap-fill-disabled region of its own, and an
+        // empty array - the fuzzy-skin caller's value - makes every island fall back to plain
+        // min_claim_width, byte-identical to before this fix ever existed).
         const float wall_stack_scaled = scaled<float>(wall_stack);
         // eps = 2*SCALED_EPSILON (the investigation's own choice): just enough to make a
         // zero-area touch (shared boundary only) register as an overlap for
-        // interclaim_absorb_winner, without meaningfully changing which neighbour has the larger
-        // share.
+        // interclaim_absorb_winner (and, since this fix-wave, the same-shaped adjacency test in
+        // interclaim_absorb_effective_claim_width), without meaningfully changing which
+        // neighbour has the larger share.
         const float eps = float(2 * SCALED_EPSILON);
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&segmented_regions_merged, &input_expolygons, t, wall_stack_scaled, eps, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&segmented_regions_merged, &input_expolygons, min_claim_width, &min_claim_width_gapfill_off_by_color, &keep_core_by_layer, wall_stack_scaled, eps, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
             for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
                 throw_on_cancel_callback();
                 if (layer_idx >= input_expolygons.size() || input_expolygons[layer_idx].empty())
@@ -2858,6 +2971,14 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
                 // never a candidate here, so the exterior bleed F1 closed cannot return through
                 // this stage.
                 const ExPolygons interior = offset_ex(input_expolygons[layer_idx], -wall_stack_scaled);
+                // Fix-wave (absorb-tail-review.md Minor 3 / M3): the F2 degradation ladder's own
+                // deliberately-preserved base residue for THIS layer (paint_depth_clamp_keep_core,
+                // via cut_segmented_layers - empty if that stage never ran, or never computed one
+                // for this layer). Never absorbed below, regardless of the F1 wall-stack guard's
+                // own verdict: keep_core can sit deeper than wall_stack from the contour (its own
+                // erosion depth is `band`, which is >= wall_stack by construction - see
+                // paint_depth_clamp_keep_core's header), so F1 alone does not reach it.
+                const bool has_keep_core_layer = layer_idx < keep_core_by_layer.size() && ! keep_core_by_layer[layer_idx].empty();
 
                 // Batched per colour and applied once after the scan below, so which component is
                 // decided first never changes another component's own (independent) decision.
@@ -2875,10 +2996,49 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
                 // own component.
                 for (const ExPolygon &island : base_area) {
                     const ExPolygons single{island};
+                    // Fix-wave (Minor 4 / M4): resolved PER ISLAND, from only the colours that
+                    // actually border it - see interclaim_absorb_effective_claim_width's header.
+                    const float effective_claim_width = interclaim_absorb_effective_claim_width(
+                        single, merged, min_claim_width_gapfill_off_by_color, min_claim_width, eps);
+                    const float t = scaled<float>(effective_claim_width * 0.5f);
                     if (! opening_ex(single, t).empty())
                         continue; // has a printable core of its own -> genuine base, leave it
                     if (! diff_ex(single, interior).empty())
                         continue; // touches/extends into the F1 wall-stack band -> F1 owns it
+                    // Fix-wave (Minor 3 / M3): F2's own keep-core -> never absorbed, but ONLY the
+                    // THIN residue keep_core degenerates to on a two-face-painted wall in
+                    // (2*band, 2*band + min_claim_width] - "hairline-to-0.45mm" per M3's own
+                    // wording, i.e. it vanishes under a min_claim_width/2 opening. keep_core is
+                    // NOT always that: cut_segmented_layers pays paint_depth_clamp_keep_core
+                    // unconditionally whenever a painted claim needs clamping at all, so on a
+                    // thick/healthy object (this file's own sphere fixture included) it is simply
+                    // the whole deep interior beyond `band` from the nearest surface - a single
+                    // connected region that can span most of the cross-section. Testing "does the
+                    // island touch/lie inside keep_core" against THAT is testing the wrong thing:
+                    // a genuine interclaim sliver (which sits near the surface, well inside
+                    // `band`) can perfectly well touch or even sit inside such a large region
+                    // without being any part of the degenerate residue M3 describes - and MUST
+                    // still be absorbed there (M4's own gap-fill-off widening exists to do exactly
+                    // that). So find the SPECIFIC keep_core connected component this island
+                    // actually overlaps (per-component, same discipline as base_area's own
+                    // decomposition above - never test the whole array at once, which would let a
+                    // thin residue's width be masked by an unrelated wide component elsewhere on
+                    // the same layer) and test THAT component's own width, not the island's.
+                    bool in_thin_keep_core_residue = false;
+                    if (has_keep_core_layer) {
+                        const float t_keep_core = scaled<float>(min_claim_width * 0.5f);
+                        for (const ExPolygon &core_component : keep_core_by_layer[layer_idx]) {
+                            const ExPolygons core_single{core_component};
+                            if (intersection_ex(single, core_single).empty())
+                                continue; // this component of keep_core has nothing to do with this island
+                            if (opening_ex(core_single, t_keep_core).empty()) {
+                                in_thin_keep_core_residue = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (in_thin_keep_core_residue)
+                        continue;
                     const size_t winner = interclaim_absorb_winner(single, merged, eps);
                     if (winner == 0)
                         continue; // no painted neighbour touches it -> never orphan it
@@ -3004,14 +3164,16 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               // ITEM 2 (interclaim-sliver-investigation.md loose end 3 / shell-
                                                               // setting-and-gapfill-report.md): the WIDER kill width the #7104
                                                               // thin-projection filter uses when gap_infill_speed == 0 for at
-                                                              // least one of the object's regions (mm, max across such regions,
-                                                              // 0.f if none), plumbed through to merge_segmented_layers's
-                                                              // interior inter-claim absorb so its own kill width can track it
-                                                              // instead of silently under-covering the wider sliver population
-                                                              // that configuration produces. 0.f (the fuzzy skin caller's value,
-                                                              // paired with segmentation_wall_stack == 0.f) is inert - the
-                                                              // absorb never runs on that path regardless.
-                                                              const float                                                      segmentation_claim_width_gapfill_off,
+                                                              // least one of the object's regions (mm), plumbed through to
+                                                              // merge_segmented_layers's interior inter-claim absorb so its own
+                                                              // kill width can track it instead of silently under-covering the
+                                                              // wider sliver population that configuration produces. Fix-wave
+                                                              // (absorb-tail-review.md Minor 4 / M4): PER COLOUR (indexed by
+                                                              // extruder id), not a single object-wide max - see
+                                                              // interclaim_absorb_effective_claim_width. Empty (the fuzzy skin
+                                                              // caller's value, paired with segmentation_wall_stack == 0.f) is
+                                                              // inert - the absorb never runs on that path regardless.
+                                                              const std::vector<float>                                        &segmentation_claim_width_gapfill_off_by_color,
                                                               const bool                                                       segmentation_interlocking_beam,
                                                               const IncludeTopAndBottomLayers                                  include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback)
@@ -3221,9 +3383,13 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - layers segmentation in parallel - end";
     throw_on_cancel_callback();
 
+    // Fix-wave (absorb-tail-review.md Minor 3 / M3): the F2 ladder's own deliberately-preserved
+    // base residue, one ExPolygons per layer - stays empty (the absorb's new exemption is then a
+    // no-op everywhere) unless cut_segmented_layers actually runs below.
+    std::vector<ExPolygons> keep_core_by_layer;
     if ((segmentation_max_width > 0.f || segmentation_interlocking_depth > 0.f) && !segmentation_interlocking_beam) {
         cut_segmented_layers(input_expolygons, segmented_regions, float(scale_(segmentation_max_width)), float(scale_(segmentation_interlocking_depth)),
-                             float(scale_(segmentation_min_claim_width)), throw_on_cancel_callback);
+                             float(scale_(segmentation_min_claim_width)), keep_core_by_layer, throw_on_cancel_callback);
         throw_on_cancel_callback();
     }
 
@@ -3238,7 +3404,8 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
     }
 
     std::vector<std::vector<ExPolygons>> segmented_regions_merged = merge_segmented_layers(segmented_regions, std::move(top_and_bottom_layers), std::move(legacy_top_and_bottom_layers), num_facets_states,
-                                                                                            input_expolygons, segmentation_min_claim_width, segmentation_claim_width_gapfill_off, segmentation_wall_stack, segmentation_normal_depth > 0.f, throw_on_cancel_callback);
+                                                                                            input_expolygons, segmentation_min_claim_width, segmentation_claim_width_gapfill_off_by_color, segmentation_wall_stack, segmentation_normal_depth > 0.f,
+                                                                                            keep_core_by_layer, throw_on_cancel_callback);
     throw_on_cancel_callback();
 
 #ifdef MM_SEGMENTATION_DEBUG_REGIONS
@@ -3328,7 +3495,17 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // past min_feature_size, 0.1mm, into a min_bead_width, 0.34mm, bead) - at ~0.75mm both
     // generators clear their own threshold and print it, so both are affected by the defect
     // this is fixing.
-    float                max_claim_width_absorb_gapfill_off = 0.f;
+    // Fix-wave (absorb-tail-review.md Minor 4 / M4): this USED to be a single float, the MAX of
+    // the term below across every region on the object regardless of which colour it belongs to
+    // - so ANY region with gap fill disabled anywhere on the object widened the absorb's kill
+    // width for EVERY colour's boundary, including ones whose own regions all have gap fill on
+    // (M4's over-absorption). Tracked PER COLOUR now (indexed by extruder id, wall_filament -
+    // the SAME discriminator layer_color_stat's own per-colour block uses,
+    // MultiMaterialSegmentation.cpp), grown lazily; merge_segmented_layers's absorb resolves the
+    // effective threshold for each island from only the colours that actually border it (see
+    // interclaim_absorb_effective_claim_width). Colour 0 (base) is never populated - the absorb
+    // never hands an island to it, matching layer_color_stat's own "PAINTED COLOURS ONLY" scope.
+    std::vector<float>  claim_width_gapfill_off_by_color;
     for (size_t region_idx = 0; region_idx < print_object.num_printing_regions(); ++region_idx) {
         const PrintRegion &region                 = print_object.printing_region(region_idx);
         const float         ext_perimeter_width   = region.flow(print_object, frExternalPerimeter, print_object.config().layer_height).width();
@@ -3344,9 +3521,13 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
         max_ext_perimeter_width = std::max(max_ext_perimeter_width, ext_perimeter_width);
         if (perimeter_spacing > 0.f)
             min_perimeter_spacing = min_perimeter_spacing > 0.f ? std::min(min_perimeter_spacing, perimeter_spacing) : perimeter_spacing;
-        if (region.config().gap_infill_speed.value <= 0.f)
-            max_claim_width_absorb_gapfill_off = std::max(max_claim_width_absorb_gapfill_off,
-                ext_perimeter_width + 0.7f * Flow::rounded_rectangle_extrusion_spacing(ext_perimeter_width, float(print_object.config().layer_height.value)));
+        const int wall_filament_color = region.config().wall_filament.value;
+        if (wall_filament_color >= 1 && region.config().gap_infill_speed.value <= 0.f) {
+            const float claim_width = ext_perimeter_width + 0.7f * Flow::rounded_rectangle_extrusion_spacing(ext_perimeter_width, float(print_object.config().layer_height.value));
+            if (size_t(wall_filament_color) >= claim_width_gapfill_off_by_color.size())
+                claim_width_gapfill_off_by_color.resize(size_t(wall_filament_color) + 1, 0.f);
+            claim_width_gapfill_off_by_color[size_t(wall_filament_color)] = std::max(claim_width_gapfill_off_by_color[size_t(wall_filament_color)], claim_width);
+        }
     }
     // Beam-interlocking mutual exclusion (:2169 below) is unchanged, but the interlocking
     // sub-band must only ever be active when depth is actually bounded (spec Stage 1, "Interlocking
@@ -3428,7 +3609,7 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
     // which is a contract worth reading at the call site rather than deriving.
     const float paint_depth_normal_mm = paint_depth_mode != pdmUnlimited ? max_width : 0.f;
 
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, max_ext_perimeter_width, paint_depth_normal_mm, max_wall_stack_absorb, max_claim_width_absorb_gapfill_off, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, max_ext_perimeter_width, paint_depth_normal_mm, max_wall_stack_absorb, claim_width_gapfill_off_by_color, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
 }
 
 // Returns fuzzy skin segmentation based on painting in fuzzy skin segmentation gizmo
@@ -3456,9 +3637,9 @@ std::vector<std::vector<ExPolygons>> fuzzy_skin_segmentation_by_painting(const P
     // just above, this keeps merge_segmented_layers's bounded_mode gate false, so the interior
     // inter-claim absorb never runs on the fuzzy skin path (which has no notion of "painted
     // colour claims" for it to absorb between in the first place).
-    // ITEM 2: 0.f for segmentation_claim_width_gapfill_off too, for the same reason - the
-    // absorb never runs on this path regardless, so there is no threshold for it to widen.
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, max_external_perimeter_width, 0.f, 0.f, 0.f, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
+    // ITEM 2: an empty segmentation_claim_width_gapfill_off_by_color too, for the same reason -
+    // the absorb never runs on this path regardless, so there is no threshold for it to widen.
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_external_perimeter_width, 0.f, max_external_perimeter_width, 0.f, 0.f, std::vector<float>{}, false, IncludeTopAndBottomLayers::No, throw_on_cancel_callback);
 }
 
 } // namespace Slic3r

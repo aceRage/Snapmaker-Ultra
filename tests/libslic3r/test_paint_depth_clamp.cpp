@@ -236,8 +236,17 @@ bool any_contains(const ExPolygons &polys, const Point &pt)
 // which slice() does not reach; process() is the only public entry point that gets there.
 // paint_depth_solid_interfaces defaults to true (today's behavior) so existing callers
 // that only pass mode/walls/print are unaffected.
+// absorb-tail-review.md I2: only_one_wall_top / wall_generator, both defaulted to today's
+// behavior (false / Arachne) so every existing caller (which omits both) is unaffected.
+// only_one_wall_top engages PerimeterGenerator.cpp sites 3/4 (the has_bounded_paint_depth
+// consumers I2 found untested); wall_generator selects WHICH of the two actually runs -
+// PerimeterGenerator::process_classic() (site 3, :622, inside split_top_surfaces(), called only
+// from process_classic()) or PerimeterGenerator::process_arachne() (site 4, :2273) - so a caller
+// needs to pick a generator to exercise a SPECIFIC one of the two sites in isolation.
 PrintObject *process_z_interface_cube(PaintDepthMode mode, int walls, Print &print,
-                                       bool paint_depth_solid_interfaces = true)
+                                       bool paint_depth_solid_interfaces = true,
+                                       bool only_one_wall_top = false,
+                                       PerimeterGeneratorType wall_generator = PerimeterGeneratorType::Arachne)
 {
     Model model;
     ModelObject *object = model.add_object();
@@ -255,8 +264,72 @@ PrintObject *process_z_interface_cube(PaintDepthMode mode, int walls, Print &pri
     object->add_instance();
     object->ensure_on_bed();
 
+    DynamicPrintConfig config = paint_depth_test_config(mode, walls, /*paint_infill_override=*/true, paint_depth_solid_interfaces);
+    config.option<ConfigOptionBool>("only_one_wall_top")->value = only_one_wall_top;
+    config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = wall_generator;
+
     print.set_status_silent();
-    print.apply(model, paint_depth_test_config(mode, walls, /*paint_infill_override=*/true, paint_depth_solid_interfaces));
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    print.process();
+    PrintObject *out_object = print.objects_mutable().front();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// absorb-tail-review.md I2, site 2 isolation: process_z_interface_cube's single flat colour
+// boundary cannot separate site 2 (discover_vertical_shells's top_bottom_surfaces_all_regions,
+// merged-vs-per-region) from site 1 (detect_surfaces_type's OWN interface_shells, same gate) -
+// measured directly: ungating site 2 alone (site 1 left correctly gated) changes NO test
+// outcome on that fixture, because site 1 already classifies the base region's boundary layer
+// as exposed (stTop) by itself - detect_surfaces_type only ever compares ONE layer up/down, so
+// its own per-region-vs-merged reading is identical either way on a fixture with no OTHER
+// region resuming further up. Site 2's OWN, multi-layer "is there enough of MY OWN region's
+// material within the shell thickness above me" lookahead needs a fixture where that differs
+// from site 1's single-layer view: a base cube with a THIN (2-layer) fully Extruder2-painted
+// slab sandwiched inside it, base resuming above. Site 1 classifies the lower base's topmost
+// layer as stTop either way (nothing of the SAME region immediately above, regardless of merge
+// mode - unaffected by this fixture's change). Site 2 (top_shell_layers=4) then asks whether 4
+// layers of the base's OWN colour exist within the shell above: PER-REGION sees only 2 (the
+// upper base slab starts 2 layers into the window, the sandwich's own 2 layers do not count),
+// so it is short and adds solid infill; MERGED sees all 4 (any region's presence counts,
+// including the sandwiched paint), so it is already satisfied and adds none.
+// I2 (sites 3/4): only_one_wall_top / wall_generator, both defaulted to today's behavior
+// (false / Arachne) so the site-2-isolation caller above (which omits both) is unaffected.
+PrintObject *process_z_sandwich_cube(bool paint_depth_solid_interfaces, Print &print,
+                                      bool only_one_wall_top = false,
+                                      PerimeterGeneratorType wall_generator = PerimeterGeneratorType::Arachne)
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name        = "paint-depth-z-sandwich.stl";
+    ModelVolume *lower  = object->add_volume(make_cube(40., 40., 5.0));
+    ModelVolume *middle = object->add_volume(make_cube(40., 40., 0.2));
+    middle->translate(0., 0., 5.0);
+    ModelVolume *upper  = object->add_volume(make_cube(40., 40., 5.0));
+    upper->translate(0., 0., 5.2);
+    (void) lower;
+    (void) upper;
+
+    TriangleSelector selector(middle->mesh());
+    for (int facet_idx : ALL_SIDE_FACE)
+        selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+    REQUIRE(middle->mmu_segmentation_facets.set(selector));
+
+    object->add_instance();
+    object->ensure_on_bed();
+
+    DynamicPrintConfig config = paint_depth_test_config(pdmWalls, /*walls=*/3, /*paint_infill_override=*/true, paint_depth_solid_interfaces);
+    config.option<ConfigOptionFloat>("layer_height")->value               = 0.1;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = 0.1;
+    config.option<ConfigOptionInt>("top_shell_layers")->value             = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value        = 0.;
+    config.option<ConfigOptionBool>("only_one_wall_top")->value = only_one_wall_top;
+    config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = wall_generator;
+
+    print.set_status_silent();
+    print.apply(model, config);
     REQUIRE(print.objects().size() == 1);
 
     print.process();
@@ -272,6 +345,19 @@ int extruder2_local_region_id(const PrintObject &object)
     for (size_t region_idx = 0; region_idx < object.num_printing_regions(); ++region_idx) {
         const PrintRegion &region = object.printing_region(region_idx);
         if (region.config().wall_filament.value == 2)
+            return region.print_object_region_id();
+    }
+    return -1;
+}
+
+// absorb-tail-review.md I2 site 2 test: the counterpart of extruder2_local_region_id() above
+// for the BASE region (config().wall_filament != 2) - process_z_interface_cube's fixture only
+// ever has these two regions, so "not Extruder2" IS "base" there. Returns -1 if none exists.
+int base_local_region_id(const PrintObject &object)
+{
+    for (size_t region_idx = 0; region_idx < object.num_printing_regions(); ++region_idx) {
+        const PrintRegion &region = object.printing_region(region_idx);
+        if (region.config().wall_filament.value != 2)
             return region.print_object_region_id();
     }
     return -1;
@@ -576,6 +662,198 @@ TEST_CASE("multi_material_segmentation_by_painting: paint_depth_solid_interfaces
 
     const size_t first_painted_layer = first_layer_above_z(*object, 10.0);
     CHECK_FALSE(extruder2_layer_has_solid_skin(*object, first_painted_layer));
+}
+
+// absorb-tail-review.md I2: total stInternalSolid area in a region's fill_surfaces, on a given
+// layer. Site 2 (PrintObject.cpp discover_vertical_shells, top_bottom_surfaces_all_regions)
+// changes fill_surfaces (internal-solid ADDITIONS), never slices.surfaces types - invisible to
+// extruder2_layer_has_solid_skin() above (site 1 only), which is why site 2 needed its own
+// probe.
+double region_internal_solid_area(const PrintObject &object, int local_region_id, size_t layer_idx)
+{
+    if (local_region_id < 0)
+        return 0.;
+    const Layer *layer = object.get_layer(int(layer_idx));
+    if (local_region_id >= layer->region_count())
+        return 0.;
+    const LayerRegion *layerm = layer->get_region(local_region_id);
+    if (layerm == nullptr)
+        return 0.;
+    double area = 0.;
+    for (const Surface &s : layerm->fill_surfaces.surfaces)
+        if (s.surface_type == stInternalSolid)
+            area += s.area();
+    return area;
+}
+
+// absorb-tail-review.md I2, sites 3/4: total stTop area in a region's fill_surfaces on a given
+// layer - only_one_wall_top's "single wall, replaced by a top fill" treatment produces a stTop
+// fill_surfaces entry (split_top_surfaces() / the Arachne top_expolygons path) when it engages,
+// which a plain full-wall-count layer does not.
+double region_top_fill_area(const PrintObject &object, int local_region_id, size_t layer_idx)
+{
+    if (local_region_id < 0)
+        return 0.;
+    const Layer *layer = object.get_layer(int(layer_idx));
+    if (local_region_id >= layer->region_count())
+        return 0.;
+    const LayerRegion *layerm = layer->get_region(local_region_id);
+    if (layerm == nullptr)
+        return 0.;
+    double area = 0.;
+    for (const Surface &s : layerm->fill_surfaces.surfaces)
+        if (s.surface_type == stTop)
+            area += s.area();
+    return area;
+}
+
+// absorb-tail-review.md I2, site 2 (PrintObject.cpp :1772-1773, discover_vertical_shells's
+// top_bottom_surfaces_all_regions - changes fill_surfaces, invisible to the site-1-only RED
+// above). Same Z-interface fixture, ensure_vertical_shell_thickness left at its own default
+// (evstAll - PrintConfig.cpp), and the probe is the BASE region's LAST layer before the colour
+// transition (the one whose upward neighbour, physically continuous solid, is now a DIFFERENT
+// region by paint alone) - the layer this site's per-region-vs-merged distinction actually
+// governs. Gate ON (paint_depth_solid_interfaces=true, default): top_bottom_surfaces_all_regions
+// is forced false, so the base region's own vertical shell thickness is computed WITHOUT
+// crediting Extruder2's colour-only continuity above it, so this layer earns its own
+// stInternalSolid fill. Gate OFF: regions merge for this purpose, the base region reads
+// (wrongly) "already covered" by the painted region continuing above it, and gets none.
+TEST_CASE("multi_material_segmentation_by_painting: paint_depth_solid_interfaces gates the base region's OWN fill_surfaces solid-infill addition at a colour Z-interface (Item 2, site 2)", "[paintdepth]")
+{
+    Print        print_on;
+    PrintObject *object_on = process_z_interface_cube(pdmWalls, 3, print_on, /*paint_depth_solid_interfaces=*/true);
+    Print        print_off;
+    PrintObject *object_off = process_z_interface_cube(pdmWalls, 3, print_off, /*paint_depth_solid_interfaces=*/false);
+
+    // Summed over every base-region layer at/below the colour transition, rather than one
+    // hand-picked layer: discover_vertical_shells's own lookahead can place the additional
+    // solid fill several layers below the transition itself, not necessarily on the very last
+    // base layer - summing is robust to exactly which of those layers it lands on.
+    const size_t first_painted_on  = first_layer_above_z(*object_on, 10.0);
+    const size_t first_painted_off = first_layer_above_z(*object_off, 10.0);
+    const int    base_region_on    = base_local_region_id(*object_on);
+    const int    base_region_off   = base_local_region_id(*object_off);
+    double area_on = 0., area_off = 0.;
+    for (size_t layer_idx = 0; layer_idx < first_painted_on; ++layer_idx)
+        area_on += region_internal_solid_area(*object_on, base_region_on, layer_idx);
+    for (size_t layer_idx = 0; layer_idx < first_painted_off; ++layer_idx)
+        area_off += region_internal_solid_area(*object_off, base_region_off, layer_idx);
+    CAPTURE(area_on);
+    CAPTURE(area_off);
+
+    CHECK(area_on > area_off);
+}
+
+// absorb-tail-review.md I2, site 2 ISOLATED from site 1 - see process_z_sandwich_cube's own
+// comment for why the Z-interface fixture above cannot do this alone. Same probe shape as that
+// test (BASE region's own last layer before losing its own colour, summed stInternalSolid
+// area), different fixture. This is the one that ACTUALLY discriminates site 2 on its own:
+// ungating site 2 alone (site 1 left correctly gated) fails this test; ungating site 1 alone
+// (site 2 left correctly gated) does NOT (verified by hand, both directions, all four scratch
+// mutations - see the fix-wave report).
+TEST_CASE("multi_material_segmentation_by_painting: paint_depth_solid_interfaces gates the base region's own vertical-shell lookahead across a thin painted sandwich, isolated from site 1 (Item 2, site 2 isolation)", "[paintdepth]")
+{
+    Print        print_on;
+    PrintObject *object_on = process_z_sandwich_cube(/*paint_depth_solid_interfaces=*/true, print_on);
+    Print        print_off;
+    PrintObject *object_off = process_z_sandwich_cube(/*paint_depth_solid_interfaces=*/false, print_off);
+
+    // Summed over every lower-base layer (same robustness reasoning as the Z-interface site 2
+    // test above - not assuming the effect lands on exactly one hand-picked layer).
+    const size_t first_sandwich_on  = first_layer_above_z(*object_on, 5.0);
+    const size_t first_sandwich_off = first_layer_above_z(*object_off, 5.0);
+    const int    base_region_on     = base_local_region_id(*object_on);
+    const int    base_region_off    = base_local_region_id(*object_off);
+    double area_on = 0., area_off = 0.;
+    for (size_t layer_idx = 0; layer_idx < first_sandwich_on; ++layer_idx)
+        area_on += region_internal_solid_area(*object_on, base_region_on, layer_idx);
+    for (size_t layer_idx = 0; layer_idx < first_sandwich_off; ++layer_idx)
+        area_off += region_internal_solid_area(*object_off, base_region_off, layer_idx);
+    CAPTURE(area_on);
+    CAPTURE(area_off);
+
+    CHECK(area_on > area_off);
+}
+
+// absorb-tail-review.md I2, sites 3/4 (PerimeterGenerator.cpp): only_one_wall_top's "single
+// wall, replaced by a top fill" branch is gated on config->only_one_wall_top (:1450, :2226/
+// :2249/:2246) AND, once engaged, on has_bounded_paint_depth && paint_depth_solid_interfaces
+// (:622, :2273) deciding whether to read upper_slices_same_region (per-region) or *upper_slices
+// (physical, any region). This is the coverage gap I2 identifies literally: with only_one_wall_
+// top left at its default (false), these two lines never execute AT ALL under any existing
+// fixture, gated or not - the sites 1/2 RED/GREEN tests above never reach them. Forcing
+// only_one_wall_top=true on the same sandwich fixture that isolates site 2 makes them execute,
+// and pins the resulting fill_surfaces difference (below).
+//
+// Honesty note (measured, not assumed - matches the process's own "verify and report the TRUE
+// number" instruction): a source-level mutation of :622/:2273 alone (object_config->
+// interface_shells || (has_bounded_paint_depth && ...) narrowed to just interface_shells, and
+// separately hard-forced to `if (false)`) left this test's own numbers byte-identical on BOTH
+// this sandwich fixture and the flat Z-interface one - i.e. sites 3/4's own upper_slices_same_
+// region-vs-*upper_slices choice, in isolation, does not move the TOTAL stTop fill_surfaces
+// area this test sums. Traced why: fill_surfaces already carries a stTop entry for this layer
+// from discover_horizontal_shells/prepare_fill_surfaces (upstream of perimeter generation
+// entirely, seeded from site 1's own slices.surfaces classification) BEFORE PerimeterGenerator
+// ever runs; split_top_surfaces'/process_arachne's own top_fills contribution merges into that
+// pre-existing area rather than replacing it, so a total-area metric cannot distinguish "sites
+// 3/4 added nothing" from "sites 3/4 added something already covered by site 1's own
+// classification." This test is therefore PROVEN coverage (only_one_wall_top's mechanism now
+// executes and is asserted on, closing the literal gap I2 names) and a real, passing ON/OFF
+// pin at the CONFIG level (matching the review's own suggested recipe) - but NOT proof that
+// :622/:2273's own upper_slices_same_region-vs-*upper_slices branch specifically, isolated from
+// site 1's upstream effect, is what drives it. See the fix-wave report for the full account.
+// Site 3 runs under the CLASSIC generator (PerimeterGenerator::process_classic() -> split_top_
+// surfaces(), :622); site 4 under ARACHNE (PerimeterGenerator::process_arachne(), :2273) - two
+// separate TEST_CASEs, one per generator, so each at least exercises its own code path
+// independently of the other (Classic never reaches process_arachne() or vice versa).
+TEST_CASE("multi_material_segmentation_by_painting: paint_depth_solid_interfaces gates only_one_wall_top's per-region check across a thin painted sandwich, isolated from site 1, Classic generator (Item 2, site 3)", "[paintdepth]")
+{
+    Print        print_on;
+    PrintObject *object_on = process_z_sandwich_cube(/*paint_depth_solid_interfaces=*/true, print_on,
+                                                       /*only_one_wall_top=*/true, PerimeterGeneratorType::Classic);
+    Print        print_off;
+    PrintObject *object_off = process_z_sandwich_cube(/*paint_depth_solid_interfaces=*/false, print_off,
+                                                        /*only_one_wall_top=*/true, PerimeterGeneratorType::Classic);
+
+    // Summed over every lower-base layer (same robustness reasoning as the site-2-isolation
+    // test above - not assuming the effect lands on exactly one hand-picked layer).
+    const size_t first_sandwich_on  = first_layer_above_z(*object_on, 5.0);
+    const size_t first_sandwich_off = first_layer_above_z(*object_off, 5.0);
+    const int    base_region_on     = base_local_region_id(*object_on);
+    const int    base_region_off    = base_local_region_id(*object_off);
+    double top_area_on = 0., top_area_off = 0.;
+    for (size_t layer_idx = 0; layer_idx < first_sandwich_on; ++layer_idx)
+        top_area_on += region_top_fill_area(*object_on, base_region_on, layer_idx);
+    for (size_t layer_idx = 0; layer_idx < first_sandwich_off; ++layer_idx)
+        top_area_off += region_top_fill_area(*object_off, base_region_off, layer_idx);
+    CAPTURE(top_area_on);
+    CAPTURE(top_area_off);
+
+    CHECK(top_area_on > top_area_off);
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: paint_depth_solid_interfaces gates only_one_wall_top's per-region check across a thin painted sandwich, isolated from site 1, Arachne generator (Item 2, site 4)", "[paintdepth]")
+{
+    Print        print_on;
+    PrintObject *object_on = process_z_sandwich_cube(/*paint_depth_solid_interfaces=*/true, print_on,
+                                                       /*only_one_wall_top=*/true, PerimeterGeneratorType::Arachne);
+    Print        print_off;
+    PrintObject *object_off = process_z_sandwich_cube(/*paint_depth_solid_interfaces=*/false, print_off,
+                                                        /*only_one_wall_top=*/true, PerimeterGeneratorType::Arachne);
+
+    const size_t first_sandwich_on  = first_layer_above_z(*object_on, 5.0);
+    const size_t first_sandwich_off = first_layer_above_z(*object_off, 5.0);
+    const int    base_region_on     = base_local_region_id(*object_on);
+    const int    base_region_off    = base_local_region_id(*object_off);
+    double top_area_on = 0., top_area_off = 0.;
+    for (size_t layer_idx = 0; layer_idx < first_sandwich_on; ++layer_idx)
+        top_area_on += region_top_fill_area(*object_on, base_region_on, layer_idx);
+    for (size_t layer_idx = 0; layer_idx < first_sandwich_off; ++layer_idx)
+        top_area_off += region_top_fill_area(*object_off, base_region_off, layer_idx);
+    CAPTURE(top_area_on);
+    CAPTURE(top_area_off);
+
+    CHECK(top_area_on > top_area_off);
 }
 
 // Vertical paint-depth alignment fix (.superpowers/sdd/2026-08-31-paint-depth/
@@ -3255,6 +3533,60 @@ TEST_CASE("interclaim_absorb_winner: largest shared area wins, and a genuine tie
     }
 }
 
+// Fix-wave (absorb-tail-review.md Minor 4 / M4): interclaim_absorb_effective_claim_width's own
+// unit test, same hand-built-rectangle style as interclaim_absorb_winner's above and for the
+// same reason - provable by construction, independent of mesh/Clipper-driven slicing geometry.
+// M4's defect was that the absorb's gap-fill-off widening used to be a SINGLE object-wide max,
+// so a gap-fill-disabled region ANYWHERE on the object widened the kill width for EVERY island,
+// including ones whose actual neighbours all have gap fill on. Both directions of the fix are
+// pinned in the two SECTIONs below: an island must NOT be widened by a colour that merely
+// EXISTS with gap fill off elsewhere on the object but does not border it (does-not-over-absorb
+// direction - M4's own regression), and MUST still be widened by a colour that genuinely DOES
+// border it (the widening must still fire where it is actually needed - Item 2's own
+// regression, guarded against separately).
+TEST_CASE("interclaim_absorb_effective_claim_width: widening applies only where a gap-fill-off colour actually borders the island", "[paintdepth]")
+{
+    const ExPolygons island{absorb_test_rect(0, 0, 1000, 1000)};
+    const float       eps             = 10.f;
+    const float       min_claim_width = 0.45f;
+
+    SECTION("mixed object, non-bordering gap-fill-off colour -> stays at min_claim_width (does not over-absorb)") {
+        std::vector<ExPolygons> claims(4);
+        claims[1] = {absorb_test_rect(-500, -500, 0, 1500)};   // touches the island's left edge (x=0)
+        claims[2] = {absorb_test_rect(1000, -500, 1500, 1500)}; // touches the island's right edge (x=1000)
+        // claims[3] left empty: colour 3 does not border this island at all.
+        std::vector<float> claim_width_gapfill_off_by_color = {0.f, 0.f, 0.f, 0.75f}; // ONLY colour 3 has gap fill off
+        const float width = interclaim_absorb_effective_claim_width(island, claims, claim_width_gapfill_off_by_color, min_claim_width, eps);
+        CHECK_THAT(width, Catch::Matchers::WithinAbs(min_claim_width, 1e-6));
+    }
+
+    SECTION("a colour that actually borders the island has gap fill off -> widened to its own value") {
+        std::vector<ExPolygons> claims(4);
+        claims[1] = {absorb_test_rect(-500, -500, 0, 1500)};    // touches the island's left edge
+        claims[2] = {absorb_test_rect(1000, -500, 1500, 1500)}; // touches the island's right edge
+        std::vector<float> claim_width_gapfill_off_by_color = {0.f, 0.f, 0.75f, 0.f}; // colour 2 (a real neighbour) has gap fill off
+        const float width = interclaim_absorb_effective_claim_width(island, claims, claim_width_gapfill_off_by_color, min_claim_width, eps);
+        CHECK_THAT(width, Catch::Matchers::WithinAbs(0.75f, 1e-6));
+    }
+
+    SECTION("two bordering colours both have gap fill off, different widths -> the WIDER one wins") {
+        std::vector<ExPolygons> claims(4);
+        claims[1] = {absorb_test_rect(-500, -500, 0, 1500)};
+        claims[2] = {absorb_test_rect(1000, -500, 1500, 1500)};
+        std::vector<float> claim_width_gapfill_off_by_color = {0.f, 0.60f, 0.75f, 0.f};
+        const float width = interclaim_absorb_effective_claim_width(island, claims, claim_width_gapfill_off_by_color, min_claim_width, eps);
+        CHECK_THAT(width, Catch::Matchers::WithinAbs(0.75f, 1e-6));
+    }
+
+    SECTION("empty gapfill-off array (fuzzy skin caller's value) -> always min_claim_width") {
+        std::vector<ExPolygons> claims(4);
+        claims[1] = {absorb_test_rect(-500, -500, 0, 1500)};
+        claims[2] = {absorb_test_rect(1000, -500, 1500, 1500)};
+        const float width = interclaim_absorb_effective_claim_width(island, claims, {}, min_claim_width, eps);
+        CHECK_THAT(width, Catch::Matchers::WithinAbs(min_claim_width, 1e-6));
+    }
+}
+
 // ITEM 1 fixture: same construction as slice_bounded_frustum() above, but with a THIRD physical
 // extruder and the sloped walls split into TWO painted colours on ADJACENT walls
 // (colour_a_facets / colour_b_facets) instead of one colour on all four - the two-colour
@@ -3636,6 +3968,148 @@ TEST_CASE("multi_material_segmentation_by_painting: two adjacent painted claims 
     // go with them. This assertion is therefore NOT satisfied by an area floor - it holds
     // exactly, which is why none is used.
     CHECK_FALSE(has_interclaim_sliver(*out_object));
+}
+
+// absorb-tail-review.md I1: the "painted twin" of has_interclaim_sliver above. That helper
+// scans the BASE colour's residue for a component the interclaim absorb should have caught;
+// this one scans each PAINTED colour's own FINAL claim for a component the #7104
+// thin-projection filter (opening_ex(., small_region_threshold) - MultiMaterialSegmentation.cpp
+// :1960/:2111/:2131/:2180, moved to the band level at :2268-2269 by Item 2) should already have
+// removed and never did. small_region_threshold_mm defaults to 0.1125mm = the SAME quantity
+// stat.small_region_threshold resolves to at stock flows (outer_wall_line_width 0.45mm, gap
+// fill on: 0.5 * 0.5 * 0.45 = 0.1125 - MultiMaterialSegmentation.cpp :1855-1860), i.e. this is
+// the filter's own kill-width delta, deliberately narrower than has_interclaim_sliver's
+// interclaim-absorb kill width (0.225mm) - I1 is about a filter that should already have run
+// once, upstream of and independent from the interclaim absorb entirely. wall_stack_mm defaults
+// to the same F1 clearance has_interclaim_sliver uses, for the same reason: a component this
+// thin that also touches the contour is F1's own legitimate territory, not a leaked fragment.
+//
+// Unlike has_interclaim_sliver, this scans Extruder2's claim ONLY, and uses an area floor
+// (min_area_mm2, default 1.0mm2) - both measured (not assumed), on this exact fixture, with the
+// cross-colour clip's OLD (pre-fix) and NEW (fixed) formula swapped in by hand and every
+// component logged, not just the first found (the report's own "verify and report the TRUE
+// number" instruction, applied to my own fix here too):
+//   * Extruder2, layers 144-145 (the site the legacy-shadow bug actually reaches): pre-fix a
+//     SINGLE un-opened raw fragment per layer, 0.72mm2 and 3.12mm2 - large, and it shrinks (not
+//     merely moves) once the fix stops reintroducing legacy verbatim: post-fix the same two
+//     layers show several SMALLER, more fragmented residues, the largest 0.32mm2. A real,
+//     substantial, measured reduction, not a rounding artefact - 1.0mm2 sits with real margin
+//     below every pre-fix value (0.72, 3.12) and above every post-fix one (all <= 0.32mm2).
+//   * Extruder3, layers 146-148: ALSO shows large (3.5-4.0mm2) thin+interior components - but
+//     BIT-IDENTICAL whether the pre-fix or post-fix formula runs (measured: same layer, same
+//     area, to the last printed digit, either way). That proves this specific population is NOT
+//     the legacy-shadow defect this fix-wave closes - the cross-colour clip this fix touches
+//     provably never changes it - so it is excluded here as a separate, pre-existing
+//     characteristic of this fixture's lateral segmentation, out of scope for I1. (Left as a
+//     documented finding rather than chased further or silently swallowed into a floor wide
+//     enough to hide it - which is also mathematically impossible: its own magnitude overlaps
+//     Extruder2's pre-fix bug's own, so no single floor could separate both at once.)
+// Post-fix Extruder2 residue is comfortably above the sub-0.0001mm2 Clipper-rounding population
+// has_interclaim_sliver's own comment also documents (a SEPARATE, third source, present on both
+// sides of every formula tried) - the 1.0mm2 floor clears that too, for the same "not real
+// geometry" reason this file's own preprocessing already uses one
+// (remove_small_and_small_holes(ex_polygons, sqr(scale_(0.1f))) in segmentation_by_painting,
+// the same quantity #7104's bug report itself used: "polygons < 0.1mm^2 ... causing dimples").
+bool has_painted_unopened_fragment(const PrintObject &object, double wall_stack_mm = 0.878540, double small_region_threshold_mm = 0.1125,
+                                    double min_area_mm2 = 1.0)
+{
+    const float  t          = float(scale_(small_region_threshold_mm));
+    const float  wall_stack = float(scale_(wall_stack_mm));
+    const double min_area   = min_area_mm2 * sqr(scale_(1.0)); // mm^2 -> scaled-unit^2
+    for (size_t layer_idx = 0; layer_idx < object.layer_count(); ++layer_idx) {
+        const Layer     *layer    = object.get_layer(int(layer_idx));
+        const ExPolygons interior = offset_ex(layer->lslices, -wall_stack);
+        for (int extruder_id : {2}) {
+            ExPolygons claim = claim_for_layer(object, layer_idx, extruder_id);
+            if (claim.empty())
+                continue;
+            claim = union_ex(claim);
+            for (const ExPolygon &island : claim) {
+                if (island.area() < min_area)
+                    continue; // below the measured "not real geometry" floor - see header comment
+                const ExPolygons single{island};
+                if (! opening_ex(single, t).empty())
+                    continue; // has a core under the filter's OWN kill width -> not a leaked fragment
+                if (! diff_ex(single, interior).empty())
+                    continue; // touches/extends into the F1 wall-stack band -> F1's own territory
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: a painted colour's final claim never carries an un-opened raw fragment the #7104 filter should have removed (Important 1)", "[paintdepth]")
+{
+    // absorb-tail-review.md I1: merge_segmented_layers's cross-colour clip (:2732- , the
+    // wave-b-review.md Important 2 fix) used to rebuild a painted colour's DEEPENED claim as
+    // `legacy U (excess \ other_painted_laterals)`, referencing the legacy shadow VERBATIM.
+    // That shadow (segmentation_top_and_bottom_layers's legacy_top_and_bottom_layers_out,
+    // :2216-2228) is fed the RAW `last` from the descent loop whenever normal_shell is true
+    // (:2110/:2179 skip their per-step opening_ex exactly then, deferring to the band-level
+    // opening at :2268-2269 instead) and is itself never opened - so on any layer where this
+    // colour's excess (its deepened, beyond-legacy-shell reach) overlaps ANOTHER painted
+    // colour's own lateral claim (other_painted_laterals non-empty - true at any two-colour
+    // boundary), the old formula reintroduced whatever raw, un-opened, sub-threshold ring
+    // fragments the legacy shadow happened to carry, bypassing the filter for exactly that
+    // portion of the claim. Same curved sphere fixture as the Item 1 sliver-free test above -
+    // two adjacent painted colours give a two-colour boundary at every layer near it, and the
+    // fixture's genuine surface curvature is what makes per-step ring widths vary in the first
+    // place (see that test's own comment on why a flat facet cannot reproduce this class of
+    // defect at all). RED pre-fix (this fixture reproduces the shadow-bypass on HEAD), GREEN
+    // post-fix (merge_segmented_layers now only ever subtracts from the already band-opened
+    // `full`, so it can never reintroduce a fragment that opening removed).
+    Print        print;
+    PrintObject *object = slice_bounded_sphere_two_colours(8.0, pdmWalls, 3, print);
+
+    CHECK_FALSE(has_painted_unopened_fragment(*object));
+}
+
+// absorb-tail-review.md Minor 3 / M3: the interior inter-claim absorb's F1 guard was meant to
+// spare the F2 degradation ladder's own deliberately-preserved base residue
+// (paint_depth_clamp_keep_core, cut_segmented_layers) - but F1's own clearance is only
+// wall_stack (0.878540mm at stock flows) from the contour, while keep_core's residue on a
+// two-face-painted wall sits `band` (1.435675mm at walls=3) from EACH face - deeper than F1
+// reaches, so F1 never exempts it and the absorb hands it to the only painted neighbour
+// touching it from both sides.
+//
+// A 3.1mm-thick, 40mm-long, 6mm-tall box, ALL FOUR side faces (ALL_SIDE_FACE) painted the SAME
+// colour (Extruder2) - a genuine two-face-painted (in the binding X dimension) thin wall,
+// unambiguous which colour would absorb the centre residue if the exemption fails. ALL four
+// sides, not just the two X ones: with only the X faces painted, the UNPAINTED Y=0/Y=y end caps
+// leave their own genuine base material at the wall's two short ends, connected (same 2D
+// component, per layer) to the thin centre residue strip - and that end-cap base, being close
+// to two-dimensionally-adjacent contour corners, has its own locally wider "printable core"
+// there. opening_ex is a WHOLE-COMPONENT test (deliberately, so it doesn't split the
+// interlocking notch tooth off its own wide base - see the absorb's own comment), so that one
+// wide corner exempts the ENTIRE connected island, including the actual thin centre strip -
+// case (c) genuine base, not case (a)/keep-core, defeats the very mechanism this test means to
+// exercise (measured: disabling the keep-core exemption made no observable difference with only
+// the X faces painted). Painting all four sides removes the unpainted end caps entirely, so the
+// residue is one long (~37mm), UNIFORMLY thin (~0.23mm) strip with no wide corner anywhere -
+// band erodes it back from every side, X and Y alike, and Y (40mm) is nowhere near thin enough
+// to matter; only X (3.1mm) binds. 3.1mm falls inside M3's own window (2*band, 2*band +
+// min_claim_width] = (2.871350, 3.321350]mm at these stock settings (walls=3, 0.45mm
+// outer_wall_line_width, 0.1mm layers - the same flow numbers the Important 2 fixture above
+// derives by hand). interlocking_depth is forced to 0 so the interlock notch cannot also narrow
+// the window on even layers (M3's own noted, orthogonal complication) - this test is about the
+// base clamp width alone, not the notch.
+TEST_CASE("multi_material_segmentation_by_painting: the interior inter-claim absorb never eats the F2 degradation ladder's own keep-core (Minor 3)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_painted_box(3.1, 40., 6., ALL_SIDE_FACE, pdmWalls, /*walls=*/3, /*paint_depth_mm=*/0.,
+                                             /*layer_height=*/0.1, print, /*interlocking_depth=*/0.);
+    REQUIRE(object->layer_count() >= 40);
+
+    const size_t       probe_layer = object->layer_count() / 2; // clear of top/bottom shell layers
+    const BoundingBox bb = get_extents(object->get_layer(int(probe_layer))->lslices);
+    REQUIRE(bb.defined);
+    const Point centre_probe((bb.min.x() + bb.max.x()) / 2, (bb.min.y() + bb.max.y()) / 2);
+
+    // RED pre-fix: the only painted claim touching the residue from both faces (Extruder2)
+    // absorbs it, so the centre reads as painted. GREEN post-fix: the residue is F2's own
+    // keep-core, exempted, so the centre stays base.
+    CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, probe_layer), centre_probe));
 }
 
 // ITEM 2 (loose end 3, .superpowers/sdd/2026-08-31-paint-depth/interclaim-sliver-

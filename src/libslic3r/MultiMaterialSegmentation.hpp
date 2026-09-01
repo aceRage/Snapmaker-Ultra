@@ -67,11 +67,15 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               // ITEM 2 (interclaim-sliver-investigation.md loose end 3, shell-
                                                               // setting-and-gapfill-report.md): the WIDER kill width the #7104
                                                               // thin-projection filter uses when gap_infill_speed == 0 for at
-                                                              // least one of the object's regions (mm, max across such regions,
-                                                              // 0.f if none), plumbed through to the absorb so its own kill width
-                                                              // can track the wider sliver population that configuration
-                                                              // produces instead of silently under-covering it. See the .cpp.
-                                                              float                                                            segmentation_claim_width_gapfill_off,
+                                                              // least one of the object's regions (mm), plumbed through to the
+                                                              // absorb so its own kill width can track the wider sliver
+                                                              // population that configuration produces instead of silently
+                                                              // under-covering it. Fix-wave (absorb-tail-review.md Minor 4 / M4):
+                                                              // PER COLOUR (indexed by extruder id) rather than a single object-
+                                                              // wide max, 0.f for a colour with no gap-fill-disabled region of
+                                                              // its own - see merge_segmented_layers's absorb stage in the .cpp.
+                                                              // Empty (the fuzzy skin caller's value) is inert.
+                                                              const std::vector<float>                                       &segmentation_claim_width_gapfill_off_by_color,
                                                               bool                                                             segmentation_interlocking_beam,
                                                               IncludeTopAndBottomLayers                                        include_top_and_bottom_layers,
                                                               const std::function<void()>                                     &throw_on_cancel_callback);
@@ -81,10 +85,28 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
 // ignored; index >= 1 = painted colours, the only eligible neighbours), returns the 1-based
 // colour index of the claim with the largest shared area against the island dilated by `eps` -
 // ties broken by the LOWEST colour index. Returns 0 if no painted claim touches the (dilated)
-// island at all. Exposed (not static) so it is directly unit-testable: the tie-break rule is
-// exact-integer-area-based and must be pinned deterministically, independent of mesh/Clipper
-// floating-point geometry.
+// island at all. Exposed (not static) so it is directly unit-testable. Determinism note
+// (corrected by absorb-tail-review.md Minor 1 - this comment previously and WRONGLY called the
+// comparison "exact-integer"): the area comparison is DOUBLE arithmetic (ExPolygon::area()),
+// deterministic because the same inputs summed in the same order by the same binary always
+// produce the same double, not because it is integer-exact - see the definition's own comment
+// for the full argument and why a genuine int64 rewrite was considered and rejected.
 size_t interclaim_absorb_winner(const ExPolygons &island, const std::vector<ExPolygons> &painted_claims, float eps);
+
+// Fix-wave (absorb-tail-review.md Minor 4 / M4): resolves the interior inter-claim absorb's
+// effective claim-width threshold for ONE base island from only the painted colours that
+// actually border it (touch its `eps`-dilated outline - the SAME adjacency test
+// interclaim_absorb_winner itself uses), rather than an object-wide MAX. claim_width_gapfill_
+// off_by_color is indexed by colour (extruder id); a colour with no gap-fill-disabled region of
+// its own, or an out-of-range index, contributes 0.f (no widening from that neighbour). Returns
+// min_claim_width unchanged whenever none of the island's actual geometric neighbours has gap
+// fill disabled, even if some OTHER, non-bordering colour elsewhere on the object does - fixing
+// the pre-fix object-wide MAX's over-absorption of a genuine 0.45-0.75mm base gap between two
+// colours that both have gap fill on. Exposed (not static) for the same reason as
+// interclaim_absorb_winner above: directly unit-testable, independent of mesh/Clipper geometry.
+float interclaim_absorb_effective_claim_width(const ExPolygons &island, const std::vector<ExPolygons> &painted_claims,
+                                               const std::vector<float> &claim_width_gapfill_off_by_color,
+                                               float min_claim_width, float eps);
 
 // Returns multi-material segmentation based on painting in multi-material segmentation gizmo
 std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(const PrintObject &print_object, const std::function<void()> &throw_on_cancel_callback);
