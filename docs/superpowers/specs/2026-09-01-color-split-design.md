@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.11 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–9) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.12 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–10) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -249,7 +249,7 @@ After the split the object's paint-depth settings are inert (no paint left) unle
 
 | Condition | Behaviour |
 |---|---|
-| Source mesh has open edges after welding | Refused before the job: "The part is not watertight; repair it first." |
+| Source mesh has open edges after welding | Refused by the job before any model change (rev 2.12): "The part is not watertight; repair it before splitting by colour." |
 | Part not painted / paint resolves to nothing | Menu item disabled / job ends with a notification, no change |
 | A painting gizmo is open or a job is running | Menu action refused with a notification |
 | A component's shell self-intersects even at its floor depth (a painted feature smaller than about two layer heights) | That component is skipped with a warning naming the filament and its size; the rest of the split proceeds (rev 2.3) |
