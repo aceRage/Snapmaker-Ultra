@@ -275,6 +275,7 @@ static ColorSplitDepths depths_for_test(double D, double h = 0.2, double ws = 0.
     return d;
 }
 static ColorSplitParams no_cap_no_step() { ColorSplitParams p; p.flat_cap = false; p.crease_step = false; return p; }
+static double volume_of(const indexed_triangle_set &its) { return double(its_volume(its)); }
 
 TEST_CASE("colorsplit: shell of a painted top face is a closed slab of depth D", "[colorsplit]")
 {
@@ -448,6 +449,28 @@ TEST_CASE("colorsplit: a feature too small to carry a shell is skipped with a wa
     REQUIRE(warnings[0] == expected.str());
 }
 
+TEST_CASE("colorsplit: the halving floor is what decides skip versus salvage", "[colorsplit]")
+{
+    // The same 0.15 mm ball as the skip test above; only the layer height differs. The fold guard and the
+    // validity fallback halve towards the SAME floor, min(layer_height, d0) (Ruling 9). At h = 0.2 that floor
+    // already equals d0 = 0.147, so neither can move anything and the feature is skipped with a warning. At
+    // h = 0.02 the guard can act: it lowers the depth until the bottom copies stop folding through one another
+    // near the centre and the shell is valid on its FIRST check - silently, because reining a convex feature's
+    // offset in is ordinary work, not an event worth telling the user about. This is also why no fixture in
+    // this suite reaches the fallback's "shell depth reduced" note (spec 9 / spike-report.md): wherever the
+    // guard can act it gets there first, and where it cannot the fallback cannot either.
+    TriangleMesh sphere(its_make_sphere(0.15, PI / 18.));
+    ColorPatches p = extract_color_patches(sphere.its, paint_by_predicate(sphere, [](const Vec3f &, const Vec3f &) { return true; }, EnforcerBlockerType::Extruder2));
+    std::vector<std::string> warnings;
+    std::vector<ColorShell>  shells = build_color_shells(p, depths_for_test(1.5, 0.02), no_cap_no_step(), nullptr, &warnings);
+    REQUIRE(shells.size() == 1);
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+    REQUIRE(c.volume > 0.);
+    REQUIRE(warnings.empty());
+}
+
 TEST_CASE("colorsplit: progress stays inside the 0..100 contract with many components", "[colorsplit]")
 {
     // 18 cells painted in a checkerboard: they only ever touch diagonally, so every one of them is its own
@@ -495,4 +518,216 @@ TEST_CASE("colorsplit: depth_override_mm replaces D and clears unlimited", "[col
     for (const Vec3f &v : shells[0].mesh.vertices) { min_z = std::min(min_z, v.z()); max_z = std::max(max_z, v.z()); }
     REQUIRE_THAT(max_z, WithinAbs(20.f, 1e-4f));
     REQUIRE_THAT(min_z, WithinAbs(20.f - float(0.7 / std::sqrt(3.)), 1e-4f));
+}
+
+TEST_CASE("colorsplit: partition of a painted top is exact and complementary", "[colorsplit]")
+{
+    TriangleMesh block = make_cube(40., 40., 20.);
+    auto data = paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ColorSplitResult r = split_volume_by_paint(block.its, data, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(r.pieces.size() == 1);
+    REQUIRE(r.pieces[0].first == 2);
+    REQUIRE(its_num_open_edges(r.body) == 0);
+    REQUIRE(its_num_open_edges(r.pieces[0].second) == 0);
+    const double total = volume_of(r.body) + volume_of(r.pieces[0].second);
+    REQUIRE_THAT(total, WithinRel(40. * 40. * 20., 1e-4));
+    REQUIRE(volume_of(r.pieces[0].second) < 40. * 40. * 1.5 + 1.);
+    // The piece's top surface is the original top face: every piece vertex has z <= 20 and the max is 20.
+    float zmax = -1.f; for (const Vec3f &v : r.pieces[0].second.vertices) zmax = std::max(zmax, v.z());
+    REQUIRE_THAT(zmax, WithinRel(20.f, 1e-5f));
+}
+
+TEST_CASE("colorsplit: three adjacent colours tile the top face, lower filament wins overlaps", "[colorsplit]")
+{
+    TriangleMesh box = make_grid_box(40., 40., 20., 4, 1);   // top = 4 cells in a row
+    auto cell = [](int i) { int base = 2 + 2 * i; return std::vector<int>{base, base + 1}; };
+    std::vector<std::pair<int, EnforcerBlockerType>> facets;
+    for (int f : cell(0)) facets.emplace_back(f, EnforcerBlockerType::Extruder2);
+    for (int f : cell(1)) facets.emplace_back(f, EnforcerBlockerType::Extruder3);
+    for (int f : cell(2)) facets.emplace_back(f, EnforcerBlockerType::Extruder4);
+    ColorSplitResult r = split_volume_by_paint(box.its, paint_data(box, facets), depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(r.pieces.size() == 3);
+    double total = volume_of(r.body);
+    for (auto &pc : r.pieces) { REQUIRE(its_num_open_edges(pc.second) == 0); total += volume_of(pc.second); }
+    REQUIRE_THAT(total, WithinRel(40. * 40. * 20., 1e-4));
+    // pairwise disjoint: intersect pieces with Manifold and expect empty
+    for (size_t i = 0; i < 3; ++i)
+        for (size_t j = i + 1; j < 3; ++j) {
+            std::vector<TriangleMesh> out;
+            REQUIRE(MeshBoolean::mfd::make_boolean(TriangleMesh(r.pieces[i].second), TriangleMesh(r.pieces[j].second), out, "INTERSECTION"));
+            double v = 0.; for (auto &m : out) v += volume_of(m.its);
+            REQUIRE(v < 1e-3);
+        }
+}
+
+TEST_CASE("colorsplit: painted sphere smaller than D is wholly its colour (island absorption)", "[colorsplit]")
+{
+    TriangleMesh sphere(its_make_sphere(1.0, PI / 18.));
+    auto data = paint_by_predicate(sphere, [](const Vec3f &, const Vec3f &) { return true; }, EnforcerBlockerType::Extruder2);
+    ColorSplitParams params = no_cap_no_step();
+    ColorSplitResult r = split_volume_by_paint(sphere.its, data, depths_for_test(1.5), params, nullptr);
+    REQUIRE(r.pieces.size() == 1);
+    REQUIRE(r.body.indices.empty());
+    REQUIRE_THAT(volume_of(r.pieces[0].second), WithinRel(volume_of(sphere.its), 1e-4));
+    params.absorb_islands = false;
+    ColorSplitResult r2 = split_volume_by_paint(sphere.its, data, depths_for_test(1.5), params, nullptr);
+    REQUIRE(!r2.body.indices.empty());
+}
+
+TEST_CASE("colorsplit: cancellation aborts without a result", "[colorsplit]")
+{
+    TriangleMesh block = make_cube(40., 40., 20.);
+    auto data = paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    REQUIRE_THROWS_AS(split_volume_by_paint(block.its, data, depths_for_test(1.5), no_cap_no_step(), [](int) { return false; }), ColorSplitCancelled);
+}
+
+TEST_CASE("colorsplit: an ultra-thin plate never asks for a negative depth", "[colorsplit]")
+{
+    // Task 3 re-review follow-up: d(v) = t(v)/2 - delta would turn NEGATIVE on a feature thinner than
+    // 2 * delta = 0.004 mm, and the fold guard cannot catch that - a uniformly negative offset moves every
+    // bottom copy OUTSIDE the part while preserving each triangle's orientation, so the guard's orientation
+    // test still passes. compute_vertex_depths therefore clamps to >= 0.
+    //
+    // MEASURED on this 3 micron plate: every depth comes back as D (1.5), not as a small or negative number.
+    // The thickness probe (ColorSplit.cpp) starts 0.001 mm inside the surface and ignores any hit closer than
+    // 5 * 0.001 mm as a self-intersection, so a corner ray that crosses only 0.003 * sqrt(3) = 0.0052 mm of
+    // plate and exits 0.0042 mm from the probe origin is discarded: t stays infinite and the depth falls back
+    // to D. Any hit the probe DOES accept is > 0.005 mm away, i.e. t > 0.006 and t/2 - delta > 0.001, so the
+    // clamp is unreachable through this path and is a guard, not a live branch. What the split must still do
+    // is stay sane: the shell overshoots the plate by 0.86 mm, the partition clips it back, and the whole
+    // plate comes out as the painted filament instead of yielding invalid geometry.
+    TriangleMesh plate = make_cube(40., 40., 0.003);
+    auto data = paint_data(plate, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ColorPatches p = extract_color_patches(plate.its, data);
+    std::vector<Vec3f> n = color_split_normals(p.surface);
+    std::vector<float> d = compute_vertex_depths(p, n, 1.5);
+    REQUIRE(*std::min_element(d.begin(), d.end()) >= 0.f);
+    REQUIRE_THAT(*std::max_element(d.begin(), d.end()), WithinAbs(1.5f, 1e-5f));
+    ColorSplitResult r = split_volume_by_paint(plate.its, data, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(r.pieces.size() == 1);
+    REQUIRE(r.pieces[0].first == 2);
+    REQUIRE(its_num_open_edges(r.pieces[0].second) == 0);
+    REQUIRE(volume_of(r.pieces[0].second) > 0.99 * 40. * 40. * 0.003);
+}
+
+// ---- Spike measurements (spec 9). They must pass; numbers go to WARN for the decision checkpoint. ----
+
+// its_make_sphere(r, fa) builds sectorCount = ceil(2*PI/fa) sectors over stackCount = ceil(PI/fa) stacks, i.e.
+// sectorCount * (2 * stackCount - 2) triangles. The PI/90 of the task brief yields only 180 * 178 = 32040 -
+// a third of the 100k the spike calls for - so this uses PI/158: 316 * 314 = 99224, inside the 80k..120k band.
+static constexpr double SPIKE_SPHERE_FA = PI / 158.;
+
+TEST_CASE("colorsplit spike: S1 self-intersecting fixtures and S3 timing", "[colorsplit_spike]")
+{
+    using clock = std::chrono::steady_clock;
+    // S3: ~100k-triangle sphere, one colour cap and three colour bands.
+    TriangleMesh sphere(its_make_sphere(20.0, SPIKE_SPHERE_FA));
+    WARN("sphere triangles: " << sphere.its.indices.size());
+    auto one = paint_by_predicate(sphere, [](const Vec3f &c, const Vec3f &) { return c.z() > 10.f; }, EnforcerBlockerType::Extruder2);
+    auto t0 = clock::now();
+    ColorSplitResult r1 = split_volume_by_paint(sphere.its, one, depths_for_test(1.5), ColorSplitParams{}, nullptr);
+    auto t1 = clock::now();
+    WARN("S3 one colour: " << std::chrono::duration<double>(t1 - t0).count() << " s, pieces " << r1.pieces.size()
+                           << ", warnings " << r1.warnings.size());
+    for (const std::string &w : r1.warnings) WARN("S3 one colour warning: " << w);
+    TriangleSelector sel(sphere);
+    for (int f = 0; f < int(sphere.its.indices.size()); ++f) {
+        const auto &t = sphere.its.indices[f];
+        float z = (sphere.its.vertices[t[0]].z() + sphere.its.vertices[t[1]].z() + sphere.its.vertices[t[2]].z()) / 3.f;
+        if (z > 10.f) sel.set_facet(f, EnforcerBlockerType::Extruder2);
+        else if (z > -5.f) sel.set_facet(f, EnforcerBlockerType::Extruder3);
+        else if (z > -15.f) sel.set_facet(f, EnforcerBlockerType::Extruder4);
+    }
+    t0 = clock::now();
+    ColorSplitResult r3 = split_volume_by_paint(sphere.its, sel.serialize(), depths_for_test(1.5), ColorSplitParams{}, nullptr);
+    t1 = clock::now();
+    WARN("S3 three colours: " << std::chrono::duration<double>(t1 - t0).count() << " s, pieces " << r3.pieces.size()
+                              << ", warnings " << r3.warnings.size());
+    for (const std::string &w : r3.warnings) WARN("S3 three colours warning: " << w);
+    double total = volume_of(r3.body); for (auto &pc : r3.pieces) total += volume_of(pc.second);
+    REQUIRE_THAT(total, WithinRel(volume_of(sphere.its), 1e-4));
+
+    // S1: 2mm boss on a block (convex feature narrower than 2D) painted entirely.
+    TriangleMesh block = make_cube(40., 40., 10.);
+    TriangleMesh boss(its_make_cylinder(1.0, 4.0, PI / 18.));
+    boss.translate(20.f, 20.f, 9.f);
+    std::vector<TriangleMesh> out;
+    REQUIRE(MeshBoolean::mfd::make_boolean(block, boss, out, "UNION"));
+    TriangleMesh bossed = out.front();
+    auto paint = paint_by_predicate(bossed, [](const Vec3f &c, const Vec3f &) { return c.z() > 10.05f; }, EnforcerBlockerType::Extruder2);
+    // S1 asks for the shell's own volume as well as the partition's, so the two stages run separately here
+    // (this is exactly what split_volume_by_paint chains internally).
+    ColorPatches pb = extract_color_patches(bossed.its, paint);
+    std::vector<std::string> bw;
+    std::vector<ColorShell>  bs = build_color_shells(pb, depths_for_test(1.5), ColorSplitParams{}, nullptr, &bw);
+    for (const ColorShell &sh : bs) WARN("S1 boss shell: filament " << sh.state << ", volume " << check_shell(sh.mesh).volume);
+    for (const std::string &w : bw) WARN("S1 boss warning: " << w);
+    REQUIRE(bs.size() == 1);
+    const double boss_shell_volume = check_shell(bs[0].mesh).volume;
+    ColorSplitResult rb = partition_by_shells(pb.surface, bs, /*absorb_islands=*/true, nullptr);
+    REQUIRE(rb.pieces.size() == 1);
+    WARN("S1 boss: piece volume " << volume_of(rb.pieces[0].second) << ", body volume " << volume_of(rb.body)
+         << " (whole boss " << PI * 4.0 << ", boss above the block " << PI * 3.0 << ")");
+    // The PARTITION is exact: the shell lies wholly inside the part, so Split hands it straight back and the
+    // piece matches the shell to five figures - nothing is lost between the shell builder and the model.
+    REQUIRE_THAT(volume_of(rb.pieces[0].second), WithinRel(boss_shell_volume, 1e-4));
+    // The brief expected the whole cylinder here (PI * 1^2 * 4 = 12.566). MEASURED: 8.289. That expectation
+    // does not hold and is a spike finding, not a tolerance to loosen - see
+    // .superpowers/sdd/2026-09-01-color-split/spike-report.md, in short:
+    //   * 1 mm of that cylinder is buried in the block and carries no painted surface at all, so no rule in
+    //     the spec can claim it - only PI * 1^2 * 3 = 9.425 mm^3 of boss is exposed;
+    //   * "two half-shells meet at the axis" needs lateral vertices with RADIAL normals. After the union the
+    //     boss wall carries exactly two rings - z = 10 from the intersection curve and z = 13 from the
+    //     cylinder top - and both are junction vertices with 45 degree bisector normals, so every offset runs
+    //     down-AND-inward and the fold guard caps it well before the axis. The shell is a cup, not a plug;
+    //   * its hollow core is NOT an enclosed island (it opens downwards into the block), so 3.8's absorption
+    //     cannot claim it either. Island absorption is pinned by the free-floating painted sphere instead.
+    // What the split must still guarantee is that the exposed boss is essentially all colour, with only a
+    // hidden core left behind:
+    REQUIRE(volume_of(rb.pieces[0].second) > 0.8 * PI * 1.0 * 1.0 * 3.0);
+    Vec3f lo = rb.pieces[0].second.vertices.front(), hi = lo;
+    for (const Vec3f &v : rb.pieces[0].second.vertices) { lo = lo.cwiseMin(v); hi = hi.cwiseMax(v); }
+    REQUIRE_THAT(hi.z(), WithinAbs(13.f, 1e-3f));                 // the piece reaches the top of the boss
+    REQUIRE_THAT(hi.x() - lo.x(), WithinAbs(2.f, 1e-2f));         // and spans its full diameter
+}
+
+TEST_CASE("colorsplit spike: S3 stage breakdown and the CGAL check share", "[colorsplit_spike]")
+{
+    // Same ~100k sphere, one colour, run stage by stage so the CGAL self-intersection check can be timed on
+    // its own: build_color_shells calls check_shell once per component when no fallback round is needed, so
+    // re-checking each finished shell here measures exactly the share of that stage that is spent in CGAL.
+    using clock = std::chrono::steady_clock;
+    TriangleMesh sphere(its_make_sphere(20.0, SPIKE_SPHERE_FA));
+    auto paint = paint_by_predicate(sphere, [](const Vec3f &c, const Vec3f &) { return c.z() > 10.f; }, EnforcerBlockerType::Extruder2);
+
+    auto t0 = clock::now();
+    ColorPatches p = extract_color_patches(sphere.its, paint);
+    auto t1 = clock::now();
+    std::vector<std::string> warnings;
+    std::vector<ColorShell> shells = build_color_shells(p, depths_for_test(1.5), ColorSplitParams{}, nullptr, &warnings);
+    auto t2 = clock::now();
+    REQUIRE(shells.size() == 1);
+    double check_s = 0.;
+    for (const ColorShell &s : shells) {
+        auto c0 = clock::now();
+        ShellCheck c = check_shell(s.mesh);
+        check_s += std::chrono::duration<double>(clock::now() - c0).count();
+        REQUIRE(c.closed);
+        REQUIRE(!c.self_intersects);
+    }
+    auto t3 = clock::now();
+    ColorSplitResult r = partition_by_shells(p.surface, shells, /*absorb_islands=*/true, nullptr);
+    auto t4 = clock::now();
+    REQUIRE(r.pieces.size() == 1);
+
+    const double patches_s   = std::chrono::duration<double>(t1 - t0).count();
+    const double shells_s    = std::chrono::duration<double>(t2 - t1).count();
+    const double partition_s = std::chrono::duration<double>(t4 - t3).count();
+    WARN("S3 breakdown (" << sphere.its.indices.size() << " tri, shell " << shells[0].mesh.indices.size() << " tri): patches "
+         << patches_s << " s, shells " << shells_s << " s (of which check_shell/CGAL " << check_s << " s = "
+         << (shells_s > 0. ? 100. * check_s / shells_s : 0.) << "% of that stage, "
+         << (100. * check_s / std::max(1e-9, patches_s + shells_s + partition_s)) << "% of the whole split), partition "
+         << partition_s << " s; shell warnings " << warnings.size());
+    for (const std::string &w : warnings) WARN("S3 breakdown warning: " << w);
+    REQUIRE(std::chrono::duration<double>(t3 - t2).count() >= 0.);
 }

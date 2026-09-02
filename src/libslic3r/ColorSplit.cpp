@@ -5,6 +5,7 @@
 #include "MeshBoolean.hpp"
 #include "NormalUtils.hpp"
 #include "PrintConfig.hpp"
+#include <manifold/manifold.h>
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
@@ -125,7 +126,11 @@ std::vector<float> compute_vertex_depths(const ColorPatches &p, const std::vecto
         // self-intersection radius is already the nearest one.
         for (const AABBMesh::hit_result &hit : aabb.query_ray_hits(src, -n))
             if (hit.is_hit() && hit.distance() > 5. * eps) { t = hit.distance() + eps; break; }
-        d[v] = float(std::min(double(d[v]), t / 2. - 0.002));   // delta keeps the bottom strictly short of the mid-surface
+        // std::max(0., ...): on a feature thinner than 2 * delta the clamp t/2 - delta turns negative, which
+        // would push the bottom copies OUTSIDE the part. The fold guard cannot catch that - where the offset
+        // is parallel (one flat patch, one normal) a negative depth translates the bottom triangle without
+        // changing its orientation, so the guard's orientation test still passes.
+        d[v] = float(std::max(0., std::min(double(d[v]), t / 2. - 0.002)));
     }
     return d;
 }
@@ -155,6 +160,15 @@ std::string too_small_warning(const ColorPatches &p, const std::vector<int> &com
     os << "Filament " << state << ": a painted feature about " << std::fixed << std::setprecision(2)
        << (hi - lo).norm() << " mm across is too small to split and stays in the body colour.";
     return os.str();
+}
+
+// Spec 9: the note left behind when the validity fallback salvaged a component by halving its depth. The
+// user's colour boundary is then shallower than the depth they asked for on that one feature, and the spike
+// needs to see how often that path is taken at all.
+std::string depth_reduced_warning(int state, int rounds)
+{
+    return "Filament " + std::to_string(state) + ": shell depth reduced (" + std::to_string(rounds) +
+           (rounds == 1 ? " halving" : " halvings") + ") on one painted feature to keep the split valid.";
 }
 
 // Edge-connected components of the facet subset `in_set` (indices into patches.surface).
@@ -412,21 +426,185 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
         ShellCheck check = check_shell(mesh);
         // Validity fallback: halve the component's depth until the shell is clean, floor = one layer. Once
         // every vertex sits on its floor there is nothing left to try and the rebuild would be identical.
+        int halvings = 0;
         for (int round = 0; round < 6 && (!check.closed || check.self_intersects); ++round) {
             if (!sb.halve_depth(comp)) break;
+            ++halvings;
             mesh  = sb.build(comp, cap_depth);
             check = check_shell(mesh);
         }
         // Spec 7 (rev 2.3): a component that still fails at its floor depth is a feature too small to
         // split, not an error. Drop it - the body keeps it in its own colour - and note it for the user.
-        if (check.closed && !check.self_intersects)
+        if (check.closed && !check.self_intersects) {
+            if (halvings > 0 && warnings)
+                warnings->push_back(depth_reduced_warning(s, halvings));
             shells.push_back({s, false, std::move(mesh)});
-        else if (warnings)
+        } else if (warnings)
             warnings->push_back(too_small_warning(p, comp, s));
         if (progress && !progress(int(10 + 40 * double(++done) / double(std::max<size_t>(1, groups.size())))))
             throw ColorSplitCancelled();
     }
     return shells;
+}
+
+namespace {
+
+// ---- Manifold conversion and the sequential-Split partition (spec 3.8) -----------------------------------
+
+// MeshGL64 is MeshGLP<double, uint64_t> (mesh.h:101-163): double coordinates, uint64 triangle indices. The
+// explicit tolerance is spec 3.7's - Manifold otherwise derives one from the bounding box, and a shell whose
+// bottom sits microns below the surface must not be simplified away. AsOriginal() (manifold.h:198-200) stamps
+// a fresh OriginalID on the result; that ID is what the island pass below reads back off the Split output to
+// tell which input each face came from.
+manifold::Manifold to_manifold64(const indexed_triangle_set &its)
+{
+    manifold::MeshGL64 m;
+    m.numProp = 3;
+    m.vertProperties.reserve(its.vertices.size() * 3);
+    for (const Vec3f &v : its.vertices) {
+        m.vertProperties.push_back(v.x());
+        m.vertProperties.push_back(v.y());
+        m.vertProperties.push_back(v.z());
+    }
+    m.triVerts.reserve(its.indices.size() * 3);
+    for (const Vec3i32 &t : its.indices) {
+        m.triVerts.push_back(uint64_t(t[0]));
+        m.triVerts.push_back(uint64_t(t[1]));
+        m.triVerts.push_back(uint64_t(t[2]));
+    }
+    m.tolerance = 1e-5;   // mm; well below any print resolution, above float noise
+    m.Merge();            // fuse duplicated vertices so a triangle soup can still form a topological manifold
+    return manifold::Manifold(m).AsOriginal();
+}
+
+indexed_triangle_set from_manifold(const manifold::Manifold &m)
+{
+    manifold::MeshGL64 out = m.GetMeshGL64();
+    indexed_triangle_set its;
+    const size_t stride = size_t(out.numProp);                                    // mesh.h:110 - always >= 3
+    const size_t nv     = stride > 0 ? out.vertProperties.size() / stride : 0;
+    its.vertices.reserve(nv);
+    for (size_t i = 0; i < nv; ++i)
+        its.vertices.emplace_back(float(out.vertProperties[i * stride]), float(out.vertProperties[i * stride + 1]),
+                                  float(out.vertProperties[i * stride + 2]));
+    its.indices.reserve(out.triVerts.size() / 3);
+    for (size_t i = 0; i + 2 < out.triVerts.size(); i += 3)
+        its.indices.emplace_back(int(out.triVerts[i]), int(out.triVerts[i + 1]), int(out.triVerts[i + 2]));
+    return its;
+}
+
+void require_ok(const manifold::Manifold &m, const char *what)
+{
+    const manifold::Manifold::Error status = m.Status();
+    if (status == manifold::Manifold::Error::Cancelled) throw ColorSplitCancelled();
+    if (status != manifold::Manifold::Error::NoError)
+        throw ColorSplitError(std::string("Boolean failed (") + what + ", Manifold status " + std::to_string(int(status)) + ").");
+}
+
+// Faces of one Split output grouped by the OriginalID of the input they came from. mesh.h:125-138: the runs
+// cover all of triVerts and runIndex is one longer than runOriginalID - if that ever stops holding, the
+// provenance this pass relies on is not what we think it is, so say so instead of guessing.
+std::map<uint32_t, size_t> faces_by_original_id(const manifold::MeshGL64 &gl)
+{
+    if (gl.runIndex.size() != gl.runOriginalID.size() + 1)
+        throw ColorSplitError("Manifold returned no usable face provenance (internal error).");
+    std::map<uint32_t, size_t> faces;
+    for (size_t run = 0; run < gl.runOriginalID.size(); ++run) {
+        // Manifold emits an EMPTY run for an input that contributed nothing to this component (measured on
+        // the fully painted sphere: the leftover core carries a 0-triangle run for the source mesh). Counting
+        // those would make every island look as if it touched the source and no island would ever be absorbed.
+        const size_t n = size_t(gl.runIndex[run + 1] - gl.runIndex[run]) / 3;
+        if (n > 0) faces[gl.runOriginalID[run]] += n;
+    }
+    return faces;
+}
+
+} // namespace
+
+ColorSplitResult partition_by_shells(const indexed_triangle_set &mesh, const std::vector<ColorShell> &shells, bool absorb_islands, const ColorSplitProgress &progress)
+{
+    // The context is the plumbing spec rev 2 (M7) asks for, and require_ok turns Error::Cancelled into
+    // ColorSplitCancelled - but note that Split is an EAGER op that does not observe an attached ctx
+    // (manifold.h:147-171: only Refine / Hull / Minkowski and a deferred tree's Status() do). Cancellation
+    // therefore lands BETWEEN shells, not inside a boolean: each Split runs to completion.
+    manifold::ExecutionContext ctx;
+    auto tick = [&](int pct) { if (progress && !progress(pct)) { ctx.Cancel(); throw ColorSplitCancelled(); } };
+
+    manifold::Manifold original = to_manifold64(mesh).WithContext(ctx);
+    require_ok(original, "source mesh");
+    const uint32_t original_id  = uint32_t(original.OriginalID());
+    const double   vol_original = original.Volume();
+
+    ColorSplitResult r;
+    std::map<int, std::vector<manifold::Manifold>> piece_parts;   // filament -> Split results
+    std::map<uint32_t, int>                        shell_state;   // shell OriginalID -> filament
+    manifold::Manifold rest = original;
+    for (size_t i = 0; i < shells.size(); ++i) {
+        manifold::Manifold shell = to_manifold64(shells[i].mesh).WithContext(ctx);
+        require_ok(shell, "shell");
+        shell_state[uint32_t(shell.OriginalID())] = shells[i].state;
+        // manifold.cpp:950-967: Split returns (intersection, difference) - the piece first, the remainder
+        // second, from one evaluation, so the two are complementary with no epsilon mismatch between them.
+        auto [piece, remainder] = rest.Split(shell);
+        require_ok(piece, "split piece"); require_ok(remainder, "split remainder");
+        if (!piece.IsEmpty()) piece_parts[shells[i].state].push_back(piece);
+        rest = remainder;
+        tick(int(50 + 40 * double(i + 1) / double(shells.size())));
+    }
+
+    // Spec 3.8: enclosed body islands -> the colour that contributed most of their surface. A component none
+    // of whose faces come from the source mesh is completely wrapped by colour pieces and therefore invisible.
+    std::vector<manifold::Manifold> body_parts;
+    for (manifold::Manifold &comp : rest.Decompose()) {
+        require_ok(comp, "body component");
+        const std::map<uint32_t, size_t> faces = faces_by_original_id(comp.GetMeshGL64());
+        const bool touches_original = faces.count(original_id) != 0;
+        if (absorb_islands && !touches_original && !faces.empty()) {
+            uint32_t best = 0; size_t best_n = 0; int best_state = std::numeric_limits<int>::max();
+            for (const std::pair<const uint32_t, size_t> &face_run : faces) {
+                auto      it = shell_state.find(face_run.first);
+                const int st = it != shell_state.end() ? it->second : std::numeric_limits<int>::max();
+                // Most surface wins; ties go to the lowest filament.
+                if (face_run.second > best_n || (face_run.second == best_n && st < best_state)) {
+                    best = face_run.first; best_n = face_run.second; best_state = st;
+                }
+            }
+            auto winner = shell_state.find(best);
+            if (winner != shell_state.end()) { piece_parts[winner->second].push_back(comp); continue; }
+        }
+        body_parts.push_back(comp);
+    }
+
+    double total = 0.;
+    for (manifold::Manifold &b : body_parts) { total += b.Volume(); its_merge(r.body, from_manifold(b)); }
+    for (auto &[state, parts] : piece_parts) {
+        indexed_triangle_set its;
+        for (manifold::Manifold &m : parts) { total += m.Volume(); its_merge(its, from_manifold(m)); }
+        if (its.indices.empty()) { r.warnings.push_back("Filament " + std::to_string(state) + ": painted area produced no solid (fully covered by lower filaments)."); continue; }
+        r.pieces.emplace_back(state, std::move(its));
+    }
+    if (std::abs(total - vol_original) > 1e-4 * vol_original + 1e-9)
+        throw ColorSplitError("Volume check failed after splitting (" + std::to_string(total) + " vs " + std::to_string(vol_original) + " mm^3).");
+    tick(95);
+    return r;
+}
+
+ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const TriangleSelector::TriangleSplittingData &paint,
+                                       const ColorSplitDepths &depths, const ColorSplitParams &params, const ColorSplitProgress &progress)
+{
+    if (progress && !progress(0)) throw ColorSplitCancelled();
+    ColorPatches patches = extract_color_patches(mesh, paint);
+    if (patches.states.empty()) throw ColorSplitError("The part has no painted colours.");
+    if (progress && !progress(10)) throw ColorSplitCancelled();
+    std::vector<std::string> shell_warnings;
+    // Ruling 10: skipped micro-components are warnings, not errors - they have to reach the caller.
+    std::vector<ColorShell> shells = build_color_shells(patches, depths, params, progress, &shell_warnings);
+    ColorSplitResult r = partition_by_shells(patches.surface, shells, params.absorb_islands, progress);
+    r.warnings.insert(r.warnings.begin(), shell_warnings.begin(), shell_warnings.end());
+    r.depths = depths;
+    if (params.depth_override_mm > 0.) { r.depths.D = params.depth_override_mm; r.depths.unlimited = false; }
+    if (progress) progress(100);
+    return r;
 }
 
 } // namespace Slic3r

@@ -66,4 +66,20 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &patches, const Co
                                            const ColorSplitParams &params, const ColorSplitProgress &progress,
                                            std::vector<std::string> *warnings = nullptr);
 
+// Spec 3.8: what one split produces. `body` is the unpainted remainder (may be empty); `pieces` holds one
+// merged mesh per painted filament, ascending; `warnings` are the user-facing notes collected on the way.
+struct ColorSplitResult {
+    indexed_triangle_set                              body;      // may be empty
+    std::vector<std::pair<int, indexed_triangle_set>> pieces;    // (filament, mesh), ascending filament
+    std::vector<std::string>                          warnings;
+    ColorSplitDepths                                  depths;
+};
+// Spec 3.8: rest <- mesh; each shell is cut out of `rest` in turn, so pieces and body are complementary by
+// construction and overlaps go to the lower filament (the shell order build_color_shells returns).
+ColorSplitResult partition_by_shells(const indexed_triangle_set &mesh, const std::vector<ColorShell> &shells,
+                                     bool absorb_islands, const ColorSplitProgress &progress);
+// The one-shot entry point: paint -> patches -> shells -> partition.
+ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const TriangleSelector::TriangleSplittingData &paint,
+                                       const ColorSplitDepths &depths, const ColorSplitParams &params, const ColorSplitProgress &progress);
+
 } // namespace Slic3r
