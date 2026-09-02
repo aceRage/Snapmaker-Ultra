@@ -127,6 +127,7 @@
 #include "GUI_Preview.hpp"
 #include "3DBed.hpp"
 #include "PartPlate.hpp"
+#include "RemoteAccess.hpp"
 #include "Camera.hpp"
 #include "Mouse3DController.hpp"
 #include "Tab.hpp"
@@ -15489,6 +15490,7 @@ void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
         //slicing parallel, only update if percent is greater than before
         if (evt.status.percent > plate_list.get_curr_plate()->get_slicing_percent())
             plate_list.get_curr_plate()->update_slicing_percent(evt.status.percent);
+        RemoteAccess::get().note_slice_progress(plate_list.get_curr_plate_index(), evt.status.percent, evt.status.text);
     }
 
     if (evt.status.flags & (PrintBase::SlicingStatus::RELOAD_SCENE | PrintBase::SlicingStatus::RELOAD_SLA_SUPPORT_POINTS)) {
@@ -15737,11 +15739,15 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
             m_slice_all_only_has_gcode = false;
     }
 
+    // Ultra: let a slice started through the remote API report its outcome.
+    RemoteAccess::get().note_slice_done(is_finished, !evt.error() && !evt.cancelled(),
+                                        evt.error() ? evt.format_error_message().first : std::string());
+
     // Stop the background task, wait until the thread goes into the "Idle" state.
     // At this point of time the thread should be either finished or canceled,
     // so the following call just confirms, that the produced data were consumed.
     this->background_process.stop();
-    if (m_slice_timing_active && !this->background_process.running()) 
+    if (m_slice_timing_active && !this->background_process.running())
     {
         if (evt.cancelled() || evt.error()) {
             m_slice_start_time    = {};

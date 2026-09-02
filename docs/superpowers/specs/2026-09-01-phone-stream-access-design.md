@@ -37,6 +37,23 @@ drivability for AI agents.
 - **Lockdown**: the existing page/auth HTTP servers (13619/13650) now bind 127.0.0.1. They
   were reachable from the LAN and `/localfile/<absolute path>` served any file on the PC.
 
+## JSON API (phases 1–3 of the remote-control roadmap)
+
+Under `/r/<token>/api`, same listener and token. Every request is marshalled to the GUI thread
+(`wxGetApp().CallAfter` + promise, 15 s timeout → 503 when a modal dialog blocks the app).
+Manifest at `GET /api`.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/plates` | project, printer preset, filaments (name/colour), plates: objects, printable/locked, sliced/ready, slicing percent, time (s), filament (mm³, g from `filament_density`) |
+| `GET /api/plates/{i}/thumbnail.png` | plate render (`update_all_plate_thumbnails(false)` on the GUI thread, PNG via `compress_thumbnail`) |
+| `GET /api/printers` | `DeviceManager` machines (my + local): online/connected, status, percent, time left, layers, bed/nozzle temps, task, selected |
+| `POST /api/slice?plate={i}\|all` | selects the plate and posts the same toolbar event as the Slice button; returns a job id; 409 while slicing |
+| `GET /api/jobs[/{id}]` | job state (running/done/error/cancelled, percent, text) fed by hooks in `Plater::priv::on_slicing_update` / `on_process_completed` |
+
+The phone page gains a Streams / Plates tab bar in remote mode: printer cards, plate cards with
+thumbnail, objects, estimates and a Slice button with live progress.
+
 ## Not in this phase
 
 Printer control, plates, slicing, sending; authentication beyond the per-session token;

@@ -49,6 +49,12 @@ public:
     // Flashforge new-gen LAN API: pull cameraStreamUrl out of the /detail JSON ("" if absent).
     static std::string ff_camera_url_from_detail(const std::string& body);
 
+    // JSON API under /r/<token>/api (see manifest at GET /r/<token>/api). Requests run on the
+    // GUI thread; these two are called by the Plater's slicing handlers (GUI thread) so that
+    // /api/jobs can report progress of a slice started through the API.
+    void note_slice_progress(int plate, int percent, const std::string& text);
+    void note_slice_done(bool finished_all, bool ok, const std::string& error);
+
 private:
     RemoteAccess() = default;
     void accept_loop();
@@ -57,12 +63,36 @@ private:
     std::string state_for_phone();
     bool        lookup_host(const std::string& id, std::string& ip, std::string& code);
 
-    std::mutex  m_mutex;
-    bool        m_on { false };
-    int         m_port { 0 };
-    std::string m_token;
-    std::string m_state; // JSON from the PC page
-    void*       m_acceptor { nullptr };
+    struct ApiResponse
+    {
+        int         status { 200 };
+        std::string type { "application/json" };
+        std::string body;
+    };
+    ApiResponse handle_api(const std::string& method, const std::string& path, const std::string& query, const std::string& body);
+    ApiResponse api_plates();
+    ApiResponse api_plate_thumbnail(int plate);
+    ApiResponse api_printers();
+    ApiResponse api_slice(int plate, bool all);
+    ApiResponse api_jobs(int id);
+
+    struct Job
+    {
+        int         id { 0 };
+        int         plate { -1 }; // -1 = all plates
+        std::string state;        // running | done | error | cancelled
+        int         percent { 0 };
+        std::string text, error;
+    };
+
+    std::mutex       m_mutex;
+    bool             m_on { false };
+    int              m_port { 0 };
+    std::string      m_token;
+    std::string      m_state; // JSON from the PC page
+    void*            m_acceptor { nullptr };
+    std::vector<Job> m_jobs;
+    int              m_next_job { 1 };
 };
 
 } // namespace GUI

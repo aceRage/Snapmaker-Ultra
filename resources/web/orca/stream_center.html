@@ -51,6 +51,24 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #modal .buttons span, #modal .field .btn { display: inline-block; padding: 7px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; user-select: none; background: #555; }
 #modal .ok { background: #0a9e50 !important; }
 #modal .qr { display: block; margin: 10px auto; background: #fff; border-radius: 6px; }
+#tabs { display: none; gap: 4px; margin-right: 6px; }
+#tabs .tab { padding: 6px 12px; border-radius: 6px; background: #3a3a3a; color: #ccc; font-size: 13px; cursor: pointer; user-select: none; }
+#tabs .tab.active { background: #0a9e50; color: #fff; }
+#plates { display: none; position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; overflow-y: auto; padding: 10px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+#plates .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; color: #ccc; font-size: 13px; }
+#plates .btn { padding: 7px 14px; border-radius: 6px; background: #0a9e50; color: #fff; font-size: 13px; cursor: pointer; user-select: none; }
+#plates .btn.dim { background: #555; }
+#plates .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+#plates .card { background: #333; border-radius: 8px; overflow: hidden; color: #eee; font-size: 13px; }
+#plates .card img { display: block; width: 100%; aspect-ratio: 1 / 1; object-fit: contain; background: #222; }
+#plates .card .body { padding: 8px 10px 10px; }
+#plates .card .title { font-weight: 600; margin-bottom: 4px; }
+#plates .card .meta { color: #aaa; font-size: 12px; line-height: 1.5; }
+#plates .card .bar { height: 6px; background: #222; border-radius: 3px; margin: 8px 0; overflow: hidden; }
+#plates .card .bar div { height: 100%; background: #0a9e50; width: 0; transition: width .3s; }
+#plates .printer { background: #2f2f2f; border-left: 4px solid #555; border-radius: 6px; padding: 8px 12px; color: #ddd; font-size: 13px; }
+#plates .printer.online { border-left-color: #0a9e50; }
+#plates .printer .meta { color: #aaa; font-size: 12px; }
 #modal .url { font-family: Consolas, monospace; font-size: 12px; color: #9ed; text-align: center; word-break: break-all; user-select: all; }
 @media (max-width: 640px) {
     #topbar { padding: 6px 8px; gap: 6px; }
@@ -61,6 +79,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 </head>
 <body>
 <div id="topbar">
+  <span id="tabs"><span class="tab active" data-view="streams">Streams</span><span class="tab" data-view="plates">Plates</span></span>
   <span id="chips"></span>
   <span class="chip" id="addchip">+ Add</span>
   <span class="chip" id="phonechip" title="Open this camera wall on your phone">&#128241; Phone</span>
@@ -71,6 +90,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
   </span>
 </div>
 <div id="grid"></div>
+<div id="plates"></div>
 <div id="modal-bg"><div id="modal"></div></div>
 <script>
 (function() {
@@ -872,6 +892,127 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         render();
     });
 
+    // ---- Phone "Plates" view: plates, printers and slicing through the slicer's JSON API ----
+    var view = 'streams', platesTimer = null, jobTimer = null, activeJob = null, thumbStamp = Date.now();
+    function api(path, opts) {
+        return fetch(REMOTE + 'api' + path, opts || {}).then(function(r) {
+            return r.json().then(function(j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; });
+        });
+    }
+    function fmtTime(s) {
+        s = Math.round(s || 0);
+        var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+        return h ? h + 'h ' + m + 'm' : m + 'm';
+    }
+    function setView(v) {
+        view = v;
+        document.querySelectorAll('#tabs .tab').forEach(function(t) { t.classList.toggle('active', t.dataset.view === v); });
+        document.getElementById('grid').style.display = v === 'streams' ? '' : 'none';
+        document.getElementById('plates').style.display = v === 'plates' ? 'block' : 'none';
+        document.getElementById('chips').style.display = v === 'streams' ? '' : 'none';
+        document.getElementById('layoutbox').style.display = v === 'streams' ? '' : 'none';
+        if (v === 'plates') { refreshPlates(); if (!platesTimer) platesTimer = setInterval(refreshPlates, 10000); }
+        else if (platesTimer) { clearInterval(platesTimer); platesTimer = null; }
+        try { localStorage.setItem('snorca_remote_view', v); } catch (e) {}
+    }
+    function el(tag, cls, text) {
+        var e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text !== undefined) e.textContent = text;
+        return e;
+    }
+    function startSlice(plate) {
+        api('/slice?plate=' + plate, { method: 'POST' }).then(function(j) {
+            activeJob = j.job;
+            pollJob();
+        }).catch(function(e) { document.getElementById('note').textContent = e.message; });
+    }
+    function pollJob() {
+        if (jobTimer) clearTimeout(jobTimer);
+        if (activeJob === null) return;
+        api('/jobs/' + activeJob).then(function(j) {
+            document.querySelectorAll('#plates .card').forEach(function(card) {
+                var mine = j.plate === -1 || +card.dataset.index === j.plate;
+                var bar = card.querySelector('.bar');
+                if (bar) { bar.style.display = mine && j.state === 'running' ? '' : 'none'; bar.firstChild.style.width = j.percent + '%'; }
+                var st = card.querySelector('.state');
+                if (st && mine && j.state === 'running') st.textContent = 'Slicing… ' + j.percent + '%' + (j.text ? ' — ' + j.text.replace(/^Slicing/, '').trim() : '');
+            });
+            if (j.state === 'running') jobTimer = setTimeout(pollJob, 1000);
+            else { activeJob = null; thumbStamp = Date.now(); refreshPlates(); if (j.state === 'error') document.getElementById('note').textContent = 'Slicing failed: ' + j.error; }
+        }).catch(function() { jobTimer = setTimeout(pollJob, 2000); });
+    }
+    function refreshPlates() {
+        var root = document.getElementById('plates');
+        Promise.all([api('/plates'), api('/printers').catch(function() { return { printers: [] }; })]).then(function(res) {
+            var data = res[0], printers = res[1].printers || [];
+            var scroll = root.scrollTop;
+            root.innerHTML = '';
+            var head = el('div', 'row');
+            head.appendChild(el('span', '', (data.project ? data.project.split(/[\\/]/).pop() : 'Untitled') + ' · ' + data.printer));
+            var all = el('span', 'btn' + (data.slicing ? ' dim' : ''), 'Slice all');
+            all.onclick = function() { if (!data.slicing) startSlice('all'); };
+            head.appendChild(all);
+            root.appendChild(head);
+            if (printers.length) {
+                var prow = el('div', 'row');
+                printers.forEach(function(p) {
+                    var card = el('div', 'printer' + (p.online ? ' online' : ''));
+                    card.appendChild(el('div', '', p.name + (p.selected ? ' ★' : '')));
+                    var meta = (p.online ? (p.status || 'idle') : 'offline');
+                    if (p.printing) meta += ' · ' + p.percent + '% · ' + fmtTime(p.left_time_s) + ' left' + (p.total_layers ? ' · layer ' + p.layer + '/' + p.total_layers : '');
+                    if (p.online) meta += ' · bed ' + Math.round(p.bed_temp) + '°' + (p.nozzles && p.nozzles.length ? ' · nozzle ' + p.nozzles.map(function(n) { return Math.round(n.temp) + '°'; }).join('/') : '');
+                    if (p.task) meta += ' · ' + p.task;
+                    card.appendChild(el('div', 'meta', meta));
+                    prow.appendChild(card);
+                });
+                root.appendChild(prow);
+            }
+            var cards = el('div', 'cards');
+            (data.plates || []).forEach(function(p) {
+                var card = el('div', 'card');
+                card.dataset.index = p.index;
+                var img = el('img');
+                img.alt = 'Plate ' + (p.index + 1);
+                img.src = REMOTE + 'api/plates/' + p.index + '/thumbnail.png?v=' + thumbStamp;
+                img.onerror = function() { img.style.display = 'none'; };
+                card.appendChild(img);
+                var body = el('div', 'body');
+                body.appendChild(el('div', 'title', (p.name ? p.name : 'Plate ' + (p.index + 1)) + (p.index === data.current_plate ? ' (current)' : '')));
+                var objs = p.objects || [];
+                body.appendChild(el('div', 'meta', objs.length ? objs.length + ' object' + (objs.length > 1 ? 's' : '') + ': ' + objs.slice(0, 4).join(', ') + (objs.length > 4 ? '…' : '') : 'Empty plate'));
+                var state = el('div', 'meta state', p.sliced ? ('Sliced · ' + fmtTime(p.time_s) + ' · ' + Math.round(p.filament_g || 0) + ' g' + (p.ready_for_print ? '' : ' · not printable')) : (p.printable ? 'Not sliced' : ''));
+                body.appendChild(state);
+                var bar = el('div', 'bar');
+                bar.appendChild(el('div'));
+                bar.style.display = 'none';
+                body.appendChild(bar);
+                if (p.printable && !p.locked) {
+                    var b = el('span', 'btn' + (data.slicing ? ' dim' : ''), p.sliced ? 'Re-slice' : 'Slice');
+                    b.onclick = function() { if (!data.slicing && activeJob === null) startSlice(p.index); };
+                    body.appendChild(b);
+                }
+                card.appendChild(body);
+                cards.appendChild(card);
+            });
+            root.appendChild(cards);
+            root.scrollTop = scroll;
+            if (data.slicing && activeJob === null) {
+                // a slice started on the PC: show the plate's own percentage
+                (data.plates || []).forEach(function(p) {
+                    if (p.slicing_percent > 0 && !p.sliced) {
+                        var c = cards.querySelector('.card[data-index="' + p.index + '"] .state');
+                        if (c) c.textContent = 'Slicing on the PC… ' + Math.round(p.slicing_percent) + '%';
+                    }
+                });
+            }
+        }).catch(function(e) { root.innerHTML = ''; root.appendChild(el('div', 'row', 'Cannot reach the slicer: ' + e.message)); });
+    }
+    if (REMOTE) {
+        document.getElementById('tabs').style.display = 'inline-flex';
+        document.querySelectorAll('#tabs .tab').forEach(function(t) { t.onclick = function() { setView(t.dataset.view); }; });
+    }
+
     load();
     // Default: first host active in the default single-stream layout.
     if (state.active.length === 0 && state.hosts.length > 0) state.active = [state.hosts[0].id];
@@ -880,6 +1021,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     if (REMOTE) {
         fetchRemoteState();
         setInterval(fetchRemoteState, 15000);
+        var v = 'streams';
+        try { v = localStorage.getItem('snorca_remote_view') || 'streams'; } catch (e) {}
+        if (v === 'plates') setView('plates');
     }
 })();
 </script>
