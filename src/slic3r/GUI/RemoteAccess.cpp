@@ -10,6 +10,7 @@
 #include "OptionsGroup.hpp"
 #include "PresetComboBoxes.hpp"
 #include "RemoteHub.hpp"
+#include "Selection.hpp"
 #include "Tab.hpp"
 #include <climits>
 #include "libslic3r/FilamentColorLibrary.hpp"
@@ -18,7 +19,10 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/Geometry/ConvexHull.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/Utils.hpp"
+#include "slic3r/Utils/UndoRedo.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/filesystem.hpp>
@@ -320,6 +324,169 @@ RemoteAccess::ApiResponse RemoteAccess::api_plate_thumbnail(int plate)
     auto png = GCodeThumbnails::compress_thumbnail(*data, GCodeThumbnailsFormat::PNG);
     r.type   = "image/png";
     r.body.assign(static_cast<const char*>(png->data), png->size);
+    return r;
+}
+
+// ------------------------------------------------------------ plate layout ----
+
+// Top-down view of one plate: every instance registered on it with the convex hull of the
+// transformed model (world mm), bounding box, position / Z rotation / uniform scale and the
+// colour of its filament. The phone draws this and edits it through api_object_transform.
+RemoteAccess::ApiResponse RemoteAccess::api_plate_layout(int plate)
+{
+    auto out = std::make_shared<nlohmann::json>();
+    bool ok  = run_on_main([out, plate]() {
+        Plater*        plater = wxGetApp().plater();
+        PartPlateList& plates = plater->get_partplate_list();
+        if (plate < 0 || plate >= plates.get_plate_count()) return;
+        PartPlate*      p  = plates.get_plate(plate);
+        nlohmann::json& j  = *out;
+        const BoundingBoxf3& pb = p->get_bounding_box(false);
+        j["index"]     = plate;
+        j["name"]      = p->get_plate_name();
+        j["plate_box"] = { pb.min.x(), pb.min.y(), pb.max.x(), pb.max.y() };
+        j["exclude"]   = nlohmann::json::array();
+        for (const BoundingBoxf3& e : p->get_exclude_areas())
+            j["exclude"].push_back({ e.min.x(), e.min.y(), e.max.x(), e.max.y() });
+        const ConfigOptionStrings* colors = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+        const Selection& sel = plater->get_view3D_canvas3D()->get_selection();
+        Model& model = plater->model();
+        j["objects"] = nlohmann::json::array();
+        for (size_t oi = 0; oi < model.objects.size(); ++oi) {
+            ModelObject* o = model.objects[oi];
+            for (size_t ii = 0; ii < o->instances.size(); ++ii) {
+                if (plates.find_instance_belongs((int) oi, (int) ii) != plate) continue;
+                ModelInstance* mi = o->instances[ii];
+                nlohmann::json ji;
+                ji["obj"]  = oi;
+                ji["inst"] = ii;
+                ji["name"] = o->name;
+                const BoundingBoxf3 bb = o->instance_bounding_box(ii);
+                ji["bbox"] = { bb.min.x(), bb.min.y(), bb.max.x(), bb.max.y() };
+                ji["size"] = { bb.size().x(), bb.size().y(), bb.size().z() };
+                const Vec3d off = mi->get_offset();
+                ji["offset"] = { off.x(), off.y(), off.z() };
+                ji["rz"]     = mi->get_rotation().z() * 180.0 / M_PI;
+                ji["scale"]  = mi->get_scaling_factor().x();
+                ji["hull"]   = nlohmann::json::array();
+                {
+                    // From the meshes themselves: the volumes' cached 2D hulls are empty until
+                    // something (arrange, collision checks) computes them.
+                    Points pts;
+                    for (const ModelVolume* v : o->volumes)
+                        if (v->is_model_part()) {
+                            // The volume's 3D convex hull projects to the same outline as the mesh
+                            // with a fraction of the vertices; fall back to the mesh when absent.
+                            const indexed_triangle_set& its = v->get_convex_hull().its.indices.empty() ? v->mesh().its : v->get_convex_hull().its;
+                            const Transform3f t = (mi->get_transformation().get_matrix() * v->get_matrix()).cast<float>();
+                            its_collect_mesh_projection_points_above(its, t, -1.e9f, pts);
+                        }
+                    const Polygon hull = Geometry::convex_hull(std::move(pts));
+                    for (const Point& pt : hull.points)
+                        ji["hull"].push_back({ unscale<double>(pt.x()), unscale<double>(pt.y()) });
+                    if (hull.points.empty()) // degenerate mesh: fall back to the bounding box
+                        ji["hull"] = { { bb.min.x(), bb.min.y() }, { bb.max.x(), bb.min.y() }, { bb.max.x(), bb.max.y() }, { bb.min.x(), bb.max.y() } };
+                }
+                int extruder = 0;
+                if (const ConfigOptionInt* e = o->config.get().option<ConfigOptionInt>("extruder")) extruder = e->value;
+                std::string color;
+                if (colors && !colors->values.empty())
+                    color = (extruder > 0 && (size_t) extruder <= colors->values.size()) ? colors->values[extruder - 1] : colors->values[0];
+                ji["color"]    = color;
+                ji["outside"]  = !(bb.min.x() >= pb.min.x() && bb.max.x() <= pb.max.x() && bb.min.y() >= pb.min.y() && bb.max.y() <= pb.max.y());
+                ji["selected"] = sel.is_single_full_instance() && sel.get_object_idx() == (int) oi && sel.get_instance_idx() == (int) ii;
+                j["objects"].push_back(ji);
+            }
+        }
+    }, 30000);
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); }
+    else if (out->empty()) { r.status = 404; r.body = json_error("no such plate"); }
+    else r.body = out->dump();
+    return r;
+}
+
+// Move / rotate / scale one instance the way the sidebar does it (selection + the canvas'
+// do_move / do_rotate / do_scale, so undo, plate membership and dirty state follow).
+// Form: obj=&inst=[&x=&y= (absolute instance position, mm)][&rz= (absolute Z rotation, deg)]
+//       [&scale= (absolute uniform factor)][&center=1 (centre the model on its plate)]
+RemoteAccess::ApiResponse RemoteAccess::api_object_transform(const std::string& form)
+{
+    auto get = [&](const char* k) { return query_param(form, k); };
+    auto num = [&](const char* k, double def, bool& has) { const std::string v = get(k); has = !v.empty(); try { return has ? std::stod(v) : def; } catch (...) { has = false; return def; } };
+    bool has_obj, has_inst, has_x, has_y, has_rz, has_scale;
+    const int    obj   = (int) num("obj", -1, has_obj);
+    const int    inst  = (int) num("inst", 0, has_inst);
+    const double x     = num("x", 0, has_x), y = num("y", 0, has_y), rz = num("rz", 0, has_rz), scale = num("scale", 1, has_scale);
+    const bool   center = get("center") == "1";
+    ApiResponse r;
+    if (!has_obj || obj < 0) { r.status = 400; r.body = json_error("obj is required"); return r; }
+    if (has_scale && (scale < 0.01 || scale > 100)) { r.status = 400; r.body = json_error("scale must be between 0.01 and 100"); return r; }
+    if (!has_x && !has_y && !has_rz && !has_scale && !center) { r.status = 400; r.body = json_error("nothing to change"); return r; }
+    auto result = std::make_shared<std::pair<int, std::string>>(500, "");
+    auto out    = std::make_shared<nlohmann::json>();
+    bool ok     = run_on_main([=]() {
+        Plater* plater = wxGetApp().plater();
+        if (plater->is_background_process_slicing()) { *result = { 409, "slicing in progress" }; return; }
+        Model& model = plater->model();
+        if (obj >= (int) model.objects.size()) { *result = { 404, "no such object" }; return; }
+        ModelObject* o = model.objects[obj];
+        if (inst < 0 || inst >= (int) o->instances.size()) { *result = { 404, "no such instance" }; return; }
+        plater->select_view_3D("3D");
+        GLCanvas3D* canvas = plater->get_view3D_canvas3D();
+        Selection&  sel    = canvas->get_selection();
+        sel.add_instance((unsigned) obj, (unsigned) inst, true);
+        ModelInstance* mi = o->instances[inst];
+        if (has_rz) {
+            const double cur = mi->get_rotation().z() * 180.0 / M_PI;
+            TransformationType t;
+            t.set_relative();
+            if (sel.is_single_full_instance()) t.set_independent();
+            sel.setup_cache();
+            sel.rotate(Vec3d(0, 0, (rz - cur) * M_PI / 180.0), t);
+            plater->take_snapshot("Set Orientation", UndoRedo::SnapshotType::GizmoAction);
+            canvas->do_rotate("");
+        }
+        if (has_scale) {
+            TransformationType t; // absolute, world
+            sel.setup_cache();
+            sel.scale(Vec3d(scale, scale, scale), t);
+            canvas->do_scale("Set Scale");
+        }
+        Vec3d target = mi->get_offset();
+        bool  move   = false;
+        if (has_x) { target.x() = x; move = true; }
+        if (has_y) { target.y() = y; move = true; }
+        if (center) {
+            PartPlateList& plates = plater->get_partplate_list();
+            const int      pi     = plates.find_instance_belongs(obj, inst);
+            PartPlate*     p      = pi >= 0 ? plates.get_plate(pi) : plates.get_curr_plate();
+            const BoundingBoxf3  bb = o->instance_bounding_box(inst);
+            const BoundingBoxf3& pb = p->get_bounding_box(false);
+            target.x() += pb.center().x() - bb.center().x();
+            target.y() += pb.center().y() - bb.center().y();
+            move = true;
+        }
+        if (move) {
+            const Vec3d cur = mi->get_offset();
+            TransformationType t;
+            t.set_relative();
+            sel.setup_cache();
+            sel.translate(target - cur, t);
+            plater->take_snapshot("Set Position", UndoRedo::SnapshotType::GizmoAction);
+            canvas->do_move("");
+        }
+        canvas->set_as_dirty();
+        const Vec3d off = mi->get_offset();
+        (*out)["offset"] = { off.x(), off.y(), off.z() };
+        (*out)["rz"]     = mi->get_rotation().z() * 180.0 / M_PI;
+        (*out)["scale"]  = mi->get_scaling_factor().x();
+        (*out)["plate"]  = plater->get_partplate_list().find_instance_belongs(obj, inst);
+        *result = { 200, "" };
+    }, 60000);
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    if (result->first != 200) { r.status = result->first; r.body = json_error(result->second); return r; }
+    r.body = out->dump();
     return r;
 }
 
@@ -931,6 +1098,8 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "POST"}, {"path", "/api/project/open"},           {"description", "form body path={file uploaded through the hub}&mode=load|import; load (.3mf) saves the current project first, import adds the model to the plate"} },
             { {"method", "GET"},  {"path", "/api/plates"},                 {"description", "project, printer preset, filaments and every plate with objects, slice state, time and filament estimates"} },
             { {"method", "GET"},  {"path", "/api/plates/{index}/thumbnail.png"}, {"description", "rendered plate preview"} },
+            { {"method", "GET"},  {"path", "/api/plates/{index}/layout"},  {"description", "top-down layout: plate box, exclude areas, every instance with its convex hull (mm), bbox, position, Z rotation, scale, colour"} },
+            { {"method", "POST"}, {"path", "/api/objects/transform"},       {"description", "form obj=&inst=[&x=&y=][&rz=][&scale=][&center=1]: move / rotate / scale one instance like the sidebar (undoable)"} },
             { {"method", "GET"},  {"path", "/api/printers"},               {"description", "known printers with live status"} },
             { {"method", "POST"}, {"path", "/api/slice?plate={index}|all"}, {"description", "start slicing one plate (selects it) or all; returns a job id; 409 while slicing"} },
             { {"method", "GET"},  {"path", "/api/jobs"},                   {"description", "recent jobs"} },
@@ -980,7 +1149,11 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
         const size_t      slash = rest.find('/');
         if (slash != std::string::npos && rest.substr(slash) == "/thumbnail.png")
             return api_plate_thumbnail(num(rest.substr(0, slash), -1));
+        if (slash != std::string::npos && rest.substr(slash) == "/layout")
+            return api_plate_layout(num(rest.substr(0, slash), -1));
     }
+    if (path == "/objects/transform" && method == "POST")
+        return api_object_transform(body.empty() ? query : body);
     if (path == "/printers" && method == "GET")
         return api_printers();
     if (path == "/slice" && method == "POST") {

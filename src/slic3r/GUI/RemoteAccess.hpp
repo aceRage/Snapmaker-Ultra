@@ -64,6 +64,8 @@ private:
     ApiResponse api_project_open(const std::string& path, const std::string& mode);
     ApiResponse api_plates();
     ApiResponse api_plate_thumbnail(int plate);
+    ApiResponse api_plate_layout(int plate);
+    ApiResponse api_object_transform(const std::string& form_body);
     ApiResponse api_printers();
     ApiResponse api_slice(int plate, bool all);
     ApiResponse api_jobs(int id);

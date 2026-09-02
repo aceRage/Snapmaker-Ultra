@@ -47,6 +47,8 @@ Manifest at `GET /api`.
 |---|---|
 | `GET /api/plates` | project, printer preset, filaments (name/colour), plates: objects, `boxes` (per object `[min_x, min_y, max_x, max_y]`) and `plate_box`, printable/locked, sliced/ready, slicing percent, time (s), filament (mm³, g from `filament_density`) |
 | `GET /api/plates/{i}/thumbnail.png` | plate render (`update_all_plate_thumbnails(false)` on the GUI thread, PNG via `compress_thumbnail`) |
+| `GET /api/plates/{i}/layout` | top-down layout of one plate: `plate_box`, `exclude` boxes, and per instance (membership by `find_instance_belongs`) the convex hull of the transformed model in world mm (`ModelObject::convex_hull_2d`), bbox, size, position (`offset`), Z rotation (`rz`, degrees), uniform `scale`, filament `color`, `outside`, `selected` |
+| `POST /api/objects/transform` (form `obj=&inst=[&x=&y=][&rz=][&scale=][&center=1]`) | selects the instance in the 3D canvas and applies the change through `Selection::translate/rotate/scale` + `GLCanvas3D::do_move/do_rotate/do_scale` with undo snapshots, exactly like the sidebar's manipulation panel; `center=1` moves the model's bbox centre onto its plate's centre |
 | `GET /api/printers` | `DeviceManager` machines (my + local): online/connected, status, percent, time left, layers, bed/nozzle temps, task, selected |
 | `POST /api/slice?plate={i}\|all` | selects the plate and posts the same toolbar event as the Slice button; returns a job id; 409 while slicing |
 | `GET /api/jobs[/{id}]` | job state (running/done/error/cancelled, percent, text) fed by hooks in `Plater::priv::on_slicing_update` / `on_process_completed` |
@@ -64,6 +66,12 @@ to the process dropdown opens a full-screen editor: preset name with modified co
 (Simple / Advanced / Expert), Revert, Save, the tab's pages as tabs, groups as collapsible sections
 (state remembered per group), and the slicer's lines with bool / enum / text controls; changed
 options are marked and applied on change.
+
+Tapping a plate thumbnail opens the **plate layout editor** (full-screen): an SVG top view of the
+plate (grid, exclude areas) with every object's footprint in its filament colour (dashed red when
+outside the plate); tap selects, drag moves (sent on release), and the bar below offers ±15°/±90°
+and a degrees field, ±10 % and a percent field (uniform scale), the position and *Centre on plate*.
+The card itself stays a thumbnail.
 
 The phone page has Streams / Prepare / Devices tabs in remote mode. Prepare mirrors the slicer:
 printer dropdown, filament rows (colour swatch + dropdown, "+ Add filament"), process dropdown,
