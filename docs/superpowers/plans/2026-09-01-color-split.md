@@ -31,7 +31,7 @@
 |---|---|
 | `src/libslic3r/ColorSplit.hpp` | Public API: depth model, patches, shells, partition, one-shot split, model mutation. No Manifold/CGAL includes. |
 | `src/libslic3r/ColorSplit.cpp` | Implementation (includes `<manifold/manifold.h>`, `MeshBoolean.hpp`, `AABBMesh.hpp`, `NormalUtils.hpp`, `Flow.hpp`, `PaintDepth.hpp`, `ClipperUtils.hpp`). |
-| `src/libslic3r/CMakeLists.txt` | Register the two files next to `MeshBoolean.hpp MeshBoolean.cpp` (line ~509). |
+| `src/libslic3r/CMakeLists.txt` | Register the two files in the main `lisbslic3r_sources` list after `PaintDepth.cpp` (line ~87), not in the `libslic3r_cgal` list. |
 | `tests/libslic3r/test_color_split.cpp` | All `[colorsplit]` / `[colorsplit_spike]` tests + fixtures. |
 | `tests/libslic3r/CMakeLists.txt` | Register the test file after `test_paint_depth_clamp.cpp`. |
 | `src/slic3r/GUI/Jobs/ColorSplitJob.hpp/.cpp` | Plater job: off-thread split, finalize = snapshot + apply + list refresh. |
@@ -46,7 +46,7 @@
 
 **Files:**
 - Create: `src/libslic3r/ColorSplit.hpp`, `src/libslic3r/ColorSplit.cpp`, `tests/libslic3r/test_color_split.cpp`
-- Modify: `src/libslic3r/CMakeLists.txt:509` (add `ColorSplit.hpp ColorSplit.cpp` after the MeshBoolean line), `tests/libslic3r/CMakeLists.txt:9` (add `test_color_split.cpp` after `test_paint_depth_clamp.cpp`)
+- Modify: `src/libslic3r/CMakeLists.txt:87` (add `ColorSplit.cpp` and `ColorSplit.hpp` to the MAIN `lisbslic3r_sources` list right after `PaintDepth.cpp` — NOT the `libslic3r_cgal` list at :506-512, which has no OpenCASCADE/Model include path; libslic3r links Manifold and libslic3r_cgal, which Tasks 2/4/6 need), `tests/libslic3r/CMakeLists.txt:9` (add `test_color_split.cpp` after `test_paint_depth_clamp.cpp`)
 
 **Interfaces:**
 - Produces: `struct ColorPatches { indexed_triangle_set surface; std::vector<int> facet_state; std::vector<int> states; }`, `ColorPatches extract_color_patches(const indexed_triangle_set &mesh, const TriangleSelector::TriangleSplittingData &paint)` (throws `ColorSplitError`), `class ColorSplitError : public std::runtime_error`.
@@ -207,7 +207,7 @@ Note: check the exact `TriangleSelector::select_patch` signature in `src/libslic
 
 - [ ] **Step 3: Register the files and run the tests to verify they fail to compile**
 
-Add `ColorSplit.hpp ColorSplit.cpp` to `src/libslic3r/CMakeLists.txt` right after `MeshBoolean.hpp MeshBoolean.cpp`, and `test_color_split.cpp` to `tests/libslic3r/CMakeLists.txt` after `test_paint_depth_clamp.cpp`. Create an EMPTY `ColorSplit.hpp` (just `#pragma once`) and `ColorSplit.cpp` (just an include). Run `build_next_wt_tests.bat`.
+Add `ColorSplit.cpp` / `ColorSplit.hpp` to the main `lisbslic3r_sources` list in `src/libslic3r/CMakeLists.txt` right after `PaintDepth.cpp`, and `test_color_split.cpp` to `tests/libslic3r/CMakeLists.txt` after `test_paint_depth_clamp.cpp`. Create an EMPTY `ColorSplit.hpp` (just `#pragma once`) and `ColorSplit.cpp` (just an include). Run `build_next_wt_tests.bat`.
 Expected: compile error in test_color_split.cpp (`ColorPatches`/`extract_color_patches` undeclared).
 
 - [ ] **Step 4: Implement the header and patch extraction**
