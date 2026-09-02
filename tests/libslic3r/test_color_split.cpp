@@ -300,6 +300,31 @@ TEST_CASE("colorsplit: refinement adds interior side vertices to a two-ring cyli
     }
 }
 
+TEST_CASE("colorsplit: every refined side vertex of a two-ring cylinder sees the wall", "[colorsplit]")
+{
+    // Ruling 13's whole point: a two-ring cylinder has no side vertex whose normal is radial, so no inward
+    // offset is radial and a painted boss becomes a cup. After refinement EVERY vertex on the wall - the new
+    // ring corners and the vertices the subdivision drops along a chord alike - must see the wall and not a
+    // cap: horizontal normal, pointing outward from the axis. The 5 degree tolerance on "radial" is the
+    // chord quantisation of fa = PI/18: a vertex inside a chord carries that chord's facet normal, which is
+    // at most half a facet angle away from its own radius.
+    TriangleMesh cyl(its_make_cylinder(1.0, 3.0, PI / 18.));
+    ColorPatches p = extract_color_patches(cyl.its, paint_by_predicate(cyl, [](const Vec3f &, const Vec3f &n) { return std::abs(n.z()) < 0.5f; }, EnforcerBlockerType::Extruder2));
+    ColorPatches r = refine_color_patches(p, 0.75);
+    std::vector<Vec3f> n = color_split_normals(r.surface);
+    size_t side = 0;
+    for (size_t v = 0; v < r.surface.vertices.size(); ++v) {
+        const Vec3f &q = r.surface.vertices[v];
+        if (q.z() <= 1e-3f || q.z() >= 3.f - 1e-3f) continue;            // skip both cap rings
+        const float rad = std::hypot(q.x(), q.y());
+        REQUIRE(rad > 0.9f);
+        REQUIRE_THAT(n[v].z(), WithinAbs(0.f, 1e-3f));
+        REQUIRE(n[v].dot(Vec3f(q.x() / rad, q.y() / rad, 0.f)) > float(std::cos(PI / 36.)) - 1e-4f);
+        ++side;
+    }
+    REQUIRE(side > 0);
+}
+
 TEST_CASE("colorsplit: refine length follows max(ws, min(D, diag/20))", "[colorsplit]")
 {
     ColorSplitDepths d = depths_for_test(1.5, 0.2, 0.87);
