@@ -20,6 +20,7 @@
 - Commit prefix `feat(color-split):` / `test(color-split):` / `docs(color-split):`; every commit ends with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 - Painted state value == 1-based filament id; NONE (0) = the volume's own extruder. Depth D, ws, h are world millimetres.
 - No placeholder behaviour: every failure path returns `ColorSplitError` with a user-readable message (§7 of the spec).
+- Floating-point assertions use Catch2 matchers (`REQUIRE_THAT(x, WithinRel(expected, rel))` / `WithinAbs(expected, abs)` with `using Catch::Matchers::WithinRel; using Catch::Matchers::WithinAbs;` and `#include <catch2/matchers/catch_matchers_floating_point.hpp>`), never `Approx` — `tests/CLAUDE.md` §4 forbids it. `its_volume` is float32: use relative tolerances ≥ 1e-4 on volumes.
 - Real TDD: each test must be seen failing (compile error or assertion) before the implementation step.
 
 ---
@@ -171,7 +172,7 @@ TEST_CASE("colorsplit: strict patches share boundary vertices and cover the surf
     REQUIRE(p.states == std::vector<int>{2});
     REQUIRE(p.facet_state.size() == p.surface.indices.size());
     REQUIRE(its_num_open_edges(p.surface) == 0);
-    REQUIRE(its_volume(p.surface) == Approx(40. * 40. * 20.).epsilon(1e-6));
+    REQUIRE_THAT(its_volume(p.surface), WithinRel(40. * 40. * 20., 1e-6));
     size_t painted = 0;
     for (int s : p.facet_state) painted += (s == 2);
     REQUIRE(painted == 2);
@@ -187,7 +188,7 @@ TEST_CASE("colorsplit: a brush stroke cutting through facets still yields a clos
     ColorPatches p = extract_color_patches(cube.its, selector.serialize());
     REQUIRE(p.states == std::vector<int>{3});
     REQUIRE(its_num_open_edges(p.surface) == 0);
-    REQUIRE(its_volume(p.surface) == Approx(40. * 40. * 20.).epsilon(1e-6));
+    REQUIRE_THAT(its_volume(p.surface), WithinRel(40. * 40. * 20., 1e-6));
     REQUIRE(p.surface.indices.size() > cube.its.indices.size());
 }
 
@@ -365,20 +366,20 @@ TEST_CASE("colorsplit: depths mirror paint_depth_band_mm and the shell layer rul
     Flow per = Flow::new_from_config_width(frPerimeter,         *cfg.option<ConfigOptionFloatOrPercent>("inner_wall_line_width"), 0.4f, 0.2f);
     float band = paint_depth_band_mm(pdmWalls, 3, 1.5, ext.width(), ext.spacing(), per.spacing());
     band = paint_depth_band_classic_floor_mm(band, ext.width(), ext.spacing());
-    REQUIRE(d.D == Approx(band));
-    REQUIRE(d.ws == Approx(ext.width() + ext.spacing()));
-    REQUIRE(d.layer_height == Approx(0.2));
+    REQUIRE_THAT(d.D, WithinRel(band, 1e-5));
+    REQUIRE_THAT(d.ws, WithinRel(ext.width() + ext.spacing(), 1e-5));
+    REQUIRE_THAT(d.layer_height, WithinRel(0.2, 1e-5));
     REQUIRE(!d.unlimited);
     // top: max(4 layers, 0.6mm/0.2 = 3 layers) = 4 layers = 0.8mm; bottom: 3 layers, thickness 0 -> 0.6mm
-    REQUIRE(d.cap_top == Approx(0.8));
-    REQUIRE(d.cap_bottom == Approx(0.6));
+    REQUIRE_THAT(d.cap_top, WithinRel(0.8, 1e-5));
+    REQUIRE_THAT(d.cap_bottom, WithinRel(0.6, 1e-5));
 
     cfg.option<ConfigOptionInt>("top_shell_layers")->value = 0;          // zero count = no shell: surface layer only
-    REQUIRE(color_split_depths(cfg, {1, 2}).cap_top == Approx(0.2));
+    REQUIRE_THAT(color_split_depths(cfg, {1, 2}).cap_top, WithinRel(0.2, 1e-5));
 
     ColorSplitDepths u = color_split_depths(split_test_config(pdmUnlimited), {1, 2});
     REQUIRE(u.unlimited);
-    REQUIRE(color_split_depths(split_test_config(pdmMillimeters, 3, 2.5), {1, 2}).D == Approx(2.5));
+    REQUIRE_THAT(color_split_depths(split_test_config(pdmMillimeters, 3, 2.5), {1, 2}).D, WithinRel(2.5, 1e-5));
 }
 
 TEST_CASE("colorsplit: per-vertex depth is min(D, half thickness)", "[colorsplit]")
@@ -389,7 +390,7 @@ TEST_CASE("colorsplit: per-vertex depth is min(D, half thickness)", "[colorsplit
     std::vector<Vec3f> np = color_split_normals(pp.surface);
     std::vector<float> dp = compute_vertex_depths(pp, np, 1.5);
     for (size_t v = 0; v < pp.surface.vertices.size(); ++v)
-        if (pp.surface.vertices[v].z() > 1.0f) REQUIRE(dp[v] == Approx(0.598f).margin(1e-3f));
+        if (pp.surface.vertices[v].z() > 1.0f) REQUIRE_THAT(dp[v], WithinAbs(0.598f, 1e-3f));
 
     TriangleMesh block = make_cube(40., 40., 20.);
     ColorPatches pb = extract_color_patches(block.its, paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
@@ -397,7 +398,7 @@ TEST_CASE("colorsplit: per-vertex depth is min(D, half thickness)", "[colorsplit
     std::vector<float> db = compute_vertex_depths(pb, nb, 1.5);
     // Corner normals are bisectors (angle weighted -> exact (±1,±1,1)/sqrt3); the ray along -n exits far away.
     for (size_t v = 0; v < pb.surface.vertices.size(); ++v)
-        REQUIRE(db[v] == Approx(1.5f).margin(1e-4f));
+        REQUIRE_THAT(db[v], WithinAbs(1.5f, 1e-4f));
     // Unlimited (D = inf) -> half thickness along the normal: 10mm at the top-face interior direction is not
     // sampled on a plain cube (only corner vertices exist), corners see the body diagonal/2.
     std::vector<float> du = compute_vertex_depths(pb, nb, std::numeric_limits<double>::infinity());
@@ -581,7 +582,7 @@ TEST_CASE("colorsplit: thin plate painted on both sides gives two shells meeting
         ShellCheck c = check_shell(s.mesh);
         REQUIRE(c.closed);
         REQUIRE(!c.self_intersects);
-        REQUIRE(c.volume == Approx(40. * 40. * 0.6).epsilon(0.08));   // frustum-ish, ~0.6mm deep
+        REQUIRE_THAT(c.volume, WithinRel(40. * 40. * 0.6, 0.08));   // frustum-ish, ~0.6mm deep
     }
 }
 
@@ -600,7 +601,7 @@ TEST_CASE("colorsplit: pinch boundary (two cells touching at one vertex) builds 
         ShellCheck c = check_shell(s.mesh);
         REQUIRE(c.closed);
         REQUIRE(!c.self_intersects);
-        REQUIRE(c.volume == Approx(10. * 10. * 1.5).epsilon(0.02));
+        REQUIRE_THAT(c.volume, WithinRel(10. * 10. * 1.5, 0.02));
     }
 }
 
@@ -869,11 +870,11 @@ TEST_CASE("colorsplit: partition of a painted top is exact and complementary", "
     REQUIRE(its_num_open_edges(r.body) == 0);
     REQUIRE(its_num_open_edges(r.pieces[0].second) == 0);
     const double total = volume_of(r.body) + volume_of(r.pieces[0].second);
-    REQUIRE(total == Approx(40. * 40. * 20.).epsilon(1e-4));
+    REQUIRE_THAT(total, WithinRel(40. * 40. * 20., 1e-4));
     REQUIRE(volume_of(r.pieces[0].second) < 40. * 40. * 1.5 + 1.);
     // The piece's top surface is the original top face: every piece vertex has z <= 20 and the max is 20.
     float zmax = -1.f; for (const Vec3f &v : r.pieces[0].second.vertices) zmax = std::max(zmax, v.z());
-    REQUIRE(zmax == Approx(20.f));
+    REQUIRE_THAT(zmax, WithinRel(20.f, 1e-5));
 }
 
 TEST_CASE("colorsplit: three adjacent colours tile the top face, lower filament wins overlaps", "[colorsplit]")
@@ -888,7 +889,7 @@ TEST_CASE("colorsplit: three adjacent colours tile the top face, lower filament 
     REQUIRE(r.pieces.size() == 3);
     double total = volume_of(r.body);
     for (auto &pc : r.pieces) { REQUIRE(its_num_open_edges(pc.second) == 0); total += volume_of(pc.second); }
-    REQUIRE(total == Approx(40. * 40. * 20.).epsilon(1e-4));
+    REQUIRE_THAT(total, WithinRel(40. * 40. * 20., 1e-4));
     // pairwise disjoint: intersect pieces with Manifold and expect empty
     for (size_t i = 0; i < 3; ++i)
         for (size_t j = i + 1; j < 3; ++j) {
@@ -907,7 +908,7 @@ TEST_CASE("colorsplit: painted sphere smaller than D is wholly its colour (islan
     ColorSplitResult r = split_volume_by_paint(sphere.its, data, depths_for_test(1.5), params, nullptr);
     REQUIRE(r.pieces.size() == 1);
     REQUIRE(r.body.indices.empty());
-    REQUIRE(volume_of(r.pieces[0].second) == Approx(volume_of(sphere.its)).epsilon(1e-4));
+    REQUIRE_THAT(volume_of(r.pieces[0].second), WithinRel(volume_of(sphere.its), 1e-4));
     params.absorb_islands = false;
     ColorSplitResult r2 = split_volume_by_paint(sphere.its, data, depths_for_test(1.5), params, nullptr);
     REQUIRE(!r2.body.indices.empty());
@@ -945,7 +946,7 @@ TEST_CASE("colorsplit spike: S1 self-intersecting fixtures and S3 timing", "[col
     t1 = clock::now();
     WARN("S3 three colours: " << std::chrono::duration<double>(t1 - t0).count() << " s, pieces " << r3.pieces.size());
     double total = volume_of(r3.body); for (auto &pc : r3.pieces) total += volume_of(pc.second);
-    REQUIRE(total == Approx(volume_of(sphere.its)).epsilon(1e-4));
+    REQUIRE_THAT(total, WithinRel(volume_of(sphere.its), 1e-4));
 
     // S1: 2mm boss on a block (convex feature narrower than 2D) painted entirely.
     TriangleMesh block = make_cube(40., 40., 10.);
@@ -958,7 +959,7 @@ TEST_CASE("colorsplit spike: S1 self-intersecting fixtures and S3 timing", "[col
     ColorSplitResult rb = split_volume_by_paint(bossed.its, paint, depths_for_test(1.5), ColorSplitParams{}, nullptr);
     REQUIRE(rb.pieces.size() == 1);
     WARN("S1 boss: piece volume " << volume_of(rb.pieces[0].second) << " (boss volume " << PI * 4.0 << ")");
-    REQUIRE(volume_of(rb.pieces[0].second) == Approx(PI * 1.0 * 1.0 * 4.0).epsilon(0.05));   // whole boss: two half-shells meet at the axis (delta sliver), top slab covers the rest
+    REQUIRE_THAT(volume_of(rb.pieces[0].second), WithinRel(PI * 1.0 * 1.0 * 4.0, 0.05));   // whole boss: two half-shells meet at the axis (delta sliver), top slab covers the rest
 }
 ```
 
@@ -1142,7 +1143,7 @@ TEST_CASE("colorsplit: flat top is capped at the solid shell depth, slopes are n
     REQUIRE(shells.size() == 1);
     REQUIRE(shells[0].capped);
     float zmin = 1e9f; for (const Vec3f &v : shells[0].mesh.vertices) zmin = std::min(zmin, v.z());
-    REQUIRE(zmin == Approx(20.f - 0.6f).margin(1e-4f));
+    REQUIRE_THAT(zmin, WithinAbs(20.f - 0.6f, 1e-4f));
 
     // 3 degree slope: a 40x40 wedge whose top rises 40*tan(3deg): NOT flat (tan 3deg = 0.052 > h/(3ws) = 0.038)
     indexed_triangle_set wedge = its_make_cube(40., 40., 20.);
@@ -1373,7 +1374,7 @@ TEST_CASE("colorsplit: a rotated, scaled and mirrored PART stays in place", "[co
     BoundingBoxf3 before = world_bbox(object);
     ColorSplitSpace space = color_split_space(object, src);
     REQUIRE(!space.world_path);                       // isotropic: mesh-space path
-    REQUIRE(space.depth_scale == Approx(1.5));
+    REQUIRE_THAT(space.depth_scale, WithinRel(1.5, 1e-5));
     ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(), scale_depths(depths_for_test(1.5), space.depth_scale), ColorSplitParams{}, nullptr);
     apply_color_split(object, 0, std::move(r), space, false, false);
     object.invalidate_bounding_box();
@@ -1402,7 +1403,7 @@ TEST_CASE("colorsplit: anisotropic instance scale takes the world path", "[color
     // the piece is 1.5mm deep in WORLD z (instance scale is in x only)
     const ModelVolume *piece = object.volumes.back();
     BoundingBoxf3 pb = piece->mesh().bounding_box();
-    REQUIRE(pb.size().z() == Approx(1.5).epsilon(0.02));
+    REQUIRE_THAT(pb.size().z(), WithinRel(1.5, 0.02));
 }
 
 TEST_CASE("colorsplit: empty body removes the source and keeps only pieces", "[colorsplit]")
