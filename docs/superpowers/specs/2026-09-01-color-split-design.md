@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.10 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–9) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.11 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–9) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -126,6 +126,12 @@ boundary is a **crease** when n_P·n_Q < cos 15°.
   Case B iff |n_P·z| < |n_Q·z| − 10⁻³. Two vertical faces (or two equally sloped ones) have no layer asymmetry,
   so their crease takes the plain mitred bisector: the 45° Voronoi diagonal the 2D segmentation produces. Holding
   a wall stack there (Case B) would claim ws·(2D − ws) per layer more than the 2D path (Task 9 measurement).
+- Per-vertex classification (rev 2.11, Ruling 26, known limit): the crease case is chosen once per boundary
+  vertex (one ring copy). A vertex where a Case-B edge meets a tie edge — every corner of a four-vertex face —
+  is Case B, so the tie edges inherit the wall-stack hold: on a plain cube face the piece claims ws·(2D − ws)
+  per layer more than the 2D Voronoi diagonal (≈1.6 mm² at stock settings, invisible, ≤ one wall stack along
+  the vertical creases). Per-edge classification would remove it and is deferred. The end-to-end parity test
+  compares against the 2D path with its interlocking notch disabled (a 2D-only artefact).
 - Width guard (rev 2.7, Ruling 22): the Case A inset is applied to a group only if the group's projection onto
   the plane perpendicular to its mean normal survives an inward offset of ws (the flat cap's own yardstick);
   otherwise the group's Case A vertices use the plain bisector rule. A painted stroke narrower than 2·ws
