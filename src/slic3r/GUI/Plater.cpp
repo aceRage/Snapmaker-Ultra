@@ -11110,9 +11110,11 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
             std::string last_backup = last;
             std::string originfile;
             // Ultra: a hidden instance must neither prompt nor delete the backup; a person decides later.
-            if (wxGetApp().is_hub_managed() && RemoteAccess::get().hidden()) {
-                if (Slic3r::has_restore_data(last_backup, originfile))
-                    RemoteAccess::get().raise_attention("an unsaved project from a previous session is waiting to be restored", "manual");
+            // It still starts from a named, empty project like a visible one (the title bar and the
+            // hub list read "Untitled" instead of nothing).
+            if (wxGetApp().is_hub_managed() && RemoteAccess::get().hidden() && Slic3r::has_restore_data(last_backup, originfile)) {
+                RemoteAccess::get().raise_attention("an unsaved project from a previous session is waiting to be restored", "manual");
+                this->q->new_project(e.GetInt(), true);
                 return;
             }
             if (Slic3r::has_restore_data(last_backup, originfile)) {

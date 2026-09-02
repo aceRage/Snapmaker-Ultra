@@ -29,13 +29,15 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
 <div class="sub">Camera relays, phone access and the list of open slicer windows. This page only works on this PC.</div>
 <div class="row">
   <div class="card" id="phone"><h2>Phone access</h2><div id="phonebody">Loading…</div></div>
-  <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div></div>
+  <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div>
+    <div class="note">A hidden slicer runs without a window and serves the phone; Show puts its window on the desktop, Hide takes it away again (it keeps working). "Needs attention" means it hit something only a person at this PC can answer - a file dialog, first-run setup, a mandatory update - so its window has been shown; Dismiss clears the flag once handled.</div>
+  </div>
 </div>
 <div class="card" style="margin-top:16px"><h2>Hub</h2>
   <span class="btn dim" id="new">Open a new slicer window</span>
   <span class="btn dim" id="newhidden">Open a hidden slicer</span>
   <span class="btn warn" id="quit">Quit hub</span>
-  <div class="note">Quitting stops phone access and the camera relays; the next slicer window starts the hub again.</div>
+  <div class="note">"Open a new slicer window" starts a slicer you can see; "Open a hidden slicer" starts one without a window (find it under Slicer windows or in the tray menu). Quitting the hub stops phone access and the camera relays; the next slicer window starts the hub again.</div>
   <div class="note" id="status"></div>
 </div>
 <script src="/hub/qrcode.js"></script>
@@ -80,11 +82,17 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
         if (!list.length) { body.appendChild(el('div', 'note', 'No slicer window is open.')); return; }
         list.forEach(function(i) {
             var d = el('div', 'inst');
-            d.appendChild(el('div', 't', i.index + ' · ' + (i.title || 'Untitled') + (i.hidden ? ' (hidden)' : '') + (i.slicing ? ' (slicing)' : '')));
+            d.appendChild(el('div', 't', i.index + ' · ' + (i.title || 'Untitled') + (i.hidden ? ' (hidden)' : '') + (i.slicing ? ' (slicing)' : '') + (i.needs_attention ? ' (needs attention)' : '')));
             d.appendChild(el('div', 'm', i.path || 'not saved yet'));
+            if (i.needs_attention) d.appendChild(el('div', 'err', 'Needs a person at this PC' + (i.attention_reason ? ': ' + i.attention_reason : '') + '.'));
             var b = el('span', 'btn' + (i.hidden ? '' : ' dim'), i.hidden ? 'Show' : 'Hide');
             b.onclick = function() { post('/hub/instances/' + i.pid + '/window?show=' + (i.hidden ? '1' : '0')).then(refresh); };
             d.appendChild(b);
+            if (i.needs_attention) {
+                var c = el('span', 'btn dim', 'Dismiss');
+                c.onclick = function() { post('/hub/instances/' + i.pid + '/attention/clear').then(refresh); };
+                d.appendChild(c);
+            }
             var q = el('span', 'btn warn', 'Quit');
             q.onclick = function() {
                 if (!confirm('Quit slicer window ' + i.index + '? Unsaved work is saved first.')) return;

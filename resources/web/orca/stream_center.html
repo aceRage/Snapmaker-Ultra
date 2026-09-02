@@ -1061,6 +1061,19 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         });
         sel.onchange = function() { selectInstance(parseInt(sel.value) || 0); };
         bar.appendChild(sel);
+        // The PC side of the selected slicer: phone-started slicers run without a window until asked.
+        var cur = null;
+        instances.forEach(function(i) { if (i.id === instSel) cur = i; });
+        if (cur) {
+            var pc = el('span', 'btn small', cur.hidden ? 'Show on PC' : 'Hide on PC');
+            pc.title = cur.hidden ? 'Open this slicer\'s window on the PC' : 'Take this slicer\'s window off the PC desktop; it keeps serving the phone';
+            pc.onclick = function() {
+                pc.textContent = cur.hidden ? 'Showing…' : 'Hiding…';
+                fetch(instBase() + 'api/window?show=' + (cur.hidden ? '1' : '0'), { method: 'POST', body: 'via=phone', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+                    .then(function() { lastInstJson = ''; setTimeout(function() { refreshInstances(); }, 1500); }).catch(fail);
+            };
+            bar.appendChild(pc);
+        }
         // A slicer that hit something only a person at the PC can answer (its window is shown there).
         var att = instances.filter(function(i) { return i.needs_attention; });
         if (att.length) {
@@ -1095,7 +1108,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 row.appendChild(load);
             }
             var fresh = el('span', 'btn' + (instances.length ? ' dim' : ''), instances.length ? 'New' : 'Open');
-            fresh.title = 'Open in a new slicer window';
+            fresh.title = 'Open in a new slicer (hidden on the PC; "Show on PC" brings its window up)';
             fresh.onclick = function() { uploadFile(REMOTE + 'api/instances/open', 'Starting a new slicer…', true); };
             row.appendChild(fresh);
         }

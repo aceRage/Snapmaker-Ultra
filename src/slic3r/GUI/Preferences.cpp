@@ -1608,6 +1608,12 @@ wxWindow* PreferencesDialog::create_ultra_page()
     auto item_spoolman_deduct = create_item_checkbox(_L("Deduct filament usage when sending a print"), page,
         _L("After a job is sent to the printer, subtract the sliced filament weight from the spools bound to each slot in the Spool Manager."), 50, "spoolman_deduct");
 
+    // Ultra: hidden service mode. The hub passes SNORCA_HIDDEN explicitly for the slicers it starts,
+    // so this only decides slicers started by hand (double-click, file association, command line).
+    auto title_phone = create_item_title(_L("Phone access"), page, _L("Phone access"));
+    auto item_start_hidden = create_item_checkbox(_L("Start hidden (serve the phone without a window)"), page,
+        _L("Slicers you start by hand run without a window and serve the phone in the background. Bring a window back from the hub's tray icon (Slicer windows > Show), the hub page, or the phone's \"Show on PC\". Slicers started from the phone are always hidden, and a hidden slicer shows itself when it needs a person at the PC."), 50, "start_hidden");
+
     sizer_page->Add(title_project, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_autosave, 0, wxTOP, FromDIP(3));
     item_autosave->Add(item_autosave_interval, 0, wxLEFT, 0);
@@ -1628,6 +1634,8 @@ wxWindow* PreferencesDialog::create_ultra_page()
     sizer_page->Add(item_spoolman_enabled, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_spoolman_url, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_spoolman_deduct, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(title_phone, 0, wxTOP | wxEXPAND, FromDIP(20));
+    sizer_page->Add(item_start_hidden, 0, wxTOP, FromDIP(3));
 
     page->SetSizer(sizer_page);
     page->Layout();

@@ -35,6 +35,16 @@ Implemented: `RemoteAccess::dialog_mode()` (Interactive / Request / Background),
 
 Gate (`test_stage3.py` on a hidden instance): request-mode modal answered yes and logged; a file dialog cancelled, attention raised, window shown, hub list flagged, cleared from the phone route, hidden again; a blocked GUI thread -> 503, timeout attention, cleared by the heartbeat after a later request; slice runs synchronously; a settings save creates no SavePresetDialog. Findings: `wxClassInfo::GetClassName()` returns `wxChar*`; the fork's dialogs without RTTI macros report their base class name, so the rule table matters mostly for wx natives and the style-derived default covers the rest (custom-button dialogs have no standard ids -> cancel). Not yet exercised at runtime: the Background-mode branches of the call-site guards (memory warning, restore prompt, wizard, force upgrade) - they are straightforward early returns, but a datadir-level test would be worth adding in Stage 4.
 
+## 2d. Stage 4 status (2026-09-02): DONE, gate held
+
+Shipped: Preferences > Ultra > Phone access > "Start hidden (serve the phone without a window)" (`start_hidden`, default off; precedence stays env > `--hidden` > preference); hub page explains visible vs hidden slicers, marks *(needs attention)* with the reason and offers Dismiss (new loopback relay `POST /hub/instances/<pid>/attention/clear`); phone Prepare tab gets a *Show on PC* / *Hide on PC* chip for the selected slicer and the *New* button says it opens hidden; user/developer description in `docs/superpowers/specs/2026-09-02-hidden-service-mode.md`.
+
+Gate (`test_stage4.py`, on isolated data directories under `snorca_hubtest\dd_fresh` and `dd_copy`, never the real one): fresh empty datadir + hidden -> no wizard, attention "this slicer has no printer configured yet", window shown, hub lists it, hub-page Dismiss relay clears it, hidden again, quit; configured copy -> preference alone starts hidden, `SNORCA_HIDDEN=0` beats it, `--hidden` beats a false preference, plain launch is visible; Show / Hide through the phone route with a form body; installed pages carry the new controls. Then `test_hidden.py`, `test_stage2.py`, `test_stage3.py` and the visible regression `test_preview2.py` all pass on the final build.
+
+Finding fixed on the way: the Stage 3 restore-prompt guard returned before `Plater::new_project`, so a hidden instance started without a file had no project name - an empty title bar once shown and an empty title in the hub list. The guard now fires only when there is restore data (keeps the backup, raises attention) and still starts from a named empty project. The test's window check requires a window title, which is what caught it.
+
+Not exercised at runtime (straightforward early returns, would need staged data): the mid-slice memory warning, the mandatory-update branch and the restore-data branch itself. Fresh-datadir attention shows the window; the person then runs the printer wizard from the menu.
+
 ## 3. Shared contract (names the three phases must agree on)
 
 The drafts were written independently; use these names when implementing:

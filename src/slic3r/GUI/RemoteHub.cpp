@@ -1089,13 +1089,17 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
         respond_json(client, 200, "{\"ok\":true}");
         m_quit = true;
     } else if (r.path.compare(0, 15, "/hub/instances/") == 0 && r.method == "POST") {
-        // /hub/instances/<pid>/window?show=1|0 and /hub/instances/<pid>/quit[?discard=1]
+        // /hub/instances/<pid>/window?show=1|0, /hub/instances/<pid>/quit[?discard=1] and
+        // /hub/instances/<pid>/attention/clear (the hub page's Dismiss)
         const std::string rest  = r.path.substr(15);
         const size_t      slash = rest.find('/');
         const long        pid   = std::atol(rest.substr(0, slash).c_str());
         const std::string sub   = slash == std::string::npos ? "" : rest.substr(slash);
         if (sub == "/window") {
             auto res = instance_post(pid, std::string("/api/window?show=") + (query_param(r.query, "show") == "0" ? "0" : "1"));
+            respond_json(client, res.first, res.second);
+        } else if (sub == "/attention/clear") {
+            auto res = instance_post(pid, "/api/attention/clear");
             respond_json(client, res.first, res.second);
         } else if (sub == "/quit") {
             auto res = instance_post(pid, std::string("/api/quit") + (query_param(r.query, "discard") == "1" ? "?discard=1" : ""));
