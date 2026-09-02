@@ -58,6 +58,7 @@ private:
         int         status { 200 };
         std::string type { "application/json" };
         std::string body;
+        std::string headers; // extra "Name: value\r\n" lines
     };
     ApiResponse handle_api(const std::string& method, const std::string& path, const std::string& query, const std::string& body);
     ApiResponse api_info();
@@ -66,7 +67,8 @@ private:
     ApiResponse api_plate_thumbnail(int plate);
     ApiResponse api_plate_layout(int plate);
     ApiResponse api_plate_preview(int plate);
-    ApiResponse api_plate_preview_png(int plate, const std::string& view, int layer, int w, int h);
+    ApiResponse api_plate_preview_png(int plate, const std::string& view, int layer, int w, int h, double zoom, double cx, double cy);
+    ApiResponse api_plate_preview_status(int plate);
     ApiResponse api_object_transform(const std::string& form_body);
     ApiResponse api_printers();
     ApiResponse api_slice(int plate, bool all);

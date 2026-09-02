@@ -13,6 +13,7 @@
 #include "Selection.hpp"
 #include "Tab.hpp"
 #include "IMSlider.hpp"
+#include <cmath>
 #include <set>
 #include <climits>
 #include "libslic3r/FilamentColorLibrary.hpp"
@@ -401,15 +402,47 @@ RemoteAccess::ApiResponse RemoteAccess::api_plate_preview(int plate)
 
 // One frame of the PC's G-code preview: the toolpaths of layers 0..layer (the PC's layer slider is
 // moved there too) from a named orthographic view, on a transparent background.
-RemoteAccess::ApiResponse RemoteAccess::api_plate_preview_png(int plate, const std::string& view_in, int layer, int w, int h)
+// Cheap, side-effect free: what the phone polls to notice a re-slice (new result_id) or an edit
+// that invalidated the result, without touching what the PC shows.
+RemoteAccess::ApiResponse RemoteAccess::api_plate_preview_status(int plate)
+{
+    auto out = std::make_shared<nlohmann::json>();
+    auto err = std::make_shared<std::string>();
+    bool ok  = run_on_main([out, err, plate]() {
+        Plater*        plater = wxGetApp().plater();
+        PartPlateList& plates = plater->get_partplate_list();
+        if (plate < 0 || plate >= plates.get_plate_count()) { *err = "no such plate"; return; }
+        PartPlate*      p      = plates.get_plate(plate);
+        const bool      sliced = p->is_slice_result_valid() && p->get_slice_result() != nullptr;
+        nlohmann::json& j      = *out;
+        j["index"]           = plate;
+        j["sliced"]          = sliced;
+        j["slicing"]         = plater->is_background_process_slicing();
+        j["slicing_percent"] = p->get_slicing_percent();
+        j["result_id"]       = sliced ? p->get_slice_result()->id : 0u;
+        j["current_plate"]   = plates.get_curr_plate_index();
+        j["preview_shown"]   = plater->is_preview_shown();
+    }, 5000);
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    if (!err->empty()) { r.status = 404; r.body = json_error(*err); return r; }
+    r.body = out->dump();
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_plate_preview_png(int plate, const std::string& view_in, int layer, int w, int h, double zoom, double cx, double cy)
 {
     static const std::set<std::string> views = { "front", "rear", "left", "right", "top", "bottom", "iso" };
     const std::string view = views.count(view_in) ? view_in : "front";
     w = std::max(64, std::min(2048, w));
     h = std::max(64, std::min(2048, h));
+    zoom = std::isfinite(zoom) ? std::max(1.0, std::min(16.0, zoom)) : 1.0;
+    cx   = std::isfinite(cx) ? std::max(0.0, std::min(1.0, cx)) : 0.5;
+    cy   = std::isfinite(cy) ? std::max(0.0, std::min(1.0, cy)) : 0.5;
     auto data = std::make_shared<ThumbnailData>();
     auto err  = std::make_shared<std::string>();
-    bool ok   = run_on_main([data, err, plate, view, layer, w, h]() {
+    auto eff  = std::make_shared<double>(1.0);
+    bool ok   = run_on_main([data, err, eff, plate, view, layer, w, h, zoom, cx, cy]() {
         const std::string e = ensure_preview_loaded(plate);
         if (!e.empty()) { *err = e; return; }
         Plater*      plater = wxGetApp().plater();
@@ -433,14 +466,15 @@ RemoteAccess::ApiResponse RemoteAccess::api_plate_preview_png(int plate, const s
         box.min.z() = std::min(box.min.z(), -1.0);
         const BoundingBoxf3& pb = plater->get_partplate_list().get_plate(plate)->get_bounding_box();
         const BoundingBoxf3  bed(Vec3d(pb.min.x(), pb.min.y(), -1.0), Vec3d(pb.max.x(), pb.max.y(), 0.0));
-        canvas->render_gcode_preview_image(*data, (unsigned int) w, (unsigned int) h, view, box, bed);
+        canvas->render_gcode_preview_image(*data, (unsigned int) w, (unsigned int) h, view, box, bed, zoom, cx, cy, eff.get());
     }, 30000);
     ApiResponse r;
     if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
     if (!err->empty()) { r.status = *err == "no such plate" ? 404 : 409; r.body = json_error(*err); return r; }
     if (!data->is_valid()) { r.status = 500; r.body = json_error("the preview could not be rendered"); return r; }
-    auto png = GCodeThumbnails::compress_thumbnail(*data, GCodeThumbnailsFormat::PNG);
-    r.type   = "image/png";
+    auto png  = GCodeThumbnails::compress_thumbnail(*data, GCodeThumbnailsFormat::PNG);
+    r.type    = "image/png";
+    r.headers = "X-Preview-Zoom: " + std::to_string(*eff) + "\r\n";
     r.body.assign(static_cast<const char*>(png->data), png->size);
     return r;
 }
@@ -1205,7 +1239,8 @@ RemoteAccess::ApiResponse RemoteAccess::api_project_open(const std::string& path
 RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, const std::string& path, const std::string& query, const std::string& body)
 {
     ApiResponse r;
-    auto num = [](const std::string& s, int def) { try { return s.empty() ? def : std::stoi(s); } catch (...) { return def; } };
+    auto num  = [](const std::string& s, int def) { try { return s.empty() ? def : std::stoi(s); } catch (...) { return def; } };
+    auto numd = [](const std::string& s, double def) { try { return s.empty() ? def : std::stod(s); } catch (...) { return def; } };
     if (path.empty() || path == "/") {
         nlohmann::json j;
         j["name"]    = "Snapmaker-Ultra remote API";
@@ -1218,7 +1253,8 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "GET"},  {"path", "/api/plates/{index}/thumbnail.png"}, {"description", "rendered plate preview"} },
             { {"method", "GET"},  {"path", "/api/plates/{index}/layout"},  {"description", "top-down layout: plate box, exclude areas, every instance with its convex hull (mm), bbox, position, Z rotation, scale, colour"} },
             { {"method", "GET"},  {"path", "/api/plates/{index}/preview"}, {"description", "slice preview state: sliced flag, layer heights, current layer range; loads that plate's G-code into the PC's preview"} },
-            { {"method", "GET"},  {"path", "/api/plates/{index}/preview.png?view=front|rear|left|right&layer={index}&w=&h="}, {"description", "orthographic render of the toolpaths up to that layer (the PC's layer slider follows)"} },
+            { {"method", "GET"},  {"path", "/api/plates/{index}/preview.png?view=front|rear|left|right&layer={index}&w=&h=[&zoom=&cx=&cy=]"}, {"description", "orthographic render of the toolpaths up to that layer (the PC's layer slider follows); zoom over the fit and the fitted-image fraction shown at the centre; X-Preview-Zoom = zoom really used"} },
+            { {"method", "GET"},  {"path", "/api/plates/{index}/preview/status"}, {"description", "sliced / slicing / slicing_percent / result_id for that plate, without changing what the PC shows"} },
             { {"method", "POST"}, {"path", "/api/objects/transform"},       {"description", "form obj=&inst=[&x=&y=][&rz=][&scale=][&center=1]: move / rotate / scale one instance like the sidebar (undoable)"} },
             { {"method", "GET"},  {"path", "/api/printers"},               {"description", "known printers with live status"} },
             { {"method", "POST"}, {"path", "/api/slice?plate={index}|all"}, {"description", "start slicing one plate (selects it) or all; returns a job id; 409 while slicing"} },
@@ -1275,7 +1311,10 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             return api_plate_preview(num(rest.substr(0, slash), -1));
         if (slash != std::string::npos && rest.substr(slash) == "/preview.png")
             return api_plate_preview_png(num(rest.substr(0, slash), -1), query_param(query, "view"), num(query_param(query, "layer"), -1),
-                                         num(query_param(query, "w"), 800), num(query_param(query, "h"), 800));
+                                         num(query_param(query, "w"), 800), num(query_param(query, "h"), 800),
+                                         numd(query_param(query, "zoom"), 1.0), numd(query_param(query, "cx"), 0.5), numd(query_param(query, "cy"), 0.5));
+        if (slash != std::string::npos && rest.substr(slash) == "/preview/status")
+            return api_plate_preview_status(num(rest.substr(0, slash), -1));
     }
     if (path == "/objects/transform" && method == "POST")
         return api_object_transform(body.empty() ? query : body);
@@ -1367,7 +1406,7 @@ void RemoteAccess::serve(void* socket_ptr)
         const char* status = ar.status == 200 ? "200 OK" : ar.status == 400 ? "400 Bad Request" : ar.status == 404 ? "404 Not Found"
                            : ar.status == 409 ? "409 Conflict" : ar.status == 413 ? "413 Payload Too Large"
                            : ar.status == 503 ? "503 Service Unavailable" : "500 Internal Server Error";
-        respond(client, status, ar.type, ar.body);
+        respond(client, status, ar.type, ar.body, ar.headers);
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(debug) << "RemoteAccess: session ended: " << e.what();
     }

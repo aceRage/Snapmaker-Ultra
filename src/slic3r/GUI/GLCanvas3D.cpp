@@ -6640,8 +6640,11 @@ void GLCanvas3D::render_thumbnail_framebuffer_ext(ThumbnailData& thumbnail_data,
 
 // Snapmaker-Ultra phone preview: the loaded toolpaths (current layer range) from a named view into
 // an RGBA image with a transparent background. Same framebuffer recipe as the plate thumbnails.
-void GLCanvas3D::render_gcode_preview_image(ThumbnailData& data, unsigned int w, unsigned int h, const std::string& view, const BoundingBoxf3& box, const BoundingBoxf3& bed)
+void GLCanvas3D::render_gcode_preview_image(ThumbnailData& data, unsigned int w, unsigned int h, const std::string& view, const BoundingBoxf3& box, const BoundingBoxf3& bed,
+                                            double zoom, double cx, double cy, double* effective_zoom)
 {
+    if (effective_zoom != nullptr)
+        *effective_zoom = 1.0;
     data.set(w, h);
     if (!data.is_valid())
         return;
@@ -6698,6 +6701,16 @@ void GLCanvas3D::render_gcode_preview_image(ThumbnailData& data, unsigned int w,
         cam.select_view(view);
         cam.zoom_to_box(box, 1.1);
         cam.set_type(Camera::EType::Ortho);
+        // Zoom / pan relative to that fit: at the fitted zoom the image spans w / fit_zoom mm.
+        const double fit_zoom = cam.get_zoom();
+        if (fit_zoom > 0.0 && (zoom != 1.0 || cx != 0.5 || cy != 0.5)) {
+            const double dx = (cx - 0.5) * (double) w / fit_zoom;
+            const double dy = (0.5 - cy) * (double) h / fit_zoom;
+            cam.set_target(cam.get_target() + dx * cam.get_dir_right() + dy * cam.get_dir_up());
+            cam.set_zoom(fit_zoom * std::max(zoom, 0.1));
+        }
+        if (effective_zoom != nullptr && fit_zoom > 0.0)
+            *effective_zoom = cam.get_zoom() / fit_zoom;
         cam.apply_projection(scene);
         live = cam;
 

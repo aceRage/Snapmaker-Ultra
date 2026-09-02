@@ -940,7 +940,10 @@ public:
     // Snapmaker-Ultra phone preview: the loaded G-code toolpaths (current layer range) from a named
     // orthographic view ("front", "rear", "left", "right", "top", "bottom", "iso"), framed on `box`
     // (world mm) with a thin floor slab spanning `bed`, into an RGBA image (transparent background).
-    void render_gcode_preview_image(ThumbnailData& data, unsigned int w, unsigned int h, const std::string& view, const BoundingBoxf3& box, const BoundingBoxf3& bed);
+    // zoom multiplies the fitted pixels-per-mm and (cx, cy) is the fraction of the fitted image (x right,
+    // y down) placed at the centre; effective_zoom receives the factor really used (the camera caps zoom).
+    void render_gcode_preview_image(ThumbnailData& data, unsigned int w, unsigned int h, const std::string& view, const BoundingBoxf3& box, const BoundingBoxf3& bed,
+                                    double zoom = 1.0, double cx = 0.5, double cy = 0.5, double* effective_zoom = nullptr);
 
     static void render_thumbnail_internal(ThumbnailData& thumbnail_data, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, ModelObjectPtrs& model_objects,
         const GLVolumeCollection& volumes, std::vector<ColorRGBA>& extruder_colors,
