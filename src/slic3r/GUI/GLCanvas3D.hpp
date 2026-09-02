@@ -783,7 +783,7 @@ public:
     //BBS
     GCodeViewer& get_gcode_viewer() { return m_gcode_viewer; }
     void init_gcode_viewer(ConfigOptionMode mode, Slic3r::PresetBundle* preset_bundle) { m_gcode_viewer.init(mode, preset_bundle); }
-    void reset_gcode_toolpaths() { m_gcode_viewer.reset(); }
+    void reset_gcode_toolpaths(); // makes a context current first: glDeleteBuffers inside
     const GCodeViewer::SequentialView& get_gcode_sequential_view() const { return m_gcode_viewer.get_sequential_view(); }
     void update_gcode_sequential_view_current(unsigned int first, unsigned int last) { m_gcode_viewer.update_sequential_view_current(first, last); }
 
@@ -1185,6 +1185,11 @@ public:
     Vec3d _mouse_to_3d(const Point& mouse_pos, float* z = nullptr);
 
     bool make_current_for_postinit();
+    // Ultra: make this canvas' GL context current and finish the one-time GL init, with no
+    // dependency on the canvas ever having been shown on screen. render() does the same work but
+    // refuses to run when not on screen; an instance that serves the phone is never shown, so
+    // every offscreen path calls this first. False = OpenGL unusable (fail the request, do not draw).
+    bool ensure_gl_ready();
 
 private:
     bool _is_shown_on_screen() const;

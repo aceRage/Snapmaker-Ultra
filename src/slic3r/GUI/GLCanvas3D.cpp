@@ -1971,6 +1971,42 @@ bool GLCanvas3D::make_current_for_postinit() {
     return _set_current();
 }
 
+bool GLCanvas3D::ensure_gl_ready()
+{
+    if (m_canvas == nullptr || m_context == nullptr)
+        return false;
+    // wglMakeCurrent on this canvas' own DC: the HWND and its pixel format exist from construction,
+    // so a never-shown window is fine on MSW (wx says so itself in wxGLCanvasBase::SetCurrent).
+    if (!_set_current())
+        return false;
+    // glewInit + framebuffer-type detection + shader compilation; must follow the make-current and
+    // precede ANY GLEW-dispatched call.
+    if (!wxGetApp().init_opengl())
+        return false;
+    if (!m_initialized) {
+        // ImGui::NewFrame() asserts on the default DisplaySize of (-1,-1) and a never-laid-out canvas
+        // is tiny: publish something usable once (the offscreen paths never call new_frame()).
+        const Size cnv = get_canvas_size();
+        wxGetApp().imgui()->set_display_size(std::max(10.0f, float(cnv.get_width())), std::max(10.0f, float(cnv.get_height())));
+        if (!init())
+            return false;
+        // init() flips m_initialized and on_idle() then runs update_notifications(), which measures
+        // text with ImGui; on the desktop render() has always called imgui->new_frame() (font atlas
+        // + texture) before that could happen. Establish the font the same way: one empty frame.
+        ImGuiWrapper* imgui = wxGetApp().imgui();
+        imgui->new_frame();
+        imgui->render();
+    }
+    return true;
+}
+
+void GLCanvas3D::reset_gcode_toolpaths()
+{
+    // GCodeViewer::reset() -> glDeleteBuffers; deleting against the wrong or no context leaks VRAM.
+    _set_current();
+    m_gcode_viewer.reset();
+}
+
 void GLCanvas3D::render(bool only_init)
 {
     if (m_in_render) {
@@ -2274,6 +2310,10 @@ void GLCanvas3D::render_thumbnail(ThumbnailData& thumbnail_data, unsigned int w,
                                   bool                      for_picking,
                                   bool                      ban_light)
 {
+    // Ultra: reached from Plater::update_all_plate_thumbnails and the phone API with no render pass
+    // around it; on a never-shown window nothing else makes a context current or inits OpenGL.
+    if (!ensure_gl_ready())
+        return;
     GLShaderProgram* shader = nullptr;
     if (for_picking)
         shader = wxGetApp().get_shader("flat");
@@ -2313,6 +2353,10 @@ void GLCanvas3D::render_thumbnail(ThumbnailData& thumbnail_data, unsigned int w,
                                   bool                      for_picking,
                                   bool                      ban_light)
 {
+    // Ultra: reached from Plater::update_all_plate_thumbnails and the phone API with no render pass
+    // around it; on a never-shown window nothing else makes a context current or inits OpenGL.
+    if (!ensure_gl_ready())
+        return;
     GLShaderProgram* shader = nullptr;
     if (for_picking)
         shader = wxGetApp().get_shader("flat");
@@ -3092,6 +3136,10 @@ void GLCanvas3D::set_shell_transparence(float alpha){
 //BBS: add only gcode mode
 void GLCanvas3D::load_gcode_preview(const GCodeProcessorResult& gcode_result, const std::vector<std::string>& str_tool_colors, bool only_gcode, bool skip_toolpaths)
 {
+    // GCodeViewer::init()/load() create GL buffers and textures directly, and this is called from
+    // Preview::load_print_as_fff outside any render pass (a hidden instance never renders).
+    if (!ensure_gl_ready())
+        return;
     PartPlateList& partplate_list = wxGetApp().plater()->get_partplate_list();
     PartPlate* plate = partplate_list.get_curr_plate();
     const std::vector<BoundingBoxf3>& exclude_bounding_box = plate->get_exclude_areas();
@@ -6648,7 +6696,7 @@ void GLCanvas3D::render_gcode_preview_image(ThumbnailData& data, unsigned int w,
     data.set(w, h);
     if (!data.is_valid())
         return;
-    if (!_set_current() || !wxGetApp().init_opengl() || (!is_initialized() && !init())) {
+    if (!ensure_gl_ready()) {
         data.reset();
         return;
     }
@@ -7060,6 +7108,9 @@ bool GLCanvas3D::_update_imgui_select_plate_toolbar()
 {
     bool result = true;
     if (!m_sel_plate_toolbar.is_enabled() || m_sel_plate_toolbar.is_render_finish) return false;
+    // del_all_item() -> glDeleteTextures and generate_texture() -> glGenTextures; reached from
+    // on_idle() and update_plate_thumbnails(), i.e. outside any render pass.
+    if (!ensure_gl_ready()) return false;
 
     _update_select_plate_toolbar_stats_item();
 

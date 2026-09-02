@@ -15076,7 +15076,11 @@ void Plater::priv::set_current_panel(wxPanel* panel, bool no_slice)
         //BBS: only switch to the first panel when visible
         panel->Show();
         //dynamic_cast<View3D *>(panel)->get_canvas3d()->render();
-        if (!panel->IsShownOnScreen())
+        // Ultra: a hub-managed instance is never shown on screen, so this test would never pass
+        // and current_panel would stay null forever (is_preview_shown(), the do_reslice branch
+        // and bind_event_handlers() would all be dead). The panels are Show()n / Hide()n normally
+        // either way, so Preview::IsShown() keeps its usual meaning.
+        if (!panel->IsShownOnScreen() && !wxGetApp().is_hub_managed())
             return;
     }
 //#endif
@@ -23798,6 +23802,15 @@ GLCanvas3D* Plater::get_view3D_canvas3D()
 GLCanvas3D* Plater::get_preview_canvas3D()
 {
     return p->preview->get_canvas3d();
+}
+
+bool Plater::ensure_gl_ready()
+{
+    // Preview first, View3D last: the 3D canvas' drawable is left current, and its volumes are
+    // what the plate thumbnails draw.
+    const bool pv = p->preview->get_canvas3d()->ensure_gl_ready();
+    const bool v3 = p->view3D->get_canvas3d()->ensure_gl_ready();
+    return pv && v3;
 }
 
 GLCanvas3D* Plater::get_assmeble_canvas3D()

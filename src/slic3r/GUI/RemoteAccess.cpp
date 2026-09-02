@@ -337,6 +337,7 @@ RemoteAccess::ApiResponse RemoteAccess::api_plate_thumbnail(int plate)
         PartPlateList& plates = plater->get_partplate_list();
         if (plate < 0 || plate >= plates.get_plate_count())
             return;
+        if (!plater->get_view3D_canvas3D()->ensure_gl_ready()) { BOOST_LOG_TRIVIAL(error) << "RemoteAccess: thumbnail: OpenGL is not usable"; return; }
         plater->update_all_plate_thumbnails(false);
         PartPlate* p = plates.get_plate(plate);
         if (!p->thumbnail_data.is_valid()) {
@@ -372,6 +373,10 @@ static std::string ensure_preview_loaded(int plate)
         return "this plate is not sliced";
     if (plates.get_curr_plate_index() != plate)
         plater->select_plate(plate, false);
+    // The G-code viewer's buffers are built by Preview::load_print_as_fff -> load_gcode_preview with
+    // no render pass around it, and load_shells is a no-op until the preview canvas is initialised.
+    if (!plater->get_preview_canvas3D()->ensure_gl_ready())
+        return "the preview is not ready (OpenGL)";
     if (!plater->is_preview_shown())
         plater->select_view_3D("Preview");
     GLCanvas3D*  canvas = plater->get_preview_canvas3D();

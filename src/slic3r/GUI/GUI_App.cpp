@@ -1008,6 +1008,36 @@ void GUI_App::post_init()
     m_open_method = "double_click";
     bool switch_to_3d = false;
 
+    // Ultra: a hidden (hub-managed) instance gets no WM_PAINT, so GLCanvas3D::render() - the usual
+    // trigger for init_opengl() / init() - never runs. Do that work here, before any project loads:
+    // without it there are no shaders, no GLEW entry points, no framebuffer type, and reload_scene()
+    // bails on !m_initialized so there are no GLVolumes for the plate thumbnails to draw.
+    if (m_hub_managed && plater_ != nullptr && mainframe != nullptr) {
+        // SNORCA_HIDDEN_WARMUP=none|gl|full (default full) - a bisect knob for the never-shown path.
+        wxString    knob;
+        std::string warmup = wxGetEnv("SNORCA_HIDDEN_WARMUP", &knob) ? knob.ToStdString() : "full";
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": hidden instance warm-up = " << warmup;
+        if (warmup != "none") {
+            flush_logs();
+            if (!plater_->ensure_gl_ready())
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": hidden instance: OpenGL warm-up FAILED; thumbnail and preview routes will return errors";
+            else
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": hidden instance: OpenGL ready, view3D canvas "
+                                           << plater_->get_view3D_canvas3D()->get_canvas_size().get_width() << "x"
+                                           << plater_->get_view3D_canvas3D()->get_canvas_size().get_height();
+            flush_logs();
+        }
+        if (warmup == "full") {
+            // Give the Plater a current panel so is_preview_shown() / select_view_3D() work from here on.
+            mainframe->select_tab(size_t(MainFrame::tp3DEditor));
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": hidden instance: tab selected";
+            flush_logs();
+            plater_->select_view_3D("3D");
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": hidden instance: 3D view selected";
+            flush_logs();
+        }
+    }
+
     if (!this->init_params->input_files.empty()) {
 
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", init with input files, size %1%, input_gcode %2%")
@@ -2094,11 +2124,11 @@ wxGLContext* GUI_App::init_glcontext(wxGLCanvas& canvas)
 bool GUI_App::init_opengl()
 {
 #ifdef __linux__
-    bool status = m_opengl_mgr.init_gl();
+    bool status = m_opengl_mgr.init_gl(/*popup_error=*/!m_hub_managed);
     m_opengl_initialized = true;
     return status;
 #else
-    return m_opengl_mgr.init_gl();
+    return m_opengl_mgr.init_gl(/*popup_error=*/!m_hub_managed);
 #endif
 }
 
