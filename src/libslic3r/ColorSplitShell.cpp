@@ -199,9 +199,8 @@ struct CreaseStep {
     // says nothing about how much material lies that way. A 1.2 mm plate's top corner has d = 1.037 along its
     // bisector while the vertical half-thickness is 0.598; a 1 mm wall's top-edge corner has d = 0.864 while
     // half its thickness is 0.498, and case B's wall-stack step alone would land 0.372 past the mid-surface.
-    // So each case re-probes the mid-thickness along n_P - exactly as the concave and same-state walls do -
-    // and spends at most that: case A from the RING's position (the wall descends one wall stack inside the
-    // boundary, not at it), case B from the boundary vertex itself (that is where it steps in).
+    // So each case re-probes the mid-thickness along n_P - as the concave and same-state walls do, through
+    // the same probe (see probe_half_thickness) - and spends at most that.
     float half_thickness = 0.f;
     bool  case_a = false;
 };
@@ -361,6 +360,21 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
     // it costs a Clipper union of the whole group.
     enum class CaseAGate { Unknown, Allowed, Denied };
     CaseAGate case_a_gate = CaseAGate::Unknown;
+    // Rulings 20/21: the mid-thickness along `dir`, measured ONE WALL STACK INTO the patch and snapped back
+    // onto the surface, for every rule that walks a vertex down a direction of its own. Two reasons for the
+    // inset. A probe launched from the boundary vertex itself grazes the neighbouring faces that vertex also
+    // sits on: measured on a 1 mm wall, the ray along -n_P from a top corner slides along both the top and
+    // the end face, reports NO hit, and the clamp silently becomes +inf - no clamp at all. And case A's wall
+    // really does descend one wall stack in, not at the boundary. The inset point is tangential, so it is
+    // generally not ON the surface (on a convex patch it floats ws^2/2R above it, where the probe would
+    // measure the air gap); snapping it to the nearest surface point is what makes half_thickness_along -
+    // which measures a thickness FROM a surface point - answer the question the wall is asking.
+    auto probe_half_thickness = [&](int v, const Vec3f &t_miter, const Vec3f &dir) {
+        int   face    = 0;
+        Vec3d closest = Vec3d::Zero();
+        aabb.squared_distance((p.surface.vertices[v] + float(depths.ws) * t_miter).cast<double>(), face, closest);
+        return ColorSplitDetail::half_thickness_along(aabb, closest.cast<float>(), dir);
+    };
     for (const std::pair<const std::pair<int, int>, BoundaryInfo> &entry : boundary) {
         const BoundaryInfo &info = entry.second;
         // n_P is all the same-state rule needs, so only the concave test may demand n_Q and t_in as well
@@ -378,9 +392,13 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
         // normal above, except that a same-state crease always wins. The neighbouring patch is claiming the
         // material immediately behind that wall and tilting it is exactly what opens a gap between them,
         // whereas an ordinary boundary only loses the cosmetic taper spec 3.6 gives it.
+        // The mitred inward tangent (see below) is what every one of the four rules measures its
+        // mid-thickness from, so it is computed for all of them; only case A also STEPS along it.
+        const float len     = info.t_in.norm();
+        const Vec3f t_miter = outside ? Vec3f(info.t_in * (std::min(float(info.edges) / len, CREASE_MITER_LIMIT) / len))
+                                      : Vec3f(Vec3f::Zero());
         if (concave || info.same_state > 0) {
-            topo.wall.emplace(entry.first, CreaseWall{n_p, ColorSplitDetail::half_thickness_along(
-                                                               aabb, p.surface.vertices[entry.first.first], n_p)});
+            topo.wall.emplace(entry.first, CreaseWall{n_p, probe_half_thickness(entry.first.first, t_miter, n_p)});
             continue;
         }
         if (!crease || !params.crease_step)
@@ -399,22 +417,8 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
             if (case_a_gate == CaseAGate::Denied)
                 continue;
         }
-        const float len = info.t_in.norm();
-        step.t_miter    = info.t_in * (std::min(float(info.edges) / len, CREASE_MITER_LIMIT) / len);
-        // Rulings 20 and 21: the mid-thickness of the direction this step travels, measured ONE WALL STACK
-        // INTO the patch. Two reasons for the inset: case A's wall really does descend there rather than at
-        // the boundary, and a probe launched from the boundary vertex itself grazes the neighbouring faces
-        // that vertex also sits on - measured on a 1 mm wall, the ray along -n_P from a top corner slides
-        // along both the top and the end face and reports NO hit, so the clamp silently became +inf.
-        // The inset point is tangential, so it is generally not ON the surface (on a convex patch it floats
-        // ws^2/2R above it, where the probe would measure the air gap); snapping it to the nearest surface
-        // point first is what makes half_thickness_along - which measures a thickness from a surface point -
-        // answer the right question. Starting one layer down at a1 itself would be worse still: it would
-        // halve only the material BELOW the ring and cross the mid-surface anyway.
-        int   face    = 0;
-        Vec3d closest = Vec3d::Zero();
-        aabb.squared_distance((p.surface.vertices[entry.first.first] + float(depths.ws) * step.t_miter).cast<double>(), face, closest);
-        step.half_thickness = ColorSplitDetail::half_thickness_along(aabb, closest.cast<float>(), n_p);
+        step.t_miter        = t_miter;
+        step.half_thickness = probe_half_thickness(entry.first.first, t_miter, n_p);
         topo.step.emplace(entry.first, step);
     }
     return topo;

@@ -928,6 +928,33 @@ TEST_CASE("colorsplit: the wall-stack step never crosses a thin wall's mid-plane
     REQUIRE_THAT(total, WithinRel(wall_volume, 1e-4));
 }
 
+TEST_CASE("colorsplit: a same-state wall on a thin wall stops at the mid-plane too", "[colorsplit]")
+{
+    // The always-on half of spec 3.6 has the same mid-thickness clamp as the crease step, and the same probe:
+    // launched from the boundary vertex it grazed the faces that vertex also sits on, found nothing, and left
+    // the clamp at +inf - so a same-state wall on a 1 mm wall walked to y = 1 - 0.864 = 0.136. Painting the
+    // +Y face AND the top with one filament puts a same-state crease along their shared top edge, which is
+    // exactly the boundary that reaches this rule (the side patch's own bottom corners are case B).
+    const std::vector<int> PLUS_Y{10, 11};
+    ColorSplitDepths d    = depths_for_test(1.5, 0.2, 0.87);
+    TriangleMesh     wall = make_cube(40., 1.0, 20.);
+    std::vector<std::pair<int, EnforcerBlockerType>> facets = all_with(PLUS_Y, EnforcerBlockerType::Extruder2);
+    for (int f : CUBE_TOP) facets.emplace_back(f, EnforcerBlockerType::Extruder2);
+    ColorPatches p = extract_color_patches(wall.its, paint_data(wall, facets));
+    auto shells = build_color_shells(p, d, cap_and_step(), nullptr);
+    REQUIRE(shells.size() == 2);                       // the top and the side are two smooth patches
+    auto has = [](const indexed_triangle_set &m, const Vec3f &q) {
+        return std::any_of(m.vertices.begin(), m.vertices.end(), [&](const Vec3f &v) { return (v - q).norm() < 1e-3f; });
+    };
+    const indexed_triangle_set &side = has(shells[0].mesh, Vec3f(0.f, 1.f, 0.f)) ? shells[0].mesh : shells[1].mesh;
+    REQUIRE(has(side, Vec3f(0.f, 1.f, 0.f)));          // the side patch reaches the build plate, the top does not
+    for (const Vec3f &v : side.vertices)
+        REQUIRE(v.y() >= 0.5f - 0.002f - 1e-4f);
+    ShellCheck c = check_shell(side);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+}
+
 TEST_CASE("colorsplit: a painted top narrower than two wall stacks falls back to the bisector", "[colorsplit]")
 {
     // Ruling 22: case A insets the ring one wall stack from every side, which on a group narrower than 2 ws
