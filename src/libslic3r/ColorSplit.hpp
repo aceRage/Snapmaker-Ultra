@@ -60,7 +60,10 @@ struct ColorShell { int state = 0; bool capped = false; indexed_triangle_set mes
 // Validity of a shell: closed (no open edge), free of self-intersections, and its signed volume.
 struct ShellCheck { bool closed = false; bool self_intersects = true; double volume = 0.; };
 ShellCheck check_shell(const indexed_triangle_set &shell);
+// Spec 7 (rev 2.3): a component that cannot carry a valid shell even at its floor depth is skipped, not an
+// error - the body keeps that feature in its own colour. `warnings`, when given, collects one note per skip.
 std::vector<ColorShell> build_color_shells(const ColorPatches &patches, const ColorSplitDepths &depths,
-                                           const ColorSplitParams &params, const ColorSplitProgress &progress);
+                                           const ColorSplitParams &params, const ColorSplitProgress &progress,
+                                           std::vector<std::string> *warnings = nullptr);
 
 } // namespace Slic3r

@@ -8,6 +8,8 @@
 #include <libslic3r/MeshBoolean.hpp>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 
 using namespace Slic3r;
 using Catch::Matchers::WithinAbs;
@@ -414,4 +416,29 @@ TEST_CASE("colorsplit: a shell on a 0.3mm plate stops short of mid-thickness", "
         REQUIRE(v.z() > 0.15f);                       // never past mid-thickness, top or bottom copy
         REQUIRE(0.3f - v.z() <= drop + 1e-4f);        // and never deeper than the vertex's own d0
     }
+}
+
+TEST_CASE("colorsplit: a feature too small to carry a shell is skipped with a warning", "[colorsplit]")
+{
+    // A 0.3mm ball. d(v) = t/2 - 0.002 = 0.148mm everywhere, which is already below the layer height, so the
+    // halving floor min(h, d0) cannot lower it any further - and at that depth every bottom copy lands within
+    // 2 microns of the centre, where the offset triangles fold through one another. Spec 7 (rev 2.3): a feature
+    // too small to carry a shell is NOT an error. The component is dropped, the body keeps that feature in its
+    // own colour, and the user gets one note naming the filament and the feature's size.
+    TriangleMesh sphere(its_make_sphere(0.15, PI / 18.));
+    ColorPatches p = extract_color_patches(sphere.its, paint_by_predicate(sphere, [](const Vec3f &, const Vec3f &) { return true; }, EnforcerBlockerType::Extruder2));
+    std::vector<std::string> warnings;
+    std::vector<ColorShell>  shells;
+    REQUIRE_NOTHROW(shells = build_color_shells(p, depths_for_test(1.5, 0.2, 0.87), no_cap_no_step(), nullptr, &warnings));
+    REQUIRE(shells.empty());
+    REQUIRE(warnings.size() == 1);
+    REQUIRE(warnings[0].find("Filament 2") != std::string::npos);
+    // The size quoted is the diagonal of the painted feature's own bounding box, computed here from the source
+    // mesh (extract_color_patches only welds and compactifies, so the coordinates are the same ones).
+    Vec3f lo = sphere.its.vertices.front(), hi = lo;
+    for (const Vec3f &v : sphere.its.vertices) { lo = lo.cwiseMin(v); hi = hi.cwiseMax(v); }
+    std::ostringstream expected;
+    expected << "Filament 2: a painted feature about " << std::fixed << std::setprecision(2) << (hi - lo).norm()
+             << " mm across is too small to split and stays in the body colour.";
+    REQUIRE(warnings[0] == expected.str());
 }

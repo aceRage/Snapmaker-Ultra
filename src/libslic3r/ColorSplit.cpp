@@ -7,9 +7,11 @@
 #include "PrintConfig.hpp"
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <numeric>
+#include <sstream>
 
 namespace Slic3r {
 
@@ -130,11 +132,30 @@ std::vector<float> compute_vertex_depths(const ColorPatches &p, const std::vecto
 
 namespace {
 
-// Ruling 8: how far each wedge's copies of a pinch vertex move along that wedge's inward tangent bisector.
+// Ruling 8: how far each wedge's copies of a pinch vertex move along that wedge's inward tangent bisector,
+// capped per vertex at a tenth of its shortest boundary edge (Ruling 11).
 // Without it the two wedges keep identical coordinates and their side walls are coincident along the pinch
 // segment, which CGAL rightly calls a self-intersection. The uncovered sliver this leaves on the surface is
 // one micron wide - orders of magnitude below slicer resolution.
 constexpr float PINCH_NUDGE_MM = 1e-3f;
+
+// Spec 7 (rev 2.3): the note left behind when a component cannot carry a shell. The size quoted is the
+// diagonal of the painted component's own bounding box - the feature the user can point at - rather than
+// anything about the failed offset geometry.
+std::string too_small_warning(const ColorPatches &p, const std::vector<int> &comp, int state)
+{
+    Vec3f lo = p.surface.vertices[p.surface.indices[comp.front()][0]], hi = lo;
+    for (int f : comp)
+        for (int k = 0; k < 3; ++k) {
+            const Vec3f &v = p.surface.vertices[p.surface.indices[f][k]];
+            lo = lo.cwiseMin(v);
+            hi = hi.cwiseMax(v);
+        }
+    std::ostringstream os;
+    os << "Filament " << state << ": a painted feature about " << std::fixed << std::setprecision(2)
+       << (hi - lo).norm() << " mm across is too small to split and stays in the body colour.";
+    return os.str();
+}
 
 // Edge-connected components of the facet subset `in_set` (indices into patches.surface).
 std::vector<std::vector<int>> connected_components(const ColorPatches &p, const std::vector<Vec3i32> &nbrs, const std::vector<char> &in_set)
@@ -220,13 +241,17 @@ struct ShellBuilder {
         // bisector, and every copy of the vertex in that wedge - top and bottom alike - moves PINCH_NUDGE_MM
         // along it, so the wedges no longer share any geometry.
         std::map<std::pair<int, int>, Vec3f> nudge;               // (vertex, wedge) -> offset
+        std::map<int, float>                 shortest_edge_at;    // pinch vertex -> its shortest boundary edge
         if (!wedge_of.empty()) {
-            auto add_tangent = [&](int v, int f, const Vec3f &tangent) {
+            auto add_tangent = [&](int v, int f, const Vec3f &tangent, float edge_len) {
                 if (boundary_count[v] <= 2) return;
                 const std::pair<int, int> key{v, wedge(v, f)};
                 auto it = nudge.find(key);
                 if (it == nudge.end()) it = nudge.emplace(key, Vec3f(Vec3f::Zero())).first;
                 it->second += tangent;
+                auto shortest = shortest_edge_at.find(v);
+                if (shortest == shortest_edge_at.end()) shortest_edge_at.emplace(v, edge_len);
+                else                                    shortest->second = std::min(shortest->second, edge_len);
             };
             for (int f : group)
                 for (int k = 0; k < 3; ++k) {
@@ -235,16 +260,19 @@ struct ShellBuilder {
                     const Vec3i32 &t  = p.surface.indices[f];
                     const Vec3f    nf = (p.surface.vertices[t[1]] - p.surface.vertices[t[0]])
                                             .cross(p.surface.vertices[t[2]] - p.surface.vertices[t[0]]);
-                    const int   a = p.surface.indices[f][k], b = p.surface.indices[f][(k + 1) % 3];
-                    const Vec3f tangent = nf.cross(p.surface.vertices[b] - p.surface.vertices[a]);
+                    const Vec3f edge    = p.surface.vertices[t[(k + 1) % 3]] - p.surface.vertices[t[k]];
+                    const Vec3f tangent = nf.cross(edge);
                     if (tangent.squaredNorm() <= 0.f) continue;   // degenerate facet or edge: nothing to bisect
                     const Vec3f unit = tangent.normalized();
-                    add_tangent(a, f, unit);
-                    add_tangent(b, f, unit);
+                    add_tangent(t[k],           f, unit, edge.norm());
+                    add_tangent(t[(k + 1) % 3], f, unit, edge.norm());
                 }
             for (auto &entry : nudge) {
                 const float len = entry.second.norm();
-                entry.second = len > 0.f ? Vec3f(entry.second * (PINCH_NUDGE_MM / len)) : Vec3f(Vec3f::Zero());
+                // Ruling 11: never move a vertex further than a tenth of the shortest boundary edge meeting it,
+                // so the nudge cannot invert a micron-scale triangle.
+                const float eps = std::min(PINCH_NUDGE_MM, 0.1f * shortest_edge_at.at(entry.first.first));
+                entry.second = len > 0.f ? Vec3f(entry.second * (eps / len)) : Vec3f(Vec3f::Zero());
             }
         }
 
@@ -346,7 +374,7 @@ ShellCheck check_shell(const indexed_triangle_set &shell)
     return c;
 }
 
-std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSplitDepths &depths_in, const ColorSplitParams &params, const ColorSplitProgress &progress)
+std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSplitDepths &depths_in, const ColorSplitParams &params, const ColorSplitProgress &progress, std::vector<std::string> *warnings)
 {
     ColorSplitDepths depths = depths_in;
     if (params.depth_override_mm > 0.) { depths.D = params.depth_override_mm; depths.unlimited = false; }
@@ -375,9 +403,12 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
                 mesh  = sb.build(comp, cap_depth);
                 check = check_shell(mesh);
             }
-            if (!check.closed || check.self_intersects)
-                throw ColorSplitError("Could not build a valid shell for filament " + std::to_string(s) + " (self-intersecting surface).");
-            shells.push_back({s, false, std::move(mesh)});
+            // Spec 7 (rev 2.3): a component that still fails at its floor depth is a feature too small to
+            // split, not an error. Drop it - the body keeps it in its own colour - and note it for the user.
+            if (check.closed && !check.self_intersects)
+                shells.push_back({s, false, std::move(mesh)});
+            else if (warnings)
+                warnings->push_back(too_small_warning(p, comp, s));
             if (progress && !progress(int(10 + 40 * double(++done) / std::max<size_t>(1, p.states.size() * 4))))
                 throw ColorSplitCancelled();
         }
