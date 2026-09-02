@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.2 (after adversarial review; §3.6 and §3.4 refined during planning) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.3 (after adversarial review; §3.4/§3.6/§7 refined during planning and Task 3) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -68,8 +68,8 @@ the body, a sub-resolution sliver the slicer drops — the pin still prints enti
 Fold guard: for every group triangle compare the reversed bottom triangle's normal with the top's; where the
 dot product ≤ 0 or the bottom area < 10⁻⁶ of the top's, halve d at that triangle's vertices and repeat (≤ 8
 rounds, floor d = h). After construction each shell is checked with `MeshBoolean::cgal::does_self_intersect`;
-a still self-intersecting component halves its d uniformly and rebuilds; if it fails at d = h the split is
-refused with an error naming the filament (§7). Small convex features (fillets, bosses, spheres with r < D) thus
+a still self-intersecting component halves its d uniformly and rebuilds; if it still fails at its floor depth the
+component is skipped with a warning naming the filament (§7, rev 2.3) so one micro-feature cannot block the split. Small convex features (fillets, bosses, spheres with r < D) thus
 get a thin skin instead of a folded shell; their interiors come back through §3.8.
 
 **3.5 Depth groups (flat cap).** Transliteration of the live 2D rule (`flat_cap_component_ex`,
@@ -205,7 +205,7 @@ After the split the object's paint-depth settings are inert (no paint left) unle
 | Source mesh has open edges after welding | Refused before the job: "The part is not watertight; repair it first." |
 | Part not painted / paint resolves to nothing | Menu item disabled / job ends with a notification, no change |
 | A painting gizmo is open or a job is running | Menu action refused with a notification |
-| Shell self-intersects even at d = h | Error naming the filament, model untouched |
+| A component's shell self-intersects even at its floor depth (a painted feature smaller than about two layer heights) | That component is skipped with a warning naming the filament and its size; the rest of the split proceeds (rev 2.3) |
 | Manifold status ≠ NoError, or the volume check fails | Error "Could not split <part> by colour (reason)", model untouched |
 | Piece for filament k empty | Dropped, warning listed in the result notification |
 | Paint or mesh changed while the job ran | Finalize aborts with a notification, model untouched |
