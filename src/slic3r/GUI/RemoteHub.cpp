@@ -753,10 +753,18 @@ struct FirewallState
     long long   checked_at { 0 };
 };
 
+// Joined for a sentence, each value once (two rules for the same profile, two networks in the
+// same profile - the user only wants to read "Private" once).
 static std::string join_words(const std::vector<std::string>& v, const char* sep)
 {
-    std::string out;
-    for (const std::string& s : v) { if (!out.empty()) out += sep; out += s; }
+    std::string              out;
+    std::vector<std::string> seen;
+    for (const std::string& s : v) {
+        if (std::find(seen.begin(), seen.end(), s) != seen.end()) continue;
+        seen.push_back(s);
+        if (!out.empty()) out += sep;
+        out += s;
+    }
     return out;
 }
 
@@ -1353,7 +1361,9 @@ FirewallState HubServer::firewall_state(bool refresh)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         port = m_webrtc_port;
-        if (!refresh && m_fw.checked_at) return m_fw;
+        // Re-checked every few minutes so the hub page notices by itself once the user has
+        // allowed go2rtc in the firewall (or removed the rule again).
+        if (!refresh && m_fw.checked_at && (long long) std::time(nullptr) - m_fw.checked_at < 300) return m_fw;
     }
     if (port > 0 && !m_fw_busy.exchange(true)) {
         std::thread([this, port]() {
