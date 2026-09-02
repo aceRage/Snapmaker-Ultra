@@ -1,0 +1,11 @@
+33:- Task 1: review clean (spec ✅, quality Approved). ⚠️ trailer verified by controller (present). Minor (deferred): (1) report overst
+40:- Task 2: review clean (spec ✅, quality Approved). Minor (deferred): (1) test_color_split.cpp:103-105 facet_state check is tautological
+48:- Task 3 review: spec ✅ except one Important plan-mandated finding (progress values exceed 100 — the brief's `states.size()*4` denomi
+58:- Task 4 review: spec ❌ (one Important: the "empty piece dropped with a warning" path is dead — a filament whose shells are fully con
+60:- Task 4: re-review — all 9 findings ADDRESSED, no new breakage. Minor (deferred): the island-attribution test's `body < 1e-6` bound wo
+67:- Task 5: review clean (spec ✅, quality Approved; trailers verified by controller). ⚠️ the move commit dropped the never-reached "s
+72:- Task 6 review: spec ❌ (two Important), quality Needs fixes. Ruling 21: Case B's first segment (along n_P) must be clamped by a half-t
+75:- Task 6: re-review — all 8 findings + the addendum ADDRESSED, no new Critical/Important breakage (boss 99.48 % = 99.66 % of the facete
+85:- Task 8: review clean (spec ✅, Approved; reviewer re-ran the e2e cases and reproduced every number; trailer verified by controller). M
+91:- Task 9: review clean (spec ✅, Approved; all eight pinned numbers re-derived by the reviewer). Minor (deferred to Task 11 polish / fin
+95:- Task 10: review clean (spec ✅ with three accepted deviations, Approved). Ruling 27: (1) non-watertight parts are refused by the job b

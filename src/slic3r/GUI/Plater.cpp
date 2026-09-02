@@ -104,6 +104,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/FilamentHotBedNozzleRules.hpp"
+#include "libslic3r/ColorSplit.hpp"
 
 // For stl export
 #include "libslic3r/CSGMesh/ModelToCSGMesh.hpp"
@@ -131,6 +132,7 @@
 #include "Camera.hpp"
 #include "Mouse3DController.hpp"
 #include "Tab.hpp"
+#include "Jobs/ColorSplitJob.hpp"
 #include "Jobs/OrientJob.hpp"
 #include "Jobs/ArrangeJob.hpp"
 #include "Jobs/FillBedJob.hpp"
@@ -201,6 +203,7 @@
 #include "CreatePresetsDialog.hpp"
 #include "FileArchiveDialog.hpp"
 #include "StepMeshDialog.hpp"
+#include "ColorSplitDialog.hpp"
 #include "CloneDialog.hpp"
 #include "WebPreprintDialog.hpp"
 
@@ -23982,6 +23985,129 @@ void Plater::drop_selection()       { p->drop_selection(); }
 void Plater::mirror(Axis axis)      { p->mirror(axis); }
 void Plater::split_object()         { p->split_object(); }
 void Plater::split_volume()         { p->split_volume(); }
+
+// Ultra: "Split by painted colour" - turn the MMU paint on the selected object's parts into solid parts,
+// one per filament, in place. Spec: docs/superpowers/specs/2026-09-01-color-split-design.md (section 5).
+void Plater::split_by_color()
+{
+    const int obj_idx = get_selection().get_object_idx();
+    if (obj_idx < 0 || obj_idx >= int(model().objects.size()))
+        return;
+    ModelObject &object = *model().objects[obj_idx];
+
+    // A painting gizmo owns the very paint this action is about to consume - and its own undo stack.
+    if (const GLCanvas3D *canvas = canvas3D()) {
+        const GLGizmosManager::EType gizmo = canvas->get_gizmos_manager().get_current_type();
+        if (gizmo == GLGizmosManager::FdmSupports || gizmo == GLGizmosManager::Seam ||
+            gizmo == GLGizmosManager::FuzzySkin || gizmo == GLGizmosManager::MmSegmentation) {
+            get_notification_manager()->push_plater_warning_notification(_u8L("Close the painting tool before splitting by colour."));
+            return;
+        }
+    }
+    Worker &worker = get_ui_job_worker();
+    if (! worker.is_idle()) {
+        get_notification_manager()->push_plater_warning_notification(_u8L("Another operation is still running; try splitting by colour again when it finishes."));
+        return;
+    }
+
+    // The config a part is really sliced with: the presets, then the object's overrides, then the volume's.
+    DynamicPrintConfig base = wxGetApp().preset_bundle->full_config();
+    base.apply(object.config.get(), true);
+
+    std::vector<ColorSplitJob::Target> targets;
+    ColorSplitDepths                   shown_depths;      // WORLD millimetres, for the dialog
+    std::vector<int>                   shown_filaments;
+    size_t                             triangle_count = 0;
+    try {
+        for (size_t vi = 0; vi < object.volumes.size(); ++ vi) {
+            ModelVolume *v = object.volumes[vi];
+            if (! v->is_model_part() || ! v->is_mm_painted())
+                continue;
+            DynamicPrintConfig cfg = base;
+            cfg.apply(v->config.get(), true);
+            const std::vector<int> filaments = v->get_extruders();   // painted states + the volume's own, 1-based
+
+            ColorSplitJob::Target t;
+            t.object_id       = object.id();
+            t.volume_id       = v->id();
+            t.paint_timestamp = v->mmu_segmentation_facets.timestamp();
+            t.name            = v->name.empty() ? object.name : v->name;
+            t.space           = color_split_space(object, *v);
+            // Spec 3.9: on the mesh-space path the world depths are divided by the transform's scale; on the
+            // world path the split already runs in world millimetres.
+            const ColorSplitDepths world_depths = color_split_depths(cfg, filaments);
+            t.depths          = t.space.world_path ? world_depths : scale_depths(world_depths, t.space.depth_scale);
+            // Ruling 23: mesh and paint are handed over in MESH space whichever path this is.
+            t.mesh            = v->mesh().its;
+            t.paint           = v->mmu_segmentation_facets.get_data();
+            t.mesh_vertices   = t.mesh.vertices.size();
+            t.mesh_indices    = t.mesh.indices.size();
+
+            // Ruling 27(3): the depths shown are the FIRST painted part's; the dialog says how many parts
+            // there are, and the per-target check below covers the ones it does not show.
+            if (targets.empty())
+                shown_depths = world_depths;
+            triangle_count += t.mesh.indices.size();
+            for (int f : filaments)
+                if (std::find(shown_filaments.begin(), shown_filaments.end(), f) == shown_filaments.end())
+                    shown_filaments.push_back(f);
+            targets.emplace_back(std::move(t));
+        }
+    } catch (const ColorSplitError &e) {
+        // Ruling 27(2): "there is nothing here to split" is a note, not a failure to dismiss.
+        if (e.kind == ColorSplitErrorKind::nothing_to_split)
+            get_notification_manager()->push_plater_warning_notification(e.what());
+        else
+            show_error(this, from_u8(e.what()));
+        return;
+    } catch (const std::exception &e) {
+        // color_split_space and color_split_depths also read the config and invert the transform; anything
+        // else they throw would otherwise unwind out through the menu handler.
+        show_error(this, from_u8(e.what()));
+        return;
+    }
+    if (targets.empty())
+        return;
+    std::sort(shown_filaments.begin(), shown_filaments.end());
+
+    // "Keep base-colour sparse infill" mirrors the 2D behaviour the object would have had without the split.
+    const ConfigOptionBool *paint_infill_override = base.option<ConfigOptionBool>("paint_infill_override");
+    ColorSplitDialog dlg(this, shown_depths, shown_filaments, triangle_count, targets.size(),
+                         paint_infill_override == nullptr || ! paint_infill_override->value);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    ColorSplitParams params = dlg.params();
+    // Spec 3.1 (Ruling 28(2)): paint states above the printer's filament count have no filament to print
+    // with. The 2D path drops them (PrintApply.cpp:1885-1893) and they print in the body colour, whereas a
+    // part carrying such an extruder would be clamped back to filament 1 at slice time behind an object-list
+    // chip for a filament that does not exist. The count is taken exactly as Print::apply takes it
+    // (PrintApply.cpp:1379 and :1484) - physical extruders from filament_diameter plus the ENABLED mixed
+    // filaments - so the mixed VIRTUAL ids stay valid and only real overflow is dropped.
+    const ConfigOptionFloats *filament_diameter = base.option<ConfigOptionFloats>("filament_diameter");
+    const size_t num_extruders = filament_diameter == nullptr ? wxGetApp().preset_bundle->filament_presets.size()
+                                                              : filament_diameter->values.size();
+    params.max_state = int(fff_print().mixed_filament_manager().total_filaments(num_extruders));
+    // Ruling 27(3): "Unlimited depth" and the override cover EVERY target, so every target has to end up with
+    // a depth to cut with - the dialog only showed the first one's. t.depths.D is the world depth times the
+    // split space's (positive) scale, so testing it is the same test as testing the world depth.
+    if (! dlg.unlimited() && params.depth_override_mm <= 0.)
+        for (const ColorSplitJob::Target &t : targets)
+            if (t.depths.D <= 0.) {
+                get_notification_manager()->push_plater_warning_notification(GUI::format(
+                    _u8L("Part %1% has no paint depth configured; tick Unlimited depth or enter an override."), t.name));
+                return;
+            }
+    for (ColorSplitJob::Target &t : targets) {
+        // scale_params divides the dialog's world-millimetre override by the depth scale, since
+        // effective_depths applies it inside the split (ColorSplit.cpp:128, 252).
+        t.params           = t.space.world_path ? params : scale_params(params, t.space.depth_scale);
+        t.depths.unlimited = dlg.unlimited();
+    }
+    replace_job(worker, std::make_unique<ColorSplitJob>(this, std::move(targets),
+                                                        dlg.solid_interfaces(), dlg.keep_base_sparse_infill()));
+}
+
 void Plater::optimize_rotation()
 {
     auto &w = get_ui_job_worker();
@@ -25109,6 +25235,17 @@ bool Plater::has_assmeble_view() const { return p->has_assemble_view(); }
 bool Plater::can_replace_with_stl() const { return p->can_replace_with_stl(); }
 bool Plater::can_mirror() const { return p->can_mirror(); }
 bool Plater::can_split(bool to_objects) const { return p->can_split(to_objects); }
+
+bool Plater::can_split_by_color() const
+{
+    const int obj_idx = get_selection().get_object_idx();
+    if (obj_idx < 0 || obj_idx >= int(model().objects.size()))
+        return false;
+    for (const ModelVolume *v : model().objects[obj_idx]->volumes)
+        if (v->is_model_part() && v->is_mm_painted())
+            return true;
+    return false;
+}
 #if ENABLE_ENHANCED_PRINT_VOLUME_FIT
 bool Plater::can_scale_to_print_volume() const { return p->can_scale_to_print_volume(); }
 #endif // ENABLE_ENHANCED_PRINT_VOLUME_FIT
