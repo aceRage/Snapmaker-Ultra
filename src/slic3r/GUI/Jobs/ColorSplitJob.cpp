@@ -72,16 +72,20 @@ void ColorSplitJob::process(Ctl &ctl)
             t.ok = true;
         } catch (const ColorSplitCancelled &) {
             return;                               // finalize() sees canceled == true and changes nothing
+        } catch (const ColorSplitError &e) {
+            // Ruling 27(2): the kind decides whether finalize() reports this as a warning or as an error.
+            t.error      = e.what();
+            t.error_kind = e.kind;
         } catch (const std::exception &e) {
-            // ColorSplitError and anything Manifold/CGAL throws land here: the target is reported, the
-            // remaining targets still get their chance (spec 7).
+            // Anything Manifold/CGAL throws lands here: the target is reported, the remaining targets still
+            // get their chance (spec 7).
             t.error = e.what();
         }
         // The copies are only needed by the split itself; release them before the next (possibly large) one.
         t.mesh  = indexed_triangle_set();
         t.paint = TriangleSelector::TriangleSplittingData();
     }
-    ctl.update_status(100, status);
+    ctl.update_status(100, _u8L("Split by painted colour done."));
 }
 
 void ColorSplitJob::finalize(bool canceled, std::exception_ptr &eptr)
@@ -99,8 +103,11 @@ void ColorSplitJob::finalize(bool canceled, std::exception_ptr &eptr)
 
     for (Target &t : m_targets) {
         if (! t.ok) {
-            if (! t.error.empty())
-                errors.push_back((boost::format(_u8L("Could not split \"%1%\" by colour: %2%")) % t.name % t.error).str());
+            if (! t.error.empty()) {
+                // Ruling 27(2): "there is nothing here to split" is a note about the part, not a failure.
+                std::vector<std::string> &into = t.error_kind == ColorSplitErrorKind::nothing_to_split ? warnings : errors;
+                into.push_back((boost::format(_u8L("Could not split \"%1%\" by colour: %2%")) % t.name % t.error).str());
+            }
             continue;
         }
 

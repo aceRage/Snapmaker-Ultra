@@ -19,8 +19,8 @@ using Catch::Matchers::WithinRel;
 
 // Facet indices of its_make_cube(x, y, z) (TriangleMesh.cpp:886-896):
 // 0,1 = bottom (-Z); 2,3 = top (+Z); 4,5 = +X; 6,7 = -Y; 8,9 = -X; 10,11 = +Y.
-// (The Y pair is the other way round from the table test_paint_depth_clamp.cpp:39-52 carries: facets 6,7 are
-// {1,7,6} and {1,6,2}, whose three vertices all have y = 0. Nothing had painted a Y face until now.)
+// (Facets 6,7 are {1,7,6} and {1,6,2}, whose three vertices all have y = 0; 10,11 are {4,0,3} and {4,3,5},
+// all at y = y. Same table as test_paint_depth_clamp.cpp:39-52, which names the Y pair by its plane.)
 static const std::vector<int> CUBE_TOP    = {2, 3};
 static const std::vector<int> CUBE_BOTTOM = {0, 1};
 static const std::vector<int> CUBE_PLUS_X = {4, 5};
@@ -1327,8 +1327,11 @@ TEST_CASE("colorsplit: a rotated, scaled and mirrored PART stays in place", "[co
     REQUIRE((after.max - before.max).norm() < 1e-3);
 }
 
-// The whole top face of a grid box: its INTERIOR vertices carry vertical normals, so the piece really is D
-// deep in z (a plain make_cube's top has nothing but corner bisectors, which drop only D/sqrt(3)).
+// The whole top face of a grid box: its INTERIOR vertices carry vertical normals, so they walk straight down
+// and the piece is a flat-topped slab exactly D deep in z, whatever the mitre does. A plain make_cube's top
+// has nothing but corner vertices: since Ruling 24 their bisectors are mitred, so they too bury D
+// perpendicular to the top face - but each also travels D inward in x and y, which makes the piece a tapered
+// wedge rather than the full-footprint slab these bounding-box measurements want.
 static std::vector<std::pair<int, EnforcerBlockerType>> grid_box_top(int n)
 {
     std::vector<int> top;

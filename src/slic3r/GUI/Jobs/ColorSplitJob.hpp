@@ -44,6 +44,8 @@ public:
         ColorSplitResult result;            // filled in by process()
         bool             ok = false;
         std::string      error;
+        // Ruling 27(2): a target that had nothing to split is reported as a warning, not as an error box.
+        ColorSplitErrorKind error_kind = ColorSplitErrorKind::generic;
     };
 
     ColorSplitJob(Plater *plater, std::vector<Target> targets, bool solid_interfaces, bool keep_base_sparse_infill);

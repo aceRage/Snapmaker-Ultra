@@ -73,7 +73,7 @@ static int effective_shell_layers(int n_layers, double thickness, double h)
 ColorSplitDepths color_split_depths(const DynamicPrintConfig &cfg, const std::vector<int> &filaments)
 {
     if (filaments.empty())
-        throw ColorSplitError("No filaments to derive the split depth from.");
+        throw ColorSplitError("No filaments to derive the split depth from.", ColorSplitErrorKind::nothing_to_split);
     ColorSplitDepths out;
     const double h = cfg.opt_float("layer_height");
     out.layer_height = h;
@@ -189,7 +189,8 @@ ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const T
     // the stroke inside every partially painted facet. On the retriangulated surface the same swap only
     // reverses a facet's own winding - facet order, and so `facet_state`, is untouched.
     ColorPatches patches = extract_color_patches(mesh, paint);
-    if (patches.states.empty()) throw ColorSplitError("The part has no painted colours.");
+    if (patches.states.empty())
+        throw ColorSplitError("The part has no painted colours.", ColorSplitErrorKind::nothing_to_split);
     if (!to_split.isApprox(Transform3d::Identity()))
         its_transform(patches.surface, to_split, /*fix_left_handed=*/true);
     if (progress && !progress(10)) throw ColorSplitCancelled();

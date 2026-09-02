@@ -39,8 +39,8 @@ namespace {
 // its_make_cube(x,y,z) (src/libslic3r/TriangleMesh.cpp) lays the box from (0,0,0) to
 // (x,y,z) with these facet indices:
 //   0,1   = bottom cap (z=0)   2,3   = top cap (z=z)
-//   4,5   = +X side (x=x)      6,7   = Y=0 side
-//   8,9   = -X side (x=0)      10,11 = Y=y side
+//   4,5   = +X side (x=x)      6,7   = -Y side (y=0)
+//   8,9   = -X side (x=0)      10,11 = +Y side (y=y)
 // Side facets each span the object's FULL height as a single triangle, which is exactly
 // what these tests need: painting facets {4,5} paints one entire side wall top-to-bottom
 // (Tests 1-2, exercising the Voronoi/cut_segmented_layers path at every layer); painting

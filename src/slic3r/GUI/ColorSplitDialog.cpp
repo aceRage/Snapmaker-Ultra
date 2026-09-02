@@ -3,6 +3,7 @@
 #include "GUI.hpp"
 #include "GUI_App.hpp"
 #include "I18N.hpp"
+#include "format.hpp"
 
 #include <wx/checkbox.h>
 #include <wx/sizer.h>
@@ -19,10 +20,10 @@ ColorSplitDialog::ColorSplitDialog(wxWindow               *parent,
                                    const ColorSplitDepths &depths,
                                    const std::vector<int> &filaments,
                                    size_t                  triangle_count,
+                                   size_t                  part_count,
                                    bool                    keep_base_sparse_infill_default)
     : DPIDialog(parent, wxID_ANY, _L("Split by painted colour"), wxDefaultPosition, wxDefaultSize,
                 wxDEFAULT_DIALOG_STYLE)
-    , m_depths(depths)
 {
     wxBoxSizer *root = new wxBoxSizer(wxVERTICAL);
 
@@ -32,6 +33,9 @@ ColorSplitDialog::ColorSplitDialog(wxWindow               *parent,
         filament_list += (i == 0 ? "" : ", ") + wxString::Format("%d", filaments[i]);
     wxString summary = _L("Filaments") + ": " + filament_list + "\n";
     summary += _L("Triangles") + ": " + from_u8(std::to_string(triangle_count)) + "\n";
+    // Ruling 27(3): every depth below is the first painted part's, but the settings behind them are per part.
+    if (part_count > 1)
+        summary += format_wxstr(_L("%1% painted parts (the depths below are the first part's)"), part_count) + "\n";
     summary += _L("Computed depth") + ": " +
                (depths.unlimited ? _L("unlimited (the colour goes all the way through)") : mm_str(depths.D)) + "\n";
     summary += _L("Wall stack") + ": " + mm_str(depths.ws) + "\n";
@@ -95,6 +99,10 @@ ColorSplitDialog::ColorSplitDialog(wxWindow               *parent,
 bool ColorSplitDialog::validate()
 {
     m_depth_override = 0.;
+    // "Unlimited depth" greys the override out and the split ignores it (ColorSplit.cpp:128), so whatever the
+    // field still holds is not an answer the user gave and must not stop them.
+    if (m_unlimited_cb->GetValue())
+        return true;
     wxString text = m_depth_ctrl->GetValue();
     text.Trim(true).Trim(false);
     if (! text.IsEmpty()) {
@@ -106,11 +114,8 @@ bool ColorSplitDialog::validate()
         m_depth_override = value;
     }
     // paint_depth_mode "unlimited" computes no depth at all (PaintDepth.cpp:12-13), so unticking the box
-    // without giving one would cut nothing.
-    if (! m_unlimited_cb->GetValue() && m_depth_override <= 0. && m_depths.D <= 0.) {
-        show_error(this, _L("The print settings give no colour depth. Tick \"Unlimited depth\" or enter a depth override."));
-        return false;
-    }
+    // without giving one would cut nothing - that is checked per target in Plater::split_by_color
+    // (Ruling 27(3)), the only place that knows the painted parts this dialog does not show.
     return true;
 }
 

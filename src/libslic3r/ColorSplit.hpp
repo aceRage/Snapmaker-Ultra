@@ -16,7 +16,17 @@ class DynamicPrintConfig;
 class ModelObject;
 class ModelVolume;
 
-class ColorSplitError : public std::runtime_error { public: using std::runtime_error::runtime_error; };
+// Ruling 27(2): the GUI shows "nothing to split" - no painted colours, no filament to derive a depth from -
+// as a plater warning rather than a modal error box, so the kind travels with the exception instead of
+// being recovered by matching on the message text.
+enum class ColorSplitErrorKind { generic, nothing_to_split };
+class ColorSplitError : public std::runtime_error
+{
+public:
+    explicit ColorSplitError(const std::string &msg, ColorSplitErrorKind kind = ColorSplitErrorKind::generic)
+        : std::runtime_error(msg), kind(kind) {}
+    ColorSplitErrorKind kind;
+};
 class ColorSplitCancelled : public ColorSplitError { public: ColorSplitCancelled() : ColorSplitError("cancelled") {} };
 
 // Progress callback: percent 0..100; return false to cancel.

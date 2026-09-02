@@ -19,13 +19,16 @@ namespace Slic3r { namespace GUI {
 class ColorSplitDialog : public DPIDialog
 {
 public:
-    // `depths` are the computed WORLD-millimetre depths, shown as they are; `filaments` are the 1-based ids
-    // the split will produce a part for; `keep_base_sparse_infill_default` is the object's
+    // `depths` are the computed WORLD-millimetre depths of the FIRST painted part, shown as they are;
+    // `part_count` is how many painted parts the action found (Ruling 27(3): the dialog says so when there is
+    // more than one, and Plater::split_by_color checks the depths of the ones not shown); `filaments` are the
+    // 1-based ids the split will produce a part for; `keep_base_sparse_infill_default` is the object's
     // paint_infill_override inverted.
     ColorSplitDialog(wxWindow                *parent,
                      const ColorSplitDepths  &depths,
                      const std::vector<int>  &filaments,
                      size_t                   triangle_count,
+                     size_t                   part_count,
                      bool                     keep_base_sparse_infill_default);
 
     // Valid once ShowModal() returned wxID_OK.
@@ -41,8 +44,7 @@ protected:
 private:
     bool validate();
 
-    ColorSplitDepths m_depths;
-    double           m_depth_override = 0.;
+    double m_depth_override = 0.;
 
     wxTextCtrl *m_depth_ctrl                 = nullptr;
     wxCheckBox *m_unlimited_cb               = nullptr;

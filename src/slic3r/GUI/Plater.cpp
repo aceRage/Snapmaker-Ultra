@@ -24037,7 +24037,10 @@ void Plater::split_by_color()
             t.mesh_vertices   = t.mesh.vertices.size();
             t.mesh_indices    = t.mesh.indices.size();
 
-            shown_depths    = world_depths;
+            // Ruling 27(3): the depths shown are the FIRST painted part's; the dialog says how many parts
+            // there are, and the per-target check below covers the ones it does not show.
+            if (targets.empty())
+                shown_depths = world_depths;
             triangle_count += t.mesh.indices.size();
             for (int f : filaments)
                 if (std::find(shown_filaments.begin(), shown_filaments.end(), f) == shown_filaments.end())
@@ -24045,6 +24048,15 @@ void Plater::split_by_color()
             targets.emplace_back(std::move(t));
         }
     } catch (const ColorSplitError &e) {
+        // Ruling 27(2): "there is nothing here to split" is a note, not a failure to dismiss.
+        if (e.kind == ColorSplitErrorKind::nothing_to_split)
+            get_notification_manager()->push_plater_warning_notification(e.what());
+        else
+            show_error(this, from_u8(e.what()));
+        return;
+    } catch (const std::exception &e) {
+        // color_split_space and color_split_depths also read the config and invert the transform; anything
+        // else they throw would otherwise unwind out through the menu handler.
         show_error(this, from_u8(e.what()));
         return;
     }
@@ -24054,12 +24066,22 @@ void Plater::split_by_color()
 
     // "Keep base-colour sparse infill" mirrors the 2D behaviour the object would have had without the split.
     const ConfigOptionBool *paint_infill_override = base.option<ConfigOptionBool>("paint_infill_override");
-    ColorSplitDialog dlg(this, shown_depths, shown_filaments, triangle_count,
+    ColorSplitDialog dlg(this, shown_depths, shown_filaments, triangle_count, targets.size(),
                          paint_infill_override == nullptr || ! paint_infill_override->value);
     if (dlg.ShowModal() != wxID_OK)
         return;
 
     const ColorSplitParams params = dlg.params();
+    // Ruling 27(3): "Unlimited depth" and the override cover EVERY target, so every target has to end up with
+    // a depth to cut with - the dialog only showed the first one's. t.depths.D is the world depth times the
+    // split space's (positive) scale, so testing it is the same test as testing the world depth.
+    if (! dlg.unlimited() && params.depth_override_mm <= 0.)
+        for (const ColorSplitJob::Target &t : targets)
+            if (t.depths.D <= 0.) {
+                get_notification_manager()->push_plater_warning_notification(GUI::format(
+                    _u8L("Part %1% has no paint depth configured; tick Unlimited depth or enter an override."), t.name));
+                return;
+            }
     for (ColorSplitJob::Target &t : targets) {
         // scale_params divides the dialog's world-millimetre override by the depth scale, since
         // effective_depths applies it inside the split (ColorSplit.cpp:128, 252).

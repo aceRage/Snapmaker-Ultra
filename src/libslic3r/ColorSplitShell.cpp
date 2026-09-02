@@ -464,13 +464,15 @@ struct ShellBuilder {
     // are its corners, at 54.7 degrees to it - spending d along n(v) buried only d/sqrt(3), a third of the
     // claim (the Task 8 parity measurement: 45.9 mm^2/layer against the 2D band's 54.4). Dividing by
     // n(v).n_P is the classic mitre, and it lands the corner on the 45 degree diagonal the 2D Voronoi
-    // segmentation draws at the same edge. The 0.5 floor is the mitre limit of 2 (a 60 degree half-angle):
-    // at a needle-sharp spike the exact mitre runs away, and doubling the depth there is already generous.
+    // segmentation draws at the same edge. BISECTOR_MITER_COS_FLOOR is a mitre limit of 2 (a 60 degree
+    // half-angle), the bisector counterpart of group_topology's CREASE_MITER_LIMIT: at a needle-sharp spike
+    // the exact mitre runs away, and doubling the depth there is already generous.
     // The half-thickness probe then clamps the LENGTHENED segment - it is measured along n(v), which is
     // exactly the direction travelled - so no mitred wall can cross the mid-surface (spec 3.4).
     float bisector_length(int v, const Vec3f &n_p, float d) const
     {
-        const float cosang = n_p.squaredNorm() > 0.f ? std::max(0.5f, normals[v].dot(n_p)) : 1.f;
+        constexpr float BISECTOR_MITER_COS_FLOOR = 0.5f;
+        const float cosang = n_p.squaredNorm() > 0.f ? std::max(BISECTOR_MITER_COS_FLOOR, normals[v].dot(n_p)) : 1.f;
         return std::min(d / cosang, half[v]);
     }
 
