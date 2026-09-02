@@ -139,12 +139,20 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #plate .obj.sel { stroke: #fff; stroke-width: 1.6; }
 #plate .obj.out { stroke: #e55; stroke-dasharray: 3 2; }
 #plate .lbl { fill: #fff; font-size: 7px; pointer-events: none; paint-order: stroke; stroke: #000; stroke-width: 2px; }
-#plate .ctl { background: #1f1f1f; padding: 8px 10px; padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
-#plate .ctl .row { margin-bottom: 8px; }
+#plate .ctl { background: #1f1f1f; padding: 10px 12px; padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
+#plate .ctl .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 #plate .ctl .row:last-child { margin-bottom: 0; }
-#plate .ctl .k { color: #9a9a9a; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; width: 62px; flex: none; }
-#plate .ctl input { width: 76px; background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 7px 9px; font-size: 14px; }
-#plate .ctl .btn.small { border-style: solid; }
+#plate .ctl .k { color: #9a9a9a; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; width: 64px; flex: none; }
+#plate .ctl input[type=text] { width: 76px; background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 8px 10px; font-size: 14px; }
+#plate .ctl .btn { margin: 2px 0; padding: 9px 16px; }
+#plate .ctl .btn.small { border-style: solid; padding: 8px 14px; }
+#plate .ctl .slider { flex: 1 1 160px; min-width: 140px; display: flex; flex-direction: column; gap: 2px; }
+#plate .ctl input[type=range] { width: 100%; margin: 6px 0 0; accent-color: #0a9e50; }
+#plate .ctl .ticks { display: flex; justify-content: space-between; color: #777; font-size: 10px; padding: 0 2px; }
+#plate .ctl .ticks span { width: 0; text-align: center; white-space: nowrap; }
+#plate .rot-line { stroke: #fff; stroke-width: 0.8; stroke-dasharray: 2 2; pointer-events: none; }
+#plate .rot-grab { fill: #0a9e50; stroke: #fff; stroke-width: 1.2; cursor: grab; }
+#plate .rot-grab.active { fill: #5fd08a; }
 #plate .ctl .sel-name { color: #fff; font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #plate .ctl .hint { color: #888; font-size: 12px; }
 #modal .url { font-family: Consolas, monospace; font-size: 12px; color: #9ed; text-align: center; word-break: break-all; user-select: all; }
@@ -1358,7 +1366,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     // selects, a drag moves, the bar below rotates / scales / centres via /api/objects/transform ----
     var plateData = null, plateSel = null, plateIndex = -1, plateBusy = false;
     function openPlate(index) {
-        plateIndex = index; plateSel = null;
+        plateIndex = index; plateSel = null; plateZoom = 1; plateCenter = null;
         var sheet = document.getElementById('plate');
         sheet.style.display = 'flex';
         sheet.querySelector('.canvas').innerHTML = '<div class="hint" style="color:#888">Loading plate…</div>';
@@ -1385,56 +1393,159 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             .catch(function(e) { plateBusy = false; fail(e); loadPlate(); });
     }
     function svgEl(tag, attrs) { var e = document.createElementNS('http://www.w3.org/2000/svg', tag); for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
+    var plateZoom = 1, plateCenter = null; // view state: zoom factor and centre (plate mm)
+    function plateViewBox(b) {
+        var m = 12, W = (b[2] - b[0] + 2 * m) / plateZoom, H = (b[3] - b[1] + 2 * m) / plateZoom;
+        if (!plateCenter) plateCenter = [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+        return [plateCenter[0] - W / 2, plateCenter[1] - H / 2, W, H];
+    }
+    function applyPlateView(svg) {
+        var vb = plateViewBox(plateData.plate_box);
+        svg.setAttribute('viewBox', vb.join(' '));
+    }
+    function snap15(v) { var n = Math.round(v / 15) * 15; return Math.abs(v - n) <= 4 ? n : v; }
+    // Live preview of a rotation (degrees, model CCW) around the object's centre: the SVG is
+    // y-down, so a visually counter-clockwise turn is rotate(-deg) there.
+    function previewRotate(g, o, deg) {
+        var b = plateData.plate_box, fy = function(y) { return b[3] + b[1] - y; };
+        var cx = (o.bbox[0] + o.bbox[2]) / 2, cy = fy((o.bbox[1] + o.bbox[3]) / 2);
+        g.setAttribute('transform', deg ? 'rotate(' + (-deg) + ' ' + cx + ' ' + cy + ')' : '');
+        var grab = document.querySelector('#plate .rot-wrap');
+        if (grab) grab.setAttribute('transform', deg ? 'rotate(' + (-deg) + ' ' + cx + ' ' + cy + ')' : '');
+    }
     function renderPlate() {
         var d = plateData, sheet = document.getElementById('plate');
         var head = sheet.querySelector('.head'); head.innerHTML = '';
         head.appendChild(el('div', 'name', (d.name ? d.name : 'Plate ' + (d.index + 1)) + ' · ' + d.objects.length + ' object' + (d.objects.length === 1 ? '' : 's')));
+        var fit = el('span', 'btn small', 'Fit'); fit.title = 'Reset zoom'; fit.onclick = function() { plateZoom = 1; plateCenter = null; renderPlate(); }; head.appendChild(fit);
         var close = el('span', 'btn small', 'Close'); close.onclick = closePlate; head.appendChild(close);
         // Canvas: plate box in mm, Y flipped so +Y is up like the slicer's top view.
-        var b = d.plate_box, m = 12, W = b[2] - b[0], H = b[3] - b[1];
+        var b = d.plate_box, W = b[2] - b[0], H = b[3] - b[1];
         var fy = function(y) { return b[3] + b[1] - y; };
-        var svg = svgEl('svg', { viewBox: (b[0] - m) + ' ' + (b[1] - m) + ' ' + (W + 2 * m) + ' ' + (H + 2 * m), preserveAspectRatio: 'xMidYMid meet' });
+        var svg = svgEl('svg', { preserveAspectRatio: 'xMidYMid meet' });
+        applyPlateView(svg);
         svg.appendChild(svgEl('rect', { x: b[0], y: b[1], width: W, height: H, 'class': 'bed', rx: 2 }));
         for (var gx = Math.ceil(b[0] / 50) * 50; gx <= b[2]; gx += 50) svg.appendChild(svgEl('line', { x1: gx, y1: b[1], x2: gx, y2: b[3], 'class': 'gridline' }));
         for (var gy = Math.ceil(b[1] / 50) * 50; gy <= b[3]; gy += 50) svg.appendChild(svgEl('line', { x1: b[0], y1: fy(gy), x2: b[2], y2: fy(gy), 'class': 'gridline' }));
         (d.exclude || []).forEach(function(e) { svg.appendChild(svgEl('rect', { x: e[0], y: fy(e[3]), width: e[2] - e[0], height: e[3] - e[1], 'class': 'excl' })); });
+        var groups = {};
         d.objects.forEach(function(o) {
             var pts = o.hull.map(function(p) { return p[0] + ',' + fy(p[1]); }).join(' ');
             var g = svgEl('g', { 'data-obj': o.obj, 'data-inst': o.inst });
-            var poly = svgEl('polygon', { points: pts, 'class': 'obj' + (plateSel && plateSel.obj === o.obj && plateSel.inst === o.inst ? ' sel' : '') + (o.outside ? ' out' : ''), fill: /^#[0-9a-fA-F]{6}$/.test(o.color) ? o.color : '#26a69a' });
+            var isSel = plateSel && plateSel.obj === o.obj && plateSel.inst === o.inst;
+            var poly = svgEl('polygon', { points: pts, 'class': 'obj' + (isSel ? ' sel' : '') + (o.outside ? ' out' : ''), fill: /^#[0-9a-fA-F]{6}$/.test(o.color) ? o.color : '#26a69a' });
             g.appendChild(poly);
             var cx = (o.bbox[0] + o.bbox[2]) / 2, cy = fy((o.bbox[1] + o.bbox[3]) / 2);
             var t = svgEl('text', { x: cx, y: cy, 'class': 'lbl', 'text-anchor': 'middle', 'dominant-baseline': 'middle' });
             t.textContent = o.name.length > 18 ? o.name.slice(0, 17) + '…' : o.name;
             g.appendChild(t);
             svg.appendChild(g);
-            // Tap = select; drag = move (the polygon follows, the move is sent on release).
+            groups[o.obj + ':' + o.inst] = g;
+            // Tap = select; one-finger drag = move (the polygon follows, the move is sent on
+            // release). A second finger cancels the drag and starts a pinch instead.
             var drag = null;
             g.addEventListener('pointerdown', function(ev) {
-                ev.preventDefault();
-                plateSel = o; renderPlateCtl();
-                svg.querySelectorAll('.obj.sel').forEach(function(p) { p.classList.remove('sel'); });
-                poly.classList.add('sel');
+                if (pointers.size >= 1) return; // a pinch / pan is in progress
+                ev.preventDefault(); ev.stopPropagation();
+                if (!(plateSel && plateSel.obj === o.obj && plateSel.inst === o.inst)) { plateSel = o; renderPlate(); }
+                var gg = groups[o.obj + ':' + o.inst] || g;
                 var pt = svgPoint(svg, ev);
-                drag = { x0: pt.x, y0: pt.y, dx: 0, dy: 0, id: ev.pointerId };
-                g.setPointerCapture(ev.pointerId);
+                drag = { x0: pt.x, y0: pt.y, dx: 0, dy: 0, id: ev.pointerId, g: gg };
+                gg.setPointerCapture(ev.pointerId);
+                gg.addEventListener('pointermove', onMove);
+                gg.addEventListener('pointerup', finish);
+                gg.addEventListener('pointercancel', finish);
             });
-            g.addEventListener('pointermove', function(ev) {
+            var onMove = function(ev) {
                 if (!drag || ev.pointerId !== drag.id) return;
+                if (pointers.size > 1) { drag.g.removeAttribute('transform'); drag = null; return; }
                 var pt = svgPoint(svg, ev);
                 drag.dx = pt.x - drag.x0; drag.dy = pt.y - drag.y0;
-                g.setAttribute('transform', 'translate(' + drag.dx + ',' + drag.dy + ')');
-            });
+                drag.g.setAttribute('transform', 'translate(' + drag.dx + ',' + drag.dy + ')');
+                var wrap = document.querySelector('#plate .rot-wrap');
+                if (wrap) wrap.setAttribute('transform', 'translate(' + drag.dx + ',' + drag.dy + ')');
+            };
             var finish = function(ev) {
                 if (!drag || ev.pointerId !== drag.id) return;
-                var dx = drag.dx, dy = drag.dy; drag = null;
-                if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) { g.removeAttribute('transform'); return; }
+                var dx = drag.dx, dy = drag.dy; drag.g.removeAttribute('transform'); drag = null;
+                if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
                 // canvas Y is flipped: moving down on screen is -Y in the slicer
                 transformSel('x=' + (o.offset[0] + dx).toFixed(3) + '&y=' + (o.offset[1] - dy).toFixed(3));
             };
-            g.addEventListener('pointerup', finish);
-            g.addEventListener('pointercancel', finish);
         });
+        // Rotation grabber on the selected object: a handle above its centre; dragging it
+        // around the centre spins the object (snaps near multiples of 15°).
+        if (plateSel && groups[plateSel.obj + ':' + plateSel.inst]) {
+            var o = plateSel, cxs = (o.bbox[0] + o.bbox[2]) / 2, cys = fy((o.bbox[1] + o.bbox[3]) / 2);
+            var rad = Math.max(o.bbox[2] - o.bbox[0], o.bbox[3] - o.bbox[1]) / 2 + 14 / plateZoom;
+            var wrap = svgEl('g', { 'class': 'rot-wrap' });
+            wrap.appendChild(svgEl('line', { x1: cxs, y1: cys, x2: cxs, y2: cys - rad, 'class': 'rot-line' }));
+            var grab = svgEl('circle', { cx: cxs, cy: cys - rad, r: 7 / plateZoom, 'class': 'rot-grab' });
+            wrap.appendChild(grab);
+            svg.appendChild(wrap);
+            var rot = null, gsel = groups[o.obj + ':' + o.inst];
+            var angleOf = function(ev) { var pt = svgPoint(svg, ev); return Math.atan2(-(pt.y - cys), pt.x - cxs) * 180 / Math.PI; };
+            grab.addEventListener('pointerdown', function(ev) {
+                ev.preventDefault(); ev.stopPropagation();
+                rot = { a0: angleOf(ev), id: ev.pointerId, deg: 0 };
+                grab.classList.add('active');
+                grab.setPointerCapture(ev.pointerId);
+            });
+            grab.addEventListener('pointermove', function(ev) {
+                if (!rot || ev.pointerId !== rot.id) return;
+                var delta = angleOf(ev) - rot.a0;
+                delta = ((delta + 540) % 360) - 180;
+                rot.deg = snap15(o.rz + delta) - o.rz;
+                previewRotate(gsel, o, rot.deg);
+                var r = document.querySelector('#plate .ctl input[type=range]'), t = document.querySelector('#plate .ctl input[data-rz]');
+                var v = o.rz + rot.deg;
+                if (r) r.value = Math.max(-90, Math.min(90, v));
+                if (t) t.value = v.toFixed(1);
+            });
+            var endRot = function(ev) {
+                if (!rot || ev.pointerId !== rot.id) return;
+                var deg = rot.deg; rot = null; grab.classList.remove('active');
+                if (Math.abs(deg) < 0.5) { previewRotate(gsel, o, 0); return; }
+                transformSel('rz=' + (o.rz + deg).toFixed(2));
+            };
+            grab.addEventListener('pointerup', endRot);
+            grab.addEventListener('pointercancel', endRot);
+        }
+        // Pan with one finger on the bed, pinch with two to zoom (around the pinch centre).
+        var pointers = new Map(), pan = null, pinch = null;
+        svg.addEventListener('pointerdown', function(ev) {
+            pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+            if (ev.target.closest && ev.target.closest('g[data-obj], .rot-grab')) return;
+            ev.preventDefault();
+            svg.setPointerCapture(ev.pointerId);
+            if (pointers.size === 1) { var pt = svgPoint(svg, ev); pan = { x0: pt.x, y0: pt.y, c0: plateCenter.slice() }; }
+        });
+        svg.addEventListener('pointermove', function(ev) {
+            if (!pointers.has(ev.pointerId)) return;
+            pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+            if (pointers.size === 2) {
+                var ps = Array.from(pointers.values());
+                var dist = Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y);
+                var mid = { clientX: (ps[0].x + ps[1].x) / 2, clientY: (ps[0].y + ps[1].y) / 2 };
+                if (!pinch) { pinch = { d0: dist, z0: plateZoom, mid0: svgPoint(svg, mid) }; pan = null; return; }
+                var z = Math.max(0.5, Math.min(8, pinch.z0 * dist / pinch.d0));
+                // keep the world point under the pinch centre fixed
+                var before = svgPoint(svg, mid);
+                plateZoom = z; applyPlateView(svg);
+                var after = svgPoint(svg, mid);
+                plateCenter[0] += before.x - after.x; plateCenter[1] += before.y - after.y;
+                applyPlateView(svg);
+            } else if (pointers.size === 1 && pan) {
+                var pt = svgPoint(svg, ev);
+                plateCenter = [pan.c0[0] - (pt.x - pan.x0), pan.c0[1] - (pt.y - pan.y0)];
+                applyPlateView(svg);
+                var p2 = svgPoint(svg, ev); pan.x0 = p2.x; pan.y0 = p2.y; pan.c0 = plateCenter.slice();
+            }
+        });
+        var endPointer = function(ev) { pointers.delete(ev.pointerId); if (pointers.size < 2) pinch = null; if (pointers.size === 0) pan = null; };
+        svg.addEventListener('pointerup', endPointer);
+        svg.addEventListener('pointercancel', endPointer);
+        svg.addEventListener('wheel', function(ev) { ev.preventDefault(); var before = svgPoint(svg, ev); plateZoom = Math.max(0.5, Math.min(8, plateZoom * (ev.deltaY < 0 ? 1.15 : 1 / 1.15))); applyPlateView(svg); var after = svgPoint(svg, ev); plateCenter[0] += before.x - after.x; plateCenter[1] += before.y - after.y; applyPlateView(svg); }, { passive: false });
         var canvas = sheet.querySelector('.canvas'); canvas.innerHTML = ''; canvas.appendChild(svg);
         renderPlateCtl();
     }
@@ -1444,20 +1555,29 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
     function renderPlateCtl() {
         var ctl = document.querySelector('#plate .ctl'); ctl.innerHTML = '';
-        if (!plateSel) { ctl.appendChild(el('div', 'hint', plateData && plateData.objects.length ? 'Tap an object to select it, drag to move it.' : 'This plate is empty.')); return; }
+        if (!plateSel) { ctl.appendChild(el('div', 'hint', plateData && plateData.objects.length ? 'Tap an object to select it, drag to move it. Pinch to zoom, drag the bed to pan.' : 'This plate is empty.')); return; }
         var o = plateSel;
+        var gsel = document.querySelector('#plate g[data-obj="' + o.obj + '"][data-inst="' + o.inst + '"]');
         var r1 = el('div', 'row');
         r1.appendChild(el('span', 'sel-name', o.name));
         r1.appendChild(el('span', 'hint', Math.round(o.size[0]) + ' × ' + Math.round(o.size[1]) + ' × ' + Math.round(o.size[2]) + ' mm' + (o.outside ? ' · outside the plate' : '')));
         ctl.appendChild(r1);
+        // Rotation: slider -90..+90 with 15° ticks (snaps within 4°), plus the exact value.
         var r2 = el('div', 'row');
         r2.appendChild(el('span', 'k', 'Rotate'));
-        [['-90', -90], ['-15', -15], ['+15', 15], ['+90', 90]].forEach(function(s) {
-            var bt = el('span', 'btn small', s[0] + '°');
-            bt.onclick = function() { transformSel('rz=' + (o.rz + s[1]).toFixed(2)); };
-            r2.appendChild(bt);
-        });
-        var rin = el('input'); rin.type = 'text'; rin.inputMode = 'decimal'; rin.value = o.rz.toFixed(1); rin.title = 'Rotation around Z, degrees';
+        var sl = el('div', 'slider');
+        var range = el('input'); range.type = 'range'; range.min = -90; range.max = 90; range.step = 0.5;
+        range.value = Math.max(-90, Math.min(90, o.rz)); range.setAttribute('list', 'rzticks');
+        var dl = el('datalist'); dl.id = 'rzticks';
+        for (var a = -90; a <= 90; a += 15) { var op = el('option'); op.value = a; dl.appendChild(op); }
+        sl.appendChild(range); sl.appendChild(dl);
+        var ticks = el('div', 'ticks');
+        for (var a2 = -90; a2 <= 90; a2 += 15) ticks.appendChild(el('span', '', a2 % 45 === 0 ? String(a2) : '·'));
+        sl.appendChild(ticks);
+        r2.appendChild(sl);
+        var rin = el('input'); rin.type = 'text'; rin.inputMode = 'decimal'; rin.value = o.rz.toFixed(1); rin.title = 'Rotation around Z, degrees'; rin.dataset.rz = '1';
+        range.oninput = function() { var v = snap15(parseFloat(range.value)); range.value = v; rin.value = v.toFixed(1); if (gsel) previewRotate(gsel, o, v - o.rz); };
+        range.onchange = function() { var v = parseFloat(range.value); if (Math.abs(v - o.rz) >= 0.05) transformSel('rz=' + v.toFixed(2)); };
         rin.onchange = function() { var v = parseFloat(rin.value); if (!isNaN(v)) transformSel('rz=' + v.toFixed(2)); };
         r2.appendChild(rin); r2.appendChild(el('span', 'hint', '°'));
         ctl.appendChild(r2);
@@ -1475,7 +1595,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         var r4 = el('div', 'row');
         r4.appendChild(el('span', 'k', 'Position'));
         r4.appendChild(el('span', 'hint', 'X ' + o.offset[0].toFixed(1) + '  Y ' + o.offset[1].toFixed(1) + ' mm'));
-        var cen = el('span', 'btn small', 'Centre on plate'); cen.onclick = function() { transformSel('center=1'); }; r4.appendChild(cen);
+        var cen = el('span', 'btn small', 'Center On Plate'); cen.onclick = function() { transformSel('center=1'); }; r4.appendChild(cen);
         ctl.appendChild(r4);
     }
     function refreshPrepare() {
@@ -1520,7 +1640,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 var img = el('img');
                 img.alt = 'Plate ' + (p.index + 1);
                 img.src = instBase() + 'api/plates/' + p.index + '/thumbnail.png?v=' + thumbStamp;
-                img.onerror = function() { img.style.display = 'none'; };
+                // The slicer may still be rendering (or busy) when asked: retry a few times.
+                var tries = 0;
+                img.onerror = function() {
+                    if (++tries > 4) { img.alt = 'Preview unavailable'; img.style.opacity = '0.35'; return; }
+                    setTimeout(function() { img.src = instBase() + 'api/plates/' + p.index + '/thumbnail.png?v=' + Date.now(); }, 1500 * tries);
+                };
                 img.title = 'Tap to arrange the objects on this plate';
                 img.style.cursor = 'pointer';
                 img.onclick = function() { openPlate(p.index); };

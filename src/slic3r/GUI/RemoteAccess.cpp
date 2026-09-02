@@ -316,7 +316,13 @@ RemoteAccess::ApiResponse RemoteAccess::api_plate_thumbnail(int plate)
         if (plate < 0 || plate >= plates.get_plate_count())
             return;
         plater->update_all_plate_thumbnails(false);
-        *data = plates.get_plate(plate)->thumbnail_data;
+        PartPlate* p = plates.get_plate(plate);
+        if (!p->thumbnail_data.is_valid()) {
+            // The current plate's thumbnail is reset by every edit; render this one now.
+            ThumbnailsParams params = { {}, false, true, true, true, plate };
+            plater->get_view3D_canvas3D()->render_thumbnail(p->thumbnail_data, p->plate_thumbnail_width, p->plate_thumbnail_height, params, Camera::EType::Ortho);
+        }
+        *data = p->thumbnail_data;
     }, 30000);
     ApiResponse r;
     if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
