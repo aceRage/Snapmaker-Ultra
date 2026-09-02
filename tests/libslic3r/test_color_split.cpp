@@ -7,6 +7,7 @@
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/MeshBoolean.hpp>
 #include <chrono>
+#include <cmath>
 
 using namespace Slic3r;
 using Catch::Matchers::WithinAbs;
@@ -228,4 +229,26 @@ TEST_CASE("colorsplit: per-vertex depth is min(D, half thickness)", "[colorsplit
     // sampled on a plain cube (only corner vertices exist), corners see the body diagonal/2.
     std::vector<float> du = compute_vertex_depths(pb, nb, std::numeric_limits<double>::infinity());
     for (float x : du) REQUIRE(x > 1.5f);
+}
+
+TEST_CASE("colorsplit: NormalUtils AngleWeighted normals are the exact corner bisector on a cube", "[colorsplit]")
+{
+    // Regression pin for the NormalUtils::indice_angle indexing fix (it was reading vertices[i1]/vertices[i]
+    // - local triangle-relative positions 0/1/2 - directly, instead of going through the triangle's own
+    // indices vertices[indice[i1]]/vertices[indice[i]], so every triangle got the SAME fixed weight pair
+    // regardless of its own shape). color_split_normals is spec 3.2's AngleWeighted consumer, and every corner
+    // of an axis-aligned cube must get the exact (+-1,+-1,+-1)/sqrt3 bisector: three mutually perpendicular
+    // faces meet there with equal 90 degree angle weight each, so the angle-weighted average is just the
+    // unweighted average of the three face normals.
+    TriangleMesh cube = make_cube(40., 40., 20.);
+    std::vector<Vec3f> n = color_split_normals(cube.its);
+    const Vec3f centre(20.f, 20.f, 10.f);
+    const float s = 1.f / std::sqrt(3.f);
+    for (size_t v = 0; v < cube.its.vertices.size(); ++v) {
+        const Vec3f &p = cube.its.vertices[v];
+        const Vec3f expected(p.x() > centre.x() ? s : -s, p.y() > centre.y() ? s : -s, p.z() > centre.z() ? s : -s);
+        REQUIRE_THAT(n[v].x(), WithinAbs(expected.x(), 1e-5f));
+        REQUIRE_THAT(n[v].y(), WithinAbs(expected.y(), 1e-5f));
+        REQUIRE_THAT(n[v].z(), WithinAbs(expected.z(), 1e-5f));
+    }
 }
