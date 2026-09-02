@@ -405,6 +405,18 @@ TEST_CASE("colorsplit: a self-touching patch builds one valid shell across its p
     REQUIRE(c.closed);
     REQUIRE(!c.self_intersects);                                       // the pinch nudge keeps the wedges apart
     REQUIRE_THAT(c.volume, WithinRel(7. * side * side * 1.5, 0.02));
+
+    // The same fixture with spec 3.6's crease step on: every boundary vertex now carries a ring copy too,
+    // including BOTH wedges of the pinch, and the shell must still be valid. The painted region lies inside
+    // one flat face, so its boundary is plain - the ring lands on the straight n(v) path and adds no volume.
+    ColorSplitParams stepped;                                          // crease_step on
+    stepped.flat_cap = false;                                          // ... but keep the depth at D = 1.5
+    std::vector<ColorShell> ss = build_color_shells(p, depths_for_test(1.5), stepped, nullptr);
+    REQUIRE(ss.size() == 1);
+    ShellCheck sc = check_shell(ss[0].mesh);
+    REQUIRE(sc.closed);
+    REQUIRE(!sc.self_intersects);
+    REQUIRE_THAT(sc.volume, WithinRel(7. * side * side * 1.5, 0.02));
 }
 
 TEST_CASE("colorsplit: a shell on a 0.3mm plate stops short of mid-thickness", "[colorsplit]")
@@ -830,6 +842,36 @@ TEST_CASE("colorsplit: painted top steps one wall stack in below the surface lay
     REQUIRE(rings == 4);      // one ring copy and one bottom copy per corner of the painted top
     REQUIRE(bottoms == 4);
     REQUIRE(check_shell(shells[0].mesh).closed);
+}
+
+TEST_CASE("colorsplit: the crease step's own descent stops at mid-thickness on a thin plate", "[colorsplit]")
+{
+    // Ruling 20: case A descends along n_P, but d(v) was measured along n(v). At this plate's corners the
+    // bisector probe gives d = 1.2*sqrt(3)/2 - delta = 1.037, while the material under the wall - straight
+    // down from the ring, one wall stack inside the rim - is only 1.2 mm thick, so the wall may descend
+    // 0.598. Without the re-probe the bottom would land at z = 1.0 - (1.037 - 0.2) = 0.163, well past the
+    // mid-surface and into the shell the other side would build.
+    ColorSplitDepths d     = depths_for_test(1.5, 0.2, 0.87);
+    TriangleMesh     plate = make_cube(40., 40., 1.2);
+    ColorPatches     p     = extract_color_patches(plate.its, paint_data(plate, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
+    for (bool flat_cap : {false, true}) {                  // the cap (0.8) is the looser of the two clamps here
+        ColorSplitParams params = cap_and_step();
+        params.flat_cap = flat_cap;
+        auto shells = build_color_shells(p, d, params, nullptr);
+        REQUIRE(shells.size() == 1);
+        int tops = 0, rings = 0, bottoms = 0;
+        for (const Vec3f &v : shells[0].mesh.vertices) {
+            if      (std::abs(v.z() - 1.2f) < 1e-3f) ++tops;
+            else if (std::abs(v.z() - 1.0f) < 1e-3f) ++rings;
+            else { REQUIRE_THAT(v.z(), WithinAbs(0.602f, 1e-3f)); ++bottoms; }
+        }
+        REQUIRE(tops == 4);
+        REQUIRE(rings == 4);
+        REQUIRE(bottoms == 4);
+        ShellCheck c = check_shell(shells[0].mesh);
+        REQUIRE(c.closed);
+        REQUIRE(!c.self_intersects);
+    }
 }
 
 TEST_CASE("colorsplit: painted side face keeps its full wall stack up to the top edge", "[colorsplit]")

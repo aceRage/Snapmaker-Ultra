@@ -170,6 +170,13 @@ struct CreaseWall {
 struct CreaseStep {
     Vec3f n_p{Vec3f::Zero()};      // unit mean normal of the group's facets there
     Vec3f t_miter{Vec3f::Zero()};  // case A only: the inward step per unit of wall stack (mitred, see below)
+    // Ruling 20: case A's descent runs along n_P, but d(v) was measured along the vertex normal n(v), so on a
+    // thin painted top it says nothing about how much material lies UNDER the wall (a 1.2 mm plate's corner
+    // has d = 1.037 along its bisector while the vertical half-thickness is 0.598). Case A therefore
+    // re-probes, like the concave and same-state walls do, at the RING's own position - the wall does not
+    // descend at the boundary vertex, it descends one wall stack inside it. Case B's second segment runs
+    // along n(v), whose depth is already that probe, so it needs nothing.
+    float half_thickness = 0.f;
     bool  case_a = false;
 };
 
@@ -187,6 +194,7 @@ struct GroupTopology {
 };
 
 GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &nbrs, const AABBMesh &aabb,
+                             const ColorSplitDepths &depths, const ColorSplitParams &params,
                              const std::vector<int> &group, int state)
 {
     auto unit_normal = [&p](int f) { return unit_face_normal(p, f); };
@@ -342,14 +350,21 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
                                                                aabb, p.surface.vertices[entry.first.first], n_p)});
             continue;
         }
-        if (!crease)
-            continue;                                  // plain boundary: the ring just walks down n(v)
+        if (!crease || !params.crease_step)
+            continue;                                  // plain boundary, or the option is off: no step
         CreaseStep step;
         step.n_p    = n_p;
         step.case_a = std::abs(n_p.z()) > std::abs(n_q.z());
         if (step.case_a) {
             const float len = info.t_in.norm();
             step.t_miter    = info.t_in * (std::min(float(info.edges) / len, CREASE_MITER_LIMIT) / len);
+            // Ruling 20: the mid-thickness clamp of the direction this wall really descends, measured where
+            // it descends. The probe starts at the ring's position ON the surface (the mitred step is
+            // tangential, so that is the vertex moved a wall stack along the patch) - not one layer down at
+            // a1 itself, since half_thickness_along measures the thickness of the part from a surface point
+            // and starting inside it would halve only the material BELOW the ring and cross the mid-surface.
+            const Vec3f ring_on_surface = p.surface.vertices[entry.first.first] + float(depths.ws) * step.t_miter;
+            step.half_thickness         = ColorSplitDetail::half_thickness_along(aabb, ring_on_surface, n_p);
         }
         topo.step.emplace(entry.first, step);
     }
@@ -361,7 +376,7 @@ struct ShellBuilder {
     const ColorPatches         &p;
     const std::vector<Vec3i32> &nbrs;          // its_face_neighbors(p.surface)
     const std::vector<Vec3f>   &normals;       // color_split_normals
-    const GroupTopology        &topo;          // group_topology(p, nbrs, aabb, group)
+    const GroupTopology        &topo;          // group_topology(p, nbrs, aabb, depths, params, group, state)
     const std::vector<float>   &d0;            // compute_vertex_depths output; the halving floor may not exceed it
     std::vector<float>          depth;         // working copy of d0 (the fold guard lowers it)
     const ColorSplitDepths     &depths;
@@ -400,9 +415,10 @@ struct ShellBuilder {
             ring   = -first * normals[v];
             bottom = -d * normals[v];
         } else if (step->second.case_a) {                  // painted face more horizontal: inset, then n_P
-            const float first = std::min(d, h);
+            const float d_p   = std::min(d, step->second.half_thickness);   // Ruling 20: clamped along n_P
+            const float first = std::min(d_p, h);
             ring   = ws * step->second.t_miter - first * step->second.n_p;
-            bottom = ring - (d - first) * step->second.n_p;
+            bottom = ring - (d_p - first) * step->second.n_p;
         } else {                                           // painted face less horizontal: a full stack in
             const float first = std::min(d, ws);
             ring   = -first * step->second.n_p;
@@ -587,7 +603,7 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
         const int               s    = group.state;
         const std::vector<int> &comp = group.facets;
         const double            cap_depth = group.cap;
-        const GroupTopology topo = group_topology(p, nbrs, aabb, comp, s);
+        const GroupTopology topo = group_topology(p, nbrs, aabb, depths, params, comp, s);
         // d0 (reference) and its working copy
         ShellBuilder sb{p, nbrs, normals, topo, depth, depth, depths, params.crease_step};
         for (int round = 0; round < 8 && sb.fold_guard(comp, cap_depth); ++round) {}
