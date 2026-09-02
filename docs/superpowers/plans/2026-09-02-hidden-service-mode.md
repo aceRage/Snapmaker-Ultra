@@ -43,7 +43,7 @@ The drafts were written independently; use these names when implementing:
 
 1. `wglMakeCurrent` on the never-shown canvas DC and FBO rendering without a visible window (Phase 2 R1/R2): a Debug build with `HAS_GLSAFE` plus one hidden thumbnail compared byte-for-byte with a shown one.
 2. Foreground activation from the hub (Phase 1 risk 1): `AllowSetForegroundWindow(pid)` in the hub before the request; fall back to `AttachThreadInput` if the window only flashes.
-3. `wxModalDialogHook` coverage in the vendored wx (Phase 3 test D): a logging-only hook must see `wxMessageBox`, `wxFileDialog`, `MessageDialog`, `InfoDialog` and `GuideFrame`.
+3. `wxModalDialogHook` coverage in the vendored wx (Phase 3 test D) - SETTLED 2026-09-02 by inspecting `deps/build/dep_wxWidgets-prefix/src/dep_wxWidgets/src`: `WX_HOOK_MODAL_DIALOG()` is present in `msw/dialog.cpp` (`wxDialog::ShowModal`, the base every fork dialog and `wxTextEntryDialog` end in), `msw/msgdlg.cpp`, `msw/richmsgdlg.cpp`, `msw/filedlg.cpp`, `msw/dirdlg.cpp`, `msw/colordlg.cpp`, `msw/fontdlg.cpp` and `msw/printdlg.cpp`. Every modal in the process reaches the hook; test D becomes a one-time confirmation, not a gate.
 4. Idle-loop cost of a bound but never-painting canvas (Phase 2 R5): CPU at idle after warm-up.
 
 ## Phase 1 — Hidden launch, registration, show/hide
