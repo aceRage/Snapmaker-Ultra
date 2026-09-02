@@ -673,7 +673,12 @@ TEST_CASE("colorsplit: a painted boss on a block is entirely its colour (smooth-
     ColorPatches p = extract_color_patches(bossed.its, paint);
     auto shells = build_color_shells(p, depths_for_test(1.5, 0.2, 0.87), ColorSplitParams{}, nullptr);
     REQUIRE(shells.size() == 2);                                       // side tube + top slab, both state 2
-    for (const ColorShell &sh : shells) { REQUIRE(sh.state == 2); REQUIRE(check_shell(sh.mesh).closed); REQUIRE(!check_shell(sh.mesh).self_intersects); }
+    for (const ColorShell &sh : shells) {
+        REQUIRE(sh.state == 2);
+        ShellCheck c = check_shell(sh.mesh);   // one CGAL run per shell, not two
+        REQUIRE(c.closed);
+        REQUIRE(!c.self_intersects);
+    }
     ColorSplitResult rb = split_volume_by_paint(bossed.its, paint, depths_for_test(1.5, 0.2, 0.87), ColorSplitParams{}, nullptr);
     REQUIRE(rb.pieces.size() == 1);
     const double exposed = PI * 1.0 * 1.0 * 3.0;                        // 1 mm of the cylinder is buried in the block
@@ -684,26 +689,204 @@ TEST_CASE("colorsplit: a painted boss on a block is entirely its colour (smooth-
          << 100. * volume_of(rb.pieces[0].second) / exposed << " %)");
 }
 
+// The lowest z of a finished shell - the depth a pinned rule produces.
+static float min_z(const indexed_triangle_set &mesh)
+{
+    float z = 1e9f;
+    for (const Vec3f &v : mesh.vertices) z = std::min(z, v.z());
+    return z;
+}
+
+// Every vertex of `mesh` is one of `expected` and every one of `expected` was built exactly once. Used where
+// a fixture's shell is small enough to pin completely: a per-vertex check catches a wall that leans the wrong
+// way at ONE corner, which the extremum check it replaces (min z, min x per shell) could not.
+static void require_vertices_are(const indexed_triangle_set &mesh, const std::vector<Vec3f> &expected, float tol)
+{
+    REQUIRE(mesh.vertices.size() == expected.size());
+    auto is_near = [tol](const Vec3f &a, const Vec3f &b) { return (a - b).norm() < tol; };
+    for (const Vec3f &v : mesh.vertices)
+        REQUIRE(std::count_if(expected.begin(), expected.end(), [&](const Vec3f &e) { return is_near(v, e); }) == 1);
+    for (const Vec3f &e : expected)
+        REQUIRE(std::count_if(mesh.vertices.begin(), mesh.vertices.end(), [&](const Vec3f &v) { return is_near(v, e); }) == 1);
+}
+
 TEST_CASE("colorsplit: a painted cube top and side are two smooth patches with straight walls", "[colorsplit]")
 {
     TriangleMesh block = make_cube(40., 40., 20.);
     std::vector<std::pair<int, EnforcerBlockerType>> facets = all_with(CUBE_TOP, EnforcerBlockerType::Extruder2);
     for (int f : CUBE_PLUS_X) facets.emplace_back(f, EnforcerBlockerType::Extruder2);
     ColorPatches p = extract_color_patches(block.its, paint_data(block, facets));
-    ColorSplitParams params; params.flat_cap = false; params.crease_step = false;
+    ColorSplitParams params = no_cap_no_step();
     auto shells = build_color_shells(p, depths_for_test(1.5, 0.2, 0.87), params, nullptr);
     REQUIRE(shells.size() == 2);
-    // the top slab's bottom lies exactly 1.5 below the top at every vertex (straight walls at the same-state crease),
-    // and the side slab's bottom exactly 1.5 inside the +X face
-    for (const ColorShell &sh : shells) {
-        float zmin = 1e9f, xmin = 1e9f;
-        for (const Vec3f &v : sh.mesh.vertices) { zmin = std::min(zmin, v.z()); xmin = std::min(xmin, v.x()); }
-        REQUIRE(((std::abs(zmin - 18.5f) < 1e-4f) || (std::abs(xmin - 38.5f) < 1e-4f)));
-    }
+    // Every boundary vertex, not just the deepest one (Task 5 review follow-up). Each patch is one quad, so
+    // its shell is exactly four top copies and four bottom copies. Ruling 19: a corner that carries the
+    // SAME-STATE crease edge (the shared top/+X edge) walks straight down the patch's own normal - 1.5 in z
+    // for the top slab, 1.5 in x for the side slab - while a corner that carries none tapers along the cube's
+    // corner bisector, 1.5/sqrt(3) = 0.866 in each axis. "Every bottom at 18.5" is NOT reachable: the two
+    // corners at x = 0 carry no same-state edge and a vertex has exactly one bottom copy.
+    const float t = 1.5f / std::sqrt(3.f);
+    auto has = [](const indexed_triangle_set &m, const Vec3f &q) {
+        return std::any_of(m.vertices.begin(), m.vertices.end(), [&](const Vec3f &v) { return (v - q).norm() < 1e-3f; });
+    };
+    const bool zero_is_top = has(shells[0].mesh, Vec3f(0.f, 0.f, 20.f));
+    const indexed_triangle_set &top_slab  = zero_is_top ? shells[0].mesh : shells[1].mesh;
+    const indexed_triangle_set &side_slab = zero_is_top ? shells[1].mesh : shells[0].mesh;
+    require_vertices_are(top_slab,
+                         {{0.f, 0.f, 20.f}, {40.f, 0.f, 20.f}, {40.f, 40.f, 20.f}, {0.f, 40.f, 20.f},
+                          {t, t, 20.f - t}, {40.f, 0.f, 18.5f}, {40.f, 40.f, 18.5f}, {t, 40.f - t, 20.f - t}}, 1e-3f);
+    require_vertices_are(side_slab,
+                         {{40.f, 0.f, 0.f}, {40.f, 40.f, 0.f}, {40.f, 40.f, 20.f}, {40.f, 0.f, 20.f},
+                          {38.5f, 0.f, 20.f}, {38.5f, 40.f, 20.f}, {40.f - t, t, t}, {40.f - t, 40.f - t, t}}, 1e-3f);
     ColorSplitResult r = split_volume_by_paint(block.its, paint_data(block, facets), depths_for_test(1.5, 0.2, 0.87), params, nullptr);
     REQUIRE(r.pieces.size() == 1);
     double total = volume_of(r.body) + volume_of(r.pieces[0].second);
     REQUIRE_THAT(total, WithinRel(40. * 40. * 20., 1e-4));
+}
+
+// ---- Spec 3.5 (flat cap) and 3.6 (crease step), both on by default. ----
+
+static ColorSplitParams cap_and_step() { return ColorSplitParams{}; }
+
+TEST_CASE("colorsplit: flat top is capped at the solid shell depth, slopes are not", "[colorsplit]")
+{
+    ColorSplitDepths d = depths_for_test(1.5, 0.1, 0.87);   // cap_top = 0.8 set in depths_for_test
+    d.cap_top = 0.6;
+    TriangleMesh block = make_cube(40., 40., 20.);
+    auto data = paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ColorPatches p = extract_color_patches(block.its, data);
+
+    // Crease step OFF isolates the cap. The only vertices of a plain cube's top face are its four corners,
+    // whose angle-weighted normal is the (+-1,+-1,1)/sqrt(3) bisector, so 0.6 mm of depth ALONG that normal
+    // is 0.6/sqrt(3) = 0.346 mm of z: what shrank is the cap depth (uncapped would be 1.5), not the taper.
+    ColorSplitParams params = cap_and_step(); params.crease_step = false;
+    auto shells = build_color_shells(p, d, params, nullptr);
+    REQUIRE(shells.size() == 1);
+    REQUIRE(shells[0].capped);
+    REQUIRE_THAT(min_z(shells[0].mesh), WithinAbs(20.f - 0.6f / std::sqrt(3.f), 1e-4f));
+
+    // Crease step ON (the shipping default): spec 3.6 case A walks the rim straight down n_P after one layer,
+    // so the same cap depth shows up as a vertical 0.6 - the 19.4 the brief pins.
+    auto stepped = build_color_shells(p, d, cap_and_step(), nullptr);
+    REQUIRE(stepped.size() == 1);
+    REQUIRE(stepped[0].capped);
+    REQUIRE_THAT(min_z(stepped[0].mesh), WithinAbs(20.f - 0.6f, 1e-4f));
+
+    // Spec 3.5's second gate: a cap that is not shallower than D has nothing to cap.
+    ColorSplitDepths deep = d; deep.cap_top = 1.5;
+    auto uncapped = build_color_shells(p, deep, cap_and_step(), nullptr);
+    REQUIRE(uncapped.size() == 1);
+    REQUIRE(!uncapped[0].capped);
+    REQUIRE_THAT(min_z(uncapped[0].mesh), WithinAbs(20.f - 1.5f, 1e-4f));
+
+    // 3 degree slope: a 40x40 wedge whose top rises 40*tan(3deg): NOT flat (tan 3deg = 0.052 > h/(3ws) = 0.038)
+    indexed_triangle_set wedge = its_make_cube(40., 40., 20.);
+    for (Vec3f &v : wedge.vertices) if (v.z() > 19.f) v.z() += float(v.x() * std::tan(3. * PI / 180.));
+    TriangleMesh wedge_mesh(wedge);
+    auto wd = paint_by_predicate(wedge_mesh, [](const Vec3f &c, const Vec3f &n) { return n.z() > 0.9f; }, EnforcerBlockerType::Extruder2);
+    ColorPatches pw = extract_color_patches(wedge_mesh.its, wd);
+    auto ws_ = build_color_shells(pw, d, params, nullptr);
+    REQUIRE(ws_.size() == 1);
+    REQUIRE(!ws_[0].capped);
+
+    // 1 degree slope IS flat (tan 1deg = 0.017 < 0.038)
+    indexed_triangle_set wedge1 = its_make_cube(40., 40., 20.);
+    for (Vec3f &v : wedge1.vertices) if (v.z() > 19.f) v.z() += float(v.x() * std::tan(1. * PI / 180.));
+    TriangleMesh w1(wedge1);
+    ColorPatches p1 = extract_color_patches(w1.its, paint_by_predicate(w1, [](const Vec3f &, const Vec3f &n) { return n.z() > 0.9f; }, EnforcerBlockerType::Extruder2));
+    REQUIRE(build_color_shells(p1, d, params, nullptr)[0].capped);
+}
+
+TEST_CASE("colorsplit: narrow flat strip (core < 3 wall stacks) is not capped", "[colorsplit]")
+{
+    TriangleMesh box = make_grid_box(40., 2., 20., 1, 1);   // top is 40 x 2mm: inward offset by 1.5*0.87 = 1.3 kills it
+    auto data = paint_data(box, {{2, EnforcerBlockerType::Extruder2}, {3, EnforcerBlockerType::Extruder2}});
+    ColorPatches p = extract_color_patches(box.its, data);
+    ColorSplitParams params = cap_and_step(); params.crease_step = false;
+    auto shells = build_color_shells(p, depths_for_test(1.5, 0.1, 0.87), params, nullptr);
+    REQUIRE(shells.size() == 1);
+    REQUIRE(!shells[0].capped);
+}
+
+TEST_CASE("colorsplit: painted top steps one wall stack in below the surface layer at side faces", "[colorsplit]")
+{
+    ColorSplitDepths d = depths_for_test(1.5, 0.2, 0.87);
+    TriangleMesh block = make_cube(40., 40., 20.);
+    ColorPatches p = extract_color_patches(block.its, paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
+    ColorSplitParams params = cap_and_step(); params.flat_cap = false;
+    auto shells = build_color_shells(p, d, params, nullptr);
+    REQUIRE(shells.size() == 1);
+    // Ring vertices at z = 20 - 0.2 must be inset 0.87 from the side faces; bottom vertices at z = 20 - 1.5 too.
+    // (Case A mitres the inward tangent at a corner, so the inset holds against BOTH side faces meeting there
+    // rather than measuring 0.87 along the diagonal.)
+    int rings = 0, bottoms = 0;
+    for (const Vec3f &v : shells[0].mesh.vertices) {
+        if (std::abs(v.z() - 19.8f) < 1e-4f || std::abs(v.z() - 18.5f) < 1e-4f) {
+            REQUIRE((std::abs(v.x() - 0.87f) < 1e-3f || std::abs(v.x() - (40.f - 0.87f)) < 1e-3f));
+            REQUIRE((std::abs(v.y() - 0.87f) < 1e-3f || std::abs(v.y() - (40.f - 0.87f)) < 1e-3f));
+            (std::abs(v.z() - 19.8f) < 1e-4f ? rings : bottoms)++;
+        }
+    }
+    REQUIRE(rings == 4);      // one ring copy and one bottom copy per corner of the painted top
+    REQUIRE(bottoms == 4);
+    REQUIRE(check_shell(shells[0].mesh).closed);
+}
+
+TEST_CASE("colorsplit: painted side face keeps its full wall stack up to the top edge", "[colorsplit]")
+{
+    ColorSplitDepths d = depths_for_test(1.5, 0.2, 0.87);
+    TriangleMesh block = make_cube(40., 40., 20.);
+    ColorPatches p = extract_color_patches(block.its, paint_data(block, all_with(CUBE_PLUS_X, EnforcerBlockerType::Extruder2)));
+    ColorSplitParams params = cap_and_step(); params.flat_cap = false;
+    auto shells = build_color_shells(p, d, params, nullptr);
+    REQUIRE(shells.size() == 1);
+    // Ring vertices at the top edge: x = 40 - 0.87, z = 20 (no downward move); bottom vertices then taper along the bisector.
+    bool found_ring = false;
+    for (const Vec3f &v : shells[0].mesh.vertices)
+        if (std::abs(v.x() - (40.f - 0.87f)) < 1e-3f && std::abs(v.z() - 20.f) < 1e-4f) found_ring = true;
+    REQUIRE(found_ring);
+    REQUIRE(check_shell(shells[0].mesh).closed);
+
+    // d <= ws: the wall stack alone uses up the whole depth, so the second strip has no room, the bottom
+    // collapses onto the ring and the side is a slab of depth d straight in along n_P with no taper at all.
+    auto shallow = build_color_shells(p, depths_for_test(0.5, 0.2, 0.87), params, nullptr);
+    REQUIRE(shallow.size() == 1);
+    for (const Vec3f &v : shallow[0].mesh.vertices)
+        REQUIRE((std::abs(v.x() - 40.f) < 1e-4f || std::abs(v.x() - 39.5f) < 1e-4f));
+    REQUIRE(check_shell(shallow[0].mesh).closed);
+}
+
+TEST_CASE("colorsplit: a capped group and the uncapped group beside it meet along a straight wall", "[colorsplit]")
+{
+    // Both options on, the shipping default, on the fixture that carries all four spec 3.6 cases at once:
+    // the cube's top (a capped flat group) and its +X face (uncapped) are painted the same filament.
+    ColorSplitDepths d = depths_for_test(1.5, 0.2, 0.87);          // cap_top = 0.8
+    TriangleMesh block = make_cube(40., 40., 20.);
+    std::vector<std::pair<int, EnforcerBlockerType>> facets = all_with(CUBE_TOP, EnforcerBlockerType::Extruder2);
+    for (int f : CUBE_PLUS_X) facets.emplace_back(f, EnforcerBlockerType::Extruder2);
+    ColorPatches p = extract_color_patches(block.its, paint_data(block, facets));
+    auto shells = build_color_shells(p, d, cap_and_step(), nullptr);
+    REQUIRE(shells.size() == 2);
+    REQUIRE(shells[0].capped);        // spec 3.8: within a filament the capped groups come first
+    REQUIRE(!shells[1].capped);
+    const float s   = 1.f / std::sqrt(3.f);       // a cube corner's angle-weighted normal component
+    const float rim = (1.5f - 0.87f) * s;         // case B: how far the bisector taper below the ring reaches
+    // Top slab, capped at 0.8: the two corners on the shared (same-state) edge walk straight down 0.8, the
+    // two at x = 0 take case A - a mitred 0.87 inward and one layer down, then straight down n_P by the rest.
+    require_vertices_are(shells[0].mesh,
+                         {{0.f, 0.f, 20.f}, {40.f, 0.f, 20.f}, {40.f, 40.f, 20.f}, {0.f, 40.f, 20.f},
+                          {0.87f, 0.87f, 19.8f}, {0.87f, 39.13f, 19.8f},
+                          {0.87f, 0.87f, 19.2f}, {0.87f, 39.13f, 19.2f}, {40.f, 0.f, 19.2f}, {40.f, 40.f, 19.2f}}, 1e-3f);
+    // Side slab, uncapped: the two corners on the shared edge walk straight in 1.5 (the top slab claims the
+    // material right behind that wall), the two at z = 0 take case B - a full wall stack in along n_P, then
+    // the taper along the corner bisector.
+    require_vertices_are(shells[1].mesh,
+                         {{40.f, 0.f, 0.f}, {40.f, 40.f, 0.f}, {40.f, 40.f, 20.f}, {40.f, 0.f, 20.f},
+                          {39.13f, 0.f, 0.f}, {39.13f, 40.f, 0.f},
+                          {38.5f, 0.f, 20.f}, {38.5f, 40.f, 20.f}, {39.13f - rim, rim, rim}, {39.13f - rim, 40.f - rim, rim}}, 1e-3f);
+    ColorSplitResult r = split_volume_by_paint(block.its, paint_data(block, facets), d, cap_and_step(), nullptr);
+    REQUIRE(r.pieces.size() == 1);
+    REQUIRE_THAT(volume_of(r.body) + volume_of(r.pieces[0].second), WithinRel(40. * 40. * 20., 1e-4));
 }
 
 // ---- Spike measurements (spec 9). They must pass; numbers go to WARN for the decision checkpoint. ----
@@ -782,7 +965,12 @@ TEST_CASE("colorsplit spike: S3 stage breakdown and the CGAL check share", "[col
     std::vector<std::string> warnings;
     std::vector<ColorShell> shells = build_color_shells(p, depths_for_test(1.5), ColorSplitParams{}, nullptr, &warnings);
     auto t2 = clock::now();
-    REQUIRE(shells.size() == 1);
+    // Two, not one, since spec 3.5's flat cap went in: the painted spherical cap is a single smooth patch,
+    // but its CROWN is flat to within h/(3ws) = 4.38 degrees, i.e. a disc of radius 20*sin(4.38) = 1.53 mm,
+    // which survives the 1.305 mm core offset and becomes a capped group at cap_top. That is the dome-crown
+    // split the 2D rule makes too (MultiMaterialSegmentation.cpp:2228's comment: the crown is capped, the rim
+    // rolling into the flank is not); the flank is the second, uncapped group.
+    REQUIRE(shells.size() == 2);
     double check_s = 0.;
     for (const ColorShell &s : shells) {
         auto c0 = clock::now();
@@ -799,7 +987,8 @@ TEST_CASE("colorsplit spike: S3 stage breakdown and the CGAL check share", "[col
     const double patches_s   = std::chrono::duration<double>(t1 - t0).count();
     const double shells_s    = std::chrono::duration<double>(t2 - t1).count();
     const double partition_s = std::chrono::duration<double>(t4 - t3).count();
-    WARN("S3 breakdown (" << sphere.its.indices.size() << " tri, shell " << shells[0].mesh.indices.size() << " tri): patches "
+    size_t shell_tri = 0; for (const ColorShell &s : shells) shell_tri += s.mesh.indices.size();
+    WARN("S3 breakdown (" << sphere.its.indices.size() << " tri, shells " << shell_tri << " tri): patches "
          << patches_s << " s, shells " << shells_s << " s (of which check_shell/CGAL " << check_s << " s = "
          << (shells_s > 0. ? 100. * check_s / shells_s : 0.) << "% of that stage, "
          << (100. * check_s / std::max(1e-9, patches_s + shells_s + partition_s)) << "% of the whole split), partition "
