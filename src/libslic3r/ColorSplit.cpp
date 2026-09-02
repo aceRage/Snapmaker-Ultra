@@ -178,6 +178,27 @@ ShellCheck check_shell(const indexed_triangle_set &shell)
     return c;
 }
 
+// Spec 3.1 (Ruling 28(2)): a paint state above the printer's filament count has no filament to print with.
+// The 2D path drops such a state and its facets keep the body colour (PrintApply.cpp:1885-1893); a PART
+// carrying that extruder would instead be clamped back to filament 1 at slice time, behind an object-list
+// chip for a filament that does not exist. So the facets are re-labelled UNPAINTED - they stay in the
+// surface, they just join the body - and each dropped state is noted once. `states` is ascending, so the
+// common case costs one comparison. max_state <= 0 means "no limit" (a caller with no printer in hand).
+static void drop_overflow_states(ColorPatches &patches, int max_state, std::vector<std::string> &notes)
+{
+    if (max_state <= 0 || patches.states.empty() || patches.states.back() <= max_state)
+        return;
+    for (int s : patches.states)
+        if (s > max_state)
+            notes.push_back("Filament " + std::to_string(s) + " is not available on this printer; its paint stays in the body colour.");
+    for (int &st : patches.facet_state)
+        if (st > max_state)
+            st = 0;
+    patches.states.erase(std::remove_if(patches.states.begin(), patches.states.end(),
+                                        [max_state](int s) { return s > max_state; }),
+                         patches.states.end());
+}
+
 ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const TriangleSelector::TriangleSplittingData &paint,
                                        const ColorSplitDepths &depths, const ColorSplitParams &params, const ColorSplitProgress &progress,
                                        const Transform3d &to_split)
@@ -189,12 +210,22 @@ ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const T
     // the stroke inside every partially painted facet. On the retriangulated surface the same swap only
     // reverses a facet's own winding - facet order, and so `facet_state`, is untouched.
     ColorPatches patches = extract_color_patches(mesh, paint);
-    if (patches.states.empty())
-        throw ColorSplitError("The part has no painted colours.", ColorSplitErrorKind::nothing_to_split);
+    // The notes lead the result's warnings, and build_color_shells appends its own to the same vector.
+    std::vector<std::string> shell_warnings;
+    drop_overflow_states(patches, params.max_state, shell_warnings);
+    if (patches.states.empty()) {
+        // Nothing left to split: with every painted state dropped, saying WHICH filaments were unavailable
+        // is the whole of the news, so it becomes the message of the same kind of "nothing to split" note.
+        std::string msg = "The part has no painted colours.";
+        if (!shell_warnings.empty()) {
+            msg.clear();
+            for (const std::string &n : shell_warnings) msg += (msg.empty() ? "" : "\n") + n;
+        }
+        throw ColorSplitError(msg, ColorSplitErrorKind::nothing_to_split);
+    }
     if (!to_split.isApprox(Transform3d::Identity()))
         its_transform(patches.surface, to_split, /*fix_left_handed=*/true);
     if (progress && !progress(10)) throw ColorSplitCancelled();
-    std::vector<std::string> shell_warnings;
     // Ruling 10: skipped micro-components are warnings, not errors - they have to reach the caller.
     std::vector<ColorShell> shells = build_color_shells(patches, depths, params, progress, &shell_warnings);
     ColorSplitResult r = partition_by_shells(patches.surface, shells, params.absorb_islands, progress);
@@ -227,8 +258,17 @@ ColorSplitSpace color_split_space(const ModelObject &object, const ModelVolume &
     // rotation and mirroring (which leave L^T L = s^2 I) stay on the cheap mesh-space path.
     const Matrix3d G   = L.transpose() * L;
     const double   tol = 1e-6 * sx * sx;
+    // Ruling 28(1): isotropy alone is NOT enough to stay in mesh space. Spec 3.5 and 3.6 define "flat" and
+    // "more horizontal" in the PRINT frame, but every one of the rules that reads them - the flat test, the
+    // flat-core projection, the case A/B choice, the group mean-normal fallback - takes them off the z of
+    // whatever space the shell stage runs in. A transform that TILTS or FLIPS z therefore has to run in world
+    // space: a cube turned 90 degrees about x would otherwise have its world top classified as a side face
+    // (case B holding the wall stack on the world sides, the painted colour showing there for the top ~ws)
+    // and a z mirror would swap cap_top for cap_bottom. Mesh +z must map to world +z with no tilt, which a
+    // turn about z - and any x/y mirror - satisfies, so those keep the cheap exact path.
+    const bool z_preserving = std::abs(L(0, 2)) < 1e-6 * sx && std::abs(L(1, 2)) < 1e-6 * sx && L(2, 2) > 0.;
     if (std::abs(sx - sy) < 1e-6 * sx && std::abs(sx - sz) < 1e-6 * sx &&
-        std::abs(G(0, 1)) < tol && std::abs(G(0, 2)) < tol && std::abs(G(1, 2)) < tol) {
+        std::abs(G(0, 1)) < tol && std::abs(G(0, 2)) < tol && std::abs(G(1, 2)) < tol && z_preserving) {
         s.depth_scale = sx;
         return s;                                  // mesh-space path, identity transforms
     }

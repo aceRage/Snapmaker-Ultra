@@ -24071,7 +24071,17 @@ void Plater::split_by_color()
     if (dlg.ShowModal() != wxID_OK)
         return;
 
-    const ColorSplitParams params = dlg.params();
+    ColorSplitParams params = dlg.params();
+    // Spec 3.1 (Ruling 28(2)): paint states above the printer's filament count have no filament to print
+    // with. The 2D path drops them (PrintApply.cpp:1885-1893) and they print in the body colour, whereas a
+    // part carrying such an extruder would be clamped back to filament 1 at slice time behind an object-list
+    // chip for a filament that does not exist. The count is taken exactly as Print::apply takes it
+    // (PrintApply.cpp:1379 and :1484) - physical extruders from filament_diameter plus the ENABLED mixed
+    // filaments - so the mixed VIRTUAL ids stay valid and only real overflow is dropped.
+    const ConfigOptionFloats *filament_diameter = base.option<ConfigOptionFloats>("filament_diameter");
+    const size_t num_extruders = filament_diameter == nullptr ? wxGetApp().preset_bundle->filament_presets.size()
+                                                              : filament_diameter->values.size();
+    params.max_state = int(fff_print().mixed_filament_manager().total_filaments(num_extruders));
     // Ruling 27(3): "Unlimited depth" and the override cover EVERY target, so every target has to end up with
     // a depth to cut with - the dialog only showed the first one's. t.depths.D is the world depth times the
     // split space's (positive) scale, so testing it is the same test as testing the world depth.

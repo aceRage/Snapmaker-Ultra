@@ -73,6 +73,12 @@ struct ColorSplitParams {
     bool   absorb_islands    = true;   // spec 3.8
     bool   crease_step       = true;   // spec 3.6
     double depth_override_mm = 0.;     // <= 0: use depths.D
+    // Spec 3.1 (Ruling 28): the printer's filament count - physical extruders plus the ENABLED mixed
+    // (virtual) filaments, i.e. MixedFilamentManager::total_filaments. A paint state above it has no
+    // filament to print with, so split_volume_by_paint treats those facets as unpainted and notes the
+    // state once, exactly as the 2D path drops it (PrintApply.cpp:1885-1893). 0 = no limit, which is
+    // what a caller with no printer in hand (the library's own tests) wants.
+    int    max_state         = 0;
 };
 
 // Spec 3.7 / 3.1a (Ruling 18): one closed, inward-offset shell per SMOOTH PATCH of one painted
@@ -115,11 +121,15 @@ ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const T
                                        const Transform3d &to_split = Transform3d::Identity());
 
 // Spec 3.9: which space the split runs in. D, ws and h are WORLD millimetres, the volume's mesh is not.
-// Let T = instance x volume matrix. An isotropic T (scale s, any rotation, mirror allowed) needs no transform
-// at all - the split runs on the mesh as it stands with the depths divided by s, which is exact and shared by
-// every instance of that scale. An anisotropic T has no single depth scale, so the mesh is carried into world
-// space by `to_split` and the pieces come back through `from_split`; T is then the FIRST instance's, and any
-// other instance with a different anisotropic scale gets an approximate depth (spec 3.9's documented limit).
+// Let T = instance x volume matrix. An isotropic T (scale s) that also PRESERVES Z - mesh +z maps to world +z
+// with no tilt, i.e. a turn about z, any x/y mirror, any uniform scale - needs no transform at all: the split
+// runs on the mesh as it stands with the depths divided by s, which is exact and shared by every instance of
+// that transform. Ruling 28(1): isotropy alone is not enough, because spec 3.5/3.6's "flat" and "more
+// horizontal" are print-frame rules that the shell stage reads off the SPLIT space's z; a rotation about x or
+// y, or a z mirror, would classify the wrong faces. Every other T - anisotropic (no single depth scale) or
+// tilted - carries the mesh into world space through `to_split` and brings the pieces back through
+// `from_split`; T is then the FIRST instance's, and any other instance whose transform differs gets an
+// approximate depth and an approximate up-axis (spec 3.9's documented limit).
 struct ColorSplitSpace {
     Transform3d to_split    = Transform3d::Identity();   // mesh -> split space (identity on the mesh-space path)
     Transform3d from_split  = Transform3d::Identity();   // split space -> mesh

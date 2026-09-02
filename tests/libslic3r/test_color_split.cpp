@@ -24,6 +24,7 @@ using Catch::Matchers::WithinRel;
 static const std::vector<int> CUBE_TOP    = {2, 3};
 static const std::vector<int> CUBE_BOTTOM = {0, 1};
 static const std::vector<int> CUBE_PLUS_X = {4, 5};
+static const std::vector<int> CUBE_PLUS_Y = {10, 11};
 static const std::vector<int> CUBE_SIDES  = {4, 5, 6, 7, 8, 9, 10, 11};
 
 // Paint the given facets of `mesh` with `state` and return the serialized paint data,
@@ -1137,6 +1138,40 @@ TEST_CASE("colorsplit: a capped group and the uncapped group beside it meet alon
     REQUIRE_THAT(volume_of(r.body) + volume_of(r.pieces[0].second), WithinRel(40. * 40. * 20., 1e-4));
 }
 
+TEST_CASE("colorsplit: a paint state above the printer's filament count stays in the body colour", "[colorsplit]")
+{
+    // Spec 3.1 (Ruling 28(2)). State 4 on a two-filament printer has no filament to print with. The 2D path
+    // drops such a state (PrintApply.cpp:1885-1893) and its facets print in the body colour; a PART carrying
+    // extruder 4 would instead be clamped back to filament 1 at slice time, behind an object-list chip for a
+    // filament that does not exist. max_state = 0 - the library default, and what the rest of this suite
+    // uses - keeps every state, so a caller with no printer in hand is unaffected.
+    TriangleMesh block = make_cube(40., 40., 20.);
+    std::vector<std::pair<int, EnforcerBlockerType>> facets = all_with(CUBE_TOP, EnforcerBlockerType::Extruder4);
+    for (int f : CUBE_PLUS_X) facets.emplace_back(f, EnforcerBlockerType::Extruder2);
+    const TriangleSelector::TriangleSplittingData paint = paint_data(block, facets);
+    const ColorSplitDepths d = depths_for_test(1.5, 0.2, 0.87);
+
+    ColorSplitResult all = split_volume_by_paint(block.its, paint, d, no_cap_no_step(), nullptr);
+    REQUIRE(all.pieces.size() == 2);                              // no limit: both states become parts
+    REQUIRE(all.pieces[0].first == 2);
+    REQUIRE(all.pieces[1].first == 4);
+    REQUIRE(all.warnings.empty());
+
+    ColorSplitParams limited = no_cap_no_step();
+    limited.max_state = 2;
+    ColorSplitResult r = split_volume_by_paint(block.its, paint, d, limited, nullptr);
+    REQUIRE(r.pieces.size() == 1);
+    REQUIRE(r.pieces[0].first == 2);
+    REQUIRE(r.warnings.size() == 1);                              // ONE note per dropped state, not per facet
+    REQUIRE(r.warnings[0].find("Filament 4") != std::string::npos);
+    // The state-4 facets are treated as UNPAINTED, not dropped from the surface: the body keeps that slab,
+    // so body + the one piece is still the whole block and the body is bigger than it was with two colours.
+    REQUIRE_THAT(volume_of(r.body) + volume_of(r.pieces[0].second), WithinRel(40. * 40. * 20., 1e-4));
+    REQUIRE(volume_of(r.body) > volume_of(all.body));
+    // ... and dropping state 4 leaves the surviving colour's piece exactly as it was.
+    REQUIRE_THAT(volume_of(r.pieces[0].second), WithinRel(volume_of(all.pieces[0].second), 1e-3));
+}
+
 // ---- Spike measurements (spec 9). They must pass; numbers go to WARN for the decision checkpoint. ----
 
 // its_make_sphere(r, fa) builds sectorCount = ceil(2*PI/fa) sectors over stackCount = ceil(PI/fa) stacks, i.e.
@@ -1304,12 +1339,16 @@ TEST_CASE("colorsplit: apply replaces the source by body + parts in place with e
     REQUIRE((after.max - before.max).norm() < 1e-4);
 }
 
-TEST_CASE("colorsplit: a rotated, scaled and mirrored PART stays in place", "[colorsplit]")
+TEST_CASE("colorsplit: a z-rotated, scaled and mirrored PART stays in place", "[colorsplit]")
 {
+    // Ruling 28(1): the mesh-space path is for isotropic transforms that also PRESERVE Z - a turn about z,
+    // any x/y mirror, any uniform scale - because spec 3.5/3.6's rules are read off the split space's own z.
+    // A tilted rotation of the same part now takes the world path instead ("a tilted isotropic instance
+    // takes the world path and caps the WORLD top", below).
     Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
     ModelObject &object = *model.objects.front();
     ModelVolume &src = *object.volumes.front();
-    src.set_rotation(Vec3d(0.3, 0.2, 0.7));
+    src.set_rotation(Vec3d(0., 0., 0.7));
     src.set_scaling_factor(Vec3d(1.5, 1.5, 1.5));
     src.set_mirror(Vec3d(-1., 1., 1.));
     src.set_offset(Vec3d(5., -3., 2.));
@@ -1589,6 +1628,77 @@ TEST_CASE("colorsplit: a rotated anisotropic scale is not mistaken for an isotro
     REQUIRE_THAT(L.col(0).norm(), WithinRel(L.col(2).norm(), 1e-9));
     REQUIRE(std::abs(L.col(0).dot(L.col(1))) > 0.5);                      // ... but the columns are not orthogonal
     REQUIRE(space.world_path);                                            // ... so it is still anisotropic
+}
+
+TEST_CASE("colorsplit: a tilted isotropic instance takes the world path and caps the WORLD top", "[colorsplit]")
+{
+    // Ruling 28(1). Spec 3.5/3.6 judge "flat" and "more horizontal" in the PRINT frame, but the shell stage
+    // reads them off the z of whatever space it runs in (the flat test, the flat-core projection, the case
+    // A/B choice, the mean-normal fallback). An isotropic transform that TILTS the mesh therefore may not
+    // take the mesh-space path, however exact its single depth scale would be.
+    // Fixture: the mesh's +Y face is painted and the INSTANCE is turned 90 degrees about x, which carries
+    // mesh +y onto world +z - so the painted face is the world TOP. In world space it is flat and up-facing:
+    // spec 3.5 caps it at cap_top and spec 3.6 case A insets every boundary one wall stack. In MESH space
+    // that same patch is vertical, so it would be uncapped at D and case B would hold the wall stack on what
+    // the printer sees as the side faces - the painted colour showing on them for the top ~ws.
+    Model model = painted_model(make_cube(40., 40., 40.), all_with(CUBE_PLUS_Y, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    object.instances.front()->set_rotation(Vec3d(PI / 2., 0., 0.));
+    object.invalidate_bounding_box();
+    ModelVolume &src = *object.volumes.front();
+
+    ColorSplitSpace space = color_split_space(object, src);
+    REQUIRE(space.world_path);                                    // isotropic, but not z-preserving
+    const BoundingBoxf3 before = world_bbox(object);
+
+    const ColorSplitDepths depths = color_split_depths(split_test_config(), {1, 2});
+    REQUIRE(depths.ws <= depths.D);                               // spec 3.5's first gate
+    REQUIRE(depths.cap_top < depths.D);                           // ... and its second: the cap has room
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               depths, cap_and_step(), nullptr, space.to_split);
+    auto created = apply_color_split(object, 0, std::move(r), space, false, false);
+    REQUIRE(created.size() == 2);
+    object.invalidate_bounding_box();
+    const BoundingBoxf3 after = world_bbox(object);
+    REQUIRE((after.min - before.min).norm() < 1e-3);
+    REQUIRE((after.max - before.max).norm() < 1e-3);
+
+    const ModelVolume *piece = created.back();
+    REQUIRE(piece->config.extruder() == 2);
+    // WORLD space: instance x volume, the frame the printer prints in.
+    const Transform3d  world = object.instances.front()->get_matrix() * piece->get_matrix();
+    std::vector<Vec3d> wv;
+    for (const Vec3f &v : piece->mesh().its.vertices) wv.push_back(world * v.cast<double>());
+    BoundingBoxf3 wb;
+    for (const Vec3d &v : wv) wb.merge(v);
+    // Spec 3.5: exactly the top-shell cap deep in WORLD z (4 layers at 0.2mm = 0.8mm), not D.
+    REQUIRE_THAT(wb.size().z(), WithinAbs(depths.cap_top, 1e-3));
+    REQUIRE_THAT(wb.max.z(), WithinAbs(before.max.z(), 1e-3));    // and it sits ON the world top
+    // Spec 3.6 case A: everything below the surface layer stands one wall stack in from all four WORLD side
+    // faces (the ring copies sit exactly one layer down, so this bbox is the bottom ring).
+    BoundingBoxf3 ring;
+    for (const Vec3d &v : wv)
+        if (v.z() < wb.max.z() - depths.layer_height - 1e-4)
+            ring.merge(v);
+    REQUIRE(ring.defined);
+    REQUIRE_THAT(ring.min.x() - before.min.x(), WithinAbs(depths.ws, 1e-3));
+    REQUIRE_THAT(before.max.x() - ring.max.x(), WithinAbs(depths.ws, 1e-3));
+    REQUIRE_THAT(ring.min.y() - before.min.y(), WithinAbs(depths.ws, 1e-3));
+    REQUIRE_THAT(before.max.y() - ring.max.y(), WithinAbs(depths.ws, 1e-3));
+}
+
+TEST_CASE("colorsplit: a z-mirrored instance takes the world path", "[colorsplit]")
+{
+    // Ruling 28(1) again, the cheapest case: a z mirror is isotropic (L^T L = I) but swaps up and down, so
+    // the mesh path would cap a painted face with cap_top where the printer sees a down-facing flat and
+    // cap_bottom applies - 0.8 against 0.6 at this suite's stock settings.
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    object.instances.front()->set_mirror(Vec3d(1., 1., -1.));
+    object.invalidate_bounding_box();
+    ColorSplitSpace space = color_split_space(object, *object.volumes.front());
+    REQUIRE(space.world_path);
+    REQUIRE(space.to_split.linear().determinant() < 0.);
 }
 
 TEST_CASE("colorsplit: a degenerate part transformation is refused", "[colorsplit]")

@@ -1,8 +1,10 @@
 #include "ColorSplitJob.hpp"
 
+#include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GUI.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmosManager.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/Plater.hpp"
@@ -92,6 +94,18 @@ void ColorSplitJob::finalize(bool canceled, std::exception_ptr &eptr)
 {
     if (canceled || eptr)
         return;
+    // Ruling 28(3): the same guard Plater::split_by_color makes before starting (Plater.cpp:23993-24000),
+    // repeated here for the window the job itself is open - a painting gizmo opened WHILE the split ran owns
+    // the very paint this is about to consume, and its own undo stack. It has to come before any mutation,
+    // beside the id/timestamp/triangle-count re-checks below, not after them.
+    if (const GLCanvas3D *canvas = m_plater->canvas3D()) {
+        const GLGizmosManager::EType gizmo = canvas->get_gizmos_manager().get_current_type();
+        if (gizmo == GLGizmosManager::FdmSupports || gizmo == GLGizmosManager::Seam ||
+            gizmo == GLGizmosManager::FuzzySkin || gizmo == GLGizmosManager::MmSegmentation) {
+            wxGetApp().notification_manager()->push_plater_warning_notification(_u8L("Close the painting tool before splitting by colour."));
+            return;
+        }
+    }
 
     Model                     &model = m_plater->model();
     std::vector<std::string>   warnings;
