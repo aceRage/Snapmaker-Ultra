@@ -1681,6 +1681,12 @@ static DynamicPrintConfig e2e_config()
     DynamicPrintConfig c = split_test_config();
     c.option<ConfigOptionFloat>("layer_height")->value               = 0.2;
     c.option<ConfigOptionFloat>("initial_layer_print_height")->value = 0.2;
+    // Ruling 26: the 2D path notches every OTHER layer by mmu_segmented_region_interlocking_depth so the two
+    // colours' teeth interlock - an artefact of segmenting one layer at a time, which the 3D split has no
+    // counterpart for (its pieces are solids and the slicer perimeters each of them once). Left at its 0.1
+    // default it alternates the 2D claim by i * (40 - 2D + i) = 3.73 mm^2 and swamps the geometric difference
+    // the parity case exists to measure, so the comparison zeroes it instead of budgeting for it.
+    c.option<ConfigOptionFloat>("mmu_segmented_region_interlocking_depth")->value = 0.;
     return c;
 }
 
@@ -1762,9 +1768,11 @@ TEST_CASE("colorsplit e2e: split parts slice like the 2D paint-depth claim on a 
     //    the +-Y edges' cells, i.e. D * (40 - D) mm^2.
     //  * 3D (spec 3.4a): the mitred bisector makes the piece exactly D deep perpendicular to the painted face,
     //    but spec 3.6 case B holds the full wall stack before that taper starts, so its ends chamfer from a
-    //    depth of ws instead of 0: 40*D - (D - ws)^2. The gap between the two, ws * (2D - ws) = 1.61 mm^2, is
-    //    that deliberate deviation and nothing else. (Before the mitre the piece was only
-    //    ws + (D - ws)/sqrt(3) = 1.150 mm deep against the band's 1.409, and fell 8.48 mm^2 short.)
+    //    depth of ws instead of 0: 40*D - (D - ws)^2. The gap between the two is the **per-vertex case B
+    //    corner hold**, ws * (2D - ws) = 1.61 mm^2/layer - a designed deviation bounded by one wall stack
+    //    along the vertical creases (the piece is never more than ws wider than the 2D band anywhere, and only
+    //    within D of the face). (Before the mitre the piece was only ws + (D - ws)/sqrt(3) = 1.150 mm deep
+    //    against the band's 1.409, and fell 8.48 mm^2 short - the other direction, and five times as far.)
     //    Ruling 25 does NOT reach this fixture: a plain cube face has no vertices but its four corners, and
     //    each corner carries a HORIZONTAL boundary edge (against the top or the bottom face) as well as a
     //    vertical one, so its mean n_Q has |n_Q.z| = 0.707 against the patch's 0 - a genuine case B, and the
@@ -1774,12 +1782,10 @@ TEST_CASE("colorsplit e2e: split parts slice like the 2D paint-depth claim on a 
     //    45 degree diagonal, and this gap closes there - see the vertical-crease case above.
     const double claim_2d = 40. * D - D * D;
     const double claim_3d = 40. * D - (D - ws) * (D - ws);
-    // The 2D path also notches every other layer by mmu_segmented_region_interlocking_depth (the interlocking
-    // teeth), which costs those layers i * (40 - 2D + i) mm^2. The configured i is an upper bound - the classic
-    // notch cap can only shrink it, which brings the two paths closer - so it bounds the worst layer.
-    const double i_lock = config.option<ConfigOptionFloat>("mmu_segmented_region_interlocking_depth")->value;
-    const double notch  = i_lock * (40. - 2. * D + i_lock);
-    const double bound  = (claim_3d - claim_2d) + notch + 0.05;      // 1.611 + 3.728 + slack = 5.389 mm^2
+    // e2e_config() zeroes the interlocking notch, so every 2D layer claims claim_2d and the whole measured
+    // difference is that residual ws * (2D - ws) = 1.61 mm^2/layer - a designed deviation bounded by one wall
+    // stack along the vertical creases, which is what the 4.0 mm^2 budget below leaves room for.
+    const double bound = 4.0;
     const size_t first = o2d->layer_count() / 4, last = 3 * o2d->layer_count() / 4;
     REQUIRE(first < last);
     double worst = 0., a2_odd = 0., a2_even = 0., a3_seen = 0.;
@@ -1791,14 +1797,14 @@ TEST_CASE("colorsplit e2e: split parts slice like the 2D paint-depth claim on a 
         REQUIRE(a3 > 0.);
         REQUIRE_THAT(layer_area(o3d->layers()[i]), WithinRel(40. * 40., 1e-3));   // ... and the parts still tile the cube
         REQUIRE_THAT(a3, WithinAbs(claim_3d, 0.05));       // the 3D piece is D deep perpendicular to the face
-        REQUIRE(std::abs(a2 - a3) <= bound);               // ... and within the two deviations derived above
+        REQUIRE(std::abs(a2 - a3) <= bound);               // ... and within the case B corner hold
         worst = std::max(worst, std::abs(a2 - a3));
-        (i % 2 ? a2_odd : a2_even) = a2;
+        (i % 2 ? a2_odd : a2_even) = a2;                   // equal once the notch is zeroed - it is, below
         a3_seen = a3;
     }
     WARN("parity over layers " << first << ".." << (last - 1) << ": 2D odd " << a2_odd << ", 2D even " << a2_even
          << ", 3D " << a3_seen << " mm^2; worst diff " << worst << " of " << bound << " (2D claim " << claim_2d
-         << ", 3D claim " << claim_3d << ", case B ring " << (claim_3d - claim_2d) << ", notch " << notch
+         << ", 3D claim " << claim_3d << ", case B corner hold " << (claim_3d - claim_2d)
          << "; D " << D << ", ws " << ws << ", one outer wall line " << one_line << ")");
 }
 
