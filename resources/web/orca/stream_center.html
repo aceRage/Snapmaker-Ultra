@@ -84,6 +84,42 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 .printer .temps div { background: #262626; border-radius: 6px; padding: 6px 10px; text-align: center; }
 .printer .temps .v { font-size: 16px; color: #fff; }
 .printer .temps .k { font-size: 11px; color: #888; }
+.setup .file { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 8px; word-break: break-all; }
+.setup .file .sub { font-size: 11px; font-weight: 400; color: #8a8a8a; text-transform: uppercase; letter-spacing: .04em; display: block; margin-bottom: 2px; }
+.setup .procrow { display: flex; gap: 8px; align-items: center; }
+.setup .procrow select { flex: 1; min-width: 0; }
+.setup .procrow .btn { flex: none; }
+.setup .procrow .btn.mod { background: #b26a00; }
+/* Settings editor (full-screen sheet) */
+#sheet { display: none; position: fixed; inset: 0; z-index: 200; background: #262626; color: #ddd; font-size: 13px; flex-direction: column; }
+#sheet .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top)); background: #1f1f1f; flex-wrap: wrap; }
+#sheet .head .name { flex: 1; min-width: 0; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#sheet .head .name .mod { color: #f0a030; }
+#sheet .head .btn { padding: 6px 12px; }
+#sheet .head .btn.warn { background: #8a3a3a; }
+#sheet .head select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 5px 8px; font-size: 12px; }
+#sheet .pagetabs { display: flex; gap: 2px; padding: 6px 8px 0; background: #1f1f1f; overflow-x: auto; }
+#sheet .pagetabs .pt { padding: 8px 12px; border-radius: 6px 6px 0 0; background: #2c2c2c; color: #bbb; cursor: pointer; white-space: nowrap; user-select: none; font-size: 13px; }
+#sheet .pagetabs .pt.active { background: #0a9e50; color: #fff; }
+#sheet .body { flex: 1; overflow-y: auto; padding: 8px 10px; padding-bottom: calc(12px + env(safe-area-inset-bottom)); -webkit-overflow-scrolling: touch; }
+#sheet .grp { background: #303030; border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+#sheet .grp .gh { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; font-weight: 600; color: #fff; cursor: pointer; user-select: none; }
+#sheet .grp .gh .chev { transition: transform .15s; color: #9a9a9a; font-size: 12px; }
+#sheet .grp.open .gh .chev { transform: rotate(90deg); }
+#sheet .grp .gb { display: none; padding: 0 12px 8px; }
+#sheet .grp.open .gb { display: block; }
+#sheet .ln { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid #3a3a3a; flex-wrap: wrap; }
+#sheet .ln .ll { flex: 1 1 140px; min-width: 120px; color: #ccc; }
+#sheet .ln .ll.dirty::before { content: '●'; color: #f0a030; margin-right: 6px; font-size: 10px; vertical-align: middle; }
+#sheet .ln .ll .u { color: #777; font-size: 11px; margin-left: 4px; }
+#sheet .ln .ctl { display: flex; gap: 6px; align-items: center; flex: 0 1 auto; }
+#sheet .ln input[type=text], #sheet .ln select { background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 7px 9px; font-size: 14px; width: 120px; }
+#sheet .ln input[type=text].wide { width: 220px; }
+#sheet .ln input.dirty, #sheet .ln select.dirty { border-color: #f0a030; }
+#sheet .ln input[type=checkbox] { width: 22px; height: 22px; accent-color: #0a9e50; }
+#sheet .ln .ctl .sub { color: #777; font-size: 11px; }
+#sheet .hidden { display: none !important; }
+#sheet .toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%); background: #0a9e50; color: #fff; padding: 8px 14px; border-radius: 8px; font-size: 13px; display: none; z-index: 210; }
 #modal .url { font-family: Consolas, monospace; font-size: 12px; color: #9ed; text-align: center; word-break: break-all; user-select: all; }
 @media (max-width: 640px) {
     #topbar { padding: 6px 8px; gap: 6px; }
@@ -107,6 +143,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 <div id="grid"></div>
 <div id="prepare" class="view"></div>
 <div id="devices" class="view"></div>
+<div id="sheet"><div class="head"></div><div class="pagetabs"></div><div class="body"></div><div class="toast"></div></div>
 <div id="modal-bg"><div id="modal"></div></div>
 <script>
 (function() {
@@ -983,8 +1020,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             sel.insertBefore(o2, sel.firstChild);
         }
     }
-    function buildSetup(pr) {
+    function buildSetup(pr, data) {
         var setup = el('div', 'setup');
+        var file = el('div', 'file');
+        file.appendChild(el('span', 'sub', 'Project'));
+        file.appendChild(document.createTextNode(data && data.project ? data.project.split(/[\\/]/).pop() : 'Untitled'));
+        setup.appendChild(file);
         setup.appendChild(el('div', 'lbl', 'Printer'));
         var sp = el('select');
         fillSelect(sp, pr.printer, pr.printer_name);
@@ -1010,11 +1051,165 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         add.onclick = function() { postPreset('/presets/filament_add'); };
         setup.appendChild(add);
         setup.appendChild(el('div', 'lbl', 'Process'));
+        var prow = el('div', 'procrow');
         var spr = el('select');
         fillSelect(spr, pr.process, pr.process_name);
         spr.onchange = function() { postPreset('/presets/select?type=process&name=' + encodeURIComponent(spr.value)); };
-        setup.appendChild(spr);
+        prow.appendChild(spr);
+        var edit = el('span', 'btn' + (pr.dirty && pr.dirty.process ? ' mod' : ''), pr.dirty && pr.dirty.process ? '✎ Edit (modified)' : '✎ Edit');
+        edit.onclick = function() { openSheet(); };
+        prow.appendChild(edit);
+        setup.appendChild(prow);
         return setup;
+    }
+
+    // ---- Process settings editor: the slicer's Process tab, rendered from /api/settings/process ----
+    var sheetData = null, sheetPage = 0, sheetMode = null, openGroups = {};
+    try { openGroups = JSON.parse(localStorage.getItem('snorca_remote_groups') || '{}') || {}; } catch (e) {}
+    var MODE_RANK = { simple: 0, advanced: 1, develop: 2 };
+    function toast(msg) {
+        var t = document.querySelector('#sheet .toast');
+        t.textContent = msg; t.style.display = 'block';
+        clearTimeout(t._h); t._h = setTimeout(function() { t.style.display = 'none'; }, 2200);
+    }
+    function openSheet() {
+        var sheet = document.getElementById('sheet');
+        sheet.style.display = 'flex';
+        sheet.querySelector('.body').innerHTML = '<div class="ln">Loading settings…</div>';
+        api('/settings/process').then(function(d) {
+            sheetData = d;
+            if (sheetMode === null) sheetMode = d.mode || 'advanced';
+            if (sheetPage >= (d.pages || []).length) sheetPage = 0;
+            renderSheet();
+        }).catch(function(e) { sheet.querySelector('.body').innerHTML = ''; sheet.querySelector('.body').appendChild(el('div', 'ln', 'Cannot load settings: ' + e.message)); });
+    }
+    function closeSheet() {
+        document.getElementById('sheet').style.display = 'none';
+        lastPresetsJson = ''; refreshPrepare();
+    }
+    function sheetPost(path, body) {
+        return api(path, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body || '' });
+    }
+    function applyState(st) {
+        if (!sheetData || !st) return;
+        sheetData.preset = st.preset; sheetData.is_system = st.is_system; sheetData.dirty = st.dirty || [];
+        var dirty = {};
+        sheetData.dirty.forEach(function(k) { dirty[k] = true; });
+        sheetData.pages.forEach(function(p) { p.groups.forEach(function(g) { g.lines.forEach(function(l) { l.options.forEach(function(o) { o.dirty = !!dirty[o.key]; }); }); }); });
+        renderSheetHead();
+        document.querySelectorAll('#sheet [data-key]').forEach(function(ctl) { ctl.classList.toggle('dirty', !!dirty[ctl.dataset.key]); });
+        document.querySelectorAll('#sheet .ll[data-keys]').forEach(function(lab) { lab.classList.toggle('dirty', lab.dataset.keys.split(',').some(function(k) { return dirty[k]; })); });
+    }
+    function setValue(key, value, ctl) {
+        ctl.disabled = true;
+        sheetPost('/settings/process', encodeURIComponent(key) + '=' + encodeURIComponent(value)).then(function(st) {
+            ctl.disabled = false;
+            var opt = findOption(key);
+            if (opt) opt.value = value;
+            applyState(st);
+        }).catch(function(e) { ctl.disabled = false; toast(e.message); var opt = findOption(key); if (opt) setCtlValue(ctl, opt); });
+    }
+    function findOption(key) {
+        var found = null;
+        (sheetData.pages || []).forEach(function(p) { p.groups.forEach(function(g) { g.lines.forEach(function(l) { l.options.forEach(function(o) { if (o.key === key) found = o; }); }); }); });
+        return found;
+    }
+    function setCtlValue(ctl, o) {
+        if (ctl.type === 'checkbox') ctl.checked = o.value === '1' || o.value === 'true';
+        else ctl.value = o.value;
+    }
+    function renderSheetHead() {
+        var head = document.querySelector('#sheet .head');
+        head.innerHTML = '';
+        var name = el('div', 'name');
+        name.textContent = sheetData.preset || '';
+        if (sheetData.dirty && sheetData.dirty.length) name.appendChild(el('span', 'mod', ' (modified: ' + sheetData.dirty.length + ')'));
+        head.appendChild(name);
+        var mode = el('select');
+        [['simple', 'Simple'], ['advanced', 'Advanced'], ['develop', 'Expert']].forEach(function(m) { var o = el('option', '', m[1]); o.value = m[0]; if (m[0] === sheetMode) o.selected = true; mode.appendChild(o); });
+        mode.onchange = function() { sheetMode = mode.value; renderSheetBody(); };
+        head.appendChild(mode);
+        var revert = el('span', 'btn warn' + (sheetData.dirty && sheetData.dirty.length ? '' : ' dim'), 'Revert');
+        revert.onclick = function() { if (!(sheetData.dirty && sheetData.dirty.length)) return; sheetPost('/settings/process/revert').then(function(st) { toast('Reverted'); openSheet(); }).catch(function(e) { toast(e.message); }); };
+        head.appendChild(revert);
+        var save = el('span', 'btn' + (sheetData.dirty && sheetData.dirty.length ? '' : ' dim'), 'Save');
+        save.onclick = function() { if (!(sheetData.dirty && sheetData.dirty.length)) return; sheetPost('/settings/process/save').then(function(st) { toast('Saved as ' + st.preset); openSheet(); }).catch(function(e) { toast(e.message); }); };
+        head.appendChild(save);
+        var close = el('span', 'btn small', 'Close');
+        close.onclick = closeSheet;
+        head.appendChild(close);
+    }
+    function renderSheet() {
+        renderSheetHead();
+        var tabs = document.querySelector('#sheet .pagetabs');
+        tabs.innerHTML = '';
+        (sheetData.pages || []).forEach(function(p, i) {
+            var t = el('span', 'pt' + (i === sheetPage ? ' active' : ''), p.title);
+            t.onclick = function() { sheetPage = i; renderSheet(); };
+            tabs.appendChild(t);
+        });
+        renderSheetBody();
+    }
+    function optionVisible(o) { return (MODE_RANK[o.mode] || 0) <= (MODE_RANK[sheetMode] || 0); }
+    function renderSheetBody() {
+        var body = document.querySelector('#sheet .body');
+        body.innerHTML = '';
+        var page = (sheetData.pages || [])[sheetPage];
+        if (!page) return;
+        page.groups.forEach(function(g) {
+            var lines = g.lines.filter(function(l) { return l.options.some(optionVisible); });
+            if (!lines.length) return;
+            var gkey = page.title + '/' + g.title;
+            var grp = el('div', 'grp' + (openGroups[gkey] === false ? '' : ' open'));
+            var gh = el('div', 'gh');
+            gh.appendChild(el('span', '', g.title));
+            gh.appendChild(el('span', 'chev', '▶'));
+            gh.onclick = function() {
+                grp.classList.toggle('open');
+                openGroups[gkey] = grp.classList.contains('open');
+                try { localStorage.setItem('snorca_remote_groups', JSON.stringify(openGroups)); } catch (e) {}
+            };
+            grp.appendChild(gh);
+            var gb = el('div', 'gb');
+            lines.forEach(function(l) {
+                var opts = l.options.filter(optionVisible);
+                var ln = el('div', 'ln');
+                var lab = el('div', 'll' + (opts.some(function(o) { return o.dirty; }) ? ' dirty' : ''));
+                lab.dataset.keys = opts.map(function(o) { return o.key; }).join(',');
+                var text = l.label || (opts[0] && opts[0].label) || opts[0].key;
+                lab.textContent = text;
+                if (l.tooltip || (opts[0] && opts[0].tooltip)) lab.title = l.tooltip || opts[0].tooltip;
+                var unit = opts.length === 1 ? opts[0].unit : '';
+                if (unit) lab.appendChild(el('span', 'u', unit));
+                ln.appendChild(lab);
+                var ctl = el('div', 'ctl');
+                opts.forEach(function(o) {
+                    var c;
+                    if (o.type === 'bool') {
+                        c = el('input'); c.type = 'checkbox';
+                    } else if (o.enum && o.enum.length) {
+                        c = el('select');
+                        o.enum.forEach(function(e) { var op = el('option', '', e.label); op.value = e.value; c.appendChild(op); });
+                    } else {
+                        c = el('input'); c.type = 'text';
+                        if (/float|int|percent/.test(o.type)) c.inputMode = 'decimal';
+                        if (/string|points|floats|ints|percents|strings/.test(o.type) && !/float_or_percent$/.test(o.type)) c.className = 'wide';
+                    }
+                    c.dataset.key = o.key;
+                    if (o.dirty) c.classList.add('dirty');
+                    if (o.readonly) c.disabled = true;
+                    if (opts.length > 1 && o.label && o.label !== text) c.title = o.label;
+                    setCtlValue(c, o);
+                    c.onchange = function() { setValue(o.key, c.type === 'checkbox' ? (c.checked ? '1' : '0') : c.value, c); };
+                    ctl.appendChild(c);
+                    if (opts.length > 1 && o.unit) ctl.appendChild(el('span', 'sub', o.unit));
+                });
+                ln.appendChild(ctl);
+                gb.appendChild(ln);
+            });
+            grp.appendChild(gb);
+            body.appendChild(grp);
+        });
     }
     function refreshPrepare() {
         var root = document.getElementById('prepare');
@@ -1025,7 +1220,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             var scroll = root.scrollTop;
             var setup = root.querySelector('.setup');
             if (!setup || (presetsJson !== lastPresetsJson && !editing)) {
-                var fresh = buildSetup(pr);
+                var fresh = buildSetup(pr, data);
                 if (setup) root.replaceChild(fresh, setup); else root.insertBefore(fresh, root.firstChild);
                 lastPresetsJson = presetsJson;
             }
@@ -1033,7 +1228,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             if (rest) rest.remove();
             rest = el('div', 'rest');
             var head = el('div', 'row');
-            head.appendChild(el('span', '', (data.project ? data.project.split(/[\\/]/).pop() : 'Untitled') + ' · ' + (data.plates || []).length + ' plate' + ((data.plates || []).length === 1 ? '' : 's')));
+            head.appendChild(el('span', '', (data.plates || []).length + ' plate' + ((data.plates || []).length === 1 ? '' : 's')));
             head.appendChild(el('span', '', '')).style.flex = '1';
             var all = el('span', 'btn' + (data.slicing ? ' dim' : ''), 'Slice all');
             all.onclick = function() { if (!data.slicing) startSlice('all'); };

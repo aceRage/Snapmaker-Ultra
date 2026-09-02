@@ -54,6 +54,16 @@ Manifest at `GET /api`.
 | `POST /api/presets/select?type=printer\|process\|filament&name=…[&index=…]` | `Tab::select_preset(name, force)` (printer, process) or `PresetBundle::set_filament_preset` + the sidebar's follow-ups (filament slot); same name → no-op. Never shows the transfer/discard dialog: unsaved modifications are captured first and re-applied to the new preset (auto-transfer; Revert on the PC still discards them) |
 | `POST /api/presets/filament_color?index=…&color=%23RRGGBB` | `PlaterPresetComboBox::ApplyFilamentColor` on that slot |
 | `POST /api/presets/filament_add` | `Sidebar::add_filament()` |
+| `GET /api/settings/process` | the Process tab as the slicer builds it (`Tab::get_pages()` → option groups → lines → options) with each option's definition (label, tooltip, type, unit, mode, min/max, enum values), current and last-saved value and dirty flag; plus preset name, is_system, app mode |
+| `POST /api/settings/process` (form `key=value…`) | `set_deserialize_strict` per key → `Tab::load_config` + `Plater::on_config_change`, i.e. the same effect as typing into the tab; 400 on a bad value, 404 on an unknown key |
+| `POST /api/settings/process/revert` | `Tab::on_roll_back_value(false)` — reset all settings to the last saved preset |
+| `POST /api/settings/process/save` | `Tab::save_preset(name)` under the same name; a system preset saves to the fork's `<name> - Custom` shadow preset (no name prompt) |
+
+The phone's Prepare tab shows the project file name above the printer, and an **Edit** button next
+to the process dropdown opens a full-screen editor: preset name with modified count, mode selector
+(Simple / Advanced / Expert), Revert, Save, the tab's pages as tabs, groups as collapsible sections
+(state remembered per group), and the slicer's lines with bool / enum / text controls; changed
+options are marked and applied on change.
 
 The phone page has Streams / Prepare / Devices tabs in remote mode. Prepare mirrors the slicer:
 printer dropdown, filament rows (colour swatch + dropdown, "+ Add filament"), process dropdown,

@@ -7,8 +7,10 @@
 #include "GUI_App.hpp"
 #include "PartPlate.hpp"
 #include "Plater.hpp"
+#include "OptionsGroup.hpp"
 #include "PresetComboBoxes.hpp"
 #include "Tab.hpp"
+#include <climits>
 #include "libslic3r/FilamentColorLibrary.hpp"
 #include "slic3r/Utils/Http.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
@@ -918,6 +920,206 @@ RemoteAccess::ApiResponse RemoteAccess::api_filament_add()
     return r;
 }
 
+// ------------------------------------------------- process settings editor ----
+
+static const char* option_type_name(ConfigOptionType t)
+{
+    switch (t) {
+    case coFloat: return "float";           case coFloats: return "floats";
+    case coInt: return "int";               case coInts: return "ints";
+    case coString: return "string";         case coStrings: return "strings";
+    case coPercent: return "percent";       case coPercents: return "percents";
+    case coFloatOrPercent: return "float_or_percent"; case coFloatsOrPercents: return "floats_or_percents";
+    case coPoint: return "point";           case coPoints: return "points";
+    case coBool: return "bool";             case coBools: return "bools";
+    case coEnum: return "enum";             case coEnums: return "enums";
+    default: return "other";
+    }
+}
+
+static const char* mode_name(ConfigOptionMode m)
+{
+    return m == comSimple ? "simple" : m == comAdvanced ? "advanced" : "develop";
+}
+
+static nlohmann::json process_state_json()
+{
+    nlohmann::json j;
+    PresetBundle* bundle = wxGetApp().preset_bundle;
+    const Preset& edited = bundle->prints.get_edited_preset();
+    j["preset"]    = edited.name;
+    j["is_system"] = edited.is_system;
+    j["dirty"]     = bundle->prints.current_dirty_options();
+    return j;
+}
+
+// The Process tab's pages / option groups / lines, with the definition, current value and the
+// last-saved value of every option — the phone renders exactly the slicer's layout from this.
+RemoteAccess::ApiResponse RemoteAccess::api_process_settings()
+{
+    auto out = std::make_shared<nlohmann::json>();
+    bool ok  = run_on_main([out]() {
+        nlohmann::json& j      = *out;
+        PresetBundle*   bundle = wxGetApp().preset_bundle;
+        Tab*            tab    = wxGetApp().get_tab(Preset::TYPE_PRINT);
+        if (!tab) return;
+        j        = process_state_json();
+        j["mode"] = mode_name(wxGetApp().get_mode());
+        const DynamicPrintConfig& edited = bundle->prints.get_edited_preset().config;
+        const DynamicPrintConfig& saved  = bundle->prints.get_selected_preset().config;
+        std::set<std::string> dirty;
+        for (const std::string& k : bundle->prints.current_dirty_options()) dirty.insert(k);
+        j["pages"] = nlohmann::json::array();
+        for (const PageShp& page : tab->get_pages()) {
+            nlohmann::json jp;
+            jp["title"]  = page->title().ToUTF8().data();
+            jp["groups"] = nlohmann::json::array();
+            for (const ConfigOptionsGroupShp& group : page->m_optgroups) {
+                nlohmann::json jg;
+                jg["title"] = group->title.ToUTF8().data();
+                jg["lines"] = nlohmann::json::array();
+                for (const Line& line : group->get_lines()) {
+                    if (line.is_separator()) continue;
+                    nlohmann::json jl;
+                    jl["label"]   = line.label.ToUTF8().data();
+                    jl["tooltip"] = line.label_tooltip.ToUTF8().data();
+                    jl["options"] = nlohmann::json::array();
+                    for (const Option& opt : line.get_options()) {
+                        std::string key = opt.opt_id;
+                        int         idx = -1;
+                        const size_t hash = key.find('#');
+                        if (hash != std::string::npos) { idx = std::atoi(key.c_str() + hash + 1); key = key.substr(0, hash); }
+                        const ConfigOption* cur = edited.option(key);
+                        if (!cur) continue;
+                        const ConfigOption* sav = saved.option(key);
+                        const ConfigOptionDef& def = opt.opt;
+                        nlohmann::json jo;
+                        jo["key"]     = key;
+                        if (idx >= 0) jo["index"] = idx;
+                        jo["label"]   = _(def.label).ToUTF8().data();
+                        jo["tooltip"] = _(def.tooltip).ToUTF8().data();
+                        jo["type"]    = option_type_name(def.type);
+                        jo["unit"]    = _(def.sidetext).ToUTF8().data();
+                        jo["mode"]    = mode_name(def.mode);
+                        jo["readonly"] = def.readonly || opt.readonly;
+                        if (def.min != INT_MIN) jo["min"] = def.min;
+                        if (def.max != INT_MAX) jo["max"] = def.max;
+                        if (!def.enum_values.empty()) {
+                            jo["enum"] = nlohmann::json::array();
+                            for (size_t e = 0; e < def.enum_values.size(); ++e) {
+                                nlohmann::json je;
+                                je["value"] = def.enum_values[e];
+                                je["label"] = e < def.enum_labels.size() ? _(def.enum_labels[e]).ToUTF8().data() : def.enum_values[e];
+                                jo["enum"].push_back(je);
+                            }
+                        }
+                        jo["value"] = cur->serialize();
+                        jo["saved"] = sav ? sav->serialize() : "";
+                        jo["dirty"] = dirty.count(key) > 0;
+                        jl["options"].push_back(jo);
+                    }
+                    if (!jl["options"].empty())
+                        jg["lines"].push_back(jl);
+                }
+                if (!jg["lines"].empty())
+                    jp["groups"].push_back(jg);
+            }
+            if (!jp["groups"].empty())
+                j["pages"].push_back(jp);
+        }
+    });
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); }
+    else if (out->empty()) { r.status = 404; r.body = json_error("no process tab"); }
+    else r.body = out->dump();
+    return r;
+}
+
+// Apply key=value pairs (form-encoded, serialized option values) to the edited process
+// preset, exactly like typing them into the Process tab; the preset becomes "modified".
+RemoteAccess::ApiResponse RemoteAccess::api_process_set(const std::string& form_body)
+{
+    std::vector<std::pair<std::string, std::string>> pairs;
+    size_t pos = 0;
+    while (pos <= form_body.size()) {
+        size_t amp = form_body.find('&', pos);
+        if (amp == std::string::npos) amp = form_body.size();
+        const std::string kv = form_body.substr(pos, amp - pos);
+        const size_t      eq = kv.find('=');
+        if (eq != std::string::npos && eq > 0)
+            pairs.emplace_back(percent_decode(kv.substr(0, eq)), percent_decode(kv.substr(eq + 1)));
+        pos = amp + 1;
+    }
+    ApiResponse r;
+    if (pairs.empty()) { r.status = 404; r.body = json_error("no key=value pairs"); return r; }
+    auto result = std::make_shared<std::pair<int, std::string>>(500, "");
+    auto state  = std::make_shared<nlohmann::json>();
+    bool ok     = run_on_main([result, state, pairs]() {
+        Tab* tab = wxGetApp().get_tab(Preset::TYPE_PRINT);
+        if (!tab) { *result = { 404, "no process tab" }; return; }
+        DynamicPrintConfig cfg;
+        for (const auto& kv : pairs) {
+            if (!print_config_def.has(kv.first)) { *result = { 404, "unknown setting: " + kv.first }; return; }
+            try {
+                cfg.set_deserialize_strict(kv.first, kv.second);
+            } catch (const std::exception& e) {
+                *result = { 400, "bad value for " + kv.first + ": " + e.what() };
+                return;
+            }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        tab->load_config(cfg);
+        const auto t1 = std::chrono::steady_clock::now();
+        wxGetApp().plater()->on_config_change(cfg);
+        const auto t2 = std::chrono::steady_clock::now();
+        BOOST_LOG_TRIVIAL(info) << "RemoteAccess: process settings applied, load_config "
+                                << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << " ms, on_config_change "
+                                << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms";
+        *state  = process_state_json();
+        *result = { 200, "" };
+    }, 60000); // the first apply after a project load has been seen to take >15 s
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    if (result->first != 200) { r.status = result->first; r.body = json_error(result->second); return r; }
+    r.body = state->dump();
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_process_revert()
+{
+    auto state = std::make_shared<nlohmann::json>();
+    bool ok    = run_on_main([state]() {
+        Tab* tab = wxGetApp().get_tab(Preset::TYPE_PRINT);
+        if (!tab) return;
+        tab->on_roll_back_value(false); // "reset all settings to the last saved preset"
+        wxGetApp().plater()->on_config_change(wxGetApp().preset_bundle->full_config());
+        *state = process_state_json();
+    }, 60000);
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); }
+    else       r.body = state->dump();
+    return r;
+}
+
+// Save under the same name; a system preset saves to its "<name> - Custom" shadow (the fork's
+// own no-prompt rule in Tab::save_preset), which then becomes the selected preset.
+RemoteAccess::ApiResponse RemoteAccess::api_process_save()
+{
+    auto state = std::make_shared<nlohmann::json>();
+    bool ok    = run_on_main([state]() {
+        Tab*          tab    = wxGetApp().get_tab(Preset::TYPE_PRINT);
+        PresetBundle* bundle = wxGetApp().preset_bundle;
+        if (!tab) return;
+        const Preset& edited = bundle->prints.get_edited_preset();
+        if (edited.is_dirty)
+            tab->save_preset(edited.is_system ? std::string() : edited.name);
+        *state = process_state_json();
+    }, 30000);
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); }
+    else       r.body = state->dump();
+    return r;
+}
+
 RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, const std::string& path, const std::string& query, const std::string& body)
 {
     ApiResponse r;
@@ -938,11 +1140,23 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "POST"}, {"path", "/api/presets/select?type=printer|process|filament&name={value}[&index={slot}]"}, {"description", "select a preset the way the sidebar does; 409 when that preset has unsaved changes on the PC"} },
             { {"method", "POST"}, {"path", "/api/presets/filament_color?index={slot}&color=%23RRGGBB"}, {"description", "set a filament slot colour"} },
             { {"method", "POST"}, {"path", "/api/presets/filament_add"},   {"description", "add a filament slot"} },
+            { {"method", "GET"},  {"path", "/api/settings/process"},       {"description", "the Process tab: pages > groups > lines > options with definition, current and saved values, dirty flags, app mode"} },
+            { {"method", "POST"}, {"path", "/api/settings/process"},       {"description", "form body key=value[&key=value…] (serialized option values); applies like typing into the tab, returns preset/dirty state"} },
+            { {"method", "POST"}, {"path", "/api/settings/process/revert"}, {"description", "reset all settings to the last saved preset"} },
+            { {"method", "POST"}, {"path", "/api/settings/process/save"},  {"description", "save modifications under the same name (system presets save to '<name> - Custom')"} },
             { {"method", "GET"},  {"path", "/state"},                      {"description", "camera list for the stream wall (see /r/<token>/)"} }
         });
         r.body = j.dump();
         return r;
     }
+    if (path == "/settings/process" && method == "GET")
+        return api_process_settings();
+    if (path == "/settings/process" && method == "POST")
+        return api_process_set(body.empty() ? query : body);
+    if (path == "/settings/process/revert" && method == "POST")
+        return api_process_revert();
+    if (path == "/settings/process/save" && method == "POST")
+        return api_process_save();
     if (path == "/presets" && method == "GET")
         return api_presets();
     if (path == "/presets/select" && method == "POST") {
@@ -1090,8 +1304,9 @@ void RemoteAccess::serve(void* socket_ptr)
                 body.append(buf, n);
             }
             ApiResponse ar = handle_api(method, rest.substr(4), query, body);
-            const char* status = ar.status == 200 ? "200 OK" : ar.status == 404 ? "404 Not Found" : ar.status == 409 ? "409 Conflict"
-                               : ar.status == 413 ? "413 Payload Too Large" : ar.status == 503 ? "503 Service Unavailable" : "500 Internal Server Error";
+            const char* status = ar.status == 200 ? "200 OK" : ar.status == 400 ? "400 Bad Request" : ar.status == 404 ? "404 Not Found"
+                               : ar.status == 409 ? "409 Conflict" : ar.status == 413 ? "413 Payload Too Large"
+                               : ar.status == 503 ? "503 Service Unavailable" : "500 Internal Server Error";
             respond(client, status, ar.type, ar.body);
         } else if (rest == "/bambu") {
             std::string ip, code;

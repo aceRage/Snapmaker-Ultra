@@ -79,6 +79,10 @@ private:
     ApiResponse api_select_preset(const std::string& type, const std::string& name, int index);
     ApiResponse api_filament_color(int index, const std::string& color);
     ApiResponse api_filament_add();
+    ApiResponse api_process_settings();
+    ApiResponse api_process_set(const std::string& form_body);
+    ApiResponse api_process_revert();
+    ApiResponse api_process_save();
 
     struct Job
     {
