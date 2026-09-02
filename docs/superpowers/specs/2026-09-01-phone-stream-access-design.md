@@ -84,7 +84,7 @@ without any slicer at all.
   on, loopback only otherwise), go2rtc (spawned into a kill-on-close Job Object so it dies
   with the hub), the Bambu MJPEG relay, the Flashforge probe, and the camera list (persisted in
   `<datadir>/hub/streams.json`, re-registered in go2rtc at start). `<datadir>/hub/hub.json`
-  holds pid, port, token, phone flag and version; `hub.log` the log.
+  holds pid, port, token, phone flag and version; the log is `<datadir>/log/hub.log.0`.
 - **Instances**: every slicer instance starts a loopback-only API on an OS-picked port
   (`RemoteAccess`) and drops `<datadir>/hub/instances/<pid>.json`. The hub scans that
   directory, drops dead pids, probes `GET /api/info` (pid, project title/path, slicing flag —
