@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.9 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–8) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.10 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–9) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -122,6 +122,10 @@ boundary is a **crease** when n_P·n_Q < cos 15°.
   meeting the block top, Ruling 14): a′ = a − d(a)·n_P with no step and no bisector, so the piece never leaves the
   painted feature's own footprint (a bisector would carry a hidden painted skirt into the neighbouring body and cost
   toolchanges on layers that carry no paint). This rule is always on, independent of the crease-step option.
+- Ties (rev 2.10, Ruling 25): the convex cases need a STRICT ordering — Case A iff |n_P·z| > |n_Q·z| + 10⁻³,
+  Case B iff |n_P·z| < |n_Q·z| − 10⁻³. Two vertical faces (or two equally sloped ones) have no layer asymmetry,
+  so their crease takes the plain mitred bisector: the 45° Voronoi diagonal the 2D segmentation produces. Holding
+  a wall stack there (Case B) would claim ws·(2D − ws) per layer more than the 2D path (Task 9 measurement).
 - Width guard (rev 2.7, Ruling 22): the Case A inset is applied to a group only if the group's projection onto
   the plane perpendicular to its mean normal survives an inward offset of ws (the flat cap's own yardstick);
   otherwise the group's Case A vertices use the plain bisector rule. A painted stroke narrower than 2·ws
