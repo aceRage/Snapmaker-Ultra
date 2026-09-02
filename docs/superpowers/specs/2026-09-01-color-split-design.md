@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.12 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–10) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.13 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–10; §12 added at Task 11) · Status: implemented (v1) — GUI round pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -310,3 +310,54 @@ voxel-resolution internal walls, ~1-voxel wobble of the visible colour edge, hea
 Per-colour depth table; geometric interlock (dovetail) at colour walls; re-projection of seam/support paint
 onto the new parts; a "split and keep the original" variant (duplicate first); batch "split all painted
 objects"; SLA.
+
+## 12. Measured
+
+Implemented on `feat/color-split` in `C:\Dev\SnapmakerOrcaNext` (Tasks 1–11, 2026-09-01/02). Every number
+below comes from the committed test suite, Release x64, Manifold 3.5.2 with `MANIFOLD_PAR=OFF`; the full
+record is `.superpowers/sdd/2026-09-01-color-split/spike-report.md`.
+
+**Tests.** `libslic3r_tests.exe "[colorsplit]"` 912 assertions in 56 cases (run twice, identical);
+`"[colorsplit_spike]"` 24 in 3; `"[paintdepth]"` 1568 in 94; `"[chameleon]"` 605 in 133; the whole binary
+52 583 assertions in 581 cases, 2 of which are the pre-existing cases that fail as expected.
+
+**S1 — engine (§9): 2 mm boss on a block, painted whole.** The painted region is two smooth patches (§3.1a),
+so two shells: side tube 9.37426 mm³, top slab 4.43006 mm³. The piece after the partition is 9.37566 mm³ =
+99.48 % of the 9.42478 mm³ of boss standing above the block, with z_min = 10.000 — nothing of it hides inside
+the body. The 1 mm of cylinder buried in the block bounds no painted facet and was never reachable; what stays
+body-coloured is an interior core, never a visible surface (§3.8).
+
+**S3 — timing.** 99 224-triangle sphere, r = 20 mm, D = 1.5 mm, default params: **one colour 1.013 s, three
+colours 6.53 s**. Stage breakdown at 69 520 shell triangles: `extract_color_patches` 0.020 s,
+`build_color_shells` 0.230 s — of which the CGAL self-intersection check 0.104 s, 45 % of that stage and
+10.3 % of the whole split — and `partition_by_shells` 0.756 s. The check earns its 10 %: engine A as designed,
+no reduced check set, no engine B (§9, §10).
+
+**S4a — slice parity on a vertical wall (§8.7).** 40×40×20 cube, +X face painted, sliced both ways with
+D = 1.40885 mm and ws = 0.79708 mm, layers 25–74. The 2D claim is 54.3691 mm² on every layer (odd and even
+alike, with the 2D-only interlocking notch disabled, Ruling 26); the 3D piece is 55.9797 mm² on every layer,
+the derived 40·D − (D − ws)². **Worst difference 1.61063 mm² of the 4.0 mm² bound (40 %)**, and it matches the
+case-B corner hold ws·(2D − ws) = 1.61059 to 4·10⁻⁵ — the residual is §3.6's geometry, not error.
+
+**S4b — painted cube top, the wall-stack step (§3.6).** Body area on layer 98 (print_z 19.8) of the same cube
+with its top painted: **47.6398 mm² with the step off, 124.991 mm² with it on**, against the exact one-stack
+ring 4·40·ws − 4ws² = 124.99 mm². With the step the piece sits exactly one wall stack in from all four side
+faces; without it the body keeps a 0.30 mm ring, under one outer wall line, and the top colour would print out
+onto the side faces.
+
+**Documented limits.**
+- **Per-vertex crease classification** (§3.6, Ruling 26): the crease case is chosen once per boundary vertex,
+  because a vertex has one ring copy. Per-edge classification is deferred.
+- **A four-vertex face therefore holds one wall stack along its vertical creases**: every corner of a plain
+  cube face is case B and the tie edges between them inherit the hold, so the piece claims
+  ws·(2D − ws) ≈ 1.61 mm² per layer more than the 2D Voronoi diagonal at stock settings — the whole of the
+  S4a residual above, and ≤ one wall stack wide.
+- **Anisotropic multi-instance objects** (§3.9): the world path uses the FIRST instance's transform, so other
+  instances with a different anisotropic scale get an approximate depth.
+- **Strokes narrower than 2·ws** (§3.6 width guard, Ruling 22) fall back to the plain mitred bisector instead
+  of the case-A inset; that is what keeps embossed text splittable at all, at the cost of 2D parity there.
+- §3.10's exclusions stand as written: no interlocking notch, no seam/support/fuzzy-skin paint transfer.
+
+**Not yet measured.** The plan's GUI round — paint, split, inspect the list and filaments, slice, undo/redo,
+3MF round trip, painting gizmo open (refused) — has not been walked through by hand; the GUI compiles and
+links into `snapmaker-orca.exe` and its logic is covered only by the library tests behind it.
