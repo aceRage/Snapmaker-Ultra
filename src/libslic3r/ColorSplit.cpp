@@ -63,6 +63,8 @@ static int effective_shell_layers(int n_layers, double thickness, double h)
 
 ColorSplitDepths color_split_depths(const DynamicPrintConfig &cfg, const std::vector<int> &filaments)
 {
+    if (filaments.empty())
+        throw ColorSplitError("No filaments to derive the split depth from.");
     ColorSplitDepths out;
     const double h = cfg.opt_float("layer_height");
     out.layer_height = h;
@@ -75,6 +77,8 @@ ColorSplitDepths color_split_depths(const DynamicPrintConfig &cfg, const std::ve
     if (ext_w.value == 0) ext_w = *cfg.option<ConfigOptionFloatOrPercent>("line_width");   // PrintRegion.cpp:95-96
     if (per_w.value == 0) per_w = *cfg.option<ConfigOptionFloatOrPercent>("line_width");
     const auto &nozzles = cfg.option<ConfigOptionFloats>("nozzle_diameter")->values;
+    if (nozzles.empty())
+        throw ColorSplitError("Printer profile has no nozzle diameters.");
     out.unlimited = mode == pdmUnlimited;
     for (int f : filaments) {
         const float nozzle = float(nozzles[std::min<size_t>(std::max(f, 1) - 1, nozzles.size() - 1)]);

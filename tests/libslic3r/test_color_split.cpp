@@ -97,12 +97,17 @@ TEST_CASE("colorsplit: strict patches share boundary vertices and cover the surf
     REQUIRE(p.facet_state.size() == p.surface.indices.size());
     REQUIRE(its_num_open_edges(p.surface) == 0);
     REQUIRE_THAT(its_volume(p.surface), WithinRel(40. * 40. * 20., 1e-6));
+    // Correlate the state with the geometry rather than with itself: exactly the two facets sitting on the
+    // painted top face (centroid z == 20) carry state 2, every other facet of the surface carries state 0.
     size_t painted = 0;
-    for (int s : p.facet_state) painted += (s == 2);
+    for (size_t f = 0; f < p.surface.indices.size(); ++f) {
+        const Vec3i32 &t = p.surface.indices[f];
+        const float cz = (p.surface.vertices[t[0]].z() + p.surface.vertices[t[1]].z() + p.surface.vertices[t[2]].z()) / 3.f;
+        const bool on_top = cz > 20.f - 1e-3f;
+        REQUIRE(p.facet_state[f] == (on_top ? 2 : 0));
+        painted += on_top;
+    }
     REQUIRE(painted == 2);
-    size_t unpainted = 0;
-    for (int s : p.facet_state) unpainted += (s == 0);
-    REQUIRE(unpainted == p.surface.indices.size() - painted);
 }
 
 TEST_CASE("colorsplit: a brush stroke cutting through facets still yields a closed surface", "[colorsplit]")
@@ -185,6 +190,14 @@ TEST_CASE("colorsplit: depths mirror paint_depth_band_mm and the shell layer rul
     ColorSplitDepths u = color_split_depths(split_test_config(pdmUnlimited), {1, 2});
     REQUIRE(u.unlimited);
     REQUIRE_THAT(color_split_depths(split_test_config(pdmMillimeters, 3, 2.5), {1, 2}).D, WithinRel(2.5, 1e-5));
+}
+
+TEST_CASE("colorsplit: depths refuse a config that cannot produce a depth", "[colorsplit]")
+{
+    DynamicPrintConfig cfg = split_test_config();
+    REQUIRE_THROWS_AS(color_split_depths(cfg, {}), ColorSplitError);       // no filament -> D and ws would stay 0
+    cfg.option<ConfigOptionFloats>("nozzle_diameter")->values.clear();
+    REQUIRE_THROWS_AS(color_split_depths(cfg, {1, 2}), ColorSplitError);   // no nozzle -> the index would underflow
 }
 
 TEST_CASE("colorsplit: per-vertex depth is min(D, half thickness)", "[colorsplit]")
