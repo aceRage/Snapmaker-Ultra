@@ -30,7 +30,7 @@
 | File | Responsibility |
 |---|---|
 | `src/libslic3r/ColorSplit.hpp` | Public API: depth model, patches, shells, partition, one-shot split, model mutation. No Manifold/CGAL includes. |
-| `src/libslic3r/ColorSplit.cpp` | Implementation (includes `<manifold/manifold.h>`, `MeshBoolean.hpp`, `AABBMesh.hpp`, `NormalUtils.hpp`, `Flow.hpp`, `PaintDepth.hpp`, `ClipperUtils.hpp`). |
+| `src/libslic3r/ColorSplit.cpp` | Patches, depths, normals, pipeline (`split_volume_by_paint`). From Task 5 on: `ColorSplitShell.cpp` (groups + ShellBuilder), `ColorSplitPartition.cpp` (Manifold: partition, refinement), `ColorSplitInternal.hpp` (shared internals). |
 | `src/libslic3r/CMakeLists.txt` | Register the two files in the main `lisbslic3r_sources` list after `PaintDepth.cpp` (line ~87), not in the `libslic3r_cgal` list. |
 | `tests/libslic3r/test_color_split.cpp` | All `[colorsplit]` / `[colorsplit_spike]` tests + fixtures. |
 | `tests/libslic3r/CMakeLists.txt` | Register the test file after `test_paint_depth_clamp.cpp`. |
@@ -1119,13 +1119,109 @@ Write `.superpowers/sdd/2026-09-01-color-split/spike-report.md` with: S1/S3 numb
 
 ---
 
-### Task 5: Flat cap depth groups and crease step
+### Task 5: Surface refinement pre-pass, concave creases, file split (spike follow-up)
+
+**Files:**
+- Create: `src/libslic3r/ColorSplitInternal.hpp` (internal declarations shared by the three .cpp files: `connected_components`, `to_manifold64`, `from_manifold`, the `ShellBuilder` declaration if needed), `src/libslic3r/ColorSplitShell.cpp` (groups + `ShellBuilder` + `build_color_shells`), `src/libslic3r/ColorSplitPartition.cpp` (Manifold helpers, `partition_by_shells`, `refine_color_patches`)
+- Modify: `src/libslic3r/ColorSplit.hpp`, `src/libslic3r/ColorSplit.cpp` (keeps patches, depths, normals, `split_volume_by_paint`), `src/libslic3r/CMakeLists.txt` (register the two new .cpp and the internal header next to `ColorSplit.cpp`), `tests/libslic3r/test_color_split.cpp`
+
+**Interfaces:**
+- Consumes: everything from Tasks 1-4.
+- Produces: `ColorPatches refine_color_patches(const ColorPatches &, double max_edge_mm)` (Ruling 13); `double color_split_refine_length(const ColorSplitDepths &, const ColorSplitParams &, const BoundingBoxf3 &)` = `max(ws, min(D_eff, bbox_diagonal / 20))` where D_eff = `depth_override_mm > 0 ? depth_override_mm : (unlimited ? +inf : D)`; `split_volume_by_paint` calls both between `extract_color_patches` and `build_color_shells`. The concave-crease rule (Ruling 14) inside `ShellBuilder::build`. No behaviour change elsewhere; every existing `[colorsplit]` test keeps passing (only the boss expectation changes, see Step 1).
+
+- [ ] **Step 1: Write the failing tests**
+
+```cpp
+TEST_CASE("colorsplit: refinement adds interior side vertices to a two-ring cylinder", "[colorsplit]")
+{
+    TriangleMesh cyl(its_make_cylinder(1.0, 3.0, PI / 18.));            // two rings, 3 mm tall
+    ColorPatches p = extract_color_patches(cyl.its, paint_by_predicate(cyl, [](const Vec3f &, const Vec3f &n) { return std::abs(n.z()) < 0.5f; }, EnforcerBlockerType::Extruder2));
+    ColorPatches r = refine_color_patches(p, 0.75);
+    REQUIRE(r.surface.indices.size() > p.surface.indices.size());
+    REQUIRE(its_num_open_edges(r.surface) == 0);
+    REQUIRE_THAT(its_volume(r.surface), WithinRel(its_volume(p.surface), 1e-5));   // flat refinement: same solid
+    REQUIRE(r.states == p.states);
+    // a side vertex strictly between the rings exists and its angle-weighted normal is radial
+    std::vector<Vec3f> n = color_split_normals(r.surface);
+    bool found = false;
+    for (size_t v = 0; v < r.surface.vertices.size(); ++v)
+        if (r.surface.vertices[v].z() > 0.5f && r.surface.vertices[v].z() < 2.5f && std::abs(n[v].z()) < 1e-3f) found = true;
+    REQUIRE(found);
+    // painted state survives refinement: every refined side facet is state 2, caps are 0
+    for (size_t f = 0; f < r.surface.indices.size(); ++f) {
+        const Vec3i32 &t = r.surface.indices[f];
+        Vec3f nf = (r.surface.vertices[t[1]] - r.surface.vertices[t[0]]).cross(r.surface.vertices[t[2]] - r.surface.vertices[t[0]]).normalized();
+        REQUIRE(r.facet_state[f] == (std::abs(nf.z()) < 0.5f ? 2 : 0));
+    }
+}
+
+TEST_CASE("colorsplit: painted boss on a block is (almost) entirely its colour after refinement", "[colorsplit]")
+{
+    TriangleMesh block = make_cube(40., 40., 10.);
+    TriangleMesh boss(its_make_cylinder(1.0, 4.0, PI / 18.));
+    boss.translate(20.f, 20.f, 9.f);
+    std::vector<TriangleMesh> out;
+    REQUIRE(MeshBoolean::mfd::make_boolean(block, boss, out, "UNION"));
+    TriangleMesh bossed = out.front();
+    auto paint = paint_by_predicate(bossed, [](const Vec3f &c, const Vec3f &) { return c.z() > 10.05f; }, EnforcerBlockerType::Extruder2);
+    ColorSplitResult rb = split_volume_by_paint(bossed.its, paint, depths_for_test(1.5, 0.2, 0.87), ColorSplitParams{}, nullptr);
+    REQUIRE(rb.pieces.size() == 1);
+    const double exposed = PI * 1.0 * 1.0 * 3.0;                        // 1 mm of the cylinder is buried in the block
+    REQUIRE(volume_of(rb.pieces[0].second) >= 0.9 * exposed);
+    // Ruling 14: nothing painted below the block top except the delta sliver tolerance
+    float zmin = 1e9f; for (const Vec3f &v : rb.pieces[0].second.vertices) zmin = std::min(zmin, v.z());
+    REQUIRE(zmin >= 10.f - 1e-3f);
+}
+
+TEST_CASE("colorsplit: refine length follows max(ws, min(D, diag/20))", "[colorsplit]")
+{
+    ColorSplitDepths d = depths_for_test(1.5, 0.2, 0.87);
+    BoundingBoxf3 bb(Vec3d(0, 0, 0), Vec3d(40, 40, 20));
+    REQUIRE_THAT(color_split_refine_length(d, ColorSplitParams{}, bb), WithinRel(1.5, 1e-9));
+    ColorSplitParams o; o.depth_override_mm = 0.3;
+    REQUIRE_THAT(color_split_refine_length(d, o, bb), WithinRel(0.87, 1e-9));           // ws floor
+    ColorSplitDepths u = depths_for_test(std::numeric_limits<double>::infinity(), 0.2, 0.87);
+    REQUIRE_THAT(color_split_refine_length(u, ColorSplitParams{}, bb), WithinRel(bb.size().norm() / 20., 1e-9));
+}
+```
+
+The S1 spike case's boss assertion (Task 4) is replaced by the boss test above (delete the interim `piece == shell` / `> 80 %` pin, keep the timing WARNs).
+
+- [ ] **Step 2: Build, verify failure** (`refine_color_patches`, `color_split_refine_length` undeclared).
+
+- [ ] **Step 3: Implement**
+
+Header additions:
+
+```cpp
+// Ruling 13: flat (linear) refinement of F so that no edge exceeds max_edge_mm; states follow the parent facet.
+ColorPatches refine_color_patches(const ColorPatches &patches, double max_edge_mm);
+double color_split_refine_length(const ColorSplitDepths &, const ColorSplitParams &, const BoundingBoxf3 &mesh_bbox);
+```
+
+`refine_color_patches` (ColorSplitPartition.cpp): `manifold::Manifold m = to_manifold64(patches.surface)` (no `AsOriginal` needed) -> `manifold::Manifold r = m.RefineToLength(max_edge_mm)` -> `from_manifold(r)` -> for each refined triangle, centroid -> `AABBMesh(patches.surface).squared_distance(centroid, face_idx, closest)` -> `facet_state[f] = patches.facet_state[face_idx]`; copy `states`; `its_num_open_edges` must stay 0 (throw `ColorSplitError` otherwise). If `RefineToLength` returns a mesh with the same triangle count (nothing to refine), return the input unchanged.
+
+`color_split_refine_length`: as specified in Interfaces.
+
+`split_volume_by_paint`: after `extract_color_patches`, compute the bounding box of `patches.surface` (loop over vertices into a `BoundingBoxf3`), `patches = refine_color_patches(patches, color_split_refine_length(depths, params, bb))`, then continue. Progress: refinement reports 5.
+
+Concave-crease rule (Ruling 14) in `ShellBuilder::build`: while gathering boundary info (Task 6 adds the full crease machinery; this task adds the minimum): per boundary vertex accumulate `n_p` (mean face normal of the group's facets at the vertex), `n_q` (mean face normal of the outside facets across its boundary edges) and `t_in` (mean inward tangent `nf x (b - a)` normalised); a vertex is a **concave crease** when `n_p . n_q < cos(15 deg)` and `n_q . t_in > 0`; for such vertices the bottom copy is `top - d * n_p` (unit `n_p`) instead of `top - d * n(v)`. Interior vertices and all other boundary vertices are unchanged. Keep the structure so Task 6 can add the convex cases (ring vertices) without rewriting.
+
+File split (Ruling 15): move `connected_components`, `ShellBuilder`, `build_color_shells` into `ColorSplitShell.cpp`; `to_manifold64`, `from_manifold`, `require_ok`, `partition_by_shells`, `refine_color_patches` into `ColorSplitPartition.cpp`; declare the shared internals in `ColorSplitInternal.hpp` (namespace `Slic3r::ColorSplitDetail`); `ColorSplit.cpp` keeps `extract_color_patches`, `color_split_depths`, `color_split_normals`, `compute_vertex_depths`, `check_shell`, `color_split_refine_length`, `split_volume_by_paint`. Remove the unreachable "shell depth reduced" warning branch. Register the files in `src/libslic3r/CMakeLists.txt` next to `ColorSplit.cpp`. No logic changes beyond Rulings 13-15.
+
+- [ ] **Step 4: Build and run** `[colorsplit]`, `[colorsplit_spike]`, `[paintdepth]` -> all pass; append the re-measured S3 timings (with refinement in the pipeline) to `.superpowers/sdd/2026-09-01-color-split/spike-report.md`.
+
+- [ ] **Step 5: Commit** - two commits: `refactor(color-split): split ColorSplit.cpp into shell/partition units` (pure move, tests unchanged) then `feat(color-split): refinement pre-pass and concave-crease walls (spike follow-up)`.
+
+---
+
+### Task 6: Flat cap depth groups and crease step
 
 **Files:**
 - Modify: `src/libslic3r/ColorSplit.cpp` (ShellBuilder: groups, ring vertices), `tests/libslic3r/test_color_split.cpp`
 
 **Interfaces:**
-- Consumes: `ColorSplitParams::flat_cap`, `crease_step`, `ColorSplitDepths::cap_top/cap_bottom/ws/layer_height`.
+- Consumes: `ColorSplitParams::flat_cap`, `crease_step`, `ColorSplitDepths::cap_top/cap_bottom/ws/layer_height`; the file layout and `refine_color_patches` from Task 5 (ShellBuilder now lives in `ColorSplitShell.cpp`; the concave-crease rule from Task 5 stays in force).
 - Produces: `ColorShell::capped == true` for capped groups; behaviour per spec 3.5/3.6. Internal: `classify_depth_groups(patches, nbrs, normals, state, depths) -> std::vector<std::pair<std::vector<int>, double /*cap or 0*/>>`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1308,7 +1404,7 @@ Side strips become `(b, a, a1, b1)` and `(b1, a1, a', b')` → triangles `(B.top
 
 ---
 
-### Task 6: Model mutation and coordinate space
+### Task 7: Model mutation and coordinate space
 
 **Files:**
 - Modify: `src/libslic3r/ColorSplit.hpp`, `src/libslic3r/ColorSplit.cpp`, `tests/libslic3r/test_color_split.cpp`
@@ -1535,7 +1631,7 @@ Verify names: `ModelVolume::text_configuration` / `emboss_shape` are `std::optio
 
 ---
 
-### Task 7: End-to-end slicing parity and the S4 wedge measurement
+### Task 8: End-to-end slicing parity and the S4 wedge measurement
 
 **Files:**
 - Modify: `tests/libslic3r/test_color_split.cpp`
@@ -1615,14 +1711,14 @@ Check the accessor names (`Layer::regions()`, `LayerRegion::region()`, `LayerReg
 
 ---
 
-### Task 8: GUI — Plater action, dialog, job, menu
+### Task 9: GUI — Plater action, dialog, job, menu
 
 **Files:**
 - Create: `src/slic3r/GUI/ColorSplitDialog.hpp/.cpp`, `src/slic3r/GUI/Jobs/ColorSplitJob.hpp/.cpp`
 - Modify: `src/slic3r/GUI/Plater.hpp` (near `void split_object();` :732), `src/slic3r/GUI/Plater.cpp` (near `Plater::split_object()`), `src/slic3r/GUI/GUI_Factories.cpp` (:1424-1436, :1462-1474, :1540-1549, :1595-1607, :1987-2002), `src/slic3r/CMakeLists.txt` (:265 area)
 
 **Interfaces:**
-- Consumes: Task 6 API (`color_split_space`, `scale_depths`, `split_volume_by_paint`, `apply_color_split`), `color_split_depths`.
+- Consumes: Task 7 API (`color_split_space`, `scale_depths`, `split_volume_by_paint`, `apply_color_split`), `color_split_depths`.
 - Produces: `void Plater::split_by_color();`, `bool Plater::can_split_by_color() const;`, `class ColorSplitJob : public Job`, `class ColorSplitDialog : public wxDialog`.
 
 - [ ] **Step 1: Job**
@@ -1828,7 +1924,7 @@ Report to the user with instructions: open a painted project, right-click → Sp
 
 ---
 
-### Task 9: Verification, docs and ledger
+### Task 10: Verification, docs and ledger
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-09-01-color-split-design.md` (status line + any spike-driven changes), `.superpowers/sdd/2026-09-01-color-split/progress.md`
@@ -1856,6 +1952,6 @@ Expected: all green (the full run has 2 known xfail cases from before). Run `[co
 
 ## Self-review notes (done while writing)
 
-- Spec coverage: 3.1 → Task 1; 3.2–3.4 → Task 2/3; 3.5–3.7 → Task 3/5; 3.8 → Task 4; 3.9 + §4 → Task 6; §5 → Task 8; §6/§8.7 → Task 7; §7 errors → Tasks 3/4/8 (ColorSplitError paths + job messages); §8 tests → Tasks 1–7; §9 spike → Task 4 step 5 + Task 7 S4; §10 fallback engine → not planned (only if the checkpoint says B); §11 deferred → out of scope.
+- Spec coverage (after the Task-5 insertion, 2026-09-02): 3.1 → Tasks 1/5 (refinement); 3.2–3.4 → Task 2/3; 3.5–3.7 → Task 3/5/6; 3.8 → Task 4; 3.9 + §4 → Task 7; §5 → Task 9; §6/§8.7 → Task 8; §7 errors → Tasks 3/4/9; §8 tests → Tasks 1–8; §9 spike → Task 4 step 5 (verdict: engine A) + Task 5 re-measure + Task 8 S4; §10 fallback engine → not needed; §11 deferred → out of scope.
 - Type consistency: `ColorSplitProgress`, `ColorSplitDepths`, `ColorSplitParams`, `ColorShell`, `ShellCheck`, `ColorSplitResult`, `ColorSplitSpace` are defined once (Tasks 1–6) and used with the same names later; `apply_color_split` takes `(ModelObject&, size_t, ColorSplitResult&&, const ColorSplitSpace&, bool, bool)` everywhere.
 - Known verification points for implementers (marked "check" in the code): `its_face_neighbors` edge convention, `TriangleSelector::select_patch` overload, `NormalUtils::Normals` type, `AABBMesh::query_ray_hits` ordering, `Manifold::Split` pair order, `LayerRegion::slices` accessor, `ModelVolume` member names for text/emboss/cut info, `Plater::TakeSnapshot` and `show_error` signatures.
