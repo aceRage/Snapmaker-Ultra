@@ -11508,6 +11508,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
     bool is_user_cancel = false;
     bool translate_old = false;
     int current_width = 0, current_depth = 0, current_height = 0;
+    // Ultra "Keep my printer": the switch back to the preferred printer is deferred until the
+    // objects and plates are loaded, so the bed-size change re-centers them like a manual switch.
+    std::string        deferred_preferred_printer;
+    DynamicPrintConfig deferred_print_dirty;
 
     if (input_files.empty()) { return std::vector<size_t>(); }
     
@@ -12124,26 +12128,24 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             // Restore the user's preferred printer instead of the printer embedded in the
                             // file. force_select bypasses the transfer/discard dialogs: the file's
                             // printer-tab modifications are dropped, and incompatible process/filament
-                            // presets are remapped to compatible ones silently.
+                            // presets are remapped to compatible ones silently. The switch itself runs
+                            // after the objects are loaded (see below): done here, no objects exist yet,
+                            // so the bed-size change had nothing to re-center and models loaded off-plate.
                             if (wxGetApp().app_config->get("keep_printer_on_open") == "true") {
                                 const std::string preferred = wxGetApp().app_config->get("preferred_printer");
                                 if (!preferred.empty()
                                     && preferred != preset_bundle->printers.get_selected_preset_name()
                                     && preset_bundle->printers.find_preset(preferred) != nullptr) {
-                                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": restoring preferred printer " << preferred
+                                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": will restore preferred printer " << preferred
                                                             << " over project printer " << preset_bundle->printers.get_selected_preset_name();
+                                    deferred_preferred_printer = preferred;
                                     // Auto-transfer: capture the project's process modifications and re-apply
                                     // them after the silent printer switch, like the dialog's Transfer button.
-                                    DynamicPrintConfig print_dirty;
-                                    {
-                                        const Preset& edited_print = preset_bundle->prints.get_edited_preset();
-                                        for (const std::string& opt : preset_bundle->prints.current_dirty_options())
-                                            if (const ConfigOption* o = edited_print.config.option(opt))
-                                                print_dirty.set_key_value(opt, o->clone());
-                                    }
-                                    wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preferred, false, "", true);
-                                    if (!print_dirty.empty())
-                                        wxGetApp().get_tab(Preset::TYPE_PRINT)->load_config(print_dirty);
+                                    deferred_print_dirty.clear();
+                                    const Preset& edited_print = preset_bundle->prints.get_edited_preset();
+                                    for (const std::string& opt : preset_bundle->prints.current_dirty_options())
+                                        if (const ConfigOption* o = edited_print.config.option(opt))
+                                            deferred_print_dirty.set_key_value(opt, o->clone());
                                 }
                             }
 
@@ -12527,6 +12529,14 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
         view3D->get_canvas3d()->remove_raycasters_for_picking(SceneRaycaster::EType::Bed);
         partplate_list.reset_size(current_width, current_depth, current_height, true, true);
         partplate_list.register_raycasters_for_picking(*view3D->get_canvas3d());
+    }
+
+    // Ultra "Keep my printer": switch now that the objects sit on the project's plates, so the
+    // bed-shape change moves them with the plates exactly as a manual printer switch would.
+    if (!deferred_preferred_printer.empty()) {
+        wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(deferred_preferred_printer, false, "", true);
+        if (!deferred_print_dirty.empty())
+            wxGetApp().get_tab(Preset::TYPE_PRINT)->load_config(deferred_print_dirty);
     }
 
     //BBS: add gcode loading logic in the end
