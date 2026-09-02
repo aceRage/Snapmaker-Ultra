@@ -1054,13 +1054,23 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         var sel = el('select');
         if (!instances.length) { var o0 = el('option', '', 'No slicer open'); o0.value = '0'; sel.appendChild(o0); sel.disabled = true; }
         instances.forEach(function(i) {
-            var o = el('option', '', i.index + ' · ' + (i.title || 'Untitled') + (i.slicing ? ' (slicing)' : ''));
+            var o = el('option', '', i.index + ' · ' + (i.title || 'Untitled') + (i.slicing ? ' (slicing)' : '') + (i.needs_attention ? ' (needs attention)' : ''));
             o.value = String(i.id);
             if (i.id === instSel) o.selected = true;
             sel.appendChild(o);
         });
         sel.onchange = function() { selectInstance(parseInt(sel.value) || 0); };
         bar.appendChild(sel);
+        // A slicer that hit something only a person at the PC can answer (its window is shown there).
+        var att = instances.filter(function(i) { return i.needs_attention; });
+        if (att.length) {
+            var ab = el('div', 'note err attention');
+            ab.appendChild(el('span', '', 'The slicer needs attention on the PC' + (att[0].attention_reason ? ': ' + att[0].attention_reason : '') + (att.length > 1 ? ' (+' + (att.length - 1) + ' more)' : '')));
+            var dis = el('span', 'btn small', 'Dismiss');
+            dis.onclick = function() { fetch(REMOTE + 'i/' + att[0].id + '/api/attention/clear', { method: 'POST' }).then(function() { lastInstJson = ''; refreshInstances(); }).catch(fail); };
+            ab.appendChild(dis);
+            bar.appendChild(ab);
+        }
         bar.appendChild(el('div', 'lbl', 'Open a file'));
         var row = el('div', 'filerow');
         var pick = el('label', 'btn dim', chosenFile ? chosenFile.name : 'Choose 3MF / STL…');

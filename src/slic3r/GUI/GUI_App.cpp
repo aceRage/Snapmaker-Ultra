@@ -1146,7 +1146,9 @@ void GUI_App::post_init()
         hms_query = new HMSQuery();
 
     m_show_gcode_window = app_config->get_bool("show_gcode_window");
-    if (m_networking_need_update) {
+    if (m_networking_need_update && m_hub_managed && RemoteAccess::get().hidden()) {
+        RemoteAccess::get().raise_attention("the network plug-in needs updating", "manual");
+    } else if (m_networking_need_update) {
         //updating networking
         int ret = updating_bambu_networking();
         if (!ret) {
@@ -2702,7 +2704,9 @@ bool GUI_App::on_init_inner()
                     wxString::Format(_L("%s\nDo you want to continue?"), msg),
                     "Snapmaker Orca", wxICON_QUESTION | wxYES_NO);
             dlg.ShowCheckBox(_L("Remember my choice"));
-            if (dlg.ShowModal() != wxID_YES) return false;
+            // Ultra: a hidden instance cannot answer and declining would abort start-up: accept (not remembered).
+            const int tls_answer = m_hub_managed ? (int) wxID_YES : dlg.ShowModal();
+            if (tls_answer != wxID_YES) return false;
 
             app_config->set("tls_cert_store_accepted",
                 dlg.IsCheckBoxChecked() ? "yes" : "no");
@@ -2839,6 +2843,7 @@ bool GUI_App::on_init_inner()
         // filament_hot_bed_nozzles.json is copied here; FilamentHotBedNozzleRules reloads in load_current_presets() (startup, recreate_GUI, preset UI sync).
         Bind(EVT_SLIC3R_VERSION_ONLINE, [this](const wxCommandEvent& evt) {
             if (this->plater_ != nullptr) {
+                if (m_hub_managed && RemoteAccess::get().hidden()) { BOOST_LOG_TRIVIAL(info) << "hidden instance: new-version notice skipped"; return; }
 
                 std::string skip_version_str = this->app_config->get("app", "skip_version");
                 bool skip_this_version = false;
@@ -2868,6 +2873,11 @@ bool GUI_App::on_init_inner()
             });
 
         Bind(EVT_ENTER_FORCE_UPGRADE, [this](const wxCommandEvent& evt) {
+                // Ultra: every answer below closes the main window; a hidden instance leaves that to a person.
+                if (m_hub_managed && RemoteAccess::get().hidden()) {
+                    RemoteAccess::get().raise_attention("a mandatory update is waiting", "manual");
+                    return;
+                }
                 wxString      version_str = wxString::FromUTF8(this->app_config->get("upgrade", "version"));
                 wxString      description_text = wxString::FromUTF8(this->app_config->get("upgrade", "description"));
                 std::string   download_url = this->app_config->get("upgrade", "url");
@@ -4117,6 +4127,7 @@ if (res) {
 
 void GUI_App::ShowDownNetPluginDlg() {
     try {
+        if (m_hub_managed && RemoteAccess::get().hidden()) { RemoteAccess::get().raise_attention("the network plug-in needs installing", "manual"); return; }
         auto iter = std::find_if(dialogStack.begin(), dialogStack.end(), [](auto dialog) {
             return dynamic_cast<DownloadProgressDialog *>(dialog) != nullptr;
         });
@@ -7404,6 +7415,11 @@ bool GUI_App::config_wizard_startup()
     BOOST_LOG_TRIVIAL(warning) << "config_wizard_startup changed the privacy policy with: " << (isAgree);
     
         if (!m_app_conf_exists || preset_bundle->printers.only_default_printers()) {
+            if (m_hub_managed && RemoteAccess::get().hidden()) {
+                // Ultra: the wizard needs a person; a printer-less instance cannot serve the phone anyway.
+                RemoteAccess::get().raise_attention("this slicer has no printer configured yet", "manual");
+                return false;
+            }
             BOOST_LOG_TRIVIAL(info) << "run wizard...";
             run_wizard(ConfigWizard::RR_DATA_EMPTY);
             BOOST_LOG_TRIVIAL(info) << "finished run wizard";
@@ -7413,6 +7429,7 @@ bool GUI_App::config_wizard_startup()
 
     if (isAgree.empty())
     {
+        if (m_hub_managed && RemoteAccess::get().hidden()) { RemoteAccess::get().raise_attention("first-run setup is waiting", "manual"); return false; }
         run_wizard(ConfigWizard::RR_DATA_EMPTY); // Compatible with older versions
         return true;
     }

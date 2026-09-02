@@ -43,6 +43,10 @@
 #include <thread>
 
 #include <wx/utils.h>
+#include <wx/modalhook.h>
+#include <wx/msgdlg.h>
+#include <wx/timer.h>
+#include <wx/thread.h>
 
 namespace Slic3r {
 namespace GUI {
@@ -111,7 +115,225 @@ bool RemoteAccess::auto_confirm() { return s_auto_confirm_depth > 0; }
 RemoteAccess::AutoConfirmScope::AutoConfirmScope() { ++s_auto_confirm_depth; }
 RemoteAccess::AutoConfirmScope::~AutoConfirmScope() { --s_auto_confirm_depth; }
 
-static bool run_on_main(std::function<void()> fn, int timeout_ms = 15000)
+RemoteAccess::Mode RemoteAccess::dialog_mode()
+{
+    if (s_auto_confirm_depth > 0) return Mode::Request;
+    if (RemoteAccess::get().hidden()) return Mode::Background;
+    return Mode::Interactive;
+}
+
+static long long now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+namespace {
+
+// Modals we let through (Interactive) that are up right now. GUI thread only.
+int g_modal_depth = 0;
+
+// Dialogs whose affirmative answer destroys work, needs typed input, or takes the instance
+// down. Matched on the wx class name (wxClassInfo), so no translated text is involved.
+struct ClassRule { const char* cls; int answer; bool human; };
+static const ClassRule k_class_rules[] = {
+    // needs typed input or a chosen path -> cancel and ask for a person
+    { "wxFileDialog",            wxID_CANCEL, true }, { "wxDirDialog",           wxID_CANCEL, true },
+    { "wxTextEntryDialog",       wxID_CANCEL, true }, { "wxColourDialog",        wxID_CANCEL, true },
+    { "wxFontDialog",            wxID_CANCEL, true }, { "wxPasswordEntryDialog", wxID_CANCEL, true },
+    { "SavePresetDialog",        wxID_CANCEL, true }, { "GuideFrame",            wxID_CANCEL, true },
+    { "InputIpAddressDialog",    wxID_CANCEL, true }, { "PingCodeBindDialog",    wxID_CANCEL, true },
+    { "BindMachineDialog",       wxID_CANCEL, true }, { "UnBindMachineDialog",   wxID_CANCEL, true },
+    { "EditDevNameDialog",       wxID_CANCEL, true }, { "MsgDataIncompatible",   wxID_CANCEL, true },
+    // destructive or takes the app down -> decline quietly
+    { "DeleteConfirmDialog",     wxID_CANCEL, false }, { "DownloadDialog",       wxID_CANCEL, false },
+    { "DownloadProgressDialog",  wxID_CANCEL, false }, { "UpdateVersionDialog",  wxID_CANCEL, false },
+    { "UpdatePluginDialog",      wxID_CANCEL, false }, { "MsgUpdateConfig",      wxID_CANCEL, false },
+    { "MsgUpdateSlic3r",         wxID_CANCEL, false },
+    // print / calibration: never start a print unattended
+    { "SelectMachineDialog",     wxID_CANCEL, false }, { "SendToPrinterDialog",  wxID_CANCEL, false },
+    { "SendMultiMachinePage",    wxID_CANCEL, false }, { "ConfirmBeforeSendDialog", wxID_CANCEL, false },
+    { "PrintHostSendDialog",     wxID_CANCEL, false }, { "CaliHistoryDialog",    wxID_CANCEL, false },
+};
+
+static bool has_btn(wxDialog* d, int id) { return d->FindWindow(id) != nullptr; }
+
+static long style_of(wxDialog* d)
+{
+    if (auto* m = dynamic_cast<wxMessageDialogBase*>(d)) return m->GetMessageDialogStyle();
+    long s = 0; // the fork's MsgDialog builds real child buttons with these ids
+    if (has_btn(d, wxID_OK))     s |= wxOK;
+    if (has_btn(d, wxID_YES))    s |= wxYES;
+    if (has_btn(d, wxID_NO))     s |= wxNO;
+    if (has_btn(d, wxID_CANCEL)) s |= wxCANCEL;
+    return s;
+}
+
+// affirmative: the phone asked for this, carry it out. Otherwise: do nothing.
+static int default_answer(long s, bool affirmative)
+{
+    if (affirmative) {
+        if (s & wxYES) return wxID_YES;
+        if (s & wxOK)  return wxID_OK;
+    } else {
+        if (s & wxNO)     return wxID_NO;
+        if (s & wxCANCEL) return wxID_CANCEL;
+        if (s & wxOK)     return wxID_OK; // a pure acknowledgement
+    }
+    if (s & wxCANCEL) return wxID_CANCEL;
+    if (s & wxNO)     return wxID_NO;
+    if (s & wxOK)     return wxID_OK;
+    return wxID_CANCEL;
+}
+
+static const char* answer_name(int id)
+{
+    switch (id) {
+    case wxID_YES: return "yes";
+    case wxID_NO:  return "no";
+    case wxID_OK:  return "ok";
+    default:       return "cancel";
+    }
+}
+
+class DialogPolicyHook : public wxModalDialogHook
+{
+protected:
+    int Enter(wxDialog* dlg) override
+    {
+        const RemoteAccess::Mode mode = RemoteAccess::dialog_mode();
+        if (mode == RemoteAccess::Mode::Interactive) {
+            ++g_modal_depth; // somebody is looking; let it show
+            return wxID_NONE;
+        }
+        const std::string cls   = dlg->GetClassInfo() ? std::string(wxString(dlg->GetClassInfo()->GetClassName()).ToUTF8().data()) : std::string("wxDialog");
+        const std::string title = dlg->GetTitle().ToUTF8().data();
+        const ClassRule*  rule  = nullptr;
+        for (const ClassRule& r : k_class_rules)
+            if (cls == r.cls) { rule = &r; break; }
+        const bool affirmative = mode == RemoteAccess::Mode::Request;
+        const int  answer      = rule ? rule->answer : default_answer(style_of(dlg), affirmative);
+        RemoteAccess::get().note_attention(cls + (title.empty() ? "" : " \"" + title + "\""), answer_name(answer));
+        BOOST_LOG_TRIVIAL(warning) << "hidden-mode dialog answered " << answer_name(answer) << ": " << cls << " \"" << title << "\"";
+        if (rule && rule->human)
+            RemoteAccess::get().raise_attention(cls + " needs someone at the PC", "manual");
+        return answer; // ShowModal() returns this without showing anything
+    }
+    void Exit(wxDialog*) override
+    {
+        if (g_modal_depth > 0) --g_modal_depth;
+    }
+};
+static DialogPolicyHook s_dialog_hook;
+
+// Every second on the GUI thread: proves the loop is pumping and reports let-through modals.
+class GuiHeartbeat : public wxTimer
+{
+public:
+    void Notify() override { RemoteAccess::get().heartbeat_review(g_modal_depth); }
+};
+static GuiHeartbeat* s_heartbeat = nullptr;
+
+} // namespace
+
+void RemoteAccess::install_dialog_policy() { s_dialog_hook.Register(); }
+
+void RemoteAccess::show_window(const std::string& reason)
+{
+    auto show = [reason]() {
+        MainFrame* mf = wxGetApp().mainframe;
+        if (mf == nullptr) return;
+        if (mf->IsIconized()) mf->Iconize(false);
+        mf->Show(true);
+        mf->Raise();
+        RemoteAccess::get().set_hidden(!mf->IsShown());
+        RemoteAccess::get().note_attention("window shown: " + reason, "shown");
+    };
+    if (wxThread::IsMain()) show(); else wxGetApp().CallAfter(show);
+}
+
+void RemoteAccess::note_attention(const std::string& dialog, const std::string& answered)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_attention.push_back({ (long long) std::time(nullptr), dialog, answered });
+    if (m_attention.size() > 50) m_attention.pop_front();
+}
+
+void RemoteAccess::raise_attention(const std::string& reason, const char* kind)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_needs_attention && m_attention_reason == reason) return;
+        m_needs_attention  = true;
+        m_attention_reason = reason;
+        m_attention_kind   = kind;
+        m_attention_since  = (long long) std::time(nullptr);
+        m_requests_done    = 0;
+        if (m_on) write_instance_file();
+    }
+    BOOST_LOG_TRIVIAL(warning) << "RemoteAccess: needs attention (" << kind << "): " << reason;
+    if (hidden())
+        show_window(reason);
+}
+
+void RemoteAccess::clear_attention(const char* why)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_needs_attention) return;
+    m_needs_attention = false;
+    m_attention_reason.clear();
+    m_attention_kind.clear();
+    if (m_on) write_instance_file();
+    BOOST_LOG_TRIVIAL(warning) << "RemoteAccess: attention cleared (" << why << ")";
+}
+
+bool RemoteAccess::needs_attention(std::string* reason)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (reason) *reason = m_attention_reason;
+    return m_needs_attention;
+}
+
+void RemoteAccess::note_gui_tick(int modal_depth)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_gui_tick_ms = now_ms();
+    m_modal_depth = modal_depth;
+}
+
+long long RemoteAccess::gui_stall_ms()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_gui_tick_ms ? now_ms() - m_gui_tick_ms : 0;
+}
+
+void RemoteAccess::note_request_done()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    ++m_requests_done;
+}
+
+void RemoteAccess::heartbeat_review(int modal_depth)
+{
+    note_gui_tick(modal_depth);
+    std::string kind;
+    bool        needs;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        kind  = m_attention_kind;
+        needs = m_needs_attention;
+    }
+    if (modal_depth > 0 && hidden())
+        raise_attention("a dialog on the PC is waiting for an answer", "dialog");
+    else if (needs && kind == "dialog" && modal_depth == 0)
+        clear_attention("the dialog is gone");
+    else if (needs && kind == "timeout") {
+        bool done;
+        { std::lock_guard<std::mutex> lock(m_mutex); done = m_requests_done > 0; }
+        if (done) clear_attention("a later request completed");
+    }
+}
+
+static bool run_on_main(std::function<void()> fn, int timeout_ms = 15000, const char* what = "a request")
 {
     auto done = std::make_shared<std::promise<void>>();
     auto fut  = done->get_future();
@@ -120,7 +342,12 @@ static bool run_on_main(std::function<void()> fn, int timeout_ms = 15000)
         try { fn(); } catch (...) {}
         done->set_value();
     });
-    return fut.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready;
+    if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready) {
+        RemoteAccess::get().note_request_done();
+        return true;
+    }
+    RemoteAccess::get().raise_attention(std::string(what) + " did not finish on the PC within " + std::to_string(timeout_ms / 1000) + " s", "timeout");
+    return false;
 }
 
 static std::string json_error(const std::string& msg)
@@ -152,6 +379,8 @@ void RemoteAccess::start()
         m_on       = true;
         std::thread([this]() { accept_loop(); }).detach();
         write_instance_file();
+        if (s_heartbeat == nullptr) s_heartbeat = new GuiHeartbeat(); // GUI thread: start() runs there
+        s_heartbeat->Start(1000);
         BOOST_LOG_TRIVIAL(info) << "RemoteAccess: instance API on 127.0.0.1:" << m_port;
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(error) << "RemoteAccess: failed to start: " << e.what();
@@ -166,6 +395,7 @@ void RemoteAccess::stop()
     if (!m_on)
         return;
     m_on = false;
+    if (s_heartbeat) s_heartbeat->Stop();
     boost::system::error_code ig;
     fs::remove(fs::path(RemoteHub::instances_dir()) / (std::to_string(wxGetProcessId()) + ".json"), ig);
     if (auto* acceptor = static_cast<tcp::acceptor*>(m_acceptor)) {
@@ -195,6 +425,8 @@ void RemoteAccess::write_instance_file()
     j["hidden"]  = m_hidden;
     j["title"]   = m_title;
     j["path"]    = m_path;
+    j["needs_attention"]  = m_needs_attention;
+    j["attention_reason"] = m_attention_reason;
     boost::nowide::ofstream f((fs::path(RemoteHub::instances_dir()) / (std::to_string(wxGetProcessId()) + ".json")).string(), std::ios::trunc);
     f << j.dump(2);
 }
@@ -729,9 +961,12 @@ RemoteAccess::ApiResponse RemoteAccess::api_slice(int plate, bool all)
         }
         plater->exit_gizmo();
         plater->update(true, true);
-        wxPostEvent(plater, SimpleEvent(all ? EVT_GLTOOLBAR_SLICE_ALL : EVT_GLTOOLBAR_SLICE_PLATE));
+        // Synchronous, not posted: the pre-slice confirms (temperature mixing, memory) then run
+        // inside this request's auto-confirm scope instead of after it.
+        SimpleEvent evt(all ? EVT_GLTOOLBAR_SLICE_ALL : EVT_GLTOOLBAR_SLICE_PLATE);
+        plater->GetEventHandler()->ProcessEvent(evt);
         *result = { 200, "" };
-    });
+    }, 60000, "starting a slice");
     ApiResponse r;
     if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
     if (result->first != 200) { r.status = result->first; r.body = json_error(result->second); return r; }
@@ -1165,7 +1400,9 @@ RemoteAccess::ApiResponse RemoteAccess::api_process_save()
         if (!tab) return;
         const Preset& edited = bundle->prints.get_edited_preset();
         if (edited.is_dirty)
-            tab->save_preset(edited.is_system ? std::string() : edited.name);
+            // An explicit name: SavePresetDialog (a text field nobody can fill) is never constructed,
+            // whatever the auto_shadow_system_presets preference says.
+            tab->save_preset(edited.is_system ? edited.name + " - Custom" : edited.name);
         *state = process_state_json();
     }, 30000);
     ApiResponse r;
@@ -1189,7 +1426,51 @@ RemoteAccess::ApiResponse RemoteAccess::api_info()
     j["slicing"] = m_slicing;
     j["hidden"]  = m_hidden;
     j["version"] = std::string(SLIC3R_VERSION);
+    j["needs_attention"]  = m_needs_attention;
+    j["attention_reason"] = m_attention_reason;
+    j["attention_kind"]   = m_attention_kind;
+    j["attention_since"]  = m_attention_since;
+    j["modal_open"]       = m_modal_depth;
+    j["gui_stall_ms"]     = m_gui_tick_ms ? now_ms() - m_gui_tick_ms : 0;
+    j["attention"]        = nlohmann::json::array();
+    for (const Attention& a : m_attention)
+        j["attention"].push_back({ {"time", a.time}, {"dialog", a.dialog}, {"answered", a.answered} });
     r.body       = j.dump();
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_attention_clear()
+{
+    clear_attention("dismissed from the phone");
+    return api_info();
+}
+
+// Test hooks, only with SNORCA_DEBUG_ROUTES=1: sleep = block the GUI thread (watchdog), modal =
+// a plain wxMessageDialog through the policy hook, file = a wxFileDialog (needs a person).
+RemoteAccess::ApiResponse RemoteAccess::api_debug(const std::string& what, const std::string& query)
+{
+    ApiResponse r;
+    wxString    on;
+    if (!wxGetEnv("SNORCA_DEBUG_ROUTES", &on) || on != "1") { r.status = 404; r.body = json_error("debug routes are off"); return r; }
+    auto out = std::make_shared<nlohmann::json>();
+    int  ms  = 20000;
+    try { const std::string v = query_param(query, "ms"); if (!v.empty()) ms = std::stoi(v); } catch (...) {}
+    bool ok = run_on_main([out, what, ms]() {
+        if (what == "sleep") {
+            wxMilliSleep(ms);
+            (*out)["slept_ms"] = ms;
+        } else if (what == "modal") {
+            wxMessageDialog dlg(wxGetApp().mainframe, "Debug: a question nobody should have to answer", "Debug modal", wxYES_NO | wxCANCEL);
+            (*out)["answer"] = dlg.ShowModal();
+        } else if (what == "file") {
+            wxFileDialog dlg(wxGetApp().mainframe, "Debug: choose a file", "", "", "*.*", wxFD_OPEN);
+            (*out)["answer"] = dlg.ShowModal();
+        } else {
+            (*out)["error"] = "unknown debug route";
+        }
+    }, 5000, "a debug request");
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    r.body = out->dump();
     return r;
 }
 
@@ -1343,6 +1624,7 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "GET"},  {"path", "/api/window"},                 {"description", "is this instance's window shown? {hidden, iconized}"} },
             { {"method", "POST"}, {"path", "/api/window?show=1|0"},        {"description", "show (and raise) or hide this instance's window"} },
             { {"method", "POST"}, {"path", "/api/quit[?discard=1]"},       {"description", "close this instance; without discard the unsaved project is saved first (an unnamed one under <datadir>/hub/saves)"} },
+            { {"method", "POST"}, {"path", "/api/attention/clear"},        {"description", "dismiss the needs-attention flag (see /api/info: needs_attention, attention_reason, attention[])"} },
             { {"method", "POST"}, {"path", "/api/project/open"},           {"description", "form body path={file uploaded through the hub}&mode=load|import; load (.3mf) saves the current project first, import adds the model to the plate"} },
             { {"method", "GET"},  {"path", "/api/plates"},                 {"description", "project, printer preset, filaments and every plate with objects, slice state, time and filament estimates"} },
             { {"method", "GET"},  {"path", "/api/plates/{index}/thumbnail.png"}, {"description", "rendered plate preview"} },
@@ -1374,6 +1656,10 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
         if (show.empty()) show = query_param(body, "show");
         return api_window(method == "GET" ? std::string() : show);
     }
+    if (path == "/attention/clear" && method == "POST")
+        return api_attention_clear();
+    if (path.compare(0, 7, "/debug/") == 0 && method == "POST")
+        return api_debug(path.substr(7), query);
     if (path == "/quit" && method == "POST") {
         std::string d = query_param(query, "discard");
         if (d.empty()) d = query_param(body, "discard");

@@ -629,6 +629,8 @@ struct Instance
     std::string title, path;
     bool        slicing { false };
     bool        hidden { false };
+    bool        needs_attention { false };
+    std::string attention_reason;
     bool        alive { false };
 };
 
@@ -649,6 +651,7 @@ public:
         std::string token, url;
         int         instances { 0 };
         int         hidden { 0 };
+        int         attention { 0 };
     };
     Snapshot snapshot();
     bool     set_phone(bool on, const std::string& token); // rebinds the listener, persists
@@ -907,6 +910,8 @@ Instance HubServer::probe_instance(Instance inst)
                 inst.path     = j.value("path", "");
                 inst.slicing  = j.value("slicing", false);
                 inst.hidden   = j.value("hidden", inst.hidden);
+                inst.needs_attention  = j.value("needs_attention", false);
+                inst.attention_reason = j.value("attention_reason", "");
             } catch (...) {}
         })
         .perform_sync();
@@ -929,6 +934,8 @@ std::vector<Instance> HubServer::instances(bool probe)
             inst.port    = j.value("port", 0);
             inst.started = j.value("started", 0LL);
             inst.hidden  = j.value("hidden", false);
+            inst.needs_attention  = j.value("needs_attention", false);
+            inst.attention_reason = j.value("attention_reason", "");
             inst.title   = j.value("title", "");
             inst.path    = j.value("path", "");
         } catch (...) {}
@@ -964,6 +971,8 @@ json HubServer::instances_json()
         ji["path"]    = inst.path;
         ji["slicing"] = inst.slicing;
         ji["hidden"]  = inst.hidden;
+        ji["needs_attention"]  = inst.needs_attention;
+        ji["attention_reason"] = inst.attention_reason;
         j["instances"].push_back(ji);
     }
     return j;
@@ -985,6 +994,7 @@ HubServer::Snapshot HubServer::snapshot()
     for (const Instance& inst : instances(false)) {
         ++s.instances;
         if (inst.hidden) ++s.hidden;
+        if (inst.needs_attention) ++s.attention;
     }
     return s;
 }
@@ -1360,6 +1370,7 @@ public:
         tip += st.phone ? "\nPhone access on" : "\nPhone access off";
         tip += wxString::Format("\n%d slicer window%s open", st.instances, st.instances == 1 ? "" : "s");
         if (st.hidden > 0) tip += wxString::Format(" (%d hidden)", st.hidden);
+        if (st.attention > 0) tip += wxString::Format("\n%d need%s attention on the PC", st.attention, st.attention == 1 ? "s" : "");
         if (m_icon.IsOk()) SetIcon(m_icon, tip);
     }
 
@@ -1385,8 +1396,9 @@ public:
             one->Append(base + 1, "Hide window")->Enable(!inst.hidden);
             one->AppendSeparator();
             one->Append(base + 2, "Quit this window");
-            subs->AppendSubMenu(one, wxString::Format("%d \xC2\xB7 %s%s", n + 1,
-                inst.title.empty() ? wxString("Untitled") : wxString::FromUTF8(inst.title), inst.hidden ? wxString("  (hidden)") : wxString()));
+            subs->AppendSubMenu(one, wxString::Format("%d \xC2\xB7 %s%s%s", n + 1,
+                inst.title.empty() ? wxString("Untitled") : wxString::FromUTF8(inst.title), inst.hidden ? wxString("  (hidden)") : wxString(),
+                inst.needs_attention ? wxString("  (needs attention)") : wxString()));
             m_menu_pids.push_back(inst.pid);
             ++n;
         }

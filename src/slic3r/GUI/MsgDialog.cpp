@@ -362,9 +362,15 @@ MessageDialog::MessageDialog(wxWindow* parent,
 // take the affirmative choice (the user's "always transfer / auto-accept" rule).
 int MessageDialog::ShowModal()
 {
-    if (RemoteAccess::auto_confirm()) {
-        const int answer = get_button(wxID_YES) ? wxID_YES : wxID_OK;
-        BOOST_LOG_TRIVIAL(info) << "MessageDialog auto-answered (" << (answer == wxID_YES ? "Yes" : "OK") << ") during a remote request";
+    const RemoteAccess::Mode mode = RemoteAccess::dialog_mode();
+    if (mode != RemoteAccess::Mode::Interactive) {
+        // Request: the phone asked for this, carry it out. Background (hidden, unasked): do nothing.
+        int answer;
+        if (mode == RemoteAccess::Mode::Request) answer = get_button(wxID_YES) ? wxID_YES : wxID_OK;
+        else answer = get_button(wxID_NO) ? wxID_NO : (get_button(wxID_CANCEL) ? wxID_CANCEL : wxID_OK);
+        const char* name = answer == wxID_YES ? "yes" : answer == wxID_NO ? "no" : answer == wxID_CANCEL ? "cancel" : "ok";
+        RemoteAccess::get().note_attention(std::string("MessageDialog \"") + GetTitle().ToUTF8().data() + "\"", name);
+        BOOST_LOG_TRIVIAL(warning) << "MessageDialog auto-answered (" << name << ", " << (mode == RemoteAccess::Mode::Request ? "request" : "hidden") << "): " << GetTitle().ToUTF8().data();
         return answer;
     }
     return MsgDialog::ShowModal();
@@ -385,9 +391,14 @@ RichMessageDialog::RichMessageDialog(wxWindow* parent,
 
 int RichMessageDialog::ShowModal()
 {
-    if (RemoteAccess::auto_confirm()) {
-        const int answer = get_button(wxID_YES) ? wxID_YES : wxID_OK;
-        BOOST_LOG_TRIVIAL(info) << "RichMessageDialog auto-answered (" << (answer == wxID_YES ? "Yes" : "OK") << ") during a remote request";
+    const RemoteAccess::Mode mode = RemoteAccess::dialog_mode();
+    if (mode != RemoteAccess::Mode::Interactive) {
+        int answer;
+        if (mode == RemoteAccess::Mode::Request) answer = get_button(wxID_YES) ? wxID_YES : wxID_OK;
+        else answer = get_button(wxID_NO) ? wxID_NO : (get_button(wxID_CANCEL) ? wxID_CANCEL : wxID_OK);
+        const char* name = answer == wxID_YES ? "yes" : answer == wxID_NO ? "no" : answer == wxID_CANCEL ? "cancel" : "ok";
+        RemoteAccess::get().note_attention(std::string("RichMessageDialog \"") + GetTitle().ToUTF8().data() + "\"", name);
+        BOOST_LOG_TRIVIAL(warning) << "RichMessageDialog auto-answered (" << name << "): " << GetTitle().ToUTF8().data();
         return answer;
     }
     if (!m_checkBoxText.IsEmpty()) {
@@ -653,8 +664,9 @@ wxBoxSizer *Newer3mfVersionDialog::get_btn_sizer()
 
 int ErrorDialog::ShowModal()
 {
-    if (RemoteAccess::auto_confirm()) {
-        BOOST_LOG_TRIVIAL(error) << "ErrorDialog: auto-dismissed for a remote request";
+    if (RemoteAccess::dialog_mode() != RemoteAccess::Mode::Interactive) {
+        RemoteAccess::get().note_attention(std::string("ErrorDialog \"") + GetTitle().ToUTF8().data() + "\"", "ok");
+        BOOST_LOG_TRIVIAL(error) << "ErrorDialog: auto-dismissed (nobody at the PC): " << GetTitle().ToUTF8().data();
         return wxID_OK;
     }
     return MsgDialog::ShowModal();

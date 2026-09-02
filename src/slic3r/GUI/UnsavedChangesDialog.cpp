@@ -825,8 +825,9 @@ inline int UnsavedChangesDialog::ShowModal()
     // Ultra: a phone/agent request is running on the GUI thread — nobody can click. Carry
     // the modifications over where that is offered (preset switch), otherwise let them go
     // (project load: the previous project was just saved with them).
-    if (RemoteAccess::auto_confirm()) {
+    if (RemoteAccess::dialog_mode() != RemoteAccess::Mode::Interactive) {
         m_exit_action = (m_buttons & ActionButtons::TRANSFER) ? Action::Transfer : Action::Discard;
+        RemoteAccess::get().note_attention("UnsavedChangesDialog", m_exit_action == Action::Transfer ? "transfer" : "discard");
         BOOST_LOG_TRIVIAL(info) << "UnsavedChangesDialog: auto-answered (" << (m_exit_action == Action::Transfer ? "transfer" : "discard") << ") for a remote request";
         return wxID_OK;
     }

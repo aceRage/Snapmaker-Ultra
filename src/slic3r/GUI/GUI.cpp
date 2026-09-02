@@ -240,9 +240,10 @@ void show_error(wxWindow* parent, const wxString& message, bool monospaced_font)
 {
     // Ultra: an error raised while a phone/agent request runs must not pop a modal nobody can
     // click (it would block every later request); hand it back to that request instead.
-    if (RemoteAccess::auto_confirm()) {
-        BOOST_LOG_TRIVIAL(error) << "show_error (remote request, not shown): " << message.ToUTF8().data();
+    if (RemoteAccess::dialog_mode() != RemoteAccess::Mode::Interactive) {
+        BOOST_LOG_TRIVIAL(error) << "show_error (nobody at the PC, not shown): " << message.ToUTF8().data();
         RemoteAccess::get().note_error(message.ToUTF8().data());
+        RemoteAccess::get().note_attention("show_error: " + std::string(message.ToUTF8().data()).substr(0, 120), "not shown");
         return;
     }
     wxGetApp().CallAfter([=] {

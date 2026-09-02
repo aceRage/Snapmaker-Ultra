@@ -4,6 +4,7 @@
 
 #include "slic3r/GUI/GUI.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/RemoteAccess.hpp"
 #include "slic3r/GUI/3DScene.hpp"
 #include "slic3r/GUI/InstanceCheck.hpp"
 #include "slic3r/GUI/format.hpp"
@@ -45,6 +46,9 @@ int GUI_Run(GUI_InitParams &params)
     //BBS: remove the try-catch and let exception goto above
     try {
         //GUI::GUI_App* gui = new GUI::GUI_App(params.start_as_gcodeviewer ? GUI::GUI_App::EAppMode::GCodeViewer : GUI::GUI_App::EAppMode::Editor);
+        // Ultra: the modal-dialog policy must exist before the first dialog can appear (some fire
+        // from the GUI_App constructor); it only acts while the instance is hidden or serving a request.
+        GUI::RemoteAccess::install_dialog_policy();
         GUI::GUI_App* gui = new GUI::GUI_App();
         //if (gui->get_app_mode() != GUI::GUI_App::EAppMode::GCodeViewer) {
             // G-code viewer is currently not performing instance check, a new G-code viewer is started every time.

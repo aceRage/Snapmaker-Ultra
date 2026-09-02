@@ -1,5 +1,6 @@
 #pragma once
 
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -30,6 +31,30 @@ public:
     // and toggle it. GUI thread (or before start()).
     void set_hidden(bool hidden);
     bool hidden();
+
+    // ---- dialog policy + attention (hidden service mode, stage 3) ----
+    // Interactive: a person is at the PC (window shown), dialogs show normally.
+    // Request:     a phone/agent request is running -> take the affirmative branch.
+    // Background:  hidden and nothing asked for this -> take the do-nothing branch.
+    enum class Mode { Interactive, Request, Background };
+    static Mode dialog_mode();
+    // Installed once, before the GUI_App exists (GUI_Init.cpp): a wxModalDialogHook that
+    // answers every ShowModal() itself while the instance is hidden or serving a request.
+    static void install_dialog_policy();
+    // Bring the main window up because something needs a person (any thread).
+    static void show_window(const std::string& reason);
+
+    struct Attention { long long time; std::string dialog; std::string answered; };
+    void      note_attention(const std::string& dialog, const std::string& answered); // any thread
+    // kind: "dialog" (clears when the modal goes), "timeout" (clears after the next completed
+    // request), "manual" (clears from the phone, or when the window is hidden again).
+    void      raise_attention(const std::string& reason, const char* kind = "manual");
+    void      clear_attention(const char* why);
+    bool      needs_attention(std::string* reason = nullptr);
+    void      note_gui_tick(int modal_depth); // GUI thread heartbeat
+    long long gui_stall_ms();
+    void      note_request_done();
+    void      heartbeat_review(int modal_depth); // the heartbeat's decisions
 
     // What the hub shows in its instance list (GUI thread, from the Plater's title code).
     void note_project(const std::string& title, const std::string& path);
@@ -69,6 +94,8 @@ private:
     ApiResponse api_info();
     ApiResponse api_window(const std::string& show); // "" = query only, "1"/"0" = set
     ApiResponse api_quit(bool discard);
+    ApiResponse api_attention_clear();
+    ApiResponse api_debug(const std::string& what, const std::string& query);
     ApiResponse api_project_open(const std::string& path, const std::string& mode);
     ApiResponse api_plates();
     ApiResponse api_plate_thumbnail(int plate);
@@ -107,6 +134,13 @@ private:
     std::string      m_title, m_path, m_last_error;
     bool             m_slicing { false };
     bool             m_hidden { false };
+    std::deque<Attention> m_attention; // ring of auto-answered dialogs, 50 entries
+    bool             m_needs_attention { false };
+    std::string      m_attention_reason, m_attention_kind;
+    long long        m_attention_since { 0 };
+    long long        m_gui_tick_ms { 0 };
+    int              m_modal_depth { 0 };
+    int              m_requests_done { 0 };
 };
 
 } // namespace GUI

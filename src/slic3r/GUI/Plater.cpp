@@ -11109,6 +11109,12 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
         this->q->Bind(EVT_RESTORE_PROJECT, [this, last = last_backup](wxCommandEvent& e) {
             std::string last_backup = last;
             std::string originfile;
+            // Ultra: a hidden instance must neither prompt nor delete the backup; a person decides later.
+            if (wxGetApp().is_hub_managed() && RemoteAccess::get().hidden()) {
+                if (Slic3r::has_restore_data(last_backup, originfile))
+                    RemoteAccess::get().raise_attention("an unsaved project from a previous session is waiting to be restored", "manual");
+                return;
+            }
             if (Slic3r::has_restore_data(last_backup, originfile)) {
                 auto result = MessageDialog(this->q, _L("Previous unsaved project detected, do you want to restore it?"), wxString(SLIC3R_APP_FULL_NAME) + " - " + _L("Restore"), wxYES_NO | wxYES_DEFAULT | wxCENTRE).ShowModal();
                 if (result == wxID_YES) {
@@ -21766,6 +21772,14 @@ bool Plater::reslice()
                         + _L("Select \"Yes\" to attempt slicing, but the software may lag or freeze.")
                         + "\n- "
                         + _L("Select \"No\" to terminate the slicing task immediately.");
+                    if (RemoteAccess::dialog_mode() != RemoteAccess::Mode::Interactive) {
+                        // Ultra: nobody can answer; stop the slice rather than risk taking the process down.
+                        RemoteAccess::get().note_attention("Memory Usage Warning", "no");
+                        RemoteAccess::get().raise_attention("slicing stopped: the PC ran out of memory", "manual");
+                        this->p->preview->set_skip_toolpath_preview(true);
+                        promise->set_value(false);
+                        return;
+                    }
                     RichMessageDialog dlg(this, msg,
                         _L("Memory Usage Warning"), wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
                     dlg.SetYesNoLabels(_L("Yes, Continue"), _L("No, Stop"));

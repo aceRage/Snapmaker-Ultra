@@ -1,4 +1,5 @@
 #include "ReleaseNote.hpp"
+#include "RemoteAccess.hpp"
 #include "I18N.hpp"
 
 #include "libslic3r/Utils.hpp"
@@ -775,6 +776,11 @@ void SecondaryCheckDialog::update_text(wxString text)
 
 void SecondaryCheckDialog::on_show()
 {
+    // Ultra: a hidden instance opens no windows; the event is logged for the phone instead.
+    if (RemoteAccess::get().hidden()) {
+        RemoteAccess::get().note_attention(std::string("SecondaryCheckDialog \"") + GetTitle().ToUTF8().data() + "\"", "not shown");
+        return;
+    }
     wxGetApp().UpdateFrameDarkUI(this);
     // recover button color
     wxMouseEvent evt_ok(wxEVT_LEFT_UP);
@@ -1035,6 +1041,10 @@ void PrintErrorDialog::update_text_image(const wxString& text, const wxString& e
 
 void PrintErrorDialog::on_show()
 {
+    if (RemoteAccess::get().hidden()) {
+        RemoteAccess::get().note_attention(std::string("PrintErrorDialog \"") + GetTitle().ToUTF8().data() + "\"", "not shown");
+        return;
+    }
     wxGetApp().UpdateFrameDarkUI(this);
 
     this->Show();
