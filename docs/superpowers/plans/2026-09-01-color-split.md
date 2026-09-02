@@ -1718,10 +1718,11 @@ public:
     struct Target {
         ObjectID object_id, volume_id;
         uint64_t paint_timestamp = 0;          // mmu_segmentation_facets.timestamp() at queue time
-        indexed_triangle_set mesh;             // copy, in split space
+        indexed_triangle_set mesh;             // copy, ALWAYS in mesh space (paint is read there; Ruling 23)
         TriangleSelector::TriangleSplittingData paint;
         ColorSplitSpace space;
-        ColorSplitDepths depths;               // already scaled for the mesh-space path
+        ColorSplitDepths depths;               // already scaled for the mesh-space path (scale_depths)
+        ColorSplitParams params;               // already scaled for the mesh-space path (scale_params: depth_override_mm / s)
         ColorSplitResult result;               // filled by process()
         bool ok = false;
         std::string error;
@@ -1761,10 +1762,10 @@ void ColorSplitJob::process(Ctl &ctl)
     for (size_t i = 0; i < m_targets.size(); ++i) {
         Target &t = m_targets[i];
         try {
-            t.result = split_volume_by_paint(t.mesh, t.paint, t.depths, m_params, [&](int pct) {
+            t.result = split_volume_by_paint(t.mesh, t.paint, t.depths, t.params, [&](int pct) {
                 ctl.update_status(int((100 * i + pct) / m_targets.size()), status);
                 return !ctl.was_canceled();
-            });
+            }, t.space.to_split);   // Ruling 23: the library transforms the extracted patches, never the raw mesh + paint
             t.ok = true;
         } catch (const ColorSplitCancelled &) {
             return;
@@ -1863,8 +1864,7 @@ void Plater::split_by_color()
         t.space = color_split_space(object, *v);
         ColorSplitDepths d = color_split_depths(cfg, filaments);
         t.depths = t.space.world_path ? d : scale_depths(d, t.space.depth_scale);
-        t.mesh = v->mesh().its;
-        if (t.space.world_path) its_transform(t.mesh, t.space.to_split);
+        t.mesh = v->mesh().its;                                       // mesh space; to_split is passed to the library (Ruling 23)
         t.paint = v->mmu_segmentation_facets.get_data();
         shown_depths = d; tri_count += t.mesh.indices.size(); all_filaments = filaments;
         targets.push_back(std::move(t));
@@ -1873,13 +1873,12 @@ void Plater::split_by_color()
     GUI::ColorSplitDialog dlg(this, shown_depths, all_filaments, tri_count, !base.opt_bool("paint_infill_override"));
     if (dlg.ShowModal() != wxID_OK) return;
     ColorSplitParams params = dlg.params();
-    if (params.depth_override_mm > 0.)
-        for (auto &t : targets) if (!t.space.world_path) t.depths.D = params.depth_override_mm / t.space.depth_scale, t.depths.unlimited = false;
+    for (auto &t : targets) t.params = t.space.world_path ? params : scale_params(params, t.space.depth_scale);
     replace_job(get_ui_job_worker(), std::make_unique<GUI::ColorSplitJob>(this, std::move(targets), params, dlg.solid_interfaces(), dlg.keep_base_sparse_infill()));
 }
 ```
 
-Note the override handling: on the mesh-space path the override must be scaled like the other depths, so the job receives `depth_override_mm = 0` and the scaled D instead (set `params.depth_override_mm = 0.` after applying it per target). On the world path pass it through unchanged.
+Note the override handling: on the mesh-space path `scale_params` divides `depth_override_mm` by the depth scale (Ruling 23 / Task 7 fix); on the world path the params pass through unchanged. `ColorSplitResult::depths` comes back in split space — multiply by `depth_scale` before showing it.
 
 GUI_Factories.cpp — in each Split submenu block (:1424-1436, :1462-1474, :1595-1607, :1987-2002) add after the "To parts" item:
 

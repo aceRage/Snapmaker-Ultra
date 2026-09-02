@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.7 (after adversarial review; §3.1a/§3.4/§3.6/§7 refined during planning, Tasks 3–6) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.8 (after adversarial review; §3.1a/§3.4/§3.6/§3.9/§7 refined during planning, Tasks 3–7) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -151,9 +151,13 @@ within 10⁻⁴·Volume(M) of Volume(M); empty pieces are dropped with a warning
 
 **3.9 Coordinate space.** D, ws, h are world millimetres. Let T = instance × volume matrix. If T's scale is
 isotropic (scale s, any rotation, mirror allowed) the split runs in mesh space with D/s, ws/s, h/s — exact for
-every instance sharing that scale. Otherwise the mesh copy is transformed by T of the first instance
-(`TriangleMesh::transform(T, fix_left_handed=true)`), split, and the pieces transformed back by T⁻¹ (same
-flag); other instances with different anisotropic scale get an approximate depth (documented limit).
+every instance sharing that scale. Otherwise (rev 2.8, Ruling 23) the paint is still read in mesh space — `extract_color_patches` runs on the
+untransformed mesh — and only the extracted patch surface F is transformed by T of the first instance (with the
+left-handed fix; a per-triangle vertex swap leaves per-facet states intact, whereas transforming the raw mesh
+first would mirror the sub-facet paint of partially painted facets); the pieces are transformed back by T⁻¹
+(same flag). `depth_override_mm` is a world length like D and is scaled on the mesh-space path too
+(`scale_params`); `ColorSplitResult::depths` is reported in split space. Other instances with a different
+anisotropic scale get an approximate depth (documented limit).
 
 **3.10 Not done by the split.** No interlocking notch (the 2D `mmu_segmented_region_interlocking_depth` has no
 geometric counterpart; a dovetail is future work). No transfer of seam/support/fuzzy-skin paint (the source
