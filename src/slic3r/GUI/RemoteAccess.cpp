@@ -57,6 +57,20 @@ using tcp      = asio::ip::tcp;
 
 // ---------------------------------------------------------------- helpers ----
 
+// A receive deadline on a blocking socket: a peer that stops talking mid-request fails the read
+// instead of parking this connection's detached thread for ever.
+static void set_read_timeout(tcp::socket& s, int seconds)
+{
+    if (!s.is_open()) return;
+#ifdef _WIN32
+    DWORD ms = (DWORD) seconds * 1000;
+    ::setsockopt(s.native_handle(), SOL_SOCKET, SO_RCVTIMEO, (const char*) &ms, sizeof(ms));
+#else
+    struct timeval tv { seconds, 0 };
+    ::setsockopt(s.native_handle(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 static std::string percent_decode(const std::string& s)
 {
     std::string out;
@@ -1753,7 +1767,11 @@ void RemoteAccess::serve(void* socket_ptr)
             return;
         client.set_option(tcp::no_delay(true));
 
-        asio::streambuf req;
+        // Bounded and deadlined, like the hub's own listener: this API is reachable from a phone
+        // through the hub's proxy, so a client that dribbles bytes must not grow the buffer or
+        // hold this detached thread. 16 KiB of head is plenty for the hub's replayed requests.
+        set_read_timeout(client, 15);
+        asio::streambuf req(16 * 1024);
         asio::read_until(client, req, "\r\n\r\n");
         std::string head(asio::buffers_begin(req.data()), asio::buffers_end(req.data()));
         const size_t head_end = head.find("\r\n\r\n") + 4;
