@@ -1,8 +1,7 @@
 // Split by painted colour, stage 3: the Manifold side - mesh conversion and the sequential-Split partition.
-// Spec: docs/superpowers/specs/2026-09-01-color-split-design.md, 3.1a and 3.8.
+// Spec: docs/superpowers/specs/2026-09-01-color-split-design.md, 3.8.
 #include "ColorSplit.hpp"
 #include "TriangleMesh.hpp"
-#include "AABBMesh.hpp"
 #include <manifold/manifold.h>
 #include <cmath>
 #include <limits>
@@ -21,10 +20,8 @@ namespace {
 // explicit tolerance is spec 3.7's - Manifold otherwise derives one from the bounding box, and a shell whose
 // bottom sits microns below the surface must not be simplified away. AsOriginal() (manifold.h:198-200) stamps
 // a fresh OriginalID on the result; that ID is what the island pass below reads back off the Split output to
-// tell which input each face came from. The refinement pre-pass has no use for that provenance and passes
-// as_original = false: the header says nothing about what AsOriginal does to the triangulation it stamps
-// over, and a flat refinement's whole product is coplanar triangles, so it does not ask.
-manifold::Manifold to_manifold64(const indexed_triangle_set &its, manifold::ExecutionContext &ctx, bool as_original = true)
+// tell which input each face came from.
+manifold::Manifold to_manifold64(const indexed_triangle_set &its, manifold::ExecutionContext &ctx)
 {
     manifold::MeshGL64 m;
     m.numProp = 3;
@@ -49,8 +46,7 @@ manifold::Manifold to_manifold64(const indexed_triangle_set &its, manifold::Exec
     // FromMeshGL (common.h:262-271) is the ctx-aware ingest: its heavy phases check for cancellation, which
     // plain Manifold(m) does not. AsOriginal() then stamps the provenance ID and drops the attachment, so
     // callers re-attach with WithContext.
-    const manifold::Manifold out = ctx.FromMeshGL(m);
-    return as_original ? out.AsOriginal() : out;
+    return ctx.FromMeshGL(m).AsOriginal();
 }
 
 // Exporting a MeshGL64 is the expensive step, so callers that already hold one (the island pass needs it
@@ -99,53 +95,6 @@ std::map<uint32_t, size_t> faces_by_original_id(const manifold::MeshGL64 &gl)
 }
 
 } // namespace
-
-ColorPatches refine_color_patches(const ColorPatches &patches, double max_edge_mm)
-{
-    if (!(max_edge_mm > 0.) || !std::isfinite(max_edge_mm))
-        return patches;
-    // RefineToLength splits an edge into ceil(length / max_edge_mm) pieces, so a surface whose edges are all
-    // short already comes back identical. Checking that here keeps an ordinary mesh - a 100k-triangle sphere,
-    // say - out of the Manifold round trip altogether, which is what spec 3.1a's "barely touched" promises.
-    bool too_long = false;
-    for (const Vec3i32 &t : patches.surface.indices)
-        for (int k = 0; k < 3 && !too_long; ++k)
-            too_long = (patches.surface.vertices[t[(k + 1) % 3]] - patches.surface.vertices[t[k]]).norm() > max_edge_mm;
-    if (!too_long)
-        return patches;
-
-    manifold::ExecutionContext ctx;
-    const manifold::Manifold source = to_manifold64(patches.surface, ctx, /*as_original=*/false);
-    require_ok(source, "refinement input");
-    // RefineToLength is an EAGER op, so it observes the attached context (manifold.h:148-166). The header
-    // files it under "Smoothing" but documents no per-function behaviour, so the refinement being FLAT is
-    // pinned by test instead ("refinement adds interior side vertices to a two-ring cylinder"): the refined
-    // cylinder keeps the coarse one's volume to 1e-5 and its new side vertices sit on the chords with exactly
-    // radial normals, which a curved refinement would not produce.
-    const manifold::Manifold refined = source.WithContext(ctx).RefineToLength(max_edge_mm);
-    require_ok(refined, "refinement");
-    if (refined.NumTri() <= source.NumTri())
-        return patches;
-
-    ColorPatches out;
-    out.surface = from_manifold(refined);
-    out.states  = patches.states;
-    if (its_num_open_edges(out.surface) != 0)
-        throw ColorSplitError("Surface refinement did not preserve the closed surface (internal error).");
-    // Every refined triangle lies inside one triangle of F, so the facet of F nearest its centroid IS its
-    // parent (distance zero) and hands over the state the paint gave that parent.
-    const AABBMesh parent(patches.surface);
-    out.facet_state.resize(out.surface.indices.size());
-    for (size_t f = 0; f < out.surface.indices.size(); ++f) {
-        const Vec3i32 &t = out.surface.indices[f];
-        const Vec3d centroid = ((out.surface.vertices[t[0]] + out.surface.vertices[t[1]] + out.surface.vertices[t[2]]) / 3.f).cast<double>();
-        int   face = 0;
-        Vec3d closest;
-        parent.squared_distance(centroid, face, closest);
-        out.facet_state[f] = patches.facet_state[size_t(face)];
-    }
-    return out;
-}
 
 ColorSplitResult partition_by_shells(const indexed_triangle_set &mesh, const std::vector<ColorShell> &shells, bool absorb_islands, const ColorSplitProgress &progress)
 {

@@ -55,16 +55,9 @@ struct ColorSplitParams {
     double depth_override_mm = 0.;     // <= 0: use depths.D
 };
 
-// Spec 3.1a (Ruling 13): a flat (linear) refinement of F so that no edge exceeds `max_edge_mm`; each refined
-// facet takes the state of the original facet it lies on. STL cylinders, pins and bosses carry only two
-// vertex rings, so without interior vertices every side normal is a junction bisector and no inward offset is
-// ever radial - a painted boss came out as a cup. Returns `patches` untouched when no edge is longer.
-ColorPatches refine_color_patches(const ColorPatches &patches, double max_edge_mm);
-// The length that pre-pass refines to: max(ws, min(D_eff, mesh diagonal / 20)) - fine enough that a feature
-// gets interior vertices, never finer than one wall stack, and never more than a twentieth of the part.
-double color_split_refine_length(const ColorSplitDepths &depths, const ColorSplitParams &params, const BoundingBoxf3 &mesh_bbox);
-
-// Spec 3.7: one closed, inward-offset shell per edge-connected component of one painted state.
+// Spec 3.7 / 3.1a (Ruling 18): one closed, inward-offset shell per SMOOTH PATCH of one painted
+// state - facets connect only across edges whose dihedral angle is under 30 degrees, so a boss's
+// side and top cap are two shells whose claims may overlap; spec 3.8 settles the overlap.
 struct ColorShell { int state = 0; bool capped = false; indexed_triangle_set mesh; };
 // Validity of a shell: closed (no open edge), free of self-intersections, and its signed volume.
 struct ShellCheck { bool closed = false; bool self_intersects = true; double volume = 0.; };

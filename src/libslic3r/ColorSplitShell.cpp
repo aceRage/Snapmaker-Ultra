@@ -1,5 +1,5 @@
 // Split by painted colour, stage 2: depth groups and the closed inward-offset shell of each of them.
-// Spec: docs/superpowers/specs/2026-09-01-color-split-design.md, 3.5 - 3.7.
+// Spec: docs/superpowers/specs/2026-09-01-color-split-design.md, 3.1a and 3.5 - 3.7.
 #include "ColorSplit.hpp"
 #include "ColorSplitInternal.hpp"
 #include "TriangleMesh.hpp"
@@ -42,8 +42,25 @@ std::string too_small_warning(const ColorPatches &p, const std::vector<int> &com
     return os.str();
 }
 
-// Edge-connected components of the facet subset `in_set` (indices into patches.surface).
-std::vector<std::vector<int>> connected_components(const ColorPatches &p, const std::vector<Vec3i32> &nbrs, const std::vector<char> &in_set)
+Vec3f unit_face_normal(const ColorPatches &p, int f)
+{
+    const Vec3i32 &t = p.surface.indices[f];
+    const Vec3f    n = (p.surface.vertices[t[1]] - p.surface.vertices[t[0]])
+                           .cross(p.surface.vertices[t[2]] - p.surface.vertices[t[0]]);
+    return n.squaredNorm() > 0.f ? Vec3f(n.normalized()) : Vec3f(Vec3f::Zero());
+}
+
+// Spec 3.1a (Ruling 18): two facets of a patch may only be joined across an edge the surface crosses
+// smoothly. 30 degrees keeps a faceted cylinder or sphere whole (a 36-sided cylinder bends 10 degrees per
+// edge) while cutting a boss's side away from its top cap, a cube's top away from its side, and the floor of
+// a groove away from its riser.
+constexpr float SMOOTH_COS_30 = 0.8660254f;
+
+// Components of the facet subset `in_set` (indices into patches.surface), joined only across the edges that
+// `can_cross` accepts.
+template<class CanCross>
+std::vector<std::vector<int>> connected_components(const ColorPatches &p, const std::vector<Vec3i32> &nbrs,
+                                                   const std::vector<char> &in_set, CanCross can_cross)
 {
     std::vector<std::vector<int>> comps;
     std::vector<char> seen(p.surface.indices.size(), 0);
@@ -56,7 +73,7 @@ std::vector<std::vector<int>> connected_components(const ColorPatches &p, const 
             comp.push_back(f);
             for (int k = 0; k < 3; ++k) {
                 int n = nbrs[f][k];
-                if (n >= 0 && in_set[n] && !seen[n]) { seen[n] = 1; stack.push_back(n); }
+                if (n >= 0 && in_set[n] && !seen[n] && can_cross(f, n)) { seen[n] = 1; stack.push_back(n); }
             }
         }
         comps.push_back(std::move(comp));
@@ -65,12 +82,12 @@ std::vector<std::vector<int>> connected_components(const ColorPatches &p, const 
 }
 
 // Spec 3.6/3.7: everything about one facet group that its working depth cannot change - the facet set, the
-// boundary, the wedges a pinch vertex splits into, their nudges and the concave creases. It is built once
+// boundary, the wedges a pinch vertex splits into, their nudges and its crease walls. It is built once
 // per group so the fold guard and the shell it guards judge the SAME offset, and so the per-vertex boundary
 // data has one home for task 6 to add the convex crease cases to.
 // its_face_neighbors convention (MeshSplitImpl.hpp create_face_neighbors_index via its_triangle_edge,
 // TriangleMesh.hpp:253-257): neighbour k sits across the edge (v[k], v[(k+1)%3]).
-struct ConcaveCrease {
+struct CreaseWall {
     Vec3f n_p{Vec3f::Zero()};    // unit mean normal of the group's facets there - the direction the wall runs
     float half_thickness = 0.f;  // spec 3.4's mid-thickness clamp, measured along THAT direction
 };
@@ -80,7 +97,7 @@ struct GroupTopology {
     std::vector<int>                             boundary_count;  // per vertex: boundary edges meeting it
     std::map<std::pair<int, int>, int>           wedge_of;        // (vertex, facet) -> wedge; pinch vertices only
     std::map<std::pair<int, int>, Vec3f>         nudge;           // (vertex, wedge) -> Ruling 8 separation
-    std::map<std::pair<int, int>, ConcaveCrease> concave;         // (vertex, wedge) -> Ruling 14 wall
+    std::map<std::pair<int, int>, CreaseWall>    wall;            // (vertex, wedge) -> spec 3.6 crease wall
 
     // .at(): every (pinch vertex, incident group facet) pair was assigned a wedge below, so a miss is a bug
     // in that walk - it must throw rather than quietly hand back wedge 0 and weld the wedges together again.
@@ -88,14 +105,9 @@ struct GroupTopology {
 };
 
 GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &nbrs, const AABBMesh &aabb,
-                             const std::vector<int> &group)
+                             const std::vector<int> &group, int state)
 {
-    auto unit_normal = [&p](int f) {
-        const Vec3i32 &t = p.surface.indices[f];
-        const Vec3f    n = (p.surface.vertices[t[1]] - p.surface.vertices[t[0]])
-                               .cross(p.surface.vertices[t[2]] - p.surface.vertices[t[0]]);
-        return n.squaredNorm() > 0.f ? Vec3f(n.normalized()) : Vec3f(Vec3f::Zero());
-    };
+    auto unit_normal = [&p](int f) { return unit_face_normal(p, f); };
 
     GroupTopology topo;
     topo.in.assign(p.surface.indices.size(), 0);
@@ -147,12 +159,15 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
     // Spec 3.6: the boundary as seen from each boundary vertex, per wedge. n_P is the mean normal of the
     // group's own facets there, n_Q the mean normal of the outside facets across its boundary edges, t_in the
     // mean unit inward tangent of those edges. Task 6 reads the same three vectors for the convex cases (the
-    // intermediate ring); this task classifies only the concave one.
-    struct BoundaryInfo { Vec3f n_p{Vec3f::Zero()}, n_q{Vec3f::Zero()}, t_in{Vec3f::Zero()}; };
+    // intermediate ring); this task classifies the concave and the same-state ones.
+    struct BoundaryInfo {
+        Vec3f n_p{Vec3f::Zero()}, n_q{Vec3f::Zero()}, t_in{Vec3f::Zero()};
+        int   same_state = 0;    // boundary edges whose OUTSIDE facet carries this group's own state
+    };
     std::map<std::pair<int, int>, BoundaryInfo> boundary;
 
     // n_P takes EVERY group facet at the vertex, boundary edge or not: it is the painted surface's own
-    // orientation there, which is what the wall of a concave crease follows.
+    // orientation there, which is what the wall at a crease follows.
     for (int f : group) {
         const Vec3f nf = unit_normal(f);
         for (int k = 0; k < 3; ++k) {
@@ -171,10 +186,12 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
             if (tang.squaredNorm() <= 0.f) continue;   // degenerate facet or edge: no tangent to work from
             const Vec3f t_in = tang.normalized();
             const Vec3f n_q  = n >= 0 ? unit_normal(n) : Vec3f(Vec3f::Zero());
+            const bool same_state = n >= 0 && p.facet_state[size_t(n)] == state;
             for (int v : {a, b}) {
                 BoundaryInfo &info = boundary[{v, topo.wedge(v, f)}];
                 info.n_q  += n_q;
                 info.t_in += t_in;
+                info.same_state += same_state ? 1 : 0;
                 if (topo.boundary_count[v] <= 2) continue;
                 const std::pair<int, int> key{v, topo.wedge(v, f)};
                 auto it = topo.nudge.find(key);
@@ -193,21 +210,33 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
         entry.second = len > 0.f ? Vec3f(entry.second * (eps / len)) : Vec3f(Vec3f::Zero());
     }
 
-    // Spec 3.6, third bullet (Ruling 14): two surfaces meeting at more than 15 degrees make a crease, and the
-    // crease is CONCAVE when the outside neighbour rises over the painted face (n_Q . t_in > 0) - a painted
-    // boss side meeting the block top. Its wall then runs straight down the painted face along n_P instead of
-    // along the vertex bisector, so the piece never leaves the painted feature's own footprint; a bisector
-    // would carry a hidden painted skirt into the neighbouring body and cost toolchanges on layers that carry
-    // no paint at all. Always on, independent of the crease-step option.
+    // Spec 3.6: at two kinds of boundary the wall runs straight down the patch's own normal n_P instead of
+    // along the vertex bisector - no step, no taper.
+    //   * The CONCAVE crease (third bullet, Ruling 14): the surfaces meet at more than 15 degrees and the
+    //     outside neighbour rises over the painted face (n_Q . t_in > 0) - a painted boss side meeting the
+    //     block top. A bisector there would carry a hidden painted skirt into the neighbouring body and cost
+    //     toolchanges on layers that carry no paint at all.
+    //   * The SAME-STATE crease (spec 3.1a, Ruling 18): the facet across the boundary carries this very
+    //     state, so the boundary is a crease INSIDE the painted region and the patch on the other side of it
+    //     is claiming the material right behind this wall. Straight is what makes the two claims meet - the
+    //     top slab's walls go straight down, the side tube's straight inward - and it is what lets a coarse
+    //     two-ring cylinder come out solid with no extra vertices at all. A bisector would tilt this wall
+    //     into the neighbour's claim and leave the feature hollow.
+    // Both are always on, independent of the crease-step option.
     constexpr float CREASE_COS_15 = 0.96592583f;
     for (const std::pair<const std::pair<int, int>, BoundaryInfo> &entry : boundary) {
         const BoundaryInfo &info = entry.second;
         if (info.n_p.squaredNorm() <= 0.f || info.n_q.squaredNorm() <= 0.f || info.t_in.squaredNorm() <= 0.f)
             continue;                                  // degenerate facets: no orientation to judge
         const Vec3f n_p = info.n_p.normalized(), n_q = info.n_q.normalized(), t_in = info.t_in.normalized();
-        if (n_p.dot(n_q) < CREASE_COS_15 && n_q.dot(t_in) > 0.f)
-            topo.concave.emplace(entry.first, ConcaveCrease{n_p, ColorSplitDetail::half_thickness_along(
-                                                                     aabb, p.surface.vertices[entry.first.first], n_p)});
+        const bool  concave = n_p.dot(n_q) < CREASE_COS_15 && n_q.dot(t_in) > 0.f;
+        // A vertex carries ONE bottom copy, so where a same-state crease meets an ordinary boundary the
+        // same-state rule wins: the neighbouring patch is claiming the material immediately behind that
+        // wall and tilting it is exactly what opens a gap between them, whereas an ordinary boundary only
+        // loses the cosmetic taper spec 3.6 gives it.
+        if (concave || info.same_state > 0)
+            topo.wall.emplace(entry.first, CreaseWall{n_p, ColorSplitDetail::half_thickness_along(
+                                                               aabb, p.surface.vertices[entry.first.first], n_p)});
     }
     return topo;
 }
@@ -222,8 +251,8 @@ struct ShellBuilder {
     std::vector<float>          depth;         // working copy of d0 (the fold guard lowers it)
     const ColorSplitDepths     &depths;
 
-    // Where a vertex's bottom copy lands relative to its top: -d * n(v), except at a concave crease, which
-    // walks down the painted face's own normal n_P and clamps d to the mid-thickness measured along THAT
+    // Where a vertex's bottom copy lands relative to its top: -d * n(v), except at a spec 3.6 crease wall,
+    // which walks down the patch's own normal n_P and clamps d to the mid-thickness measured along THAT
     // direction (d(v) was measured along n(v) and says nothing about how much material lies along n_P - on a
     // painted boss it is the difference between stopping at the axis and crossing straight through it).
     // build() and fold_guard() share this, so the guard always judges the shell that is actually built.
@@ -231,8 +260,8 @@ struct ShellBuilder {
     {
         float d = depth[v];
         if (cap_depth > 0.) d = std::min(d, float(cap_depth));
-        const auto crease = topo.concave.find({v, wedge_id});
-        if (crease == topo.concave.end())
+        const auto crease = topo.wall.find({v, wedge_id});
+        if (crease == topo.wall.end())
             return Vec3f(-d * normals[v]);
         return Vec3f(-std::min(d, crease->second.half_thickness) * crease->second.n_p);
     }
@@ -336,8 +365,8 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
     const double D = depths.unlimited ? std::numeric_limits<double>::infinity() : depths.D;
     std::vector<Vec3i32> nbrs    = its_face_neighbors(p.surface);
     std::vector<Vec3f>   normals = color_split_normals(p.surface);
-    // One tree for the whole stage: the depth model probes it per vertex, and spec 3.6's concave creases
-    // re-probe it along their own wall direction.
+    // One tree for the whole stage: the depth model probes it per vertex, and spec 3.6's crease walls
+    // re-probe it along their own direction.
     const AABBMesh       aabb(p.surface);
     std::vector<float>   depth   = ColorSplitDetail::vertex_depths(aabb, p, normals, D);
 
@@ -345,14 +374,16 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
     // built at d(v) with a single side strip, i.e. exactly what flat_cap = crease_step = false will mean.
     const double cap_depth = 0.;
 
-    // Materialise every component up front: the progress callback is documented as a 0..100 percentage
-    // (ColorSplit.hpp) and this stage owns the 10..50 band, so the tick needs the real component total - a
-    // single state can hold dozens of them (painted text, a logo).
-    std::vector<std::pair<int, std::vector<int>>> groups;      // (state, component facets)
+    // Materialise every group up front: the progress callback is documented as a 0..100 percentage
+    // (ColorSplit.hpp) and this stage owns the 10..50 band, so the tick needs the real group total - a single
+    // state can hold dozens of them (painted text, a logo), and spec 3.1a cuts each of those again at every
+    // crease.
+    auto smooth = [&p](int a, int b) { return unit_face_normal(p, a).dot(unit_face_normal(p, b)) > SMOOTH_COS_30; };
+    std::vector<std::pair<int, std::vector<int>>> groups;      // (state, smooth-patch facets)
     for (int s : p.states) {
         std::vector<char> in(p.surface.indices.size(), 0);
         for (size_t f = 0; f < in.size(); ++f) in[f] = char(p.facet_state[f] == s);
-        for (std::vector<int> &comp : connected_components(p, nbrs, in))
+        for (std::vector<int> &comp : connected_components(p, nbrs, in, smooth))
             groups.emplace_back(s, std::move(comp));
     }
 
@@ -361,7 +392,7 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
     for (const std::pair<int, std::vector<int>> &group : groups) {
         const int               s    = group.first;
         const std::vector<int> &comp = group.second;
-        const GroupTopology topo = group_topology(p, nbrs, aabb, comp);
+        const GroupTopology topo = group_topology(p, nbrs, aabb, comp, s);
         ShellBuilder sb{p, nbrs, normals, topo, depth, depth, depths};   // d0 (reference) and its working copy
         for (int round = 0; round < 8 && sb.fold_guard(comp, cap_depth); ++round) {}
         indexed_triangle_set mesh = sb.build(comp, cap_depth);

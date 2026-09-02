@@ -277,65 +277,6 @@ static ColorSplitDepths depths_for_test(double D, double h = 0.2, double ws = 0.
 static ColorSplitParams no_cap_no_step() { ColorSplitParams p; p.flat_cap = false; p.crease_step = false; return p; }
 static double volume_of(const indexed_triangle_set &its) { return double(its_volume(its)); }
 
-TEST_CASE("colorsplit: refinement adds interior side vertices to a two-ring cylinder", "[colorsplit]")
-{
-    TriangleMesh cyl(its_make_cylinder(1.0, 3.0, PI / 18.));            // two rings, 3 mm tall
-    ColorPatches p = extract_color_patches(cyl.its, paint_by_predicate(cyl, [](const Vec3f &, const Vec3f &n) { return std::abs(n.z()) < 0.5f; }, EnforcerBlockerType::Extruder2));
-    ColorPatches r = refine_color_patches(p, 0.75);
-    REQUIRE(r.surface.indices.size() > p.surface.indices.size());
-    REQUIRE(its_num_open_edges(r.surface) == 0);
-    REQUIRE_THAT(its_volume(r.surface), WithinRel(its_volume(p.surface), 1e-5f));  // flat refinement: same solid
-    REQUIRE(r.states == p.states);
-    // a side vertex strictly between the rings exists and its angle-weighted normal is radial
-    std::vector<Vec3f> n = color_split_normals(r.surface);
-    bool found = false;
-    for (size_t v = 0; v < r.surface.vertices.size(); ++v)
-        if (r.surface.vertices[v].z() > 0.5f && r.surface.vertices[v].z() < 2.5f && std::abs(n[v].z()) < 1e-3f) found = true;
-    REQUIRE(found);
-    // painted state survives refinement: every refined side facet is state 2, caps are 0
-    for (size_t f = 0; f < r.surface.indices.size(); ++f) {
-        const Vec3i32 &t = r.surface.indices[f];
-        Vec3f nf = (r.surface.vertices[t[1]] - r.surface.vertices[t[0]]).cross(r.surface.vertices[t[2]] - r.surface.vertices[t[0]]).normalized();
-        REQUIRE(r.facet_state[f] == (std::abs(nf.z()) < 0.5f ? 2 : 0));
-    }
-}
-
-TEST_CASE("colorsplit: every refined side vertex of a two-ring cylinder sees the wall", "[colorsplit]")
-{
-    // Ruling 13's whole point: a two-ring cylinder has no side vertex whose normal is radial, so no inward
-    // offset is radial and a painted boss becomes a cup. After refinement EVERY vertex on the wall - the new
-    // ring corners and the vertices the subdivision drops along a chord alike - must see the wall and not a
-    // cap: horizontal normal, pointing outward from the axis. The 5 degree tolerance on "radial" is the
-    // chord quantisation of fa = PI/18: a vertex inside a chord carries that chord's facet normal, which is
-    // at most half a facet angle away from its own radius.
-    TriangleMesh cyl(its_make_cylinder(1.0, 3.0, PI / 18.));
-    ColorPatches p = extract_color_patches(cyl.its, paint_by_predicate(cyl, [](const Vec3f &, const Vec3f &n) { return std::abs(n.z()) < 0.5f; }, EnforcerBlockerType::Extruder2));
-    ColorPatches r = refine_color_patches(p, 0.75);
-    std::vector<Vec3f> n = color_split_normals(r.surface);
-    size_t side = 0;
-    for (size_t v = 0; v < r.surface.vertices.size(); ++v) {
-        const Vec3f &q = r.surface.vertices[v];
-        if (q.z() <= 1e-3f || q.z() >= 3.f - 1e-3f) continue;            // skip both cap rings
-        const float rad = std::hypot(q.x(), q.y());
-        REQUIRE(rad > 0.9f);
-        REQUIRE_THAT(n[v].z(), WithinAbs(0.f, 1e-3f));
-        REQUIRE(n[v].dot(Vec3f(q.x() / rad, q.y() / rad, 0.f)) > float(std::cos(PI / 36.)) - 1e-4f);
-        ++side;
-    }
-    REQUIRE(side > 0);
-}
-
-TEST_CASE("colorsplit: refine length follows max(ws, min(D, diag/20))", "[colorsplit]")
-{
-    ColorSplitDepths d = depths_for_test(1.5, 0.2, 0.87);
-    BoundingBoxf3 bb(Vec3d(0, 0, 0), Vec3d(40, 40, 20));
-    REQUIRE_THAT(color_split_refine_length(d, ColorSplitParams{}, bb), WithinRel(1.5, 1e-9));
-    ColorSplitParams o; o.depth_override_mm = 0.3;
-    REQUIRE_THAT(color_split_refine_length(d, o, bb), WithinRel(0.87, 1e-9));           // ws floor
-    ColorSplitDepths u = depths_for_test(std::numeric_limits<double>::infinity(), 0.2, 0.87);
-    REQUIRE_THAT(color_split_refine_length(u, ColorSplitParams{}, bb), WithinRel(bb.size().norm() / 20., 1e-9));
-}
-
 TEST_CASE("colorsplit: shell of a painted top face is a closed slab of depth D", "[colorsplit]")
 {
     TriangleMesh block = make_cube(40., 40., 20.);
@@ -423,10 +364,16 @@ TEST_CASE("colorsplit: concave groove painted across the crease still yields a v
     }, EnforcerBlockerType::Extruder2);
     ColorPatches p = extract_color_patches(bracket.its, data);
     auto shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(), nullptr);
-    REQUIRE(shells.size() == 1);
-    ShellCheck c = check_shell(shells[0].mesh);
-    REQUIRE(c.closed);
-    REQUIRE(!c.self_intersects);
+    // Spec 3.1a (Ruling 18): floor and riser meet at 90 degrees, so they are two smooth patches and two
+    // shells whose claims overlap in the corner - which is exactly what lets each of them keep a straight
+    // wall at their shared same-state crease instead of tapering away from it.
+    REQUIRE(shells.size() == 2);
+    for (const ColorShell &sh : shells) {
+        REQUIRE(sh.state == 2);
+        ShellCheck c = check_shell(sh.mesh);
+        REQUIRE(c.closed);
+        REQUIRE(!c.self_intersects);
+    }
 }
 
 TEST_CASE("colorsplit: a self-touching patch builds one valid shell across its pinch vertex", "[colorsplit]")
@@ -714,7 +661,7 @@ TEST_CASE("colorsplit: an ultra-thin plate never asks for a negative depth", "[c
     REQUIRE(volume_of(r.pieces[0].second) > 0.99 * 40. * 40. * 0.003);
 }
 
-TEST_CASE("colorsplit: painted boss on a block is (almost) entirely its colour after refinement", "[colorsplit]")
+TEST_CASE("colorsplit: a painted boss on a block is entirely its colour (smooth-patch decomposition)", "[colorsplit]")
 {
     TriangleMesh block = make_cube(40., 40., 10.);
     TriangleMesh boss(its_make_cylinder(1.0, 4.0, PI / 18.));
@@ -723,29 +670,40 @@ TEST_CASE("colorsplit: painted boss on a block is (almost) entirely its colour a
     REQUIRE(MeshBoolean::mfd::make_boolean(block, boss, out, "UNION"));
     TriangleMesh bossed = out.front();
     auto paint = paint_by_predicate(bossed, [](const Vec3f &c, const Vec3f &) { return c.z() > 10.05f; }, EnforcerBlockerType::Extruder2);
+    ColorPatches p = extract_color_patches(bossed.its, paint);
+    auto shells = build_color_shells(p, depths_for_test(1.5, 0.2, 0.87), ColorSplitParams{}, nullptr);
+    REQUIRE(shells.size() == 2);                                       // side tube + top slab, both state 2
+    for (const ColorShell &sh : shells) { REQUIRE(sh.state == 2); REQUIRE(check_shell(sh.mesh).closed); REQUIRE(!check_shell(sh.mesh).self_intersects); }
     ColorSplitResult rb = split_volume_by_paint(bossed.its, paint, depths_for_test(1.5, 0.2, 0.87), ColorSplitParams{}, nullptr);
     REQUIRE(rb.pieces.size() == 1);
     const double exposed = PI * 1.0 * 1.0 * 3.0;                        // 1 mm of the cylinder is buried in the block
-    // Ruling 14: the wall at the boss/block crease runs straight down the boss side, so the piece stays inside
-    // the boss footprint - nothing painted below the block top, and the whole boss above it.
-    Vec3f lo = rb.pieces[0].second.vertices.front(), hi = lo;
-    for (const Vec3f &v : rb.pieces[0].second.vertices) { lo = lo.cwiseMin(v); hi = hi.cwiseMax(v); }
-    REQUIRE(lo.z() >= 10.f - 1e-3f);
-    REQUIRE_THAT(hi.z(), WithinAbs(13.f, 1e-3f));                       // reaches the top of the boss
-    REQUIRE_THAT(hi.x() - lo.x(), WithinAbs(2.f, 1e-2f));               // and spans its full diameter
-    // MEASURED: 7.990 mm^3 = 84.8 % of the exposed boss, all of it above z = 10 (before Ruling 14 the shell
-    // was a cup that reached BELOW the block top and scored 8.289 by counting that hidden skirt). The brief
-    // expected >= 90 %; that is a finding, not a tolerance to loosen - the last 15 % is a 0.5 mm-radius core
-    // left because the offset cannot reach the axis. RefineToLength subdivides a triangle uniformly by
-    // ceil(maxEdge / L), so the boss's 0.174 mm circumferential edges are split into three as well; a vertex
-    // at 1/3 of a chord offsets along its FACET normal and, once the offset approaches the local
-    // half-thickness, lands ~90 degrees away from where the chord's endpoints land. The bottom ring becomes a
-    // star, the shell self-intersects (verified: with the fold guard disabled the validity fallback halves
-    // the whole group instead), and the guard halves the side depths to ~0.5 mm - which reopens a 0.25 mm
-    // hole at z = 10, so spec 3.8 cannot absorb the core as an island either. Every visible surface of the
-    // boss is still the painted filament. See .superpowers/sdd/2026-09-01-color-split/task-5-report.md.
-    WARN("boss piece " << volume_of(rb.pieces[0].second) << " mm^3 of " << exposed << " exposed ("
+    REQUIRE(volume_of(rb.pieces[0].second) >= 0.95 * exposed);
+    float zmin = 1e9f; for (const Vec3f &v : rb.pieces[0].second.vertices) zmin = std::min(zmin, v.z());
+    REQUIRE(zmin >= 10.f - 1e-3f);                                       // Ruling 14: nothing painted below the block top
+    WARN("S1 boss piece " << volume_of(rb.pieces[0].second) << " mm^3 of " << exposed << " exposed ("
          << 100. * volume_of(rb.pieces[0].second) / exposed << " %)");
+}
+
+TEST_CASE("colorsplit: a painted cube top and side are two smooth patches with straight walls", "[colorsplit]")
+{
+    TriangleMesh block = make_cube(40., 40., 20.);
+    std::vector<std::pair<int, EnforcerBlockerType>> facets = all_with(CUBE_TOP, EnforcerBlockerType::Extruder2);
+    for (int f : CUBE_PLUS_X) facets.emplace_back(f, EnforcerBlockerType::Extruder2);
+    ColorPatches p = extract_color_patches(block.its, paint_data(block, facets));
+    ColorSplitParams params; params.flat_cap = false; params.crease_step = false;
+    auto shells = build_color_shells(p, depths_for_test(1.5, 0.2, 0.87), params, nullptr);
+    REQUIRE(shells.size() == 2);
+    // the top slab's bottom lies exactly 1.5 below the top at every vertex (straight walls at the same-state crease),
+    // and the side slab's bottom exactly 1.5 inside the +X face
+    for (const ColorShell &sh : shells) {
+        float zmin = 1e9f, xmin = 1e9f;
+        for (const Vec3f &v : sh.mesh.vertices) { zmin = std::min(zmin, v.z()); xmin = std::min(xmin, v.x()); }
+        REQUIRE(((std::abs(zmin - 18.5f) < 1e-4f) || (std::abs(xmin - 38.5f) < 1e-4f)));
+    }
+    ColorSplitResult r = split_volume_by_paint(block.its, paint_data(block, facets), depths_for_test(1.5, 0.2, 0.87), params, nullptr);
+    REQUIRE(r.pieces.size() == 1);
+    double total = volume_of(r.body) + volume_of(r.pieces[0].second);
+    REQUIRE_THAT(total, WithinRel(40. * 40. * 20., 1e-4));
 }
 
 // ---- Spike measurements (spec 9). They must pass; numbers go to WARN for the decision checkpoint. ----
@@ -793,20 +751,14 @@ TEST_CASE("colorsplit spike: S1 self-intersecting fixtures and S3 timing", "[col
     REQUIRE(MeshBoolean::mfd::make_boolean(block, boss, out, "UNION"));
     TriangleMesh bossed = out.front();
     auto paint = paint_by_predicate(bossed, [](const Vec3f &c, const Vec3f &) { return c.z() > 10.05f; }, EnforcerBlockerType::Extruder2);
-    // S1 asks for the shell's own volume as well as the partition's, so the two stages run separately here
-    // (this is exactly what split_volume_by_paint chains internally, refinement pre-pass included).
-    ColorPatches  pb = extract_color_patches(bossed.its, paint);
-    BoundingBoxf3 bb;
-    for (const Vec3f &v : pb.surface.vertices) bb.merge(v.cast<double>());
-    const double refine_len = color_split_refine_length(depths_for_test(1.5, 0.2, 0.87), ColorSplitParams{}, bb);
-    const size_t coarse_tri = pb.surface.indices.size();
-    pb = refine_color_patches(pb, refine_len);
-    WARN("S1 boss refinement: L " << refine_len << " mm, " << coarse_tri << " -> " << pb.surface.indices.size() << " tri");
+    // S1 asks for the shells' own volumes as well as the partition's, so the two stages run separately here
+    // (this is exactly what split_volume_by_paint chains internally).
+    ColorPatches pb = extract_color_patches(bossed.its, paint);
     std::vector<std::string> bw;
     std::vector<ColorShell>  bs = build_color_shells(pb, depths_for_test(1.5), ColorSplitParams{}, nullptr, &bw);
     for (const ColorShell &sh : bs) WARN("S1 boss shell: filament " << sh.state << ", volume " << check_shell(sh.mesh).volume);
     for (const std::string &w : bw) WARN("S1 boss warning: " << w);
-    REQUIRE(bs.size() == 1);
+    REQUIRE(bs.size() == 2);                    // spec 3.1a: the boss side and its top cap are two patches
     ColorSplitResult rb = partition_by_shells(pb.surface, bs, /*absorb_islands=*/true, nullptr);
     REQUIRE(rb.pieces.size() == 1);
     WARN("S1 boss: piece volume " << volume_of(rb.pieces[0].second) << ", body volume " << volume_of(rb.body)

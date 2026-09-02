@@ -116,9 +116,9 @@ std::vector<Vec3f> color_split_normals(const indexed_triangle_set &surface)
 
 namespace ColorSplitDetail {
 
-// The dialog's depth override wins over both the depth AND the unlimited flag. Every entry point has to
-// apply it identically - build_color_shells to cut with, color_split_refine_length to size the refinement,
-// split_volume_by_paint to report back - so none of them gets to spell the rule out for itself.
+// The dialog's depth override wins over both the depth AND the unlimited flag. Both entry points have to
+// apply it identically - build_color_shells to cut with, split_volume_by_paint to report back - so neither
+// gets to spell the rule out for itself.
 ColorSplitDepths effective_depths(const ColorSplitDepths &depths, const ColorSplitParams &params)
 {
     ColorSplitDepths out = depths;
@@ -159,16 +159,6 @@ std::vector<float> compute_vertex_depths(const ColorPatches &p, const std::vecto
     return ColorSplitDetail::vertex_depths(AABBMesh(p.surface), p, normals, D);
 }
 
-double color_split_refine_length(const ColorSplitDepths &depths_in, const ColorSplitParams &params, const BoundingBoxf3 &mesh_bbox)
-{
-    const ColorSplitDepths depths = ColorSplitDetail::effective_depths(depths_in, params);
-    const double D = depths.unlimited ? std::numeric_limits<double>::infinity() : depths.D;
-    // Spec 3.1a: fine enough that a feature of depth D gets vertices inside it, never finer than one wall
-    // stack (below that the extra triangles buy nothing a nozzle can print), and never coarser than a
-    // twentieth of the part - which is what makes the length scale-free on an unlimited-depth split.
-    return std::max(depths.ws, std::min(D, mesh_bbox.size().norm() / 20.));
-}
-
 ShellCheck check_shell(const indexed_triangle_set &shell)
 {
     ShellCheck c;
@@ -182,14 +172,8 @@ ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const T
                                        const ColorSplitDepths &depths, const ColorSplitParams &params, const ColorSplitProgress &progress)
 {
     if (progress && !progress(0)) throw ColorSplitCancelled();
-    ColorPatches patches = extract_color_patches(mesh, paint);
+    const ColorPatches patches = extract_color_patches(mesh, paint);
     if (patches.states.empty()) throw ColorSplitError("The part has no painted colours.");
-    if (progress && !progress(5)) throw ColorSplitCancelled();
-    // Spec 3.1a: refine BEFORE the normals and the shells - they are what the missing interior vertices
-    // would have starved (a two-ring cylinder has no side vertex whose normal is radial).
-    BoundingBoxf3 bbox;
-    for (const Vec3f &v : patches.surface.vertices) bbox.merge(v.cast<double>());
-    patches = refine_color_patches(patches, color_split_refine_length(depths, params, bbox));
     if (progress && !progress(10)) throw ColorSplitCancelled();
     std::vector<std::string> shell_warnings;
     // Ruling 10: skipped micro-components are warnings, not errors - they have to reach the caller.
