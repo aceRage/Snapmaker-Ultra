@@ -1505,6 +1505,55 @@ static inline ExPolygons exposed_surface_part(const ExPolygons              &pro
     return diff_ex(projected_patch, offset_ex(input_expolygons[reference_layer_idx], wall_stack_width));
 }
 
+// FLAT-TOP CAP FIX WAVE (.superpowers/sdd/2026-08-31-paint-depth/flat-top-cap-review.md, I1/I2):
+// exposed_surface_part()'s wall-stack yardstick is POINTWISE - it measures each point's distance
+// to the reference layer's own contour, not the local slope of the patch the point belongs to.
+// That misclassifies two related cases the same way, because both put a point within one wall
+// stack of a neighbour's contour even though the PATCH is not locally steep there:
+//   I1  a genuinely FLAT ledge that merely sits beside a taller riser (a shelf beside a boss, a
+//       tier of a stepped part) - the wall-stack-wide band of the ledge nearest the riser reads
+//       as "sloped" even though its own local slope is 0, so it never gets capped and keeps a
+//       full-D painted ring there forever (measured: 15 painted layers / 73mm2 on a slab+tower
+//       fixture beside the riser, saving zero tool changes - the cap's whole purpose).
+//   I2  a genuine shallow SLOPE whose per-layer staircase run r is only a little above one wall
+//       stack - the yardstick keeps the INNER wall-stack-wide band (nearest the layer above) and
+//       caps the OUTER r - wall_stack remainder, the wrong way round for a dome (the inner band
+//       is the flatter part) - producing a bullseye of alternating capped/uncapped rings that the
+//       absorb then silently re-annexes, or not, depending on gap_infill_speed.
+//
+// Fix: widen the pointwise verdict into a PER-COMPONENT one, using the SAME wall-stack yardstick
+// exposed_surface_part() already computes - no new angle constant, just applied to the
+// COMPONENT'S OWN WIDTH instead of to each point of it in isolation. exposed_surface_part()'s
+// output (the part of the patch already known to be farther than one wall stack from the
+// reference contour) is opened at wall_stack_width, so a component survives only if it has an
+// actual core at least 2*wall_stack_width wide (a ring or ledge at least 3 wall stacks total,
+// ~2.6mm / <= ~2.2deg at 0.1mm layers) - then the survivor is dilated back out by wall_stack_width
+// plus the SAME erosion exposed_surface_part() already applied (2*wall_stack_width total), and
+// clipped to the patch:
+//   - A component that survives the opening (I1's ledge: 10mm wide, far past the 2.6mm floor) is
+//     capped WHOLE, rim included - the dilate-back specifically restores the near-riser band the
+//     pointwise test used to exclude, so the ledge is one decision, not two.
+//   - A component that does not survive (I2's 3/4/5deg staircase rings: r - wall_stack =
+//     1.03/0.55/0.26mm, all under 2*wall_stack_width = 1.757mm) returns EMPTY - the whole ring
+//     stays wholly at D, exactly like any slope above the classic ~6.49deg cliff, never partially
+//     capped into a bullseye.
+//   - The topmost/bottommost origin's own half-ring (Minor 1: a patch with no reference layer at
+//     all is wholly "exposed" by exposed_surface_part()'s own early return, :1502-1503) is itself
+//     narrower than 2*wall_stack_width at every slope this feature targets, so it is opened away
+//     to empty here too - the apex is never wrongly capped, and a slope's descent is
+//     byte-identical to before this whole feature at every layer it can reach, apex included.
+static inline ExPolygons flat_cap_component_ex(const ExPolygons              &projected_patch,
+                                                const std::vector<ExPolygons> &input_expolygons,
+                                                size_t                         reference_layer_idx,
+                                                size_t                         num_layers,
+                                                float                          wall_stack_width)
+{
+    const ExPolygons exposed = exposed_surface_part(projected_patch, input_expolygons, reference_layer_idx, num_layers, wall_stack_width);
+    if (exposed.empty())
+        return ExPolygons{};
+    return intersection_ex(projected_patch, offset_ex(opening_ex(exposed, wall_stack_width), 2.f * wall_stack_width));
+}
+
 // WAVE B / OPTION N (.superpowers/sdd/2026-08-31-paint-depth/curved-gap-design.md): the painted
 // claim is a CONSTANT-THICKNESS SHELL measured NORMAL to the painted surface - "a certain amount
 // of inward taper and normal projection so the coloured section becomes its own object" (the
@@ -2019,29 +2068,31 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                             // SAME colour either way (paint_infill_override). Cap the FLAT part
                             // of the claim there; SLOPES AND WALLS MUST KEEP THE FULL D BOUND.
                             //
-                            // Discriminator: reuse exposed_surface_part()'s own wall-stack
-                            // yardstick - "is this part of the patch farther than one wall stack
-                            // from the neighbouring layer's own contour" - the SAME test that
-                            // used to gate top_exposed_ex before N1 retired it, computed fresh
-                            // here UNCONDITIONALLY of normal_shell so it never touches
-                            // top_exposed_ex itself (which N1 deliberately made unconditional so
-                            // slopes still reach D). Where the local staircase run r is below one
-                            // wall stack (the classic slope gate, ~6.49deg at 0.1mm layers - see
-                            // the self-limiting note above), the patch is genuinely near-flat and
-                            // top_flat_cap_ex is non-empty there; above it (every slope this
-                            // wave's T1/T2/T3 pin, 10-63deg) top_flat_cap_ex is EMPTY and the cap
-                            // below is a no-op by construction - no new angle constant. On a
-                            // patch that is flat in the middle and rolls over to steep at its rim
-                            // (a dome crown), the split is POINTWISE, exactly like
-                            // exposed_surface_part's own documented behaviour: the crown is
-                            // capped, the rim (rolling into the flank) is not.
+                            // Discriminator (FLAT-TOP CAP FIX WAVE, .superpowers/sdd/
+                            // 2026-08-31-paint-depth/flat-top-cap-review.md I1/I2): a
+                            // PER-COMPONENT verdict built on exposed_surface_part()'s own
+                            // wall-stack yardstick - see flat_cap_component_ex()'s header above
+                            // for the full derivation - computed fresh here UNCONDITIONALLY of
+                            // normal_shell so it never touches top_exposed_ex itself (which N1
+                            // deliberately made unconditional so slopes still reach D). A
+                            // component whose flat core is at least 3 wall stacks wide (a ledge, a
+                            // cap, a shallow dome crown) is capped WHOLE, rim included, whatever
+                            // touches it (I1); a component that never had a core that wide (every
+                            // slope this wave's T1/T2/T3 pin, 10-63deg, and every near-flat ring
+                            // below the SAME ~2.2deg floor at 0.1mm layers) is EMPTY and the cap
+                            // below is a no-op by construction on the WHOLE component, never a
+                            // partial per-point split (I2) - no new angle constant either way. On
+                            // a patch that is flat in the middle and rolls over to steep at its
+                            // rim (a dome crown), the split is still POINTWISE between components,
+                            // exactly like exposed_surface_part's own documented behaviour: the
+                            // crown is capped, the rim (rolling into the flank) is not.
                             //
                             // Only worth computing when D actually reaches deeper than the shell
                             // - if it doesn't, there is nothing beyond stat.top_shell_layers to
                             // cap and this would be wasted Clipper work.
                             const bool       top_cap_active = normal_shell && stat.top_descent_layers > stat.top_shell_layers;
                             const ExPolygons top_flat_cap_ex = top_cap_active
-                                ? exposed_surface_part(top_ex, input_expolygons, layer_idx + 1, num_layers, wall_stack)
+                                ? flat_cap_component_ex(top_ex, input_expolygons, layer_idx + 1, num_layers, wall_stack)
                                 : ExPolygons{};
                             float offset = 0.f;
                             // Option N (N3): on a slope the full-width term is empty for the NEAR
@@ -2213,10 +2264,10 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                             const ExPolygons bottom_exposed_ex = normal_shell ? bottom_ex
                                                                               : exposed_surface_part(bottom_ex, input_expolygons, layer_idx - 1, num_layers, wall_stack);
                             // FLAT-TOP CAP, mirrored - see the top loop's comment above for the
-                            // full reasoning.
+                            // full reasoning (flat_cap_component_ex()'s per-component I1/I2 fix).
                             const bool       bottom_cap_active = normal_shell && stat.bottom_descent_layers > stat.bottom_shell_layers;
                             const ExPolygons bottom_flat_cap_ex = bottom_cap_active
-                                ? exposed_surface_part(bottom_ex, input_expolygons, layer_idx - 1, num_layers, wall_stack)
+                                ? flat_cap_component_ex(bottom_ex, input_expolygons, layer_idx - 1, num_layers, wall_stack)
                                 : ExPolygons{};
                             float offset = 0.f;
                             bool  deposited = false;

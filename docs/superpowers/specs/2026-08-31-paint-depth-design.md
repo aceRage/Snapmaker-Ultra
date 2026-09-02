@@ -105,8 +105,33 @@ solid-shell depth is now capped away — measured on the flat-cap fixture (40×4
 ⇒ D = 1.435675 mm, 0.1 mm layers): **15 → 6 painted layers, i.e. the 9 tool changes / ≈2.5 cm³ of
 purge above are recovered, with NO visible change** (the material removed was always beneath the
 solid shell). SLOPES AND WALLS ARE UNAFFECTED: the cap discriminates flat from sloped using the
-existing `exposed_surface_part()` wall-stack yardstick (the same one N1 retired as a gate), applied
-pointwise to each origin layer's own patch rather than as a hard angle cutoff — a dome's crown is
-capped while its flanks keep the full D bound, verified by a dedicated test. The measured 10/15/20°
-normal-thickness figures above (1.476 / 1.436 / 1.402 mm) are byte-identical before and after this
-change, confirmed to 10 decimal places by a before/after digit comparison, not merely asserted.
+existing `exposed_surface_part()` wall-stack yardstick (the same one N1 retired as a gate) — a
+dome's crown is capped while its flanks keep the full D bound, verified by a dedicated test. The
+measured 10/15/20° normal-thickness figures above (1.476 / 1.436 / 1.402 mm) are byte-identical
+before and after this change, confirmed to 10 decimal places by a before/after digit comparison,
+not merely asserted.
+
+**FLAT-TOP CAP FIX WAVE (`.superpowers/sdd/2026-08-31-paint-depth/flat-top-cap-review.md`,
+`flat-top-cap-fixwave-report.md`) — corrects the discriminator above from POINTWISE to
+PER-COMPONENT.** Applying the wall-stack yardstick pointwise (as first landed, and as this note
+originally described it) does not equal "flat vs sloped": a genuinely flat top/bottom that is not
+the object's own topmost/bottommost face — a ledge beside a taller riser, a tier of a stepped part
+— has a wall-stack-wide band nearest the riser that reads as "sloped" by that test alone even
+though its local slope is 0, so it kept the full D depth there and recovered none of the 9 tool
+changes on exactly the geometry this cap targets. The same pointwise test also SPLIT a slope only
+a little above the ~6.49° cliff into alternating capped/uncapped rings (a striped bullseye) instead
+of leaving it whole. Fixed by widening the verdict from a point to the whole CONNECTED COMPONENT:
+a component is capped in full only if it has an actual flat core at least 3 wall stacks wide
+(≈2.6 mm, ≤≈2.2° at 0.1 mm layers — the SAME yardstick, no new angle constant) — a ledge next to a
+riser, however narrow the gap between them, is then capped as one whole ring, rim included; a
+slope that never had a core that wide (everything at or above the ~6.49° cliff, plus the
+~2.2–6.49° band that used to stripe) stays wholly at D, never partially capped. Pinned directly: a
+40×40 mm slab with a centred 20×20 mm tower goes from 15 painted layers / 73 mm² beside the riser
+(saving nothing) to the same 6-layer cap as the interior, on both the top and bottom mirrors; 3/4/5°
+slopes go from ~10 disjoint capped/uncapped rings (reach truncated to ~40% of the un-capped bound)
+to a single whole-component decision, verified byte-identical to a same-depth cap-disabled
+reference with `gap_infill_speed` both on and off; the 10° apex half-ring (a topmost-origin
+artefact of `exposed_surface_part()`'s own "no reference layer" early return, invisible at 15/20°
+where the smaller half-ring was already erased by the pre-existing small-region opening) no longer
+gets wrongly capped, so the 10° slope's reach is now byte-identical to the cap-disabled reference
+across its whole descent, apex included — not merely at one probe layer.

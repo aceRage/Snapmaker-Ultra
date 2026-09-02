@@ -1090,6 +1090,90 @@ Point layer_edge_probe(const PrintObject &object, size_t layer_idx, double inset
     return Point(coord_t(bb.max.x() - scale_(inset_mm)), (bb.min.y() + bb.max.y()) / 2);
 }
 
+// I1 (.superpowers/sdd/2026-08-31-paint-depth/flat-top-cap-review.md): a flat painted top/bottom
+// that is NOT the object's own topmost/bottommost face - a ledge beside a taller riser, the
+// common case on any stepped or bossed real part - is what exposed_surface_part()'s POINTWISE
+// wall-stack yardstick misclassified pre-fix: the ledge band within one wall stack of the riser
+// read as "sloped" even though its own local slope is 0, so it never got capped. Two stacked
+// ModelVolumes, same construction as process_z_interface_cube() above (no boolean mesh needed) -
+// a 40x40xheight SLAB and a centred 20x20xheight TOWER sharing one face, so the slab's own top (or
+// bottom) cap facet is painted in full but the ACTUAL exposed surface the segmenter sees is
+// clipped by the tower's footprint automatically, to exactly the 10mm-wide ledge ring around it -
+// the same occlusion the two-volume Z-stack already relies on elsewhere in this file.
+//   - top_face == true:  the TOWER sits ABOVE the slab (z in [4,8]) - the riser rises past the
+//     painted ledge, mirroring every other TOP_CAP_FACE fixture's descent direction (depth
+//     increases going DOWN from the ledge's own layer).
+//   - top_face == false: the STEM (same 20x20xheight box) sits BELOW a SHELF (z in [4,8]) whose
+//     own BOTTOM_CAP_FACE is painted - the riser drops past the painted ledge, mirroring every
+//     other BOTTOM_CAP_FACE fixture's descent direction (depth increases going UP).
+PrintObject *slice_capped_ledge(bool top_face, Print &print)
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name        = "paint-depth-ledge.stl";
+
+    ModelVolume *wide_volume;
+    if (top_face) {
+        wide_volume         = object->add_volume(make_cube(40., 40., 4.));
+        ModelVolume *tower  = object->add_volume(make_cube(20., 20., 4.));
+        tower->translate(10., 10., 4.);
+
+        TriangleSelector selector(wide_volume->mesh());
+        for (int facet_idx : TOP_CAP_FACE)
+            selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+        REQUIRE(wide_volume->mmu_segmentation_facets.set(selector));
+    } else {
+        ModelVolume *stem = object->add_volume(make_cube(20., 20., 4.));
+        stem->translate(10., 10., 0.);
+        wide_volume        = object->add_volume(make_cube(40., 40., 4.));
+        wide_volume->translate(0., 0., 4.);
+
+        TriangleSelector selector(wide_volume->mesh());
+        for (int facet_idx : BOTTOM_CAP_FACE)
+            selector.set_facet(facet_idx, EnforcerBlockerType::Extruder2);
+        REQUIRE(wide_volume->mmu_segmentation_facets.set(selector));
+    }
+
+    object->add_instance();
+    object->ensure_on_bed();
+
+    // Same shell pinning as slice_bounded_frustum()/slice_two_painted_colours(): top_shell_layers
+    // = 4 / top_shell_thickness = 0.6 at 0.1mm layers is a 6-layer effective top shell,
+    // bottom_shell_layers = 3 / bottom_shell_thickness = 0.0 is a 3-layer effective bottom shell -
+    // both far short of the D-driven 15-layer descent at walls = 3, so any claim surviving past
+    // them is unambiguously the pre-fix D-driven bug, not the shell.
+    DynamicPrintConfig config = paint_depth_test_config(pdmWalls, /*walls=*/3);
+    config.option<ConfigOptionFloat>("layer_height")->value               = 0.1;
+    config.option<ConfigOptionFloat>("initial_layer_print_height")->value = 0.1;
+    config.option<ConfigOptionInt>("top_shell_layers")->value             = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value        = 0.6;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value          = 3;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value     = 0.0;
+
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+
+    PrintObject *out_object = print.objects_mutable().front();
+    out_object->slice();
+    REQUIRE(out_object->layer_count() > 0);
+    return out_object;
+}
+
+// I1: a point offset_mm from the ledge fixture's own XY centre along +X, at the given (wide,
+// 40x40-footprint) layer's mid-Y - i.e. how far out from the riser (tower half-width 10mm) or in
+// from the slab's own edge (half-width 20mm) the probe sits. The ledge itself spans offset_mm in
+// (10, 20). reference_layer_idx must be a layer whose OWN lslices is the full 40x40 slab/shelf
+// footprint (never the 20x20 tower/stem's) - both slice_capped_ledge() call sites below compute
+// this via first_layer_above_z() before calling this helper.
+Point ledge_offset_probe(const PrintObject &object, size_t reference_layer_idx, double offset_mm)
+{
+    const BoundingBox bb = get_extents(object.get_layer(int(reference_layer_idx))->lslices);
+    REQUIRE(bb.defined);
+    const coord_t cy = (bb.min.y() + bb.max.y()) / 2;
+    return Point(coord_t(((bb.min.x() + bb.max.x()) / 2) + scale_(offset_mm)), cy);
+}
+
 // Taper bound: same construction as slice_capped_slab() above, but with the prism's XY
 // footprint and height as parameters so a SMALL painted feature can be built - one whose
 // entire cross-section is narrower than the erosion the descent loop accumulates
@@ -2774,10 +2858,26 @@ TEST_CASE("multi_material_segmentation_by_painting: on the arachne generator the
 // so any descent deeper than 6 layers is unambiguously the normal-depth bound and not the shell.
 // inner_wall_line_width is pinned for the same reason slice_painted_box() pins it: the band is
 // driven by the frPerimeter spacing too, so both widths must be known for the band to be exact.
+// Flat-top cap fix wave: two trailing parameters, both DEFAULTED so every pre-existing caller is
+// byte-identical.
+//   - gap_infill_speed < 0 means "leave at paint_depth_test_config's own registry default" - the
+//     same sentinel convention slice_painted_box/slice_bounded_frustum_two_colours/
+//     slice_bounded_sphere_two_colours already use.
+//   - top_shell_layers_override < 0 means "leave top_shell_layers/top_shell_thickness at 4/0.6"
+//     (today's behaviour); >= 0 instead sets top_shell_layers to that exact count AND
+//     top_shell_thickness to 0 (purely count-driven), so out.top_shell_layers becomes EXACTLY
+//     that count. Passing 15 (== M, the D-driven descent depth at walls=3/0.1mm layers) makes
+//     top_cap_active's "descent_layers > shell_layers" test false everywhere - the cap is
+//     provably INACTIVE - while top_descent_layers itself (max(top_shell_layers, M)) stays 15,
+//     UNCHANGED from the default 4/0.6 config (max(6, 15) == max(15, 15) == 15 either way). Used
+//     to build a "same descent depth, cap disabled" reference fixture without hand-deriving the
+//     exact reach at every layer near the object's own apex (I2/Minor 1 regression pins below).
 PrintObject *slice_bounded_frustum(double bottom, double top, double height,
                                     const std::vector<int> &painted_facets,
                                     PaintDepthMode mode, int walls, double layer_height, Print &print,
-                                    PerimeterGeneratorType wall_generator = PerimeterGeneratorType::Arachne)
+                                    PerimeterGeneratorType wall_generator = PerimeterGeneratorType::Arachne,
+                                    double gap_infill_speed = -1.0,
+                                    int top_shell_layers_override = -1)
 {
     Model        model;
     ModelObject *object = model.add_object();
@@ -2796,11 +2896,13 @@ PrintObject *slice_bounded_frustum(double bottom, double top, double height,
     config.option<ConfigOptionFloat>("initial_layer_print_height")->value       = layer_height;
     config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
     config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
-    config.option<ConfigOptionInt>("top_shell_layers")->value                   = 4;
-    config.option<ConfigOptionFloat>("top_shell_thickness")->value              = 0.6;
+    config.option<ConfigOptionInt>("top_shell_layers")->value                   = top_shell_layers_override >= 0 ? top_shell_layers_override : 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value              = top_shell_layers_override >= 0 ? 0.0 : 0.6;
     config.option<ConfigOptionInt>("bottom_shell_layers")->value                = 3;
     config.option<ConfigOptionFloat>("bottom_shell_thickness")->value           = 0.0;
     config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = wall_generator;
+    if (gap_infill_speed >= 0.0)
+        config.option<ConfigOptionFloat>("gap_infill_speed")->value = gap_infill_speed;
 
     print.set_status_silent();
     print.apply(model, config);
@@ -3440,9 +3542,13 @@ TEST_CASE("ToolOrdering::collect_extruders does not add the base filament to a l
 // extending slice_painted_box() / paint_depth_test_config(), which stay untouched: every other
 // fixture in this file paints exactly one colour, so generalizing either of those shared helpers
 // for this one two-colour case would be a bigger, riskier change than adding beside them.
+// Flat-top cap fix wave (Minor 4): trailing gap_infill_speed, same < 0 "leave at
+// paint_depth_test_config's own registry default" sentinel every other gap_infill_speed
+// parameter in this file uses - every existing caller (which omits it) is unaffected.
 PrintObject *slice_two_painted_colours(double x, double y, double z,
                                         const std::vector<int> &cap_facets, const std::vector<int> &side_facets,
-                                        PaintDepthMode mode, int walls, double layer_height, Print &print)
+                                        PaintDepthMode mode, int walls, double layer_height, Print &print,
+                                        double gap_infill_speed = -1.0)
 {
     Model model;
     ModelObject *object = model.add_object();
@@ -3476,6 +3582,8 @@ PrintObject *slice_two_painted_colours(double x, double y, double z,
     // layers at stock defaults" numbers apply verbatim.
     config.option<ConfigOptionInt>("top_shell_layers")->value    = 4;
     config.option<ConfigOptionFloat>("top_shell_thickness")->value = 0.6;
+    if (gap_infill_speed >= 0.0)
+        config.option<ConfigOptionFloat>("gap_infill_speed")->value = gap_infill_speed;
 
     print.set_status_silent();
     print.apply(model, config);
@@ -4704,24 +4812,36 @@ TEST_CASE("multi_material_segmentation_by_painting: the interior absorb does not
     // right up to the shared top edge) - a genuinely ACTIVE painted neighbour at every layer,
     // which is exactly the precondition the interior inter-claim absorb needs to have a "winner"
     // candidate at all.
-    Print        print;
-    PrintObject *object = slice_two_painted_colours(/*x=*/40., /*y=*/40., /*z=*/6.,
-                                                      TOP_CAP_FACE, PLUS_X_FACE,
-                                                      pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print);
-    const size_t top_index = object->layer_count() - 1;
-    REQUIRE(top_index >= 20);
+    //
+    // Flat-top cap fix wave (Minor 4): looped over gap_infill_speed default (gap fill ON) and 0
+    // (OFF, the WIDENED kill width) - cheap insurance per the review, since the fix means no
+    // capped gap is ever sliver-sized any more (either the whole rim is capped WITH the floor, or
+    // the whole component stays at D), so the widened kill width has nothing new to misjudge
+    // either.
+    const double gap_fill_cases[] = {-1.0 /*default, gap fill ON*/, 0.0 /*OFF, widened kill width*/};
+    for (double gap_infill_speed : gap_fill_cases) {
+        DYNAMIC_SECTION("gap_infill_speed=" << gap_infill_speed) {
+            Print        print;
+            PrintObject *object = slice_two_painted_colours(/*x=*/40., /*y=*/40., /*z=*/6.,
+                                                              TOP_CAP_FACE, PLUS_X_FACE,
+                                                              pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print,
+                                                              gap_infill_speed);
+            const size_t top_index = object->layer_count() - 1;
+            REQUIRE(top_index >= 20);
 
-    // Depth 8: past colour A's capped floor (shell depth 6) and far past colour B's own lateral
-    // reach (~1.44mm from the +X wall) - the box centre is 20mm from every edge. Pre-fix, colour
-    // A's (uncapped) claim reaches the centre here (RED, same mechanism as the plain flat-cap
-    // test above). The genuine risk this pins is the SECOND check: if the now-empty capped floor
-    // were ever mistaken for an absorbable inter-claim sliver, colour B - the only active
-    // painted neighbour at this layer - is exactly who it would be annexed into. It must stay
-    // base instead.
-    const size_t probe_layer = top_index - 8;
-    const Point  centre      = slab_center_point(*object);
-    CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder2, colour A, the capped flat top*/ 2), centre));
-    CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder3, colour B, the side stripe*/ 3), centre));
+            // Depth 8: past colour A's capped floor (shell depth 6) and far past colour B's own
+            // lateral reach (~1.44mm from the +X wall) - the box centre is 20mm from every edge.
+            // Pre-fix, colour A's (uncapped) claim reaches the centre here (RED, same mechanism as
+            // the plain flat-cap test above). The genuine risk this pins is the SECOND check: if
+            // the now-empty capped floor were ever mistaken for an absorbable inter-claim sliver,
+            // colour B - the only active painted neighbour at this layer - is exactly who it would
+            // be annexed into. It must stay base instead.
+            const size_t probe_layer = top_index - 8;
+            const Point  centre      = slab_center_point(*object);
+            CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder2, colour A, the capped flat top*/ 2), centre));
+            CHECK_FALSE(any_contains(claim_for_layer(*object, probe_layer, /*Extruder3, colour B, the side stripe*/ 3), centre));
+        }
+    }
 }
 
 // Cost evidence (the whole point of this change - spec's "Cost note",
@@ -4751,4 +4871,230 @@ TEST_CASE("multi_material_segmentation_by_painting: cost evidence - painted-laye
     INFO("painted layers on the flat-cap fixture (== tool changes saved versus the pre-cap "
          "D-driven depth of 15): " << painted_layers);
     CHECK(painted_layers == 6);
+}
+
+// ===========================================================================================
+// FLAT-TOP CAP FIX WAVE (user decision 2026-09-01, .superpowers/sdd/2026-08-31-paint-depth/
+// flat-top-cap-review.md I1/I2, folding in Minors 1/3/4): the cap above classified a flat top or
+// bottom PER POINT, using exposed_surface_part()'s wall-stack yardstick measured against the
+// NEXT layer's own contour - which is not the patch's local slope. Two consequences, one fix
+// (flat_cap_component_ex(), MultiMaterialSegmentation.cpp): a flat top/bottom beside a taller
+// riser kept a wall-stack-wide painted ring at the full D depth forever (I1, below); a slope only
+// a little above the classic ~6.49deg cliff got PARTIALLY capped into a striped bullseye that the
+// absorb then silently undid, or not, depending on gap_infill_speed (I2, further below).
+// ===========================================================================================
+
+TEST_CASE("multi_material_segmentation_by_painting: a flat painted top beside a riser is capped WITH the rest of the flat component, rim included (I1, ledge)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_capped_ledge(/*top_face=*/true, print);
+
+    // The slab's OWN top layer (z=4, the boundary with the tower) - first_layer_above_z(4.0)
+    // lands on the tower's FIRST layer (z in [4.0,4.1], 20x20 footprint); the slab's own last
+    // layer (z in [3.9,4.0], full 40x40 footprint) is one below that, and is the ledge's own
+    // origin.
+    const size_t surface = first_layer_above_z(*object, 4.0) - 1;
+    REQUIRE(surface >= 16);
+
+    // mid-ledge: 15mm out from centre - 5mm clear of the 10mm tower edge and 5mm clear of the
+    // 20mm slab edge, comfortably inside the ledge either way.
+    const Point mid_ledge  = ledge_offset_probe(*object, surface, 15.0);
+    // near-riser: 10.4mm out from centre - 0.4mm past the tower's own 10mm edge, deep inside the
+    // ~0.8785mm wall-stack band the pointwise yardstick used to exclude (review's own measured
+    // [10.0, 10.85] window).
+    const Point near_riser = ledge_offset_probe(*object, surface, 10.4);
+
+    // Surface facet + shell depths 1-5 (6 layers total, matching the effective 6-layer solid
+    // shell) stay claimed everywhere on the ledge, exactly as the plain flat-cap test already
+    // pins for a top with no riser at all.
+    for (size_t depth = 0; depth <= 5; ++depth) {
+        CAPTURE(depth);
+        CHECK(any_contains(extruder2_claim_for_layer(*object, surface - depth), mid_ledge));
+        CHECK(any_contains(extruder2_claim_for_layer(*object, surface - depth), near_riser));
+    }
+    // RED on HEAD: mid_ledge (already more than one wall stack from the riser) was already
+    // correctly capped, but near_riser - within one wall stack of the tower's own contour - kept
+    // a painted ring all the way to the old D-driven depth (15 layers total): depths 6-14 were
+    // STILL claimed there, saving zero tool changes on exactly the geometry the cap exists for.
+    // Per-component classification must cap the WHOLE ledge, rim included.
+    for (size_t depth = 6; depth <= 14; ++depth) {
+        CAPTURE(depth);
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, surface - depth), mid_ledge));
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, surface - depth), near_riser));
+    }
+}
+
+TEST_CASE("multi_material_segmentation_by_painting: a flat painted bottom beside a riser is capped WITH the rest of the flat component, rim included (I1, ledge, bottom mirror)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_capped_ledge(/*top_face=*/false, print);
+
+    // The shelf's OWN bottom layer (z in [4.0,4.1], the boundary with the stem, full 40x40
+    // footprint) - the ledge's own origin for a bottom claim.
+    const size_t surface = first_layer_above_z(*object, 4.0);
+    REQUIRE(object->layer_count() - surface >= 16);
+
+    const Point mid_ledge  = ledge_offset_probe(*object, surface, 15.0);
+    const Point near_riser = ledge_offset_probe(*object, surface, 10.4);
+
+    // Effective bottom shell = 3 (bottom_shell_thickness disabled), same as every other bottom-
+    // mirror test in this file - depths 0-2 claimed everywhere on the ledge.
+    for (size_t depth = 0; depth <= 2; ++depth) {
+        CAPTURE(depth);
+        CHECK(any_contains(extruder2_claim_for_layer(*object, surface + depth), mid_ledge));
+        CHECK(any_contains(extruder2_claim_for_layer(*object, surface + depth), near_riser));
+    }
+    // RED on HEAD: same bug, mirrored - near_riser stayed claimed to the D-driven depth (15
+    // layers) while mid_ledge was already correctly capped.
+    for (size_t depth = 3; depth <= 14; ++depth) {
+        CAPTURE(depth);
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, surface + depth), mid_ledge));
+        CHECK_FALSE(any_contains(extruder2_claim_for_layer(*object, surface + depth), near_riser));
+    }
+}
+
+// Minor 3: the existing cost-evidence test above counts painted layers via a CENTRE probe, which
+// on this ledge fixture would report 6 (the centre sits mid-ledge, already correctly capped even
+// pre-fix) while the near-riser rim above proves 15 layers actually carried paint - the proxy
+// passes precisely where the saving used to be lost. Count over the WHOLE cap footprint instead:
+// a layer counts as painted if its claim is non-empty ANYWHERE, not merely at one point.
+TEST_CASE("multi_material_segmentation_by_painting: cost evidence on the ledge fixture - painted layers are counted over the WHOLE cap footprint, not a centre probe (Minor 3)", "[paintdepth]")
+{
+    Print        print;
+    PrintObject *object = slice_capped_ledge(/*top_face=*/true, print);
+    const size_t surface = first_layer_above_z(*object, 4.0) - 1;
+    REQUIRE(surface >= 20);
+
+    size_t painted_layers = 0;
+    for (size_t depth = 0; depth <= 20 && depth <= surface; ++depth) {
+        if (extruder2_claim_for_layer(*object, surface - depth).empty())
+            break; // contiguous from the surface on this fixture (a wide flat ledge).
+        ++painted_layers;
+    }
+
+    INFO("painted layers over the WHOLE ledge footprint, incl. the rim beside the riser (== tool "
+         "changes saved versus the pre-fix D-driven depth of 15): " << painted_layers);
+    CHECK(painted_layers == 6);
+}
+
+// Important 2: a slope whose per-layer staircase run r is only a little above one wall stack used
+// to get the INNER wall-stack band capped and the OUTER remainder kept (the wrong way round),
+// producing alternating capped/uncapped rings that the absorb then silently re-annexed, or not,
+// depending on gap_infill_speed. Per-component classification means every origin along a UNIFORM
+// slope makes the SAME whole-ring decision, so there is nothing left to stripe: a component-level
+// "flat enough" ring is capped whole, and one that is not stays wholly at D - reproducing this
+// slope's PRE-CAP-FEATURE descent exactly. Verified directly against a same-depth, cap-disabled
+// reference build (slice_bounded_frustum's top_shell_layers_override) rather than a hand-derived
+// reach formula, so there is no magic number to get subtly wrong near the object's own edges.
+TEST_CASE("multi_material_segmentation_by_painting: near-flat slopes (3/4/5 deg) get one whole-component decision, never per-layer stripes (I2)", "[paintdepth]")
+{
+    constexpr double kPi = 3.14159265358979323846;
+    const double      degrees_cases[]  = {3., 4., 5.};
+    const double      gap_fill_cases[] = {-1.0 /*default, gap fill ON*/, 0.0 /*OFF, widened kill width*/};
+
+    for (double gap_infill_speed : gap_fill_cases) {
+        for (double degrees : degrees_cases) {
+            DYNAMIC_SECTION(degrees << " deg, gap_infill_speed=" << gap_infill_speed) {
+                // Same "18mm top over 3mm" family as the 10/15/20deg pin above: tan(theta) =
+                // height / half_diff, so half_diff = height / tan(theta) and bottom = top +
+                // 2*half_diff.
+                const double theta  = degrees * kPi / 180.;
+                const double bottom = 18. + 2. * 3. / std::tan(theta);
+
+                Print        print_capped;
+                PrintObject *with_cap = slice_bounded_frustum(bottom, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                               pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print_capped,
+                                                               PerimeterGeneratorType::Arachne, gap_infill_speed);
+                REQUIRE(with_cap->layer_count() >= 27);
+
+                Print        print_reference;
+                PrintObject *cap_disabled = slice_bounded_frustum(bottom, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                                    pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print_reference,
+                                                                    PerimeterGeneratorType::Arachne, gap_infill_speed,
+                                                                    /*top_shell_layers_override=*/15);
+                REQUIRE(cap_disabled->layer_count() >= 27);
+
+                const ExPolygons claim_with_cap     = extruder2_claim_for_layer(*with_cap, 12);
+                const ExPolygons claim_cap_disabled = extruder2_claim_for_layer(*cap_disabled, 12);
+                CAPTURE(degrees);
+                CAPTURE(gap_infill_speed);
+                CAPTURE(claim_with_cap.size());
+                CAPTURE(claim_cap_disabled.size());
+
+                // No disjoint-polygon striping (the I2 bug produced ~10 separate capped/uncapped
+                // rings at 3/4deg): the claim keeps the SAME small polygon count as the
+                // cap-disabled reference - never inflated by a bullseye of alternating bands.
+                CHECK(claim_with_cap.size() == claim_cap_disabled.size());
+                CHECK(claim_with_cap.size() <= 2);
+
+                // No base annuli inside the claim, absorb inert either way: the claim reaches
+                // EXACTLY as far, contiguously from the contour, as the same-depth cap-disabled
+                // reference - a striped claim would break claim_reach_mm's contiguous scan at the
+                // first capped gap and fall far short (measured pre-fix: ~11.4/8.55/8.50mm at
+                // 3/4/5deg vs a full un-capped reach of 28.62/21.45/17.15mm = 15 * r).
+                const double reach_with_cap     = claim_reach_mm(*with_cap, 12, 32.0);
+                const double reach_cap_disabled = claim_reach_mm(*cap_disabled, 12, 32.0);
+                CAPTURE(reach_with_cap);
+                CAPTURE(reach_cap_disabled);
+                CHECK_THAT(reach_with_cap, Catch::Matchers::WithinAbs(reach_cap_disabled, 0.0001));
+            }
+        }
+    }
+}
+
+// Minor 1 (apex half-ring wrongly capped): exposed_surface_part() returns the WHOLE patch when
+// the reference layer does not exist, so the TOPMOST origin layer of any painted slope was always
+// "flat" by that pointwise test alone - a genuine bug at 10deg (its half-ring, 0.284mm, survives
+// the pre-existing small_region_threshold opening and therefore reached flat_cap_component_ex()'s
+// own opening/dilate test) though invisible at 15/20deg (the smaller 0.19/0.14mm half-ring is
+// erased by that SAME pre-existing opening before this feature ever sees it). The "Slope
+// regression pin" test above only samples ONE layer (12), 17 layers below the apex - too deep to
+// see it (measured pre-fix: layer 20's reach was 5.10mm instead of the correct 5.39mm).
+//
+// Rather than hand-deriving the exact reach at every layer near the object's own apex (not a
+// closed form worth inlining - it depends on how many origins are actually available there), pin
+// the INVARIANT directly: compare this fixture's claim against an otherwise-identical build where
+// top_shell_layers_override makes the cap provably INACTIVE while leaving the descent depth
+// itself (top_descent_layers, hence the raw claim) UNCHANGED at every origin that can reach any
+// of the probed layers - see slice_bounded_frustum()'s own comment. Any difference measured is
+// then caused ONLY by the cap actually firing somewhere it should not, at ANY layer across the
+// whole reachable descent - apex included.
+TEST_CASE("multi_material_segmentation_by_painting: the flat-top cap leaves 10/15/20 degree slopes byte-identical across the WHOLE descent, apex included (Minor 1)", "[paintdepth]")
+{
+    struct SlopeCase { double degrees; double bottom; };
+    const SlopeCase cases[] = {
+        {10., 52.0276},
+        {15., 40.3920},
+        {20., 34.4848},
+    };
+
+    for (const SlopeCase &c : cases) {
+        DYNAMIC_SECTION("slope " << c.degrees << " deg") {
+            Print        print_capped;
+            PrintObject *with_cap = slice_bounded_frustum(c.bottom, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                           pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print_capped);
+            REQUIRE(with_cap->layer_count() >= 27);
+            const size_t top_index = with_cap->layer_count() - 1;
+
+            Print        print_reference;
+            PrintObject *cap_disabled = slice_bounded_frustum(c.bottom, 18., 3., FRUSTUM_SLOPED_WALLS,
+                                                                pdmWalls, /*walls=*/3, /*layer_height=*/0.1, print_reference,
+                                                                PerimeterGeneratorType::Arachne, /*gap_infill_speed=*/-1.0,
+                                                                /*top_shell_layers_override=*/15);
+            REQUIRE(cap_disabled->layer_count() == with_cap->layer_count());
+
+            // The review's own measured window (5.10 vs 5.39mm at layer 20, 9 layers below the
+            // apex at layer 29) is layers 15-23; scan a few layers either side of it too, spanning
+            // the whole region the apex origin's own descent can reach (M=15 layers below it,
+            // i.e. down to layer top_index-15=14).
+            for (size_t layer_idx = 14; layer_idx <= 26; ++layer_idx) {
+                CAPTURE(c.degrees);
+                CAPTURE(layer_idx);
+                CAPTURE(top_index);
+                const double reach_with_cap     = claim_reach_mm(*with_cap, layer_idx, 12.0);
+                const double reach_cap_disabled = claim_reach_mm(*cap_disabled, layer_idx, 12.0);
+                CHECK_THAT(reach_with_cap, Catch::Matchers::WithinAbs(reach_cap_disabled, 0.0001));
+            }
+        }
+    }
 }
