@@ -1,5 +1,6 @@
-// The hub process (see RemoteHub.hpp). Deliberately wx-free: it runs from CLI::run before
-// any wxApp exists, so only Boost.Asio, libcurl (Http), nlohmann::json and the OS are used.
+// The hub process (see RemoteHub.hpp). The server itself is wx-free (Boost.Asio, libcurl via
+// Http, nlohmann::json, the OS); only the tray icon at the bottom of this file uses wx, with its
+// own minimal wxApp (never GUI_App) created by run_server().
 #include "RemoteHub.hpp"
 
 #include "BambuCamRelay.hpp"
@@ -43,6 +44,15 @@
 #  include <sys/wait.h>
 #  include <unistd.h>
 #endif
+
+#include <wx/app.h>
+#include <wx/icon.h>
+#include <wx/image.h>
+#include <wx/init.h>
+#include <wx/menu.h>
+#include <wx/taskbar.h>
+#include <wx/timer.h>
+#include <wx/utils.h>
 
 namespace Slic3r {
 namespace GUI {
@@ -625,10 +635,27 @@ class HubServer
 {
 public:
     HubServer(std::string token, bool phone) : m_token(std::move(token)), m_phone(phone) {}
-    int run();
+
+    bool start();                 // state, go2rtc, relay, listener, hub.json
+    void loop(bool idle_exit);    // until request_quit(); with idle_exit also once nobody needs us
+    void shutdown();
+    void request_quit() { m_quit = true; }
+
+    struct Snapshot
+    {
+        bool        phone { false };
+        int         port { 0 };
+        std::string token, url;
+        int         instances { 0 };
+    };
+    Snapshot snapshot();
+    bool     set_phone(bool on, const std::string& token); // rebinds the listener, persists
+    long     spawn_slicer(const std::string& file);        // "" = an empty window
+    std::vector<Instance> instances(bool probe);
 
 private:
     json  info_json();
+    json  instances_json();
     void  write_hub_json();
     bool  bind(bool lan);
     void  accept_loop(std::shared_ptr<tcp::acceptor> acceptor);
@@ -639,7 +666,6 @@ private:
     void  register_streams();
     std::string state_for_phone();
     bool  lookup_host(const std::string& id, std::string& ip, std::string& code);
-    std::vector<Instance> instances(bool probe);
     static Instance probe_instance(Instance inst);
 
     std::mutex                     m_mutex;
@@ -913,10 +939,86 @@ std::vector<Instance> HubServer::instances(bool probe)
     return out;
 }
 
+json HubServer::instances_json()
+{
+    json j;
+    j["instances"] = json::array();
+    int index      = 0;
+    for (const Instance& inst : instances(true)) {
+        if (!inst.alive) continue;
+        json ji;
+        ji["id"]      = inst.pid;
+        ji["index"]   = ++index;
+        ji["pid"]     = inst.pid;
+        ji["title"]   = inst.title;
+        ji["path"]    = inst.path;
+        ji["slicing"] = inst.slicing;
+        j["instances"].push_back(ji);
+    }
+    return j;
+}
+
+HubServer::Snapshot HubServer::snapshot()
+{
+    Snapshot s;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        s.phone = m_phone;
+        s.port  = m_port;
+        s.token = m_token;
+    }
+    if (s.phone) {
+        const std::vector<std::string> ips = lan_ips();
+        if (!ips.empty()) s.url = "http://" + ips.front() + ":" + std::to_string(s.port) + "/r/" + s.token + "/";
+    }
+    s.instances = (int) instances(false).size();
+    return s;
+}
+
+bool HubServer::set_phone(bool on, const std::string& token)
+{
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        changed = on != m_phone;
+        m_phone = on;
+        // A new link every time it is turned on (as the PC page promises), unless the caller
+        // brings the one it remembered.
+        if (changed && on) m_token = valid_token(token) ? token : random_token();
+    }
+    if (!changed) return true;
+    const bool ok = bind(on);
+    write_hub_json();
+    BOOST_LOG_TRIVIAL(info) << "RemoteHub: phone access " << (on ? "on" : "off");
+    return ok;
+}
+
+long HubServer::spawn_slicer(const std::string& file)
+{
+    std::vector<std::string> args = { current_exe() };
+    if (!file.empty()) args.push_back(file);
+    const long pid = spawn_process(args, { { "SNORCA_NEW_INSTANCE", "1" } }, false, nullptr);
+    BOOST_LOG_TRIVIAL(info) << "RemoteHub: new instance pid " << pid << (file.empty() ? std::string() : " for " + file);
+    return pid;
+}
+
+// Loopback-only: the slicer instances and the hub's own page (GET /hub/) talk to these.
 void HubServer::handle_hub(tcp::socket& client, Request& r)
 {
     if (r.path == "/hub/info" && r.method == "GET") {
         respond_json(client, 200, info_json().dump());
+    } else if ((r.path == "/hub/" || r.path == "/hub/index.html") && r.method == "GET") {
+        respond(client, 200, "text/html; charset=utf-8", read_file(resources_dir() + "/web/orca/hub.html"));
+    } else if (r.path == "/hub/qrcode.js" && r.method == "GET") {
+        respond(client, 200, "application/javascript", read_file(resources_dir() + "/web/orca/qrcode.js"));
+    } else if (r.path == "/hub/instances" && r.method == "GET") {
+        respond_json(client, 200, instances_json().dump());
+    } else if (r.path == "/hub/new" && r.method == "POST") {
+        const long pid = spawn_slicer("");
+        json j;
+        j["ok"]  = pid > 0;
+        j["pid"] = pid;
+        respond_json(client, pid > 0 ? 200 : 500, pid > 0 ? j.dump() : json_error("could not start a slicer"));
     } else if (r.path == "/hub/state" && r.method == "POST") {
         std::string body;
         if (!read_small_body(client, r, body, 4 * 1024 * 1024)) { respond_json(client, 413, json_error("state too large")); return; }
@@ -928,22 +1030,7 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
         register_streams();
         respond_json(client, 200, "{\"ok\":true}");
     } else if (r.path == "/hub/phone" && r.method == "POST") {
-        const bool        on    = query_param(r.query, "on") == "1";
-        const std::string token = query_param(r.query, "token"); // a remembered link to keep
-        bool              changed;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            changed = on != m_phone;
-            m_phone = on;
-        }
-        if (changed) {
-            // A new link every time it is turned on (as the PC page promises), unless the
-            // caller brings the one it remembered.
-            if (on) { std::lock_guard<std::mutex> lock(m_mutex); m_token = valid_token(token) ? token : random_token(); }
-            bind(on);
-            write_hub_json();
-            BOOST_LOG_TRIVIAL(info) << "RemoteHub: phone access " << (on ? "on" : "off");
-        }
+        set_phone(query_param(r.query, "on") == "1", query_param(r.query, "token") /* a remembered link to keep */);
         respond_json(client, 200, info_json().dump());
     } else if (r.path == "/hub/quit" && r.method == "POST") {
         respond_json(client, 200, "{\"ok\":true}");
@@ -971,33 +1058,18 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
         return;
     }
     if (rest == "/api/instances" && r.method == "GET") {
-        json j;
-        j["instances"] = json::array();
-        int index      = 0;
-        for (const Instance& inst : instances(true)) {
-            if (!inst.alive) continue;
-            json ji;
-            ji["id"]      = inst.pid;
-            ji["index"]   = ++index;
-            ji["pid"]     = inst.pid;
-            ji["title"]   = inst.title;
-            ji["path"]    = inst.path;
-            ji["slicing"] = inst.slicing;
-            j["instances"].push_back(ji);
-        }
-        respond_json(client, 200, j.dump());
+        respond_json(client, 200, instances_json().dump());
         return;
     }
     if (rest == "/api/instances/open" && r.method == "POST") {
         std::string path, error;
         if (!spool_upload(client, r, path, error)) { respond_json(client, 400, json_error(error)); return; }
-        const long pid = spawn_process({ current_exe(), path }, { { "SNORCA_NEW_INSTANCE", "1" } }, false, nullptr);
+        const long pid = spawn_slicer(path);
         json j;
         j["ok"]      = pid > 0;
         j["file"]    = path;
         j["spawned"] = pid;
         respond_json(client, pid > 0 ? 200 : 500, pid > 0 ? j.dump() : json_error("could not start a new slicer"));
-        BOOST_LOG_TRIVIAL(info) << "RemoteHub: new instance pid " << pid << " for " << path;
         return;
     }
     // ---- per-instance: /i/<pid>/open, /i/<pid>/api/... ----
@@ -1128,7 +1200,7 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner)
     }
 }
 
-int HubServer::run()
+bool HubServer::start()
 {
     ensure_dirs();
     // Settings from the last run, unless the caller decided them.
@@ -1142,14 +1214,19 @@ int HubServer::run()
 
     start_go2rtc();
     BambuCamRelay::get().port();
-    if (!bind(m_phone)) return 1;
+    if (!bind(m_phone)) return false;
     write_hub_json();
     register_streams();
+    return true;
+}
 
+void HubServer::loop(bool idle_exit)
+{
     auto idle_since = std::chrono::steady_clock::now();
     while (!m_quit) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
         flush_logs(); // the file sink buffers; keep hub.log readable while we run
+        if (!idle_exit) continue;
         bool phone;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -1163,6 +1240,10 @@ int HubServer::run()
             break;
         }
     }
+}
+
+void HubServer::shutdown()
+{
     {
         boost::system::error_code ig;
         fs::remove(hub_json_path(), ig);
@@ -1173,8 +1254,116 @@ int HubServer::run()
     if (m_go2rtc_pid > 0) ::kill((pid_t) m_go2rtc_pid, SIGTERM);
 #endif
     // On Windows the kill-on-close job object takes go2rtc down with us.
-    return 0;
+    flush_logs();
 }
+
+// ------------------------------------------------------------ tray icon ----
+
+// The hub's face on the desktop: phone access toggle, the hub page (QR code, link, open
+// slicers), a new slicer window, quit. Double-click opens the page.
+class HubTaskBarIcon : public wxTaskBarIcon
+{
+public:
+    enum { ID_STATUS = wxID_HIGHEST + 100, ID_PHONE, ID_PAGE, ID_NEW, ID_QUIT };
+
+    HubTaskBarIcon(HubServer& server, std::function<void()> on_quit) : m_server(server), m_on_quit(std::move(on_quit))
+    {
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_server.set_phone(!m_server.snapshot().phone, ""); refresh(); }, ID_PHONE);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { open_page(); }, ID_PAGE);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_server.spawn_slicer(""); }, ID_NEW);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_on_quit(); }, ID_QUIT);
+        Bind(wxEVT_TASKBAR_LEFT_DCLICK, [this](wxTaskBarIconEvent&) { open_page(); });
+    }
+
+    void set_icon(const wxIcon& icon)
+    {
+        m_icon = icon;
+        refresh();
+    }
+
+    void refresh()
+    {
+        const HubServer::Snapshot st = m_server.snapshot();
+        wxString tip = "Snapmaker-Ultra Hub";
+        tip += st.phone ? "\nPhone access on" : "\nPhone access off";
+        tip += wxString::Format("\n%d slicer window%s open", st.instances, st.instances == 1 ? "" : "s");
+        if (m_icon.IsOk()) SetIcon(m_icon, tip);
+    }
+
+    wxMenu* CreatePopupMenu() override
+    {
+        const HubServer::Snapshot st = m_server.snapshot();
+        auto* menu = new wxMenu;
+        menu->Append(ID_STATUS, wxString::Format("Snapmaker-Ultra Hub: %d slicer window%s open", st.instances, st.instances == 1 ? "" : "s"))->Enable(false);
+        menu->AppendSeparator();
+        menu->AppendCheckItem(ID_PHONE, "Phone access")->Check(st.phone);
+        menu->Append(ID_PAGE, st.phone ? "Open hub page (QR code, link, slicers)" : "Open hub page");
+        menu->Append(ID_NEW, "Open a new slicer window");
+        menu->AppendSeparator();
+        menu->Append(ID_QUIT, "Quit hub (stops phone access and camera relays)");
+        return menu;
+    }
+
+private:
+    void open_page()
+    {
+        wxLaunchDefaultBrowser(wxString::Format("http://127.0.0.1:%d/hub/", m_server.snapshot().port));
+    }
+
+    HubServer&            m_server;
+    std::function<void()> m_on_quit;
+    wxIcon                m_icon;
+};
+
+// A wxApp with no windows: the tray icon plus the server running on its own thread.
+class HubApp : public wxApp
+{
+public:
+    HubApp(std::string token, bool phone) : m_server(std::move(token), phone) {}
+
+    bool OnInit() override
+    {
+        SetAppName("Snapmaker-Ultra Hub");
+        SetExitOnFrameDelete(false); // no frames: the loop runs until the server thread ends
+        wxInitAllImageHandlers();
+        if (!m_server.start()) {
+            BOOST_LOG_TRIVIAL(error) << "RemoteHub: could not start the listener";
+            return false;
+        }
+        m_icon = new HubTaskBarIcon(m_server, [this]() { m_server.request_quit(); });
+        wxIcon icon(wxString::FromUTF8(Slic3r::var("Snapmaker_Orca.ico")), wxBITMAP_TYPE_ICO);
+        if (!icon.IsOk()) icon = wxIcon(wxString::FromUTF8(Slic3r::var("Snapmaker_Orca_128px.png")), wxBITMAP_TYPE_PNG);
+        m_icon->set_icon(icon);
+        m_thread = std::thread([this]() {
+            m_server.loop(false);
+            CallAfter([this]() {
+                if (m_icon) m_icon->RemoveIcon();
+                ExitMainLoop();
+            });
+        });
+        // Keep the tooltip's instance count fresh.
+        m_timer.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { if (m_icon) m_icon->refresh(); });
+        m_timer.Start(5000);
+        return true;
+    }
+
+    int OnExit() override
+    {
+        m_timer.Stop();
+        m_server.request_quit();
+        if (m_thread.joinable()) m_thread.join();
+        m_server.shutdown();
+        delete m_icon;
+        m_icon = nullptr;
+        return 0;
+    }
+
+private:
+    HubServer       m_server;
+    HubTaskBarIcon* m_icon { nullptr };
+    std::thread     m_thread;
+    wxTimer         m_timer;
+};
 
 int run_server(const std::string& token_hint, bool phone_on)
 {
@@ -1191,8 +1380,22 @@ int run_server(const std::string& token_hint, bool phone_on)
             BOOST_LOG_TRIVIAL(info) << "RemoteHub: another hub (pid " << existing.pid << ") is already running, exiting";
             return 0;
         }
-        HubServer server(valid_token(token_hint) ? token_hint : std::string(), phone_on);
-        return server.run();
+        // The tray app owns the server from here; wxEntry returns when it quits.
+        wxApp::SetInstance(new HubApp(valid_token(token_hint) ? token_hint : std::string(), phone_on));
+#ifdef _WIN32
+        // wxEntry wants argv in the ANSI code page; hand it just the module path (GUI_Init does the same).
+        wchar_t module_path[MAX_PATH + 1] = {};
+        ::GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+        char module_ansi[MAX_PATH * 2 + 1] = {};
+        ::WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, module_path, -1, module_ansi, sizeof(module_ansi), nullptr, nullptr);
+        int   argc   = 1;
+        char* argv[] = { module_ansi, nullptr };
+#else
+        int   argc   = 1;
+        char  name[] = "snapmaker-orca";
+        char* argv[] = { name, nullptr };
+#endif
+        return wxEntry(argc, argv);
     } catch (const std::exception& e) {
         // No console to see it on: leave a note next to the state files.
         boost::nowide::ofstream f((fs::path(hub_dir()) / "hub_error.txt").string(), std::ios::trunc);

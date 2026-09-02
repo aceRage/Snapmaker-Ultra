@@ -55,10 +55,9 @@ StreamPanel::StreamPanel(wxWindow* parent)
         token = wxGetApp().app_config->get("stream_phone_token");
         phone = true;
     }
-    if (phone) {
-        // Off the GUI thread: spawning and waiting for the hub takes a moment.
-        std::thread([token]() { RemoteHub::ensure_running(token, true); }).detach();
-    }
+    // The hub (tray icon, camera relays, phone access) starts with the first slicer window and
+    // stays until quit from its tray menu. Off the GUI thread: spawning it takes a moment.
+    std::thread([token, phone]() { RemoteHub::ensure_running(token, phone); }).detach();
 }
 
 void StreamPanel::OnScriptMessage(wxWebViewEvent& evt)

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snapmaker-Ultra Hub</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #2b2b2b; color: #ddd; font-family: 'Segoe UI', Roboto, -apple-system, sans-serif; font-size: 14px; padding: 20px; }
+h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
+.sub { color: #999; font-size: 12px; margin-bottom: 16px; }
+.row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.card { background: #333; border-radius: 8px; padding: 14px 16px; min-width: 280px; flex: 1 1 280px; }
+.card h2 { font-size: 13px; color: #9a9a9a; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }
+.btn { display: inline-block; padding: 7px 14px; border-radius: 6px; background: #0a9e50; color: #fff; cursor: pointer; user-select: none; font-size: 13px; margin: 4px 6px 4px 0; }
+.btn.dim { background: #555; }
+.btn.warn { background: #8a3a3a; }
+.qr { display: block; margin: 10px 0; background: #fff; border-radius: 6px; }
+.url { font-family: Consolas, monospace; font-size: 12px; color: #9ed; word-break: break-all; user-select: all; margin: 6px 0 10px; }
+.inst { padding: 8px 10px; border-left: 4px solid #0a9e50; background: #2f2f2f; border-radius: 6px; margin-bottom: 6px; }
+.inst .t { font-weight: 600; color: #fff; }
+.inst .m { color: #999; font-size: 12px; word-break: break-all; }
+.note { color: #999; font-size: 12px; margin-top: 8px; }
+.err { color: #e88; }
+</style>
+</head>
+<body>
+<h1>Snapmaker-Ultra Hub</h1>
+<div class="sub">Camera relays, phone access and the list of open slicer windows. This page only works on this PC.</div>
+<div class="row">
+  <div class="card" id="phone"><h2>Phone access</h2><div id="phonebody">Loading…</div></div>
+  <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div></div>
+</div>
+<div class="card" style="margin-top:16px"><h2>Hub</h2>
+  <span class="btn dim" id="new">Open a new slicer window</span>
+  <span class="btn warn" id="quit">Quit hub</span>
+  <div class="note">Quitting stops phone access and the camera relays; the next slicer window starts the hub again.</div>
+  <div class="note" id="status"></div>
+</div>
+<script src="/hub/qrcode.js"></script>
+<script>
+(function() {
+    var info = null, lastUrl = null;
+    function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+    function post(path) { return fetch(path, { method: 'POST' }).then(function(r) { return r.json(); }); }
+    function drawQr(canvas, text) {
+        if (typeof qrcode !== 'function') return false;
+        var qr = qrcode(0, 'M'); qr.addData(text); qr.make();
+        var n = qr.getModuleCount(), scale = 5, margin = 4 * scale, size = n * scale + 2 * margin;
+        canvas.width = canvas.height = size;
+        var ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, size, size); ctx.fillStyle = '#000';
+        for (var r = 0; r < n; r++) for (var c = 0; c < n; c++) if (qr.isDark(r, c)) ctx.fillRect(margin + c * scale, margin + r * scale, scale, scale);
+        return true;
+    }
+    function renderPhone() {
+        var body = document.getElementById('phonebody');
+        if (!info) return;
+        if (info.url === lastUrl && body.dataset.done) return; // keep the canvas
+        lastUrl = info.url; body.dataset.done = '1';
+        body.innerHTML = '';
+        if (info.phone && info.url) {
+            body.appendChild(el('div', '', 'On. Scan the code (or type the address) on a phone connected to the same Wi-Fi.'));
+            var canvas = el('canvas', 'qr'); body.appendChild(canvas); drawQr(canvas, info.url);
+            body.appendChild(el('div', 'url', info.url));
+            if (info.ips && info.ips.length > 1) body.appendChild(el('div', 'note', 'Other addresses of this PC: ' + info.ips.slice(1).join(', ')));
+            var off = el('span', 'btn dim', 'Turn off'); off.onclick = function() { post('/hub/phone?on=0').then(refresh); }; body.appendChild(off);
+        } else if (info.phone) {
+            body.appendChild(el('div', 'err', 'On, but no network address was found on this PC.'));
+            var off2 = el('span', 'btn dim', 'Turn off'); off2.onclick = function() { post('/hub/phone?on=0').then(refresh); }; body.appendChild(off2);
+        } else {
+            body.appendChild(el('div', '', 'Off. Turn it on to get a link for phones on the same Wi-Fi; anyone with the link can watch the cameras and drive the slicers while it is on.'));
+            var on = el('span', 'btn', 'Turn on'); on.onclick = function() { post('/hub/phone?on=1').then(refresh); }; body.appendChild(on);
+        }
+    }
+    function renderSlicers(list) {
+        var body = document.getElementById('slicerbody');
+        body.innerHTML = '';
+        if (!list.length) { body.appendChild(el('div', 'note', 'No slicer window is open.')); return; }
+        list.forEach(function(i) {
+            var d = el('div', 'inst');
+            d.appendChild(el('div', 't', i.index + ' · ' + (i.title || 'Untitled') + (i.slicing ? ' (slicing)' : '')));
+            d.appendChild(el('div', 'm', i.path || 'not saved yet'));
+            body.appendChild(d);
+        });
+    }
+    function refresh() {
+        fetch('/hub/info').then(function(r) { return r.json(); }).then(function(j) { info = j; renderPhone(); document.getElementById('status').textContent = 'Hub pid ' + j.pid + ', port ' + j.port + ', version ' + j.version; }).catch(function() {});
+        fetch('/hub/instances').then(function(r) { return r.json(); }).then(function(j) { renderSlicers(j.instances || []); }).catch(function() {});
+    }
+    document.getElementById('new').onclick = function() { post('/hub/new').then(function() { setTimeout(refresh, 3000); }); };
+    document.getElementById('quit').onclick = function() {
+        if (!confirm('Quit the hub? Phone access and the camera relays stop until a slicer window starts it again.')) return;
+        post('/hub/quit').then(function() { document.body.innerHTML = '<h1>Hub stopped</h1><div class="sub">You can close this page.</div>'; });
+    };
+    refresh();
+    setInterval(refresh, 3000);
+})();
+</script>
+</body>
+</html>

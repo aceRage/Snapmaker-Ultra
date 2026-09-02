@@ -110,6 +110,15 @@ without any slicer at all.
   remembered toggle (`stream_phone_access` / token) and `SNORCA_PHONE_ACCESS` now bring the
   hub up with phone access on. The hub exits by itself once phone access is off and no
   instance has been alive for a minute; a version mismatch makes the slicer restart it.
+- **Tray icon (2026-09-02)**: the hub is a wx tray app (`HubApp`, a windowless `wxApp` created
+  by `run_server` with `wxApp::SetInstance` + `wxEntry`, never `GUI_App`): the server runs on a
+  thread, the icon's menu offers *Phone access* (toggle), *Open hub page*, *Open a new slicer
+  window* and *Quit hub*; double-click opens the page. `GET /hub/` (loopback only,
+  `resources/web/orca/hub.html`) shows phone access with the QR code and link, the open slicer
+  windows, and buttons for a new window and quitting. Every slicer start now calls
+  `RemoteHub::ensure_running` (the first window spawns the hub; later ones find it), and the
+  hub no longer exits on idle: it stays until *Quit hub*. An old-version hub is restarted by the
+  next slicer start.
 - **Phone page**: the Prepare tab starts with a *Slicer* dropdown (index · project title) and
   a file picker with **Load/Import** (into that slicer) and **New** (spawn); with no instance
   open only the picker and **Open** remain. Uploads show progress; "New" polls the instance
