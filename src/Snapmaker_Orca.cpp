@@ -82,6 +82,11 @@ using namespace nlohmann;
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/BitmapCache.hpp"
 #include "slic3r/GUI/OpenGLManager.hpp"
+#include "libslic3r/PresetBundle.hpp"
+#include <array>
+#include <memory>
+#include <mutex>
+#include <set>
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/Camera.hpp"
 #include "slic3r/GUI/Plater.hpp"
@@ -156,7 +161,32 @@ typedef struct  _sliced_plate_info{
     size_t sliced_time_with_cache {0};
     size_t triangle_count{0};
     std::string warning_message;
+    // Ultra: estimates and all warnings, reported in result.json / --progress-json
+    double time_s{0};
+    double filament_mm3{0};
+    double filament_g{0};
+    std::string gcode_path;
+    std::vector<std::string> warnings;
 }sliced_plate_info_t;
+
+// Ultra: --progress-json — JSON lines on stdout (all platforms), one object per line.
+static bool       g_progress_json        = false;
+static int        g_progress_plate_index = 0;
+static int        g_progress_plate_count = 0;
+static std::mutex g_progress_mutex;
+static void emit_progress(int percent, const std::string& message, bool warning = false)
+{
+    if (!g_progress_json)
+        return;
+    std::lock_guard<std::mutex> lock(g_progress_mutex);
+    nlohmann::json j;
+    j["event"]         = "progress";
+    j["plate_index"]   = g_progress_plate_index;
+    j["plate_count"]   = g_progress_plate_count;
+    j["plate_percent"] = percent;
+    if (warning) j["warning"] = message; else j["message"] = message;
+    boost::nowide::cout << j.dump() << std::endl;
+}
 
 typedef struct _sliced_info {
     int                 plate_count {0};
@@ -371,6 +401,7 @@ void default_status_callback(const PrintBase::SlicingStatus& slicing_status)
         g_slicing_warnings.push_back(slicing_status);
     }
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": percent=%1%, warning_step=%2%, message=%3%, message_type=%4%")%slicing_status.percent %slicing_status.warning_step %slicing_status.text %(int)(slicing_status.message_type);
+    emit_progress(slicing_status.percent, slicing_status.text, slicing_status.warning_step != -1);
 
     return;
 }
@@ -404,7 +435,8 @@ static PrinterTechnology get_printer_technology(const DynamicConfig &config)
 
 void record_exit_reson(std::string outputdir, int code, int plate_id, std::string error_message, sliced_info_t& sliced_info, std::map<std::string, std::string> key_values = std::map<std::string, std::string>())
 {
-#if defined(__linux__) || defined(__LINUX__)
+    // Ultra: written on every platform (was Linux-only), with per-plate estimates and warnings,
+    // and echoed to stdout as a JSON line when --progress-json is on.
     std::string result_file;
 
     if (!outputdir.empty())
@@ -432,6 +464,11 @@ void record_exit_reson(std::string outputdir, int code, int plate_id, std::strin
             plate_json["sliced_time_with_cache"] = sliced_info.sliced_plates[index].sliced_time_with_cache;
             plate_json["triangle_count"] = sliced_info.sliced_plates[index].triangle_count;
             plate_json["warning_message"] = sliced_info.sliced_plates[index].warning_message;
+            plate_json["time_s"]       = sliced_info.sliced_plates[index].time_s;
+            plate_json["filament_mm3"] = sliced_info.sliced_plates[index].filament_mm3;
+            plate_json["filament_g"]   = sliced_info.sliced_plates[index].filament_g;
+            plate_json["gcode"]        = sliced_info.sliced_plates[index].gcode_path;
+            plate_json["warnings"]     = sliced_info.sliced_plates[index].warnings;
             j["sliced_plates"].push_back(plate_json);
         }
         for (auto& iter: key_values)
@@ -443,10 +480,166 @@ void record_exit_reson(std::string outputdir, int code, int plate_id, std::strin
         c.close();
 
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" <<__LINE__ << boost::format(", saved config to %1%\n")%result_file;
+
+        if (g_progress_json) {
+            std::lock_guard<std::mutex> lock(g_progress_mutex);
+            j["event"] = "result";
+            boost::nowide::cout << j.dump() << std::endl;
+        }
     }
     catch (...) {}
-#endif
 }
+
+static int load_key_values_from_json(const std::string &file, std::map<std::string, std::string>& key_values);
+
+// Ultra: presets by name for --printer-preset / --process-preset / --filament-presets.
+// System presets come from resources/profiles/<vendor>.json bundles (inherits flattened by
+// PresetBundle), user presets from <datadir>/user/*/{machine,process,filament}/*.json flattened
+// onto their system parent. The result is written as a flat "from: system" JSON file that the
+// existing --load-settings / --load-filaments code path consumes unchanged.
+namespace {
+struct NamedPresets
+{
+    std::map<std::string, std::array<std::set<std::string>, 3>> vendor_index; // vendor -> names per type
+    std::map<std::string, std::unique_ptr<PresetBundle>>        bundles;
+    std::unique_ptr<PresetBundle>                               library; // OrcaFilamentLibrary, base for cross-vendor inherits
+    bool                                                        indexed { false };
+
+    static int type_slot(Preset::Type t) { return t == Preset::TYPE_PRINTER ? 0 : t == Preset::TYPE_PRINT ? 1 : 2; }
+    static const char* type_dir(Preset::Type t) { return t == Preset::TYPE_PRINTER ? "machine" : t == Preset::TYPE_PRINT ? "process" : "filament"; }
+    static const char* type_list(Preset::Type t) { return t == Preset::TYPE_PRINTER ? "machine_list" : t == Preset::TYPE_PRINT ? "process_list" : "filament_list"; }
+
+    void build_index()
+    {
+        if (indexed) return;
+        indexed = true;
+        const boost::filesystem::path dir = boost::filesystem::path(resources_dir()) / "profiles";
+        if (!boost::filesystem::exists(dir)) return;
+        for (auto& entry : boost::filesystem::directory_iterator(dir)) {
+            if (!boost::filesystem::is_regular_file(entry) || entry.path().extension() != ".json") continue;
+            try {
+                boost::nowide::ifstream ifs(entry.path().string());
+                nlohmann::json j = nlohmann::json::parse(ifs);
+                const std::string vendor = entry.path().stem().string();
+                auto& slots = vendor_index[vendor];
+                for (Preset::Type t : { Preset::TYPE_PRINTER, Preset::TYPE_PRINT, Preset::TYPE_FILAMENT })
+                    if (j.contains(type_list(t)) && j[type_list(t)].is_array())
+                        for (const auto& item : j[type_list(t)])
+                            if (item.contains("name")) slots[type_slot(t)].insert(item["name"].get<std::string>());
+            } catch (...) {}
+        }
+    }
+
+    PresetBundle* vendor_bundle(const std::string& vendor)
+    {
+        auto it = bundles.find(vendor);
+        if (it != bundles.end()) return it->second.get();
+        const std::string dir = resources_dir() + "/profiles";
+        const std::string lib_name = PresetBundle::ORCA_FILAMENT_LIBRARY;
+        if (!library && vendor != lib_name && vendor_index.count(lib_name)) {
+            library = std::make_unique<PresetBundle>();
+            try { library->load_vendor_configs_from_json(dir, lib_name, PresetBundle::LoadSystem, ForwardCompatibilitySubstitutionRule::EnableSilent); }
+            catch (const std::exception& e) { BOOST_LOG_TRIVIAL(warning) << "presets by name: filament library failed: " << e.what(); library.reset(); }
+        }
+        auto bundle = std::make_unique<PresetBundle>();
+        try {
+            bundle->load_vendor_configs_from_json(dir, vendor, PresetBundle::LoadSystem, ForwardCompatibilitySubstitutionRule::EnableSilent, library.get());
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << "presets by name: loading vendor " << vendor << " failed: " << e.what();
+            return nullptr;
+        }
+        PresetBundle* raw = bundle.get();
+        bundles[vendor]   = std::move(bundle);
+        return raw;
+    }
+
+    static const PresetCollection& collection(const PresetBundle& b, Preset::Type t)
+    {
+        return t == Preset::TYPE_PRINTER ? b.printers : t == Preset::TYPE_PRINT ? b.prints : b.filaments;
+    }
+
+    // System preset: full (inherits-flattened) config from the vendor bundle that lists the name.
+    const Preset* find_system(const std::string& name, Preset::Type t)
+    {
+        build_index();
+        for (const auto& kv : vendor_index)
+            if (kv.second[type_slot(t)].count(name))
+                if (PresetBundle* b = vendor_bundle(kv.first))
+                    if (const Preset* p = collection(*b, t).find_preset(name))
+                        return p;
+        if (library)
+            if (const Preset* p = collection(*library, t).find_preset(name))
+                return p;
+        return nullptr;
+    }
+
+    // User preset: <datadir>/user/*/<type>/*.json whose "name" matches, flattened onto its parent.
+    bool find_user(const std::string& name, Preset::Type t, DynamicPrintConfig& out, std::string& filament_id)
+    {
+        const boost::filesystem::path root = boost::filesystem::path(data_dir()) / "user";
+        if (!boost::filesystem::exists(root)) return false;
+        for (auto& user : boost::filesystem::directory_iterator(root)) {
+            const boost::filesystem::path dir = user.path() / type_dir(t);
+            if (!boost::filesystem::is_directory(dir)) continue;
+            for (auto& entry : boost::filesystem::directory_iterator(dir)) {
+                if (entry.path().extension() != ".json") continue;
+                std::map<std::string, std::string> key_values;
+                if (load_key_values_from_json(entry.path().string(), key_values) != 0 || key_values[BBL_JSON_KEY_NAME] != name)
+                    continue;
+                DynamicPrintConfig cfg;
+                std::string        reason;
+                cfg.load_from_json(entry.path().string(), ForwardCompatibilitySubstitutionRule::EnableSilent, key_values, reason);
+                if (!reason.empty()) return false;
+                const std::string inherits = key_values.count(BBL_JSON_KEY_INHERITS) ? key_values[BBL_JSON_KEY_INHERITS] : "";
+                if (!inherits.empty()) {
+                    const Preset* parent = find_system(inherits, t);
+                    if (!parent) { BOOST_LOG_TRIVIAL(error) << "presets by name: parent '" << inherits << "' of user preset '" << name << "' not found"; return false; }
+                    out = parent->config;
+                    out.apply(cfg, true);
+                    if (filament_id.empty()) filament_id = parent->filament_id;
+                } else {
+                    out = cfg;
+                }
+                if (key_values.count(BBL_JSON_KEY_FILAMENT_ID)) filament_id = key_values[BBL_JSON_KEY_FILAMENT_ID];
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Resolve a name to a flat JSON file in out_dir; returns "" on failure.
+    std::string resolve_to_file(const std::string& name, Preset::Type t, const std::string& out_dir, int ordinal)
+    {
+        DynamicPrintConfig cfg;
+        std::string        filament_id;
+        if (const Preset* p = find_system(name, t)) {
+            cfg         = p->config;
+            filament_id = p->filament_id;
+        } else if (!find_user(name, t, cfg, filament_id)) {
+            return "";
+        }
+        cfg.erase(BBL_JSON_KEY_INHERITS);
+        nlohmann::json j;
+        j[BBL_JSON_KEY_TYPE]     = type_dir(t);
+        j[BBL_JSON_KEY_NAME]     = name;
+        j[BBL_JSON_KEY_FROM]     = "system";
+        j[BBL_JSON_KEY_VERSION]  = SLIC3R_VERSION;
+        j[BBL_JSON_KEY_INHERITS] = "";
+        if (t == Preset::TYPE_FILAMENT && !filament_id.empty()) j[BBL_JSON_KEY_FILAMENT_ID] = filament_id;
+        for (const std::string& key : cfg.keys()) {
+            const ConfigOption* opt = cfg.option(key);
+            if (!opt) continue;
+            if (opt->is_vector()) j[key] = static_cast<const ConfigOptionVectorBase*>(opt)->vserialize();
+            else                  j[key] = opt->serialize();
+        }
+        boost::filesystem::create_directories(out_dir);
+        const std::string file = out_dir + "/" + type_dir(t) + "_" + std::to_string(ordinal) + ".json";
+        boost::nowide::ofstream ofs(file, std::ios::out | std::ios::trunc);
+        ofs << j.dump(2);
+        return file;
+    }
+};
+} // namespace
 
 static int decode_png_to_thumbnail(std::string png_file, ThumbnailData& thumbnail_data)
 {
@@ -1120,6 +1313,46 @@ int CLI::run(int argc, char **argv)
     sliced_info_t sliced_info;
     std::map<std::string, std::string> record_key_values;
 
+    // Ultra: agent-friendly options.
+    if (auto* opt = m_config.option<ConfigOptionBool>("progress_json"))
+        g_progress_json = opt->value;
+    bool no_thumbnails = false;
+    if (auto* opt = m_config.option<ConfigOptionBool>("no_thumbnails"))
+        no_thumbnails = opt->value;
+    // Presets by name are turned into flat JSON files that join the --load-settings /
+    // --load-filaments lists, so everything downstream stays as it was.
+    std::vector<std::string> load_configs_all(load_configs.begin(), load_configs.end());
+    std::vector<std::string> load_filaments_all(load_filaments.begin(), load_filaments.end());
+    {
+        const std::string printer_name = m_config.opt_string("printer_preset", true);
+        const std::string process_name = m_config.opt_string("process_preset", true);
+        std::vector<std::string> filament_names;
+        if (auto* opt = m_config.option<ConfigOptionStrings>("filament_presets"))
+            filament_names = opt->values;
+        if (!printer_name.empty() || !process_name.empty() || !filament_names.empty()) {
+            NamedPresets      presets;
+            const std::string preset_dir = (boost::filesystem::path(temporary_dir()) / ("ultra_cli_presets_" + std::to_string(get_current_pid()))).string();
+            auto resolve = [&](const std::string& name, Preset::Type t, int ordinal, std::vector<std::string>& into) -> bool {
+                if (name.empty()) return true;
+                const std::string file = presets.resolve_to_file(name, t, preset_dir, ordinal);
+                if (file.empty()) {
+                    boost::nowide::cerr << "preset not found: " << name << std::endl;
+                    return false;
+                }
+                BOOST_LOG_TRIVIAL(info) << "preset by name: " << name << " -> " << file;
+                into.push_back(file);
+                return true;
+            };
+            bool ok = resolve(printer_name, Preset::TYPE_PRINTER, 0, load_configs_all) && resolve(process_name, Preset::TYPE_PRINT, 0, load_configs_all);
+            for (size_t i = 0; ok && i < filament_names.size(); ++i)
+                ok = resolve(filament_names[i], Preset::TYPE_FILAMENT, (int) i, load_filaments_all);
+            if (!ok) {
+                record_exit_reson(outfile_dir, CLI_CONFIG_FILE_ERROR, 0, "A named preset was not found (see stderr).", sliced_info);
+                flush_and_exit(CLI_CONFIG_FILE_ERROR);
+            }
+        }
+    }
+
     // Only honor downward_check when explicitly requested on CLI.
     // This prevents accidental activation during normal GUI startup.
     bool downward_check_requested = false;
@@ -1538,8 +1771,8 @@ int CLI::run(int argc, char **argv)
                     int object_extruder_id = 0, clone_count = 1;
                     if (loaded_filament_ids.size() > input_index) {
                         if (loaded_filament_ids[input_index] > 0) {
-                            if (loaded_filament_ids[input_index] > load_filaments.size()) {
-                                BOOST_LOG_TRIVIAL(error) << boost::format("invalid filament_id %1% at index %2%, max %3%")%loaded_filament_ids[input_index] % (input_index + 1) %load_filaments.size();
+                            if (loaded_filament_ids[input_index] > load_filaments_all.size()) {
+                                BOOST_LOG_TRIVIAL(error) << boost::format("invalid filament_id %1% at index %2%, max %3%")%loaded_filament_ids[input_index] % (input_index + 1) %load_filaments_all.size();
                                 record_exit_reson(outfile_dir, CLI_INVALID_PARAMS, 0, cli_errors[CLI_INVALID_PARAMS], sliced_info);
                                 flush_and_exit(CLI_INVALID_PARAMS);
                             }
@@ -1758,10 +1991,10 @@ int CLI::run(int argc, char **argv)
         }
         return 0;
     };
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< ":before load settings, file count="<< load_configs.size() << std::endl;
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< ":before load settings, file count="<< load_configs_all.size() << std::endl;
     //std::vector<std::string> filament_compatible_printers;
     // load config files supplied via --load
-    for (auto const &file : load_configs) {
+    for (auto const &file : load_configs_all) {
         DynamicPrintConfig  config;
         std::string config_type, config_name, filament_id, config_from;
         int ret = load_config_file(file, config, config_type, config_name, filament_id, config_from);
@@ -1847,7 +2080,7 @@ int CLI::run(int argc, char **argv)
     }
 
     //load filaments files
-    int load_filament_count = load_filaments.size();
+    int load_filament_count = load_filaments_all.size();
     std::vector<int> load_filaments_index;
     std::set<std::string> load_filaments_set;
     bool disable_wipe_tower_after_mapping = false;
@@ -1860,7 +2093,7 @@ int CLI::run(int argc, char **argv)
     if (use_first_fila_as_default) {
         //construct default filament
         for (int index = 0; index < load_filament_count; index++) {
-            const std::string& file = load_filaments[index];
+            const std::string& file = load_filaments_all[index];
             if (default_filament_file.empty() && !file.empty()) {
                 DynamicPrintConfig  config;
                 std::string config_type, config_name, filament_id, config_from;
@@ -1897,7 +2130,7 @@ int CLI::run(int argc, char **argv)
         }
     }
     for (int index = 0; index < load_filament_count; index++) {
-        const std::string& file = load_filaments[index];
+        const std::string& file = load_filaments_all[index];
         current_index++;
         if (!file.empty()) {
             DynamicPrintConfig  config;
@@ -5086,6 +5319,9 @@ int CLI::run(int argc, char **argv)
                                 BOOST_LOG_TRIVIAL(info) << "set print's callback to default_status_callback.";
                                 print->set_status_callback(default_status_callback);
 #endif
+                                g_progress_plate_index = index + 1;
+                                g_progress_plate_count = (plate_to_slice == 0) ? partplate_list.get_plate_count() : 1;
+                                emit_progress(4, warning.string.empty() ? std::string("Slicing begins") : warning.string, !warning.string.empty());
                                 //check whether it is bbl printer
                                 std::string& printer_model_string = new_print_config.opt_string("printer_model", true);
                                 bool is_bbl_vendor_preset = false;
@@ -5148,6 +5384,7 @@ int CLI::run(int argc, char **argv)
                                             if ((status.warning_step != -1) && (status.message_type != PrintStateBase::SlicingDefaultNotification))
                                             {
                                                 sliced_plate_info.warning_message = status.text;
+                                                sliced_plate_info.warnings.push_back(status.text);
 
                                                 if (status.warning_level == PrintStateBase::WarningLevel::NON_CRITICAL) {
                                                     BOOST_LOG_TRIVIAL(warning) << "plate "<< index+1<< ": found NON_CRITICAL slicing warnings: "<<status.text <<std::endl;
@@ -5185,6 +5422,22 @@ int CLI::run(int argc, char **argv)
                                     outfile = print_fff->export_gcode(outfile, gcode_result, nullptr);
                                     time_using_cache = time_using_cache + ((long long)Slic3r::Utils::get_current_time_utc() - temp_time);
                                     BOOST_LOG_TRIVIAL(info) << "export_gcode finished: time_using_cache update to " << time_using_cache << " secs.";
+                                    // Ultra: estimates for result.json
+                                    sliced_plate_info.gcode_path = outfile;
+                                    if (gcode_result) {
+                                        const auto& st = gcode_result->print_statistics;
+                                        if (!st.modes.empty())
+                                            sliced_plate_info.time_s = st.modes.front().time;
+                                        for (const auto& kv : st.total_volumes_per_extruder)
+                                            sliced_plate_info.filament_mm3 += kv.second;
+                                    }
+                                    {
+                                        const PrintStatistics& ps = print_fff->print_statistics();
+                                        sliced_plate_info.filament_g = ps.total_weight;
+                                        if (sliced_plate_info.filament_mm3 <= 0)
+                                            sliced_plate_info.filament_mm3 = ps.total_extruded_volume;
+                                    }
+                                    emit_progress(100, "Slicing finished");
 
                                     //outfile_final = (dynamic_cast<Print*>(print))->print_statistics().finalize_output_path(outfile);
                                     //m_fff_print->export_gcode(m_temp_output_path, m_gcode_result, [this](const ThumbnailsParams& params) { return this->render_thumbnails(params); });
@@ -5447,7 +5700,9 @@ int CLI::run(int argc, char **argv)
             }
         }
 
-        if (need_regenerate_thumbnail || need_regenerate_no_light_thumbnail || need_regenerate_top_thumbnail) {
+        if (no_thumbnails) {
+            BOOST_LOG_TRIVIAL(info) << "--no-thumbnails: skipping thumbnail rendering";
+        } else if (need_regenerate_thumbnail || need_regenerate_no_light_thumbnail || need_regenerate_top_thumbnail) {
             std::vector<std::string> colors;
             if (filament_color) {
                 colors= filament_color->vserialize();

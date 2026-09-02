@@ -22,6 +22,22 @@ All paths relative to `C:\Dev\SnapmakerOrca`; line numbers are from the tree on 
 - A is cheap and unblocks agents now; B is the load-bearing refactor that makes C small; D rides on A
   from day one and on C later.
 
+## Status
+
+**Phase A landed 2026-09-01** (`scripts/orca_cli.py` is the agent entry point):
+`result.json` is written on every platform and carries per-plate `time_s`, `filament_mm3`,
+`filament_g`, `gcode` and `warnings`; `--progress-json` streams `{"event":"progress"|"result"}`
+lines on stdout; `--no-thumbnails` skips the GL path; `--printer-preset`, `--process-preset` and
+`--filament-presets` resolve system presets from `resources/profiles/<vendor>.json` bundles or user
+presets from `<datadir>/user` and feed the unchanged `--load-settings` path. Null-`wxGetApp()`
+crashes fixed on the way: `GLModel::render` (shader via `OpenGLManager::get_active_shader()`),
+`PartPlateList::select_plate`/`add_instance`, `PartPlate::check_outside` (build volume),
+`expand_plate_extruders` (mixed filaments); `normalize_fdm` on a process-only config;
+`small_perimeter_speed` min 1 → 0 so GUI-saved projects validate. Drive the exe from a real process
+API (PowerShell's `&` does not wait for the GUI-subsystem launcher) and pass `--allow-newer-file`
+for this fork's 2.x 3MFs (the wrapper does both). Verified: STL by preset names + 3MF export, and a
+4-plate H2D project sliced end to end with estimates.
+
 ## Current CLI capabilities and gaps
 
 Entry `CLI::run` (1042); no action => launches the GUI (1141-1186). `CLI::setup` parses options and

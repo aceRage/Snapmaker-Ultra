@@ -1914,7 +1914,7 @@ void PrintConfigDef::init_fff_params()
                    "on the outer wall speed setting above. Set to zero for auto.");
     def->sidetext = L("mm/s or %");
     def->ratio_over = "outer_wall_speed";
-    def->min = 1;
+    def->min = 0; // 0 = auto (as the tooltip says); min 1 made the CLI reject projects saved by the GUI
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloatOrPercent(50, true));
 
@@ -7961,7 +7961,9 @@ void DynamicPrintConfig::normalize_fdm(int used_filaments)
         }
     }
 
-    if (this->has("wipe_tower_filament")) {
+    // A process-only config (e.g. a flattened process preset loaded on its own) carries
+    // wipe_tower_filament but no nozzle_diameter; only validate when both are present.
+    if (this->has("wipe_tower_filament") && this->has("nozzle_diameter")) {
         // If invalid, replace with 0.
         int extruder      = this->opt<ConfigOptionInt>("wipe_tower_filament")->value;
         int num_extruders = this->opt<ConfigOptionFloats>("nozzle_diameter")->size();
@@ -8993,6 +8995,37 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->tooltip = L("Allow 3mf with newer version to be sliced.");
     def->cli_params = "option";
     def->set_default_value(new  ConfigOptionBool(false));
+
+    // Ultra: headless / agent-friendly CLI additions
+    def = this->add("progress_json", coBool);
+    def->label = L("JSON progress on stdout");
+    def->tooltip = L("Write slicing progress and the final result as JSON lines on stdout (one object per line).");
+    def->cli_params = "option";
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("no_thumbnails", coBool);
+    def->label = L("Skip thumbnails");
+    def->tooltip = L("Do not render plate thumbnails when exporting 3mf (no OpenGL context needed).");
+    def->cli_params = "option";
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("printer_preset", coString);
+    def->label = L("Printer preset name");
+    def->tooltip = L("Use the named printer preset (system preset from resources/profiles, or a user preset from the data directory) instead of a --load-settings file.");
+    def->cli_params = "name";
+    def->set_default_value(new ConfigOptionString());
+
+    def = this->add("process_preset", coString);
+    def->label = L("Process preset name");
+    def->tooltip = L("Use the named process preset instead of a --load-settings file.");
+    def->cli_params = "name";
+    def->set_default_value(new ConfigOptionString());
+
+    def = this->add("filament_presets", coStrings);
+    def->label = L("Filament preset names");
+    def->tooltip = L("Use the named filament presets, in extruder order, instead of --load-filaments files.");
+    def->cli_params = "\"name1;name2;...\"";
+    def->set_default_value(new ConfigOptionStrings());
 }
 
 const CLIActionsConfigDef    cli_actions_config_def;

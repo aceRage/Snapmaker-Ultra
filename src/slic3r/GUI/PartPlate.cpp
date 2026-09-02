@@ -1348,6 +1348,10 @@ int PartPlate::picking_id_component(int idx) const
 
 static void expand_plate_extruders(std::vector<int>& ids)
 {
+	// Ultra: virtual (mixed) filaments are a GUI-side notion; in the CLI there is no wxApp and
+	// the ids are physical already.
+	if (wxApp::GetInstance() == nullptr)
+		return;
 	const size_t num_physical = static_cast<size_t>(std::max(wxGetApp().filaments_cnt(), 0));
 	if (num_physical > 0) {
 		wxGetApp().preset_bundle->mixed_filaments.expand_virtual_extruder_ids(ids, num_physical);
@@ -2107,7 +2111,9 @@ bool PartPlate::check_outside(int obj_id, int instance_id, BoundingBoxf3* boundi
 		// Orca: For sinking object, we use a more expensive algorithm so part below build plate won't be considered
 		if (plate_box.intersects(instance_box)) {
 			// TODO: FIXME: this does not take exclusion area into account
-			const BuildVolume build_volume(get_shape(), m_plater->build_volume().printable_height());
+			// Ultra: no Plater in the CLI — the plate box already carries the printable height.
+			const double printable_height = m_plater ? m_plater->build_volume().printable_height() : get_plate_box().max.z();
+			const BuildVolume build_volume(get_shape(), printable_height);
 			const auto state = instance->calc_print_volume_state(build_volume);
 			outside = state == ModelInstancePVS_Partly_Outside;
 		}
@@ -4067,8 +4073,9 @@ int PartPlateList::select_plate(int index)
 
 	m_current_plate = index;
 	m_plate_list[m_current_plate]->set_selected();
-        if (old_plate_index != m_current_plate && wxGetApp().plater())
-            wxGetApp().plater()->notify_filament_usage_changed();
+        // Ultra: m_plater is null in the CLI, where wxGetApp() itself is a null reference.
+        if (old_plate_index != m_current_plate && m_plater)
+            m_plater->notify_filament_usage_changed();
 
 	//BBS
 	if(m_model)
@@ -4544,7 +4551,8 @@ int PartPlateList::add_to_plate(int obj_id, int instance_id, int plate_id)
 	}
 	ret = plate->add_instance(obj_id, instance_id, true);
 
-    wxGetApp().plater()->notify_filament_usage_changed();
+    if (m_plater)
+        m_plater->notify_filament_usage_changed();
 
 	return ret;
 }

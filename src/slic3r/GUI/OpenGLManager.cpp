@@ -238,8 +238,11 @@ OpenGLManager::~OpenGLManager()
 #endif //__APPLE__
 }
 
+OpenGLManager* OpenGLManager::s_active = nullptr;
+
 bool OpenGLManager::init_gl(bool popup_error)
 {
+    s_active = this;
     if (!m_gl_initialized) {
         GLenum result = glewInit();
         if (result != GLEW_OK) {

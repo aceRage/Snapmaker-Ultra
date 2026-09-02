@@ -87,6 +87,7 @@ private:
 
     static EMultisampleState s_multisample;
     static EFramebufferType s_framebuffers_type;
+    static OpenGLManager* s_active;
 
 public:
     OpenGLManager() = default;
@@ -97,6 +98,9 @@ public:
 
     GLShaderProgram* get_shader(const std::string& shader_name) { return m_shaders_manager.get_shader(shader_name); }
     GLShaderProgram* get_current_shader() { return m_shaders_manager.get_current_shader(); }
+    // Ultra: the manager whose init_gl() ran last (the GUI's, or the CLI's thumbnail renderer),
+    // so render code can find the bound shader without a wxApp.
+    static GLShaderProgram* get_active_shader() { return s_active ? s_active->get_current_shader() : nullptr; }
 
     static bool are_compressed_textures_supported() { return s_compressed_textures_supported; }
     static bool can_multisample() { return s_multisample == EMultisampleState::Enabled; }

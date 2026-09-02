@@ -4,6 +4,7 @@
 #include "3DScene.hpp"
 #include "GUI_App.hpp"
 #include "GLShader.hpp"
+#include "OpenGLManager.hpp"
 
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/Model.hpp"
@@ -599,7 +600,8 @@ void GLModel::render(const std::pair<size_t, size_t>& range)
     if (range.second == range.first)
         return;
 
-    GLShaderProgram* shader = wxGetApp().get_current_shader();
+    // Ultra: through the active OpenGLManager, not wxGetApp() — the CLI renders thumbnails with no wxApp.
+    GLShaderProgram* shader = OpenGLManager::get_active_shader();
     if (shader == nullptr)
         return;
 
@@ -668,7 +670,7 @@ void GLModel::render_instanced(unsigned int instances_vbo, unsigned int instance
     if (instances_vbo == 0 || instances_count == 0)
         return;
 
-    GLShaderProgram* shader = wxGetApp().get_current_shader();
+    GLShaderProgram* shader = OpenGLManager::get_active_shader();
     if (shader == nullptr || !boost::algorithm::iends_with(shader->get_name(), "_instanced"))
         return;
 
