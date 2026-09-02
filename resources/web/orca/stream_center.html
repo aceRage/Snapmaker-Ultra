@@ -21,6 +21,8 @@ html, body { width: 100%; height: 100%; background: #2b2b2b; font-family: 'Segoe
 #spacer { flex: 1; }
 select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
 #layoutbox { display: inline-flex; align-items: center; gap: 4px; color: #aaa; font-size: 12px; }
+#videobox { display: none; align-items: center; gap: 4px; margin-right: 8px; }
+#videowarn { display: none; color: #e0a33c; font-size: 15px; cursor: pointer; padding: 0 2px; }
 #grid { position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; display: grid; gap: 4px; padding: 4px; padding-bottom: calc(4px + env(safe-area-inset-bottom)); padding-left: calc(4px + env(safe-area-inset-left)); padding-right: calc(4px + env(safe-area-inset-right)); background: #2b2b2b; overflow-y: auto; overflow-x: hidden; align-content: start; -webkit-overflow-scrolling: touch; }
 #grid::-webkit-scrollbar { width: 10px; }
 #grid::-webkit-scrollbar-track { background: #222; }
@@ -199,6 +201,14 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
   <span id="spacer"></span>
   <span id="via" title="Connected through your Tailscale network"></span>
   <span id="note"></span>
+  <span id="videobox">
+    <span id="videowarn" title="">&#9888;</span>
+    <select id="videomode" title="How camera video reaches this phone. Auto tries a direct WebRTC connection and keeps the relayed stream until it takes over.">
+      <option value="auto">Video: auto</option>
+      <option value="webrtc">Video: WebRTC</option>
+      <option value="mse">Video: relay</option>
+    </select>
+  </span>
   <span id="layoutbox" title="Grid layout: columns x rows (drag a name to reorder)">
     <select id="cols"></select><span>&times;</span><select id="rows"></select>
   </span>
@@ -304,13 +314,38 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         });
         postToSlicer('stream_state:' + JSON.stringify({ hosts: hosts, active: state.active }));
     }
+    // How video reaches this phone, kept per phone (not on the PC). 'auto' asks the player for
+    // 'webrtc,mse': the bundled go2rtc player starts both, plays the relayed MSE stream at once
+    // and swaps to the direct WebRTC one the moment it produces a picture, so there is no gap and
+    // no wait if WebRTC cannot get through (a blocked firewall port, a network that drops UDP).
+    var VIDEO_KEY = 'snorca_remote_video';
+    var videoPref = 'auto', remoteWebrtc = false, videoNote = '';
+    try { var vp = localStorage.getItem(VIDEO_KEY); if (vp === 'webrtc' || vp === 'mse' || vp === 'auto') videoPref = vp; } catch (e) {}
+    function remoteVideoMode() {
+        if (videoPref === 'webrtc') return 'webrtc';
+        if (videoPref === 'mse') return 'mse';
+        return remoteWebrtc ? 'webrtc,mse' : 'mse';
+    }
+    function renderVideoBox() {
+        if (!REMOTE) return;
+        var box = document.getElementById('videobox'), sel = document.getElementById('videomode'), warn = document.getElementById('videowarn');
+        box.style.display = document.getElementById('layoutbox').style.display === 'none' ? 'none' : 'inline-flex'; // follows the layout picker
+        sel.value = videoPref;
+        var show = !!videoNote && videoPref !== 'mse';
+        warn.style.display = show ? '' : 'none';
+        warn.title = videoNote;
+    }
     // Phone mode: pull the list from the PC now and every 15 s.
     function fetchRemoteState() {
         fetch(REMOTE + 'state').then(function(r) { return r.json(); }).then(function(s) {
             var hosts = (s && s.hosts) || [];
             var known = {};
             hosts.forEach(function(h) { known[h.id] = true; });
-            var changed = JSON.stringify(hosts) !== JSON.stringify(state.hosts);
+            var wasMode = remoteVideoMode();
+            remoteWebrtc = !!(s && s.webrtc);
+            videoNote = (s && s.video_note) || '';
+            var changed = JSON.stringify(hosts) !== JSON.stringify(state.hosts) || remoteVideoMode() !== wasMode;
+            renderVideoBox();
             state.hosts = hosts;
             var before = state.active.join(',');
             state.active = state.active.filter(function(id) { return known[id]; });
@@ -509,7 +544,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             var f = document.createElement('iframe');
             f.allow = 'autoplay';
             f.setAttribute('scrolling', 'no'); // iOS otherwise grows the frame to its content
-            f.src = '/stream.html?src=' + encodeURIComponent(h.rname) + '&mode=mse';
+            f.src = '/stream.html?src=' + encodeURIComponent(h.rname) + '&mode=' + remoteVideoMode();
             cell.appendChild(f);
         } else if (h.rkind === 'p1') {
             var im = document.createElement('img');
@@ -1070,6 +1105,18 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             save(); render();
         };
     });
+    if (REMOTE) {
+        var vsel = document.getElementById('videomode');
+        vsel.value = videoPref;
+        vsel.onchange = function() {
+            videoPref = vsel.value;
+            try { localStorage.setItem(VIDEO_KEY, videoPref); } catch (e) {}
+            // Every camera tile is an iframe with the mode in its URL: drop them and rebuild.
+            document.querySelectorAll('#grid .cell').forEach(function(cell) { cell.remove(); });
+            renderVideoBox(); render();
+        };
+        document.getElementById('videowarn').onclick = function() { if (videoNote) alert(videoNote); };
+    }
     window.addEventListener('resize', function() {
         if (REMOTE && remoteAutoLayout && state.layout !== remoteDefaultLayout()) { state.layout = remoteDefaultLayout(); save(); }
         render();
@@ -1224,6 +1271,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         document.getElementById('devices').style.display = v === 'devices' ? 'block' : 'none';
         document.getElementById('chips').style.display = v === 'streams' ? '' : 'none';
         document.getElementById('layoutbox').style.display = v === 'streams' ? '' : 'none';
+        renderVideoBox();
         if (v === 'streams') render(); // tile sizes come from the grid's on-screen size
         if (viewTimer) { clearInterval(viewTimer); viewTimer = null; }
         if (v === 'prepare') { lastPresetsJson = ''; refreshInstances(refreshPrepare); viewTimer = setInterval(function() { refreshInstances(refreshPrepare); }, 10000); }

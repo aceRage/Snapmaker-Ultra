@@ -87,21 +87,37 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
         }
     }
     var lastRemote = null;
+    // Camera video goes straight from go2rtc to the phone over WebRTC when it can (Phase 2), which
+    // is the one part of the hub that needs an inbound port. We only report what Windows Firewall
+    // says - allowing a program is the user's call, and it needs administrator rights.
+    function videoLine(body) {
+        var v = info.video;
+        if (!v) return;
+        if (v.webrtc_port && v.firewall === 'allowed') {
+            body.appendChild(el('div', 'note', 'Direct video (WebRTC) on UDP/TCP port ' + v.webrtc_port + '; Windows Firewall already allows go2rtc.'));
+            return;
+        }
+        body.appendChild(el('div', v.firewall === 'unknown' || v.firewall === 'off' ? 'note' : 'err', v.note));
+        if (v.go2rtc_exe) body.appendChild(el('div', 'note', v.go2rtc_exe));
+        body.appendChild(el('div', 'note', 'Video still works without it - the phone falls back to the relayed stream through this hub.'));
+    }
     function renderRemote() {
         var body = document.getElementById('remotebody');
         if (!info || !info.remote) return;
-        var rm = info.remote, key = JSON.stringify(rm);
+        var rm = info.remote, key = JSON.stringify(rm) + JSON.stringify(info.video || {});
         if (key === lastRemote && body.dataset.done) return; // keep the canvas
         lastRemote = key; body.dataset.done = '1';
         body.innerHTML = '';
         if (!rm.installed) {
             body.appendChild(el('div', '', 'Tailscale gives your phone a private, encrypted path to this hub from anywhere - no port forwarding, no hosting fees, and the phone\'s Tailscale sign-in is the second factor.'));
             body.appendChild(el('div', 'note', 'It is not installed on this PC. Install it from tailscale.com/download and sign in, put the Tailscale app on the phone signed in to the same account, then reload this page.'));
+            videoLine(body);
             return;
         }
         if (rm.state !== 'Running') {
             body.appendChild(el('div', 'err', rm.error || ('Tailscale is ' + rm.state)));
             body.appendChild(el('div', 'note', 'Open Tailscale from the system tray and sign in, then reload this page.'));
+            videoLine(body);
             return;
         }
         if (rm.on && rm.url) {
@@ -129,6 +145,7 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
         addrow.appendChild(add);
         body.appendChild(addrow);
         if (rm.last_login) body.appendChild(el('div', 'note', 'Last remote visit: ' + rm.last_login));
+        videoLine(body);
         var tog = el('span', 'btn' + (rm.on ? ' dim' : ''), rm.on ? 'Turn off' : 'Turn on');
         tog.onclick = function() {
             tog.textContent = rm.on ? 'Turning off\u2026' : 'Turning on\u2026 (the first time fetches a certificate, up to a minute)';

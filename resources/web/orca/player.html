@@ -13,8 +13,9 @@ html, body { height: 100%; width: 100%; margin: 0; padding: 0; background: #000;
      credential-only and never reachable from a browser). video-stream.js and video-rtc.js next to
      this file are verbatim copies from go2rtc 1.9.14 (MIT, see resources/tools/go2rtc/LICENSE-NOTE.txt)
      and must be refreshed together with go2rtc.exe.
-     ?src=<stream name>&mode=<mse|webrtc|mp4|mjpeg>[&lt=<hub secret; the PC's own Stream tab only>]
-     The WebSocket goes to api/ws on the hub, which attaches go2rtc's credentials. -->
+     ?src=<stream name>&mode=<mse|webrtc|webrtc,mse|mp4|mjpeg>[&lt=<hub secret; the PC's own Stream tab only>]
+     The WebSocket goes to api/ws on the hub, which attaches go2rtc's credentials; WebRTC signalling
+     (offer / answer / candidate) rides that same WebSocket, so nothing else has to be opened. -->
 <script type="module" src="./video-stream.js"></script>
 <script type="module">
     const params = new URLSearchParams(location.search);
@@ -25,6 +26,20 @@ html, body { height: 100%; width: 100%; margin: 0; padding: 0; background: #000;
     video.style.flex = '1 0 ' + (params.get('width') || '320px');
     video.src = new URL('api/ws?src=' + encodeURIComponent(params.get('src') || '') + (lt ? '&lt=' + encodeURIComponent(lt) : ''), location.href);
     document.body.appendChild(video);
+
+    // With mode=webrtc,mse the player runs both at once and swaps to WebRTC as soon as it has a
+    // picture, so MSE is already playing while the peer connection is negotiated. If WebRTC has
+    // not taken over by then (the PC's firewall blocks go2rtc's media port, or the network drops
+    // UDP), stop it: the browser would otherwise keep an ICE agent and a second decode alive
+    // behind a stream the viewer can already see. MSE is untouched and keeps playing.
+    const both = video.mode.includes('webrtc') && video.mode.includes('mse');
+    const giveUp = parseInt(params.get('rtctimeout') || '8000', 10);
+    if (both && giveUp > 0) setTimeout(() => {
+        if (video.pcState === WebSocket.OPEN || !video.pc) return; // WebRTC won, or was never started
+        video.pcState = WebSocket.CLOSED;
+        video.pc.close();
+        video.pc = null;
+    }, giveUp);
 </script>
 </body>
 </html>
