@@ -19,6 +19,7 @@
 #include "libslic3r.h"
 #include "Config.hpp"
 #include "Polygon.hpp"
+#include "PaintDepth.hpp"
 #include <boost/preprocessor/facilities/empty.hpp>
 #include <boost/preprocessor/punctuation/comma_if.hpp>
 #include <boost/preprocessor/seq/for_each.hpp>
@@ -526,6 +527,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLADisplayOrientation)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SLAPillarConnectionMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BrimFilamentSource)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PaintDepthMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TimelapseType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(BedType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SkirtType)
@@ -915,6 +917,30 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,               layer_height))
     ((ConfigOptionFloat,               mmu_segmented_region_max_width))
     ((ConfigOptionFloat,               mmu_segmented_region_interlocking_depth))
+    // Paint Depth Stage 1 (docs/superpowers/specs/2026-08-31-paint-depth-design.md):
+    // supersede mmu_segmented_region_max_width as the user-facing depth control -
+    // mmu_segmented_region_max_width stays defined only so old project/preset files
+    // still deserialize (see PrintConfigDef::handle_legacy_composite), but is no
+    // longer read directly by the segmentation code (Task 2).
+    ((ConfigOptionEnum<PaintDepthMode>, paint_depth_mode))
+    ((ConfigOptionInt,                 paint_depth_walls))
+    ((ConfigOptionFloat,               paint_depth_mm))
+    // Paint Depth Stage 2 (Task 3 item 2): default true keeps today's behavior (sparse
+    // infill painted like walls/solid infill). false keeps a bounded claim's sparse infill
+    // in the base filament (PrintApply.cpp's generate_print_object_regions /
+    // verify_update_print_object_regions - the region-override site).
+    ((ConfigOptionBool,                paint_infill_override))
+    // Paint Depth follow-up (item 1, .superpowers/sdd/2026-08-31-paint-depth/interclaim-
+    // absorb-report.md "still open" / shell-setting-and-gapfill-report.md, user decision
+    // 2026-09-01): default true keeps today's behavior - has_bounded_paint_depth() forces
+    // solid shells at every color Z-interface (PrintObject.cpp detect_surfaces_type() /
+    // discover_vertical_shells(), and PerimeterGenerator.cpp's two mirrors of the same
+    // flag - all four gated on this option, see those call sites). That solid-shell
+    // forcing is what stops color bleeding through Z-boundaries, but it also creates many
+    // narrow internal-solid patches that detect_narrow_internal_solid_infill reroutes to a
+    // concentric pattern ("erratic square infill"), costing solid material and time. false
+    // lets those four sites fall back to the user's plain interface_shells value instead.
+    ((ConfigOptionBool,                paint_depth_solid_interfaces))
     ((ConfigOptionFloat,               raft_contact_distance))
     ((ConfigOptionFloat,               raft_expansion))
     ((ConfigOptionPercent,             raft_first_layer_density))

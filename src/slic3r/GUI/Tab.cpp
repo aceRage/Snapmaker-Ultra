@@ -2626,7 +2626,20 @@ void TabPrint::build()
         optgroup = page->new_optgroup(L("Advanced"), L"advanced");
         optgroup->append_single_option_line("interlocking_beam", "multimaterial_settings_advanced#interlocking-beam");
         optgroup->append_single_option_line("interface_shells", "multimaterial_settings_advanced#interface-shells");
-        optgroup->append_single_option_line("mmu_segmented_region_max_width", "multimaterial_settings_advanced#maximum-width-of-segmented-region");
+        // Paint Depth Stage 1: paint_depth_mode/walls/mm supersede the old
+        // mmu_segmented_region_max_width single-float control on this page (that key
+        // stays defined - see PrintConfig.cpp - only for legacy project/preset parsing).
+        optgroup->append_single_option_line("paint_depth_mode", "multimaterial_settings_advanced#paint-depth-mode");
+        optgroup->append_single_option_line("paint_depth_walls", "multimaterial_settings_advanced#paint-depth-walls");
+        optgroup->append_single_option_line("paint_depth_mm", "multimaterial_settings_advanced#paint-depth-distance");
+        // Paint Depth Stage 2 (Task 3 item 2): only meaningful once paint depth is bounded
+        // (see ConfigManipulation.cpp's update_print_fff_config, which greys this out in
+        // "Unlimited" mode).
+        optgroup->append_single_option_line("paint_infill_override", "multimaterial_settings_advanced#paint-sparse-infill");
+        // Follow-up (item 1, shell-setting-and-gapfill-report.md): only meaningful once
+        // paint depth is bounded, same greying condition as paint_infill_override above
+        // (see ConfigManipulation.cpp's update_print_fff_config).
+        optgroup->append_single_option_line("paint_depth_solid_interfaces", "multimaterial_settings_advanced#paint-depth-solid-interfaces");
         optgroup->append_single_option_line("mmu_segmented_region_interlocking_depth", "multimaterial_settings_advanced#interlocking-depth-of-segmented-region");
         optgroup->append_single_option_line("interlocking_beam_width", "multimaterial_settings_advanced#interlocking-beam-width");
         optgroup->append_single_option_line("interlocking_orientation", "multimaterial_settings_advanced#interlocking-direction");

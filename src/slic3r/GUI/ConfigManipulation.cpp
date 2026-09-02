@@ -906,6 +906,20 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
     toggle_line("scarf_angle_threshold", has_seam_slope && config->opt_bool("seam_slope_conditional"));
     toggle_line("scarf_overhang_threshold", has_seam_slope && config->opt_bool("seam_slope_conditional"));
 
+    // Paint Depth Stage 1: the walls/mm value fields are only meaningful for their own
+    // mode - grey out whichever one paint_depth_mode isn't currently using.
+    auto paint_depth_mode = config->opt_enum<PaintDepthMode>("paint_depth_mode");
+    toggle_line("paint_depth_walls", paint_depth_mode == PaintDepthMode::pdmWalls);
+    toggle_line("paint_depth_mm", paint_depth_mode == PaintDepthMode::pdmMillimeters);
+    // Paint Depth Stage 2 (Task 3 item 2): the sparse-infill override only has an effect on
+    // a bounded claim (see PrintApply.cpp's generate_print_object_regions /
+    // verify_update_print_object_regions), so grey it out in "Unlimited" mode.
+    toggle_line("paint_infill_override", paint_depth_mode != PaintDepthMode::pdmUnlimited);
+    // Follow-up (item 1, shell-setting-and-gapfill-report.md): same rationale as
+    // paint_infill_override above - has_bounded_paint_depth() (Print.hpp) is false for the
+    // whole object outside bounded mode, so the option has no effect there either.
+    toggle_line("paint_depth_solid_interfaces", paint_depth_mode != PaintDepthMode::pdmUnlimited);
+
     bool use_beam_interlocking = config->opt_bool("interlocking_beam");
     toggle_line("mmu_segmented_region_interlocking_depth", !use_beam_interlocking);
     toggle_line("interlocking_beam_width", use_beam_interlocking);

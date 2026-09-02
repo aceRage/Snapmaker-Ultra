@@ -220,6 +220,12 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         this->layer()->object()->layer_count()
     );
     
+    // Paint Depth (F3 fix-wave): give the top-surface/one-wall-top detection the same
+    // interface_shells treatment PrintObject::has_bounded_paint_depth() already gets at
+    // its own two read sites, so a bounded painted object's color-region boundary counts
+    // as an interface consistently everywhere interface_shells is consulted.
+    g.has_bounded_paint_depth = this->layer()->object()->has_bounded_paint_depth();
+
     if (this->layer()->lower_layer != nullptr)
         // Cummulative sum of polygons over all the regions.
         g.lower_slices = &this->layer()->lower_layer->lslices;

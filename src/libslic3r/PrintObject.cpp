@@ -956,6 +956,21 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "mixed_filament_region_collapse"
             || opt_key == "mmu_segmented_region_max_width"
             || opt_key == "mmu_segmented_region_interlocking_depth"
+            || opt_key == "paint_depth_mode"
+            || opt_key == "paint_depth_walls"
+            || opt_key == "paint_depth_mm"
+            || opt_key == "paint_infill_override"
+            || opt_key == "paint_depth_solid_interfaces"
+            // Vertical paint-depth alignment fix (.superpowers/sdd/2026-08-31-paint-depth/
+            // vertical-depth-investigation.md section 4 "Invalidation"): segmentation_top_and_
+            // bottom_layers (MultiMaterialSegmentation.cpp) now consults top_shell_thickness /
+            // bottom_shell_thickness too (previously only discover_vertical_shells /
+            // discover_horizontal_shells at posPrepareInfill did, where these two keys were
+            // routed below). Moved here (posSlice cascades forward to posPrepareInfill and
+            // everything after it - PrintObject::invalidate_step) so editing either re-runs
+            // the MMU segmentation, not just the later shell-generation step.
+            || opt_key == "top_shell_thickness"
+            || opt_key == "bottom_shell_thickness"
             || opt_key == "raft_layers"
             || opt_key == "raft_contact_distance"
             || opt_key == "slice_closing_radius"
@@ -1093,8 +1108,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "infill_multiline"
             || opt_key == "infill_combination"
             || opt_key == "infill_combination_max_layer_height"
-            || opt_key == "bottom_shell_thickness"
-            || opt_key == "top_shell_thickness"
+            // top_shell_thickness / bottom_shell_thickness moved to the posSlice group above
+            // (vertical paint-depth alignment fix) - posSlice already cascades forward to
+            // posPrepareInfill, so they don't also need listing here.
             || opt_key == "minimum_sparse_infill_area"
             || opt_key == "sparse_infill_filament"
             || opt_key == "solid_infill_filament"
@@ -1311,7 +1327,15 @@ void PrintObject::detect_surfaces_type()
     // This is useful if one of the parts is to be dissolved, or if it is transparent and the internal shells
     // should be visible.
     bool spiral_mode      = this->print()->config().spiral_mode.value;
-    bool interface_shells = ! spiral_mode && m_config.interface_shells.value;
+    // Paint Depth Stage 2 (Task 3 item 1): a bounded painted claim needs solid skin at its
+    // color Z-interfaces (bleed path (c)) exactly the way interface_shells already provides
+    // for any region boundary - see PrintObject::has_bounded_paint_depth()'s comment (Print.hpp)
+    // for why this ORs into the existing flag instead of a scoped reclassification.
+    // Follow-up (item 1, shell-setting-and-gapfill-report.md): gated on paint_depth_solid_
+    // interfaces (default true = today's behavior) so the user can trade the bleed guarantee
+    // for less solid material/time when the forced solid shells cost more than they're worth.
+    bool interface_shells = ! spiral_mode && (m_config.interface_shells.value ||
+        (this->has_bounded_paint_depth() && m_config.paint_depth_solid_interfaces.value));
     size_t num_layers     = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
 
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
@@ -1740,7 +1764,13 @@ void PrintObject::discover_vertical_shells()
     bool     spiral_mode      = this->print()->config().spiral_mode.value;
     size_t   num_layers       = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
     std::vector<DiscoverVerticalShellsCacheEntry> cache_top_botom_regions(num_layers, DiscoverVerticalShellsCacheEntry());
-    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value;
+    // Paint Depth Stage 2 (Task 3 item 1): mirror detect_surfaces_type()'s effective
+    // interface_shells value (see PrintObject::has_bounded_paint_depth()) so vertical shell
+    // thickness is computed per-region (not merged across the whole object) whenever a color
+    // Z-interface needs its own solid skin. Follow-up (item 1): same paint_depth_solid_
+    // interfaces gate as detect_surfaces_type(), so the two stay consistent.
+    bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! (m_config.interface_shells.value ||
+        (this->has_bounded_paint_depth() && m_config.paint_depth_solid_interfaces.value));
 //    static constexpr const float top_bottom_expansion_coeff = 1.05f;
     // Just a tiny fraction of an infill extrusion width to merge neighbor regions reliably.
     static constexpr const float top_bottom_expansion_coeff = 0.05f;

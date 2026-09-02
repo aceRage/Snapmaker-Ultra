@@ -619,7 +619,7 @@ void PerimeterGenerator::split_top_surfaces(const ExPolygons &orig_polygons, ExP
 
     // get the Polygons upper the polygon this layer
     Polygons upper_polygons_series_clipped;
-    if (object_config->interface_shells) {
+    if (object_config->interface_shells || (has_bounded_paint_depth && object_config->paint_depth_solid_interfaces)) {
         auto upper_slicer_same_region = to_expolygons(this->upper_slices_same_region->surfaces);
         upper_polygons_series_clipped = ClipperUtils::clip_clipper_polygons_with_subject_bbox(upper_slicer_same_region, last_box);
     } else
@@ -2270,7 +2270,7 @@ void PerimeterGenerator::process_arachne()
 
             // Get top ExPolygons from current infill contour.
             Polygons upper_slices_clipped;
-            if (object_config->interface_shells) {
+            if (object_config->interface_shells || (has_bounded_paint_depth && object_config->paint_depth_solid_interfaces)) {
                 auto upper_slicer_same_region = to_expolygons(this->upper_slices_same_region->surfaces);
                 upper_slices_clipped = ClipperUtils::clip_clipper_polygons_with_subject_bbox(upper_slicer_same_region, infill_contour_bbox);
             } else

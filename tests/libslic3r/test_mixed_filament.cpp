@@ -502,7 +502,17 @@ TEST_CASE("Grouped manual perimeter patterns resolve overlapping singleton inner
     CHECK(mgr.resolve_perimeter(mixed_filament_id, 2, 2, 1) == 1);
 }
 
-TEST_CASE("Grouped manual wall patterns make infill follow the innermost perimeter tool", "[MixedFilament]")
+// Wave A fix-wave / C-1 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md): this test
+// used to be named "...make infill follow the innermost perimeter tool", pinning wall_filament()
+// as the one lookup that did NOT apply the grouped-manual-pattern resolution sparse_infill_
+// filament()/solid_infill_filament() already did - i.e. it characterized the exact divergence
+// C-1 flags as a defect (gap fill, which resolves via wall_filament, could print on a different
+// physical extruder than its own walls on an object with no MM painting at all). wall_filament()
+// now resolves through the same grouped-pattern step, so all three lookups agree; updated to
+// match (layer1.wall_filament(region) was 1 - the flattened-pattern reading of layer 1 - and is
+// now 0, the grouped reading via the group at wall_loops-1, matching solid_infill_filament below
+// exactly, which already used that resolution and is unchanged by this fix).
+TEST_CASE("Grouped manual wall patterns resolve consistently across wall, sparse infill and solid infill", "[MixedFilament]")
 {
     const std::vector<std::string> colors = {"#00FFFF", "#FF00FF"};
 
@@ -537,8 +547,12 @@ TEST_CASE("Grouped manual wall patterns make infill follow the innermost perimet
     layer1.mixed_mgr         = &mgr;
     layer1.num_physical      = 2;
 
+    // Both layers resolve through the grouped "1" (index wall_loops-1 = 1) perimeter group, a
+    // single-token group ("1" -> component_a) that does not vary with layer_index - so both
+    // layers now read 0 (component_a, zero-based), matching solid_infill_filament below exactly
+    // (same configured id 3, same region, so the same grouped resolution).
     CHECK(layer0.wall_filament(region) == 0);
-    CHECK(layer1.wall_filament(region) == 1);
+    CHECK(layer1.wall_filament(region) == 0);
     CHECK(layer0.sparse_infill_filament(region) == 1);
     CHECK(layer1.sparse_infill_filament(region) == 1);
     CHECK(layer0.solid_infill_filament(region) == 0);

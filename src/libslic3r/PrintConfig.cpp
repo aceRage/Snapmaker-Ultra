@@ -349,6 +349,13 @@ static const t_config_enum_values s_keys_map_BrimType = {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(BrimType)
 
+static t_config_enum_values s_keys_map_PaintDepthMode {
+    { "unlimited",   int(PaintDepthMode::pdmUnlimited) },
+    { "walls",       int(PaintDepthMode::pdmWalls) },
+    { "millimeters", int(PaintDepthMode::pdmMillimeters) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(PaintDepthMode)
+
 static t_config_enum_values s_keys_map_BrimFilamentSource {
     { "object",       int(BrimFilamentSource::bfsObject) },
     { "nearest_wall", int(BrimFilamentSource::bfsNearestWall) }
@@ -3930,6 +3937,15 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    // Paint Depth Stage 1: mmu_segmented_region_max_width stays defined (legacy-
+    // parse-only) so old project/preset files still deserialize this key without
+    // erroring - see PrintConfigDef::handle_legacy_composite below, which migrates a
+    // nonzero stored value into {paint_depth_mode=millimeters, paint_depth_mm=value}
+    // (zero migrates to the new bounded-by-default: paint_depth_mode=walls). The
+    // segmentation code (MultiMaterialSegmentation.cpp) is wired to the new options
+    // directly, not to this one; it is deliberately no longer exposed on the
+    // Multimaterial settings page (see Tab.cpp) in favor of paint_depth_mode/
+    // paint_depth_walls/paint_depth_mm below.
     def           = this->add("mmu_segmented_region_max_width", coFloat);
     def->label    = L("Maximum width of a segmented region");
     def->tooltip  = L("Maximum width of a segmented region. Zero disables this feature.");
@@ -3939,16 +3955,178 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.));
 
-    def           = this->add("mmu_segmented_region_interlocking_depth", coFloat);
-    def->label    = L("Interlocking depth of a segmented region");
-    def->tooltip  = L("Interlocking depth of a segmented region. It will be ignored if "
-                    "\"mmu_segmented_region_max_width\" is zero or if \"mmu_segmented_region_interlocking_depth\" "
-                    "is bigger than \"mmu_segmented_region_max_width\". Zero disables this feature.");
-    def->sidetext = "mm";	// milimeters, don't need translation 
+    def           = this->add("paint_depth_mode", coEnum);
+    def->label    = L("Paint depth mode");
+    // WAVE B / Option N (.superpowers/sdd/2026-08-31-paint-depth/curved-gap-design.md): the depth
+    // is now a THICKNESS MEASURED PERPENDICULAR TO THE PAINTED SURFACE, the same everywhere -
+    // vertical walls, curves and flat tops alike - rather than "a lateral distance from the sliced
+    // boundary" that thinned to nothing on shallow slopes. The tooltips say so, and name
+    // "Limited by distance" as the direct control, because it is the one whose number the user
+    // reads back as millimetres of colour.
+    def->tooltip  = L("Controls how thick a painted (multi-material/multi-color) claim is before "
+                    "the object reverts to its base filament for walls, solid infill and sparse "
+                    "infill. The depth is measured perpendicular to the painted surface, so it is "
+                    "the same on a vertical wall, on a curve and on a flat top. Without a bound, a "
+                    "small dark painted spot can extrude dark filament all the way to the object's "
+                    "core, showing through light-colored walls/infill above and around it. "
+                    "\"Limited by distance\" sets that thickness directly in millimeters and is the "
+                    "control to reach for; \"Limited by walls\" converts a wall count into the same "
+                    "millimeter thickness; \"Unlimited\" restores the old unbounded behavior (the "
+                    "painted claim reaches the object's medial axis).");
+    def->enum_keys_map = &ConfigOptionEnum<PaintDepthMode>::get_enum_values();
+    def->enum_values.emplace_back("unlimited");
+    def->enum_values.emplace_back("walls");
+    def->enum_values.emplace_back("millimeters");
+    def->enum_labels.emplace_back(L("Unlimited"));
+    def->enum_labels.emplace_back(L("Limited by walls"));
+    def->enum_labels.emplace_back(L("Limited by distance"));
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<PaintDepthMode>(pdmWalls));
+
+    def           = this->add("paint_depth_walls", coInt);
+    def->label    = L("Paint depth walls");
+    // Fix-wave F3: the tooltip described the old `ext_width + (walls-1)*spacing` band, which
+    // is no longer the formula (see paint_depth_band_mm, PaintDepth.hpp).
+    //
+    // WAVE B: the number is UNCHANGED, its promise is not. F3 sized it against Arachne's bead-count
+    // windows, and on a vertical wall Arachne does deliver N loops across it - but the user runs
+    // the CLASSIC generator, where process_classic tiles the band with two external-width loops
+    // plus at most one gap-fill line for anything in the 1.3-1.5mm range regardless of this
+    // setting (classic-generator-investigation.md section 2d). Promising "N wall loops" to every
+    // user was therefore false for half of them. It is honest as a THICKNESS - "about N wall
+    // widths of material" - so that is what it now says, with "Paint depth distance" named as the
+    // control that means exactly what it says on either generator.
+    def->tooltip  = L("Thickness of a painted claim, expressed as a number of wall widths, when "
+                    "\"Paint depth mode\" is \"Limited by walls\". This is converted to about that "
+                    "many wall widths of material measured perpendicular to the painted surface: "
+                    "one perimeter spacing per wall, plus the inset the wall generator applies "
+                    "before laying its outer loop, plus a margin so the thickness does not sit on "
+                    "a rounding boundary. It is a thickness, not a promise of a loop count - how "
+                    "many loops fit inside it is decided by \"Wall generator\" (the classic "
+                    "generator tiles a band with an even number of loops plus a gap-fill line, and "
+                    "Arachne will not produce more than twice \"Wall loops\" loops in any region, "
+                    "so depth beyond that prints as painted solid/sparse infill). If you want an "
+                    "exact thickness in millimeters, use \"Limited by distance\" instead.");
+    def->sidetext = "walls";
+    def->min      = 1;
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(3));
+
+    def           = this->add("paint_depth_mm", coFloat);
+    def->label    = L("Paint depth distance");
+    // WAVE B / Option N: this is now the headline control, and it means one thing - how thick the
+    // colour is, measured perpendicular to the surface the user painted. Value unchanged at 1.5mm
+    // (standing decision: no default VALUES move in this wave); only the meaning is stated
+    // correctly. On a flat top the claim is now that thickness deep rather than
+    // "top_shell_layers" deep, which is the honest consequence of a constant thickness and costs
+    // one tool change per newly-painted layer - see the Wave B report.
+    def->tooltip  = L("How thick a painted claim is, measured perpendicular to the painted "
+                    "surface, when \"Paint depth mode\" is \"Limited by distance\". The same "
+                    "everywhere: a vertical wall gets this much colour measured horizontally, a "
+                    "flat top gets it measured vertically, and a slope gets it measured along its "
+                    "own normal - so a painted region behaves like a shell of the color rather "
+                    "than thinning out on shallow curves. Zero behaves the same as \"Paint depth "
+                    "mode\" = \"Unlimited\": no clamp is applied on any layer.");
+    def->sidetext = "mm";	// milimeters, don't need translation
+    // Fix-wave F4: min stays 0 rather than being raised, because 0 is coherent here - see
+    // cut_segmented_layers's fix-wave F1 comment (MultiMaterialSegmentation.cpp): a zero
+    // band makes interlocking_cut_width clamp to 0 on every layer regardless of the
+    // interlocking depth setting, so the claim is left unbounded on both even and odd
+    // layers alike (matching pdmUnlimited's geometry, just without that mode's cheaper
+    // early-out at the :2170 gate). Previously (pre-F1) a zero band was incoherent: even
+    // layers still clamped to a 0.3mm sliver while odd layers were unbounded.
     def->min      = 0;
     def->category = L("Advanced");
     def->mode     = comAdvanced;
-    def->set_default_value(new ConfigOptionFloat(0.));
+    def->set_default_value(new ConfigOptionFloat(1.5));
+
+    def           = this->add("paint_infill_override", coBool);
+    def->label    = L("Paint sparse infill");
+    def->tooltip  = L("If enabled (default), a painted claim's sparse infill is printed in the "
+                    "painted filament, matching walls and solid infill. If disabled, a bounded "
+                    "painted claim (\"Paint depth mode\" other than \"Unlimited\") keeps its "
+                    "sparse infill in the object's base filament - walls and solid infill (which "
+                    "can be visible on top surfaces) still print in the painted filament.");
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    // Paint Depth follow-up (item 1, .superpowers/sdd/2026-08-31-paint-depth/interclaim-
+    // absorb-report.md "still open" / shell-setting-and-gapfill-report.md, user decision
+    // 2026-09-01, default ON): has_bounded_paint_depth() (Print.hpp) has always
+    // unconditionally OR'd into interface_shells's effective value at four read sites
+    // (PrintObject.cpp's detect_surfaces_type()/discover_vertical_shells(),
+    // PerimeterGenerator.cpp x2) to stop color bleeding through Z-boundaries - see
+    // Print.hpp's has_bounded_paint_depth() comment. That is also what creates many
+    // narrow internal-solid patches at every color boundary layer, which
+    // detect_narrow_internal_solid_infill (default true) reroutes to ipConcentricInternal
+    // - the "erratic square infill" symptom, costing solid material and time. This option
+    // gates that forcing at all four sites; default true is zero behavior change.
+    def           = this->add("paint_depth_solid_interfaces", coBool);
+    def->label    = L("Paint depth solid interfaces");
+    def->tooltip  = L("Print solid shells at colour boundaries inside the object so the base "
+                    "colour cannot show through painted areas from above/below. Turning this "
+                    "off saves solid material and time but can let the base colour bleed "
+                    "through thin painted skins.");
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    // Greyed out (ConfigManipulation.cpp) whenever paint depth is unbounded (paint_depth_
+    // mode == unlimited), same condition as paint_infill_override, since it has no effect
+    // there either - has_bounded_paint_depth() is false for the whole object in that mode.
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def           = this->add("mmu_segmented_region_interlocking_depth", coFloat);
+    def->label    = L("Interlocking depth of a segmented region");
+    // Fix-wave F5: the old tooltip named mmu_segmented_region_max_width as the gate and as
+    // an "ignored if bigger than" bound - neither is true anymore. That key is legacy-parse-
+    // only (see its own def comment above); the real gate is "Paint depth mode" (unlimited
+    // disables interlocking entirely - see multi_material_segmentation_by_painting's mode
+    // gate, MultiMaterialSegmentation.cpp). A depth that reaches or exceeds the paint depth
+    // band is not ignored/rejected either: cut_segmented_layers clamps the even-layer cut to
+    // max(band - depth, 0), so an over-large depth simply saturates at a full-band cut on
+    // even layers rather than erroring or being skipped (see its fix-wave F1 comment).
+    // Fix-wave F4: the tooltip now also documents the effective-depth clamp, because a user
+    // who types 0.5 here and measures 0.107 in the preview would otherwise have no way to
+    // know why. See paint_depth_interlocking_depth_mm (PaintDepth.hpp) for the reasoning.
+    //
+    // Wave A fix-wave / I-4 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md): the cap
+    // is WALLS-MODE ONLY (paint_depth_interlocking_depth_mm), but this sentence stated it
+    // unconditionally - false in millimetres mode, where a hand-set notch is honoured verbatim
+    // and, set large relative to the configured depth, can reintroduce the same alternating-
+    // layer loop-count difference the cap exists to prevent in walls mode.
+    def->tooltip  = L("Interlocking depth of a segmented region. Only active when \"Paint depth "
+                    "mode\" is not \"Unlimited\". Zero disables this feature. When \"Paint depth "
+                    "mode\" is \"Limited by walls\", the effective depth is capped at a quarter "
+                    "of one perimeter spacing (about 0.11mm at a 0.45mm line width), because a "
+                    "deeper notch would narrow the painted band on alternating layers by more "
+                    "than a whole wall loop - so \"Paint depth walls\" would silently deliver one "
+                    "wall fewer on every other layer. That cap does not apply when \"Paint depth "
+                    "mode\" is \"Limited by distance\": the value there is used exactly as "
+                    "entered, and setting it large relative to \"Paint depth distance\" can "
+                    "narrow the band on alternating layers enough to cost a loop there too - keep "
+                    "it small relative to that depth if you want the same loop count on every "
+                    "layer.");
+    def->sidetext = "mm";	// milimeters, don't need translation
+    def->min      = 0;
+    def->category = L("Advanced");
+    def->mode     = comAdvanced;
+    // Paint Depth Stage 1 (spec decision 3): default flips 0 -> nonzero now that depth is
+    // bounded by default (paint_depth_mode default = walls) - the gate that makes this
+    // value only active when the depth clamp is actually applied is unchanged (see the
+    // segmentation call site, Task 2), so this default only takes effect together with
+    // the bounded-by-default flip.
+    //
+    // Fix-wave F4 (.superpowers/sdd/2026-08-31-paint-depth/wall-count-investigation.md
+    // section 3): that Stage-1 default was 0.3mm - roughly 0.70 * perimeter_spacing, i.e.
+    // most of a whole Arachne bead-count window, and 3.6x-5.3x the margin the band had. It
+    // dropped the painted region from N wall loops to N-1 on every even-indexed layer
+    // (cut_segmented_layers :1164/:1169), producing the 3/2/3/2 alternation the user
+    // reported as "clearly only 1-2 walls being used". 0.1mm is a real mechanical tooth
+    // that sits inside the band's own count-window margin at stock flows, so it cannot cost
+    // a loop; paint_depth_interlocking_depth_mm enforces that bound for any value set here.
+    def->set_default_value(new ConfigOptionFloat(0.1));
 
     def           = this->add("interlocking_beam", coBool);
     def->label    = L("Use beam interlocking");
@@ -7890,6 +8068,42 @@ void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
             }
         }
         config.set_key_value("wiping_volumes_use_custom_matrix", new ConfigOptionBool(custom));
+    }
+
+    // Paint Depth Stage 1 (spec decision 1/2, plan Task 1 item 2): migrate a stored
+    // legacy mmu_segmented_region_max_width into the new paint_depth_* options, once,
+    // for any project/preset saved before this feature existed. Guarded on
+    // !config.has("paint_depth_mode") so a config that already carries the new key
+    // (saved by a build that has this feature) is never overwritten - same guard shape
+    // as the wiping_volumes_use_custom_matrix migration above.
+    //
+    // A NONZERO stored value carries forward as an explicit millimeters-mode depth
+    // (the value the user actually configured under the old single-float option) -
+    // {paint_depth_mode=millimeters, paint_depth_mm=<value>}.
+    //
+    // A ZERO (or absent, since paint_depth_mode's own default already covers that
+    // case) stored value does NOT map to paint_depth_mode=unlimited despite 0 being the
+    // legacy "disabled" convention: the approved bounded-by-default flip (spec decision
+    // 1) applies to every project being (re)loaded, old ones included, not only newly
+    // created ones - so a legacy zero is left alone and simply falls through to
+    // paint_depth_mode's own default (walls), matching a config that never had the key
+    // at all. This is the "bounded by default" behavior actually taking effect for
+    // reslices, not just new projects, as the spec requires.
+    if (config.has("mmu_segmented_region_max_width") && !config.has("paint_depth_mode")) {
+        double legacy_max_width = config.opt_float("mmu_segmented_region_max_width");
+        if (legacy_max_width > 0.) {
+            config.set_key_value("paint_depth_mode", new ConfigOptionEnum<PaintDepthMode>(pdmMillimeters));
+            config.set_key_value("paint_depth_mm", new ConfigOptionFloat(legacy_max_width));
+            // Neutralize the old key once migrated: a diff-serialized preset save only
+            // writes keys that differ from default, so if the user later switches back
+            // to paint_depth_mode=walls (the default) and saves, paint_depth_mode drops
+            // out of the diff but this stale nonzero legacy key would not - re-arming
+            // the !config.has("paint_depth_mode") guard on every future load and
+            // silently reverting the user's explicit walls choice back to millimeters
+            // forever. Zeroing it here (its own "disabled" convention) means a re-save
+            // never re-triggers this migration.
+            config.set_key_value("mmu_segmented_region_max_width", new ConfigOptionFloat(0.));
+        }
     }
 }
 

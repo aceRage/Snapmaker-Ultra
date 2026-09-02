@@ -5222,11 +5222,12 @@ LayerResult GCode::process_layer(const Print& print,
             if (layer_tools.extruder_override != 0)
                 return layer_tools.extruder_override;
             const ExtrusionRole role = entities.entities.empty() ? erNone : entities.entities.front()->role();
-            if (role == erSolidInfill && std::abs(region.config().sparse_infill_density.value - 100.) < EPSILON)
-                return unsigned(region.config().sparse_infill_filament.value);
-            if (is_solid_infill(role))
-                return unsigned(region.config().solid_infill_filament.value);
-            return unsigned(region.config().sparse_infill_filament.value);
+            switch (fill_filament_source(region.config(), role)) {
+            case FillFilamentSource::Wall:        return unsigned(region.config().wall_filament.value);
+            case FillFilamentSource::SolidInfill: return unsigned(region.config().solid_infill_filament.value);
+            case FillFilamentSource::SparseInfill:
+            default:                              return unsigned(region.config().sparse_infill_filament.value);
+            }
         }
         return layer_tools.extruder_override == 0 ? unsigned(region.config().wall_filament.value) : layer_tools.extruder_override;
     };
@@ -5236,11 +5237,12 @@ LayerResult GCode::process_layer(const Print& print,
                                                  const PrintRegion&                                  region) -> int {
         if (entity_type == GCode::ObjectByExtruder::Island::Region::INFILL) {
             const ExtrusionRole role = entities.entities.empty() ? erNone : entities.entities.front()->role();
-            if (role == erSolidInfill && std::abs(region.config().sparse_infill_density.value - 100.) < EPSILON)
-                return int(layer_tools.sparse_infill_filament(region));
-            if (is_solid_infill(role))
-                return int(layer_tools.solid_infill_filament(region));
-            return int(layer_tools.sparse_infill_filament(region));
+            switch (fill_filament_source(region.config(), role)) {
+            case FillFilamentSource::Wall:        return int(layer_tools.wall_filament(region));
+            case FillFilamentSource::SolidInfill: return int(layer_tools.solid_infill_filament(region));
+            case FillFilamentSource::SparseInfill:
+            default:                              return int(layer_tools.sparse_infill_filament(region));
+            }
         }
         return int(layer_tools.wall_filament(region));
     };
