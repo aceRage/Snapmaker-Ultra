@@ -233,7 +233,9 @@ struct ShellBuilder {
                 }
             }
 
-        auto wedge = [&](int v, int f) { return boundary_count[v] > 2 ? wedge_of[{v, f}] : 0; };
+        // .at(): every (pinch vertex, incident group facet) pair was assigned a wedge above, so a miss is a
+        // bug in that walk - it must throw rather than quietly hand back wedge 0 and weld the wedges again.
+        auto wedge = [&](int v, int f) { return boundary_count[v] > 2 ? wedge_of.at({v, f}) : 0; };
 
         // Ruling 8: separate the wedges of a pinch vertex. Each wedge is bounded at the vertex by exactly two
         // boundary edges; the unit inward tangent of a boundary edge a->b of facet f is n_f x (b - a), which
@@ -332,14 +334,15 @@ struct ShellBuilder {
         return halve(std::move(to_halve));
     }
 
-    // Uniformly halves the whole group's depth - the retry after a failed validity check.
-    void halve_depth(const std::vector<int> &group)
+    // Uniformly halves the whole group's depth - the retry after a failed validity check. Returns false when
+    // every vertex already sits on its floor, so the caller can stop instead of rebuilding an identical shell.
+    bool halve_depth(const std::vector<int> &group)
     {
         std::vector<int> vertices;
         vertices.reserve(group.size() * 3);
         for (int f : group)
             for (int k = 0; k < 3; ++k) vertices.push_back(p.surface.indices[f][k]);
-        halve(std::move(vertices));
+        return halve(std::move(vertices));
     }
 
     // Halves the depth of each listed vertex exactly ONCE. The list is deduplicated first: a vertex is shared
@@ -387,31 +390,41 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
     // built at d(v) with a single side strip, i.e. exactly what flat_cap = crease_step = false will mean.
     const double cap_depth = 0.;
 
-    std::vector<ColorShell> shells;
-    size_t done = 0;
+    // Materialise every component up front: the progress callback is documented as a 0..100 percentage
+    // (ColorSplit.hpp) and this stage owns the 10..50 band, so the tick needs the real component total - a
+    // single state can hold dozens of them (painted text, a logo).
+    std::vector<std::pair<int, std::vector<int>>> groups;      // (state, component facets)
     for (int s : p.states) {
         std::vector<char> in(p.surface.indices.size(), 0);
         for (size_t f = 0; f < in.size(); ++f) in[f] = char(p.facet_state[f] == s);
-        for (const std::vector<int> &comp : connected_components(p, nbrs, in)) {
-            ShellBuilder sb{p, nbrs, normals, depth, depth, depths};   // d0 (reference) and its working copy
-            for (int round = 0; round < 8 && sb.fold_guard(comp); ++round) {}
-            indexed_triangle_set mesh = sb.build(comp, cap_depth);
-            ShellCheck check = check_shell(mesh);
-            // Validity fallback: halve the component's depth until the shell is clean, floor = one layer.
-            for (int round = 0; round < 6 && (!check.closed || check.self_intersects); ++round) {
-                sb.halve_depth(comp);
-                mesh  = sb.build(comp, cap_depth);
-                check = check_shell(mesh);
-            }
-            // Spec 7 (rev 2.3): a component that still fails at its floor depth is a feature too small to
-            // split, not an error. Drop it - the body keeps it in its own colour - and note it for the user.
-            if (check.closed && !check.self_intersects)
-                shells.push_back({s, false, std::move(mesh)});
-            else if (warnings)
-                warnings->push_back(too_small_warning(p, comp, s));
-            if (progress && !progress(int(10 + 40 * double(++done) / std::max<size_t>(1, p.states.size() * 4))))
-                throw ColorSplitCancelled();
+        for (std::vector<int> &comp : connected_components(p, nbrs, in))
+            groups.emplace_back(s, std::move(comp));
+    }
+
+    std::vector<ColorShell> shells;
+    size_t done = 0;
+    for (const std::pair<int, std::vector<int>> &group : groups) {
+        const int               s    = group.first;
+        const std::vector<int> &comp = group.second;
+        ShellBuilder sb{p, nbrs, normals, depth, depth, depths};   // d0 (reference) and its working copy
+        for (int round = 0; round < 8 && sb.fold_guard(comp); ++round) {}
+        indexed_triangle_set mesh = sb.build(comp, cap_depth);
+        ShellCheck check = check_shell(mesh);
+        // Validity fallback: halve the component's depth until the shell is clean, floor = one layer. Once
+        // every vertex sits on its floor there is nothing left to try and the rebuild would be identical.
+        for (int round = 0; round < 6 && (!check.closed || check.self_intersects); ++round) {
+            if (!sb.halve_depth(comp)) break;
+            mesh  = sb.build(comp, cap_depth);
+            check = check_shell(mesh);
         }
+        // Spec 7 (rev 2.3): a component that still fails at its floor depth is a feature too small to
+        // split, not an error. Drop it - the body keeps it in its own colour - and note it for the user.
+        if (check.closed && !check.self_intersects)
+            shells.push_back({s, false, std::move(mesh)});
+        else if (warnings)
+            warnings->push_back(too_small_warning(p, comp, s));
+        if (progress && !progress(int(10 + 40 * double(++done) / double(std::max<size_t>(1, groups.size())))))
+            throw ColorSplitCancelled();
     }
     return shells;
 }

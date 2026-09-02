@@ -6,6 +6,7 @@
 #include <libslic3r/Print.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/MeshBoolean.hpp>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -316,6 +317,10 @@ TEST_CASE("colorsplit: thin plate painted on both sides gives two shells meeting
     ColorPatches p = extract_color_patches(plate.its, data);
     auto shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(), nullptr);
     REQUIRE(shells.size() == 2);
+    std::vector<int> states;
+    for (const ColorShell &s : shells) states.push_back(s.state);
+    std::sort(states.begin(), states.end());
+    REQUIRE(states == std::vector<int>{2, 3});   // one shell per painted filament, whatever order they are built in
     for (const ColorShell &s : shells) {
         ShellCheck c = check_shell(s.mesh);
         REQUIRE(c.closed);
@@ -441,4 +446,53 @@ TEST_CASE("colorsplit: a feature too small to carry a shell is skipped with a wa
     expected << "Filament 2: a painted feature about " << std::fixed << std::setprecision(2) << (hi - lo).norm()
              << " mm across is too small to split and stays in the body colour.";
     REQUIRE(warnings[0] == expected.str());
+}
+
+TEST_CASE("colorsplit: progress stays inside the 0..100 contract with many components", "[colorsplit]")
+{
+    // 18 cells painted in a checkerboard: they only ever touch diagonally, so every one of them is its own
+    // edge-connected component of a single state. ColorSplit.hpp documents the callback as a 0..100 percentage,
+    // and this stage of the split owns the 10..50 band - the reported value has to respect that however many
+    // components a state has, and painted text or a logo routinely produces dozens.
+    const int n = 6;
+    TriangleMesh box = make_grid_box(40., 40., 10., n, n);
+    std::vector<std::pair<int, EnforcerBlockerType>> facets;
+    int cells = 0;
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i)
+            if ((i + j) % 2 == 0) {
+                const int base = 2 + 2 * (j * n + i);
+                facets.emplace_back(base,     EnforcerBlockerType::Extruder2);
+                facets.emplace_back(base + 1, EnforcerBlockerType::Extruder2);
+                ++cells;
+            }
+    REQUIRE(cells == 18);
+    ColorPatches p = extract_color_patches(box.its, paint_data(box, facets));
+    std::vector<int> reported;
+    auto shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(),
+                                     [&reported](int percent) { reported.push_back(percent); return true; });
+    REQUIRE(shells.size() == size_t(cells));
+    REQUIRE(reported.size() == size_t(cells));       // one tick per component
+    for (int percent : reported) {
+        REQUIRE(percent >= 0);
+        REQUIRE(percent <= 100);
+    }
+    REQUIRE(reported.back() <= 50);                  // and the band this stage owns
+}
+
+TEST_CASE("colorsplit: depth_override_mm replaces D and clears unlimited", "[colorsplit]")
+{
+    // Unlimited would take every vertex to half the block's thickness; the override has to win over both the
+    // depth AND the unlimited flag. The painted top face's only vertices are the cube corners, whose
+    // (+-1,+-1,1)/sqrt(3) bisector normals turn an 0.7mm depth into 0.7/sqrt(3) = 0.40415mm of vertical drop.
+    TriangleMesh block = make_cube(40., 40., 20.);
+    ColorPatches p = extract_color_patches(block.its, paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
+    ColorSplitParams params = no_cap_no_step();
+    params.depth_override_mm = 0.7;
+    auto shells = build_color_shells(p, depths_for_test(std::numeric_limits<double>::infinity()), params, nullptr);
+    REQUIRE(shells.size() == 1);
+    float min_z = shells[0].mesh.vertices.front().z(), max_z = min_z;
+    for (const Vec3f &v : shells[0].mesh.vertices) { min_z = std::min(min_z, v.z()); max_z = std::max(max_z, v.z()); }
+    REQUIRE_THAT(max_z, WithinAbs(20.f, 1e-4f));
+    REQUIRE_THAT(min_z, WithinAbs(20.f - float(0.7 / std::sqrt(3.)), 1e-4f));
 }
