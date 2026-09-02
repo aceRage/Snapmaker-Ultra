@@ -98,6 +98,7 @@ using namespace nlohmann;
 
 #ifdef SLIC3R_GUI
     #include "slic3r/GUI/GUI_Init.hpp"
+    #include "slic3r/GUI/RemoteHub.hpp"
 #endif /* SLIC3R_GUI */
 
 using namespace Slic3r;
@@ -1274,6 +1275,12 @@ int CLI::run(int argc, char **argv)
     BOOST_LOG_TRIVIAL(info) << "finished setup params, argc="<< argc << std::endl;
     std::string temp_path = wxFileName::GetTempDir().utf8_str().data();
     set_temporary_dir(temp_path);
+
+#ifdef SLIC3R_GUI
+    // Ultra: `--hub` runs the phone-access / camera-relay helper instead of the slicer.
+    if (const ConfigOptionBool* hub = m_config.opt<ConfigOptionBool>("hub"); hub && hub->value)
+        return Slic3r::GUI::RemoteHub::run_server(m_config.opt_string("hub_token"), m_config.opt_bool("hub_phone"));
+#endif
 
     m_extra_config.apply(m_config, true);
     m_extra_config.normalize_fdm();

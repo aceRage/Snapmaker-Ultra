@@ -1,7 +1,7 @@
 #include "StreamPanel.hpp"
 
-#include "BambuCamRelay.hpp"
 #include "RemoteAccess.hpp"
+#include "RemoteHub.hpp"
 #include "GUI_App.hpp"
 #include "HttpServer.hpp"
 #include "slic3r/GUI/Widgets/WebView.hpp"
@@ -13,6 +13,8 @@
 #include <wx/uri.h>
 #include <wx/weakref.h>
 
+#include <thread>
+
 namespace Slic3r {
 namespace GUI {
 
@@ -21,65 +23,97 @@ StreamPanel::StreamPanel(wxWindow* parent)
 {
     wxString url = wxString::FromUTF8(LOCALHOST_URL + std::to_string(wxGetApp().get_page_http_port()) +
                                       "/web/orca/stream_center.html");
-    // Local MJPEG relay for Bambu cameras (see BambuCamRelay).
-    url += wxString::Format("?relay=%d", BambuCamRelay::get().port());
     // Seed the page's host list from the legacy camera-address preference, if set.
     const std::string seed = wxGetApp().app_config->get("hd_camera_host");
     if (!seed.empty())
-        url += "&seed=" + wxURI(wxString::FromUTF8(seed)).BuildURI();
+        url += "?seed=" + wxURI(wxString::FromUTF8(seed)).BuildURI();
 
     m_browser = WebView::CreateWebView(this, url);
     if (m_browser == nullptr)
         return;
 
-    // The page asks for the go2rtc relay (RTSPS cameras) on demand via the
-    // app-wide "wx" script channel that CreateWebView already injects; a second
-    // named handler is never injected by the Edge backend, so don't add one.
+    // The page talks to us over the app-wide "wx" script channel that CreateWebView already
+    // injects; a second named handler is never injected by the Edge backend, so don't add one.
     m_browser->Bind(wxEVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED, &StreamPanel::OnScriptMessage, this, m_browser->GetId());
 
     auto* sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(m_browser, wxSizerFlags().Expand().Proportion(1));
     SetSizer(sizer);
 
-    // Phone access left on last time: bring it back with the same link. SNORCA_PHONE_ACCESS=<token>
+    // This instance's loopback API: the hub lists and proxies it (phone Prepare/Devices tabs).
+    RemoteAccess::get().start();
+
+    // Phone access left on last time: bring the hub up with the same link. SNORCA_PHONE_ACCESS=<token>
     // in the environment does the same without touching the saved settings (headless/agent use).
     wxString env_token;
-    if (wxGetEnv("SNORCA_PHONE_ACCESS", &env_token) && !env_token.empty())
-        RemoteAccess::get().start(env_token.ToStdString());
-    else if (wxGetApp().app_config->get("stream_phone_access") == "1")
-        RemoteAccess::get().start(wxGetApp().app_config->get("stream_phone_token"));
+    std::string token;
+    bool        phone = false;
+    if (wxGetEnv("SNORCA_PHONE_ACCESS", &env_token) && !env_token.empty()) {
+        token = env_token.ToStdString();
+        phone = true;
+    } else if (wxGetApp().app_config->get("stream_phone_access") == "1") {
+        token = wxGetApp().app_config->get("stream_phone_token");
+        phone = true;
+    }
+    if (phone) {
+        // Off the GUI thread: spawning and waiting for the hub takes a moment.
+        std::thread([token]() { RemoteHub::ensure_running(token, true); }).detach();
+    }
 }
 
 void StreamPanel::OnScriptMessage(wxWebViewEvent& evt)
 {
-    if (evt.GetString() == "start_go2rtc") {
-        const int port = Go2RtcLauncher::get().port();
-        WebView::RunScript(m_browser, wxString::Format("if (window.__go2rtcReady) window.__go2rtcReady(%d);", port));
-    } else if (evt.GetString().StartsWith("stream_state:")) {
-        // The page's full camera list (with credentials) - kept in-process for phone access.
-        RemoteAccess::get().set_state(evt.GetString().Mid(13).ToStdString(wxConvUTF8));
-    } else if (evt.GetString() == "remote_on" || evt.GetString() == "remote_off" || evt.GetString() == "remote_info") {
+    const wxString msg = evt.GetString();
+    if (msg == "hub_start") {
+        // The page needs a relay (go2rtc for RTSP/ONVIF, MJPEG for Bambu P1): make sure the
+        // hub runs and hand back its ports.
+        wxWeakRef<StreamPanel> weak(this);
+        std::thread([weak]() {
+            RemoteHub::Info info = RemoteHub::ensure_running("", false);
+            wxGetApp().CallAfter([weak, info]() {
+                if (weak == nullptr || weak->m_browser == nullptr)
+                    return;
+                WebView::RunScript(weak->m_browser, wxString::Format("if (window.__hubReady) window.__hubReady(%d, %d);", info.go2rtc_port, info.relay_port));
+            });
+        }).detach();
+    } else if (msg.StartsWith("stream_state:")) {
+        // The page's full camera list (with credentials): the hub keeps it for the phone and
+        // for streams that outlive this window. Remembered here if no hub runs yet.
+        const std::string state = msg.Mid(13).ToStdString(wxConvUTF8);
+        std::thread([state]() { RemoteHub::post_state(state); }).detach();
+    } else if (msg == "remote_on" || msg == "remote_off" || msg == "remote_info") {
         // The toggle is remembered (with its token, so a scanned link survives restarts).
-        RemoteAccess::Info info;
-        auto*              cfg = wxGetApp().app_config;
-        if (evt.GetString() == "remote_on") {
-            info = RemoteAccess::get().start();
-            cfg->set("stream_phone_access", info.on ? "1" : "0");
-            cfg->set("stream_phone_token", info.token);
-        } else if (evt.GetString() == "remote_off") {
-            RemoteAccess::get().stop();
-            info = RemoteAccess::get().info();
-            cfg->set("stream_phone_access", "0");
-            cfg->set("stream_phone_token", "");
-        } else
-            info = RemoteAccess::get().info();
-        WebView::RunScript(m_browser, wxString::Format("if (window.__remoteInfo) window.__remoteInfo(%s);", wxString::FromUTF8(info.json())));
-    } else if (evt.GetString().StartsWith("ff_detail:")) {
+        wxWeakRef<StreamPanel> weak(this);
+        const std::string      saved_token = wxGetApp().app_config->get("stream_phone_token");
+        const std::string      what        = msg.ToStdString();
+        std::thread([weak, what, saved_token]() {
+            RemoteHub::Info info;
+            if (what == "remote_on")
+                info = RemoteHub::ensure_running(saved_token, true);
+            else if (what == "remote_off")
+                info = RemoteHub::set_phone(false);
+            else
+                info = RemoteHub::query();
+            wxGetApp().CallAfter([weak, what, info]() {
+                auto* cfg = wxGetApp().app_config;
+                if (what == "remote_on") {
+                    cfg->set("stream_phone_access", info.alive && info.phone ? "1" : "0");
+                    cfg->set("stream_phone_token", info.token);
+                } else if (what == "remote_off") {
+                    cfg->set("stream_phone_access", "0");
+                    cfg->set("stream_phone_token", "");
+                }
+                if (weak == nullptr || weak->m_browser == nullptr)
+                    return;
+                WebView::RunScript(weak->m_browser, wxString::Format("if (window.__remoteInfo) window.__remoteInfo(%s);", wxString::FromUTF8(info.json())));
+            });
+        }).detach();
+    } else if (msg.StartsWith("ff_detail:")) {
         // Flashforge new-gen LAN API: POST http://<ip>:8898/detail returns device
         // detail JSON including cameraStreamUrl (rtsp:// on Creator 5, MJPEG http://
         // on the Adventurer 5M family). The page cannot POST there itself (no CORS
         // headers from the printer), so probe from here and hand the URL back.
-        const std::string ip = evt.GetString().Mid(10).ToStdString();
+        const std::string ip = msg.Mid(10).ToStdString();
         if (ip.empty() || ip.find_first_of("\"'\\<>") != std::string::npos)
             return;
         wxWeakRef<StreamPanel> weak(this);

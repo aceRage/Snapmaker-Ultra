@@ -90,6 +90,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 .setup .procrow select { flex: 1; min-width: 0; }
 .setup .procrow .btn { flex: none; }
 .setup .procrow .btn.mod { background: #b26a00; }
+.setup .filerow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.setup .filerow label.btn { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.setup .note { color: #9ed; font-size: 12px; margin-top: 8px; }
+.setup .note.err { color: #e88; }
+.view .empty { color: #999; padding: 24px 6px; text-align: center; line-height: 1.5; }
 /* Settings editor (full-screen sheet) */
 #sheet { display: none; position: fixed; inset: 0; z-index: 200; background: #262626; color: #ddd; font-size: 13px; flex-direction: column; }
 #sheet .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top)); background: #1f1f1f; flex-wrap: wrap; }
@@ -278,8 +283,8 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         try { window.wx.postMessage(msg); return; } catch (e) {}
         try { window.snorca.postMessage(msg); } catch (e) {}
     }
+    // Relay ports (Bambu MJPEG, go2rtc) belong to the hub process; see ensureHub below.
     var relayPort = 0;
-    try { relayPort = parseInt(new URLSearchParams(location.search).get('relay')) || 0; } catch (e) {}
     function kindOf(h) {
         if (/^(rtsps?|onvif):\/\//i.test(h.ip)) return 'rtsp-url'; // a pasted stream URL wins over the picked type
         if (h.kind === 'rtsps' || h.kind === 'flashforge' || h.kind === 'ipcam' || h.kind === 'wyze') return h.kind;
@@ -314,18 +319,24 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
              : 'rtspx://bblp:' + encodeURIComponent(h.code) + '@' + h.ip + ':322/streaming/live/1';
     }
 
-    // go2rtc relay (RTSP/ONVIF sources): started by the slicer on request.
-    var go2rtcPort = 0, go2rtcRequested = false, go2rtcFailed = false, go2rtcStreams = {};
-    window.__go2rtcReady = function(p) {
-        go2rtcPort = p || 0;
+    // The relays live in the hub process (RemoteHub.cpp): go2rtc for RTSP/ONVIF sources and
+    // the MJPEG relay for Bambu P1/A1 cameras. The slicer starts the hub on request and
+    // reports both ports here; streams then keep running after this window is closed.
+    var go2rtcPort = 0, hubAsked = false, hubAnswered = false, go2rtcFailed = false, go2rtcStreams = {};
+    window.__hubReady = function(go2rtc, relay) {
+        go2rtcPort = go2rtc || 0;
+        relayPort = relay || 0;
         go2rtcFailed = !go2rtcPort;
+        hubAnswered = true;
         render();
     };
+    window.__go2rtcReady = function(p) { window.__hubReady(p, relayPort); };
     function ensureGo2rtc() {
-        if (go2rtcPort || go2rtcRequested) return;
-        go2rtcRequested = true;
-        postToSlicer('start_go2rtc');
+        if (hubAsked) return;
+        hubAsked = true;
+        postToSlicer('hub_start');
     }
+    var ensureHub = ensureGo2rtc;
     function go2rtcCell(cell, src) {
         var name = 's' + hashStr(src);
         if (!go2rtcStreams[name]) {
@@ -338,11 +349,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         f.src = 'http://127.0.0.1:' + go2rtcPort + '/stream.html?src=' + name + '&mode=mse';
         cell.appendChild(f);
     }
-    function relayWaitCell(cell) {
-        ensureGo2rtc();
+    function relayWaitCell(cell, failed) {
+        ensureHub();
         var wait = document.createElement('div');
-        wait.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:' + (go2rtcFailed ? '#c66' : '#888') + ';font-size:13px;text-align:center;padding:8px;';
-        wait.textContent = go2rtcFailed ? 'Stream relay failed to start - restart the app and check the log for Go2RtcLauncher errors.' : 'Starting stream relay…';
+        wait.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:' + (failed ? '#c66' : '#888') + ';font-size:13px;text-align:center;padding:8px;';
+        wait.textContent = failed ? 'Stream relay failed to start - check <data dir>/hub/hub.log.' : 'Starting stream relay…';
         cell.appendChild(wait);
         cell.dataset.id = ''; // rebuild this cell once the relay reports in
     }
@@ -400,7 +411,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             return;
         }
         if (/^rtsps?:\/\//i.test(url)) {
-            if (go2rtcPort) go2rtcCell(cell, url); else relayWaitCell(cell);
+            if (go2rtcPort) go2rtcCell(cell, url); else relayWaitCell(cell, hubAnswered && !go2rtcPort);
         } else if (/action=stream/i.test(url)) {
             var im = document.createElement('img');
             im.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
@@ -481,7 +492,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         txt.className = 'info';
         txt.textContent = on
             ? 'Phone access is on. Scan the code (or type the address) on a phone connected to the same Wi-Fi. ' +
-              'The link only works while the slicer is running and phone access stays on; a new link is made each time it is turned on.'
+              'The link keeps working after this window is closed (a small hub process stays on until phone access is turned off); a new link is made each time it is turned on.'
             : 'Turn on phone access to get a link for phones on the same Wi-Fi. The cameras\' addresses and passwords stay on this PC; ' +
               'anyone who has the link can watch the streams while it is on.';
         info.appendChild(txt);
@@ -869,13 +880,16 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                     } else if (kind === 'flashforge') {
                         ffCell(hh, cell);
                     } else if (kind === 'rtsp-url' || kind === 'rtsps' || kind === 'ipcam' || kind === 'wyze') {
-                        if (go2rtcPort) go2rtcCell(cell, go2rtcSrc(hh, kind)); else relayWaitCell(cell);
+                        if (go2rtcPort) go2rtcCell(cell, go2rtcSrc(hh, kind)); else relayWaitCell(cell, hubAnswered && !go2rtcPort);
                     } else if (kind === 'p1') {
-                        // The relay serves MJPEG, which renders in a plain <img>.
-                        var im = document.createElement('img');
-                        im.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
-                        im.src = streamSrc(hh);
-                        cell.appendChild(im);
+                        // The hub's relay serves MJPEG, which renders in a plain <img>.
+                        if (!relayPort) relayWaitCell(cell, hubAnswered && !relayPort);
+                        else {
+                            var im = document.createElement('img');
+                            im.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
+                            im.src = streamSrc(hh);
+                            cell.appendChild(im);
+                        }
                     } else {
                         var f = document.createElement('iframe');
                         f.allow = 'autoplay';
@@ -945,12 +959,111 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         render();
     });
 
-    // ---- Phone "Prepare" and "Devices" views, driven by the slicer's JSON API ----
+    // ---- Phone "Prepare" and "Devices" views: the hub lists the open slicer instances and
+    // proxies each one's JSON API under /i/<id>/api; the phone works on one at a time. ----
     var view = 'streams', viewTimer = null, jobTimer = null, activeJob = null, thumbStamp = Date.now(), lastPresetsJson = '';
+    var instances = [], instSel = 0, lastInstJson = '', pendingNew = 0, pendingSince = 0, instTimer = null, uploadNote = '', uploadErr = false, chosenFile = null;
+    try { instSel = parseInt(localStorage.getItem('snorca_remote_inst')) || 0; } catch (e) {}
+    function jsonOf(r) { return r.json().then(function(j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); }
+    function hubApi(path, opts) { return fetch(REMOTE + 'api' + path, opts || {}).then(jsonOf); }
+    function instBase() { return REMOTE + 'i/' + instSel + '/'; }
     function api(path, opts) {
-        return fetch(REMOTE + 'api' + path, opts || {}).then(function(r) {
-            return r.json().then(function(j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; });
+        if (!instSel) return Promise.reject(new Error('No slicer is open'));
+        return fetch(instBase() + 'api' + path, opts || {}).then(jsonOf);
+    }
+    function instIndex(id) { var f = instances.filter(function(i) { return i.id === id; })[0]; return f ? f.index : '?'; }
+    function selectInstance(id) {
+        instSel = id;
+        try { localStorage.setItem('snorca_remote_inst', String(id)); } catch (e) {}
+        lastPresetsJson = ''; activeJob = null;
+        renderInstBar();
+        if (view === 'prepare') refreshPrepare(); else if (view === 'devices') refreshDevices();
+    }
+    function refreshInstances(then) {
+        hubApi('/instances').then(function(j) {
+            instances = j.instances || [];
+            var json = JSON.stringify(instances);
+            var have = instances.some(function(i) { return i.id === instSel; });
+            if (!have) { instSel = instances.length ? instances[0].id : 0; try { localStorage.setItem('snorca_remote_inst', String(instSel)); } catch (e) {} lastPresetsJson = ''; }
+            if (pendingNew) {
+                if (instances.length >= pendingNew) { pendingNew = 0; uploadNote = ''; instSel = instances[instances.length - 1].id; lastPresetsJson = ''; }
+                else if (Date.now() - pendingSince > 180000) { pendingNew = 0; uploadNote = 'The new slicer did not show up - check the PC.'; uploadErr = true; }
+            }
+            if (json !== lastInstJson || !have) { lastInstJson = json; renderInstBar(); }
+            if (then) then();
+        }).catch(function(e) { fail(e); if (then) then(); });
+    }
+    // Top of the Prepare tab: which slicer, and a file to open (in it, or in a new one).
+    function renderInstBar() {
+        var root = document.getElementById('prepare');
+        var bar = root.querySelector('.instbar');
+        if (!bar) { bar = el('div', 'setup instbar'); root.insertBefore(bar, root.firstChild); }
+        bar.innerHTML = '';
+        bar.appendChild(el('div', 'lbl', 'Slicer'));
+        var sel = el('select');
+        if (!instances.length) { var o0 = el('option', '', 'No slicer open'); o0.value = '0'; sel.appendChild(o0); sel.disabled = true; }
+        instances.forEach(function(i) {
+            var o = el('option', '', i.index + ' · ' + (i.title || 'Untitled') + (i.slicing ? ' (slicing)' : ''));
+            o.value = String(i.id);
+            if (i.id === instSel) o.selected = true;
+            sel.appendChild(o);
         });
+        sel.onchange = function() { selectInstance(parseInt(sel.value) || 0); };
+        bar.appendChild(sel);
+        bar.appendChild(el('div', 'lbl', 'Open a file'));
+        var row = el('div', 'filerow');
+        var pick = el('label', 'btn dim', chosenFile ? chosenFile.name : 'Choose 3MF / STL…');
+        var input = el('input');
+        input.type = 'file'; input.accept = '.3mf,.stl,.obj,.step,.stp'; input.style.display = 'none';
+        input.onchange = function() { chosenFile = input.files[0] || null; uploadNote = ''; renderInstBar(); };
+        pick.appendChild(input);
+        row.appendChild(pick);
+        if (chosenFile && !pendingNew) {
+            var isProject = /\.3mf$/i.test(chosenFile.name);
+            if (instances.length) {
+                var load = el('span', 'btn', isProject ? 'Load' : 'Import');
+                load.title = isProject ? 'Save the current project, then open this one in the selected slicer' : 'Add this model to the selected slicer\'s plate';
+                load.onclick = function() { uploadFile(instBase() + 'open', 'Opening in slicer ' + instIndex(instSel) + '…', false); };
+                row.appendChild(load);
+            }
+            var fresh = el('span', 'btn' + (instances.length ? ' dim' : ''), instances.length ? 'New' : 'Open');
+            fresh.title = 'Open in a new slicer window';
+            fresh.onclick = function() { uploadFile(REMOTE + 'api/instances/open', 'Starting a new slicer…', true); };
+            row.appendChild(fresh);
+        }
+        bar.appendChild(row);
+        if (uploadNote) bar.appendChild(el('div', 'note' + (uploadErr ? ' err' : ''), uploadNote));
+    }
+    function uploadFile(url, note, isNew) {
+        if (!chosenFile) return;
+        var f = chosenFile, xhr = new XMLHttpRequest();
+        uploadErr = false;
+        xhr.open('POST', url);
+        xhr.setRequestHeader('X-File-Name', encodeURIComponent(f.name));
+        xhr.upload.onprogress = function(e) { if (e.lengthComputable) { uploadNote = 'Uploading ' + f.name + ' · ' + Math.round(100 * e.loaded / e.total) + '%'; renderInstBar(); } };
+        xhr.upload.onload = function() { uploadNote = note; renderInstBar(); };
+        xhr.onload = function() {
+            var j = {};
+            try { j = JSON.parse(xhr.responseText); } catch (e) {}
+            if (xhr.status !== 200) { pendingNew = 0; uploadErr = true; uploadNote = 'Failed: ' + (j.error || ('HTTP ' + xhr.status)); renderInstBar(); return; }
+            chosenFile = null;
+            if (isNew) {
+                pendingNew = instances.length + 1; pendingSince = Date.now(); uploadNote = note;
+                if (!instTimer) instTimer = setInterval(function() {
+                    if (!pendingNew) { clearInterval(instTimer); instTimer = null; if (view === 'prepare') refreshPrepare(); return; }
+                    refreshInstances();
+                }, 2000);
+            } else {
+                uploadNote = j.saved ? 'Opened. The previous project was saved to ' + j.saved.split(/[\\/]/).pop() : 'Opened.';
+            }
+            lastPresetsJson = ''; thumbStamp = Date.now();
+            renderInstBar();
+            refreshInstances(function() { if (view === 'prepare') refreshPrepare(); });
+        };
+        xhr.onerror = function() { pendingNew = 0; uploadErr = true; uploadNote = 'Failed: connection lost'; renderInstBar(); };
+        uploadNote = 'Uploading ' + f.name + '…';
+        renderInstBar();
+        xhr.send(f);
     }
     function fmtTime(s) {
         s = Math.round(s || 0);
@@ -966,8 +1079,8 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         document.getElementById('chips').style.display = v === 'streams' ? '' : 'none';
         document.getElementById('layoutbox').style.display = v === 'streams' ? '' : 'none';
         if (viewTimer) { clearInterval(viewTimer); viewTimer = null; }
-        if (v === 'prepare') { lastPresetsJson = ''; refreshPrepare(); viewTimer = setInterval(refreshPrepare, 10000); }
-        if (v === 'devices') { refreshDevices(); viewTimer = setInterval(refreshDevices, 5000); }
+        if (v === 'prepare') { lastPresetsJson = ''; refreshInstances(refreshPrepare); viewTimer = setInterval(function() { refreshInstances(refreshPrepare); }, 10000); }
+        if (v === 'devices') { refreshInstances(refreshDevices); viewTimer = setInterval(function() { refreshInstances(refreshDevices); }, 5000); }
         try { localStorage.setItem('snorca_remote_view', v); } catch (e) {}
     }
     function el(tag, cls, text) {
@@ -1000,7 +1113,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
     // Any change made here goes through the slicer's own sidebar code path.
     function postPreset(path, then) {
-        var setup = document.querySelector('#prepare .setup');
+        var setup = document.querySelector('#prepare .setup.presets');
         if (setup) setup.classList.add('busy');
         api(path, { method: 'POST' }).then(function() { lastPresetsJson = ''; refreshPrepare(); if (then) then(); })
             .catch(function(e) { fail(e); lastPresetsJson = ''; refreshPrepare(); });
@@ -1021,7 +1134,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         }
     }
     function buildSetup(pr, data) {
-        var setup = el('div', 'setup');
+        var setup = el('div', 'setup presets');
         var file = el('div', 'file');
         file.appendChild(el('span', 'sub', 'Project'));
         file.appendChild(document.createTextNode(data && data.project ? data.project.split(/[\\/]/).pop() : 'Untitled'));
@@ -1213,15 +1326,27 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
     function refreshPrepare() {
         var root = document.getElementById('prepare');
+        if (!root.querySelector('.instbar')) renderInstBar();
+        if (!instSel) {
+            var old = root.querySelector('.setup.presets'), oldRest = root.querySelector('.rest');
+            if (old) old.remove();
+            if (oldRest) oldRest.remove();
+            var empty = el('div', 'rest');
+            empty.appendChild(el('div', 'empty', pendingNew ? 'Waiting for the new slicer window…' : 'No slicer is open on the PC. Choose a 3MF or STL above to open one.'));
+            root.appendChild(empty);
+            lastPresetsJson = '';
+            return;
+        }
         Promise.all([api('/presets'), api('/plates')]).then(function(res) {
             var pr = res[0], data = res[1];
             var presetsJson = JSON.stringify(pr);
             var editing = root.contains(document.activeElement) && /^(SELECT|INPUT)$/.test(document.activeElement.tagName);
             var scroll = root.scrollTop;
-            var setup = root.querySelector('.setup');
+            var setup = root.querySelector('.setup.presets');
             if (!setup || (presetsJson !== lastPresetsJson && !editing)) {
                 var fresh = buildSetup(pr, data);
-                if (setup) root.replaceChild(fresh, setup); else root.insertBefore(fresh, root.firstChild);
+                var bar = root.querySelector('.instbar');
+                if (setup) root.replaceChild(fresh, setup); else root.insertBefore(fresh, bar ? bar.nextSibling : root.firstChild);
                 lastPresetsJson = presetsJson;
             }
             var rest = root.querySelector('.rest');
@@ -1240,7 +1365,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 card.dataset.index = p.index;
                 var img = el('img');
                 img.alt = 'Plate ' + (p.index + 1);
-                img.src = REMOTE + 'api/plates/' + p.index + '/thumbnail.png?v=' + thumbStamp;
+                img.src = instBase() + 'api/plates/' + p.index + '/thumbnail.png?v=' + thumbStamp;
                 img.onerror = function() { img.style.display = 'none'; };
                 card.appendChild(img);
                 var body = el('div', 'body');
@@ -1271,10 +1396,19 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                     }
                 });
             }
-        }).catch(function(e) { root.innerHTML = ''; root.appendChild(el('div', 'row', 'Cannot reach the slicer: ' + e.message)); });
+        }).catch(function(e) {
+            var setup = root.querySelector('.setup.presets'), rest = root.querySelector('.rest');
+            if (setup) setup.remove();
+            if (rest) rest.remove();
+            rest = el('div', 'rest');
+            rest.appendChild(el('div', 'empty', 'Cannot reach the slicer: ' + e.message));
+            root.appendChild(rest);
+            lastPresetsJson = '';
+        });
     }
     function refreshDevices() {
         var root = document.getElementById('devices');
+        if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); return; }
         api('/printers').then(function(res) {
             var printers = res.printers || [];
             root.innerHTML = '';
@@ -1298,7 +1432,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 }
                 root.appendChild(card);
             });
-        }).catch(function(e) { root.innerHTML = ''; root.appendChild(el('div', 'row', 'Cannot reach the slicer: ' + e.message)); });
+        }).catch(function(e) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'Cannot reach the slicer: ' + e.message)); });
     }
     if (REMOTE) {
         document.getElementById('tabs').style.display = 'inline-flex';

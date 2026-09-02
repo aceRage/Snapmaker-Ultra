@@ -1,4 +1,6 @@
 #include "UnsavedChangesDialog.hpp"
+#include "RemoteAccess.hpp"
+#include <boost/log/trivial.hpp>
 
 #include <cstddef>
 #include <string>
@@ -820,7 +822,15 @@ UnsavedChangesDialog::UnsavedChangesDialog(Preset::Type type, PresetCollection *
 
 inline int UnsavedChangesDialog::ShowModal()
 {
-    auto choise_key = "save_preset_choise"; 
+    // Ultra: a phone/agent request is running on the GUI thread — nobody can click. Carry
+    // the modifications over where that is offered (preset switch), otherwise let them go
+    // (project load: the previous project was just saved with them).
+    if (RemoteAccess::auto_confirm()) {
+        m_exit_action = (m_buttons & ActionButtons::TRANSFER) ? Action::Transfer : Action::Discard;
+        BOOST_LOG_TRIVIAL(info) << "UnsavedChangesDialog: auto-answered (" << (m_exit_action == Action::Transfer ? "transfer" : "discard") << ") for a remote request";
+        return wxID_OK;
+    }
+    auto choise_key = "save_preset_choise";
     auto choise     = wxGetApp().app_config->get(choise_key);
     long result = 0;
     if ((m_buttons & REMEMBER_CHOISE) && !choise.empty() && wxString(choise).ToLong(&result) && (1 << result) & (m_buttons | DONT_SAVE)) {

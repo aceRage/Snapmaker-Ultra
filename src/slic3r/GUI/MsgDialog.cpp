@@ -651,6 +651,15 @@ wxBoxSizer *Newer3mfVersionDialog::get_btn_sizer()
     return horizontal_sizer;
 }
 
+int ErrorDialog::ShowModal()
+{
+    if (RemoteAccess::auto_confirm()) {
+        BOOST_LOG_TRIVIAL(error) << "ErrorDialog: auto-dismissed for a remote request";
+        return wxID_OK;
+    }
+    return MsgDialog::ShowModal();
+}
+
 NetworkErrorDialog::NetworkErrorDialog(wxWindow* parent)
     : DPIDialog(parent ? parent : nullptr, wxID_ANY, _L("Server Exception"), wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX)
 {

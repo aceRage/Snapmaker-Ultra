@@ -1,6 +1,7 @@
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/FilamentHotBedNozzleRules.hpp"
 #include "GUI_App.hpp"
+#include "RemoteAccess.hpp"
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
 #include "GUI_Factories.hpp"
@@ -2474,6 +2475,9 @@ int GUI_App::OnExit()
 {
     // Ultra: Flashforge device stack - shut their network lib down first
     MultiComMgr::inst()->uninitalize();
+
+    // Ultra: drop this instance from the hub's list (the hub itself lives on).
+    RemoteAccess::get().stop();
 
     stop_sync_user_preset();
 

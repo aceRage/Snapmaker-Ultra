@@ -70,10 +70,57 @@ printer dropdown, filament rows (colour swatch + dropdown, "+ Add filament"), pr
 then plate cards (preview, name, estimate, Slice / Re-slice, progress bar). Devices lists the
 printers with status, progress and bed/nozzle temperatures.
 
+## The hub: one permanent server, many slicer instances (2026-09-02)
+
+Phone access moved out of the slicer window into a **hub process**: the same executable
+started as `snapmaker-orca --hub [--datadir …] [--hub-token …] [--hub-phone]`
+(`src/slic3r/GUI/RemoteHub.*`, wx-free, entered from `CLI::run` before any wxApp exists).
+The first slicer instance that needs it spawns the hub detached (`CreateProcess` with
+`CREATE_BREAKAWAY_FROM_JOB`; double fork + `setsid` elsewhere), so the hub — and the camera
+streams — survive closing the slicer. A separate launcher (tray / service) can start it later
+without any slicer at all.
+
+- **Owns**: the token-gated listener on 13640 (bound to all interfaces while phone access is
+  on, loopback only otherwise), go2rtc (spawned into a kill-on-close Job Object so it dies
+  with the hub), the Bambu MJPEG relay, the Flashforge probe, and the camera list (persisted in
+  `<datadir>/hub/streams.json`, re-registered in go2rtc at start). `<datadir>/hub/hub.json`
+  holds pid, port, token, phone flag and version; `hub.log` the log.
+- **Instances**: every slicer instance starts a loopback-only API on an OS-picked port
+  (`RemoteAccess`) and drops `<datadir>/hub/instances/<pid>.json`. The hub scans that
+  directory, drops dead pids, probes `GET /api/info` (pid, project title/path, slicing flag —
+  no GUI thread involved) and proxies `/r/<token>/i/<pid>/api/...` to `/api/...` on the
+  instance as a raw splice. Ids are pids; the phone shows a 1-based index.
+- **Uploads**: `POST /r/<token>/api/instances/open` (body = the file, `X-File-Name` = its
+  name; .3mf/.stl/.obj/.step only, streamed to `<datadir>/hub/uploads`) starts a new instance
+  with the file (`SNORCA_NEW_INSTANCE=1` bypasses the single-instance preference).
+  `POST /r/<token>/i/<pid>/open?mode=load|import` opens it in an instance instead:
+  *load* (.3mf, the default for projects) first saves the project on screen — to its own file,
+  or to `<datadir>/hub/saves/Untitled_<stamp>.3mf` if it was never saved — then
+  `Plater::load_project(file, "<loadall>")`; *import* adds the model to the current plate
+  (`load_files(LoadModel)`). Only files under the uploads folder are accepted by the instance.
+- **Prompts** during those operations answer themselves: `MessageDialog` /
+  `RichMessageDialog` say Yes/OK, `UnsavedChangesDialog` transfers where offered and discards
+  otherwise (the previous project was just saved with the modifications), and `show_error` /
+  `ErrorDialog` (e.g. "Loading of model file failed.") is not shown at all: the text is logged
+  and returned in the request's error (`nothing was imported: Loading of model file failed.`),
+  so a modal never blocks later requests.
+- **Slicer side**: the Stream tab asks the hub for relay ports on demand (`hub_start` →
+  `__hubReady(go2rtc, relay)`), forwards the camera list (`POST /hub/state`), and toggles
+  phone access (`POST /hub/phone?on=1&token=…`); `GET /hub/info` feeds the QR modal. The
+  remembered toggle (`stream_phone_access` / token) and `SNORCA_PHONE_ACCESS` now bring the
+  hub up with phone access on. The hub exits by itself once phone access is off and no
+  instance has been alive for a minute; a version mismatch makes the slicer restart it.
+- **Phone page**: the Prepare tab starts with a *Slicer* dropdown (index · project title) and
+  a file picker with **Load/Import** (into that slicer) and **New** (spawn); with no instance
+  open only the picker and **Open** remain. Uploads show progress; "New" polls the instance
+  list until the new window registers and selects it. Streams come from the hub regardless
+  of instances; Devices uses the selected instance.
+
 ## Not in this phase
 
-Printer control, plates, slicing, sending; authentication beyond the per-session token;
-IPv6; HTTPS. Later JSON routes belong under `/r/<token>/api/...` on the same listener.
+Printer control, sending; authentication beyond the per-session token; IPv6; HTTPS; a
+standalone hub launcher (tray / service); STEP import prompts (its mesh-parameter dialog is
+not auto-answered).
 
 ## Testing
 

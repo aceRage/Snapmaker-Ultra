@@ -16797,6 +16797,8 @@ void Plater::priv::set_project_name(const wxString& project_name)
 {
     BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << __LINE__ << " project is:" << project_name;
     m_project_name = project_name;
+    // Ultra: what the hub lists for this instance (path follows in set_project_filename).
+    RemoteAccess::get().note_project(project_name.ToUTF8().data(), "");
     //update topbar title
 #ifdef __WINDOWS__
     wxGetApp().mainframe->SetTitle(m_project_name + " - Snapmaker Orca");
@@ -16850,6 +16852,7 @@ void Plater::priv::set_project_filename(const wxString& filename)
     //BBS
     wxString project_name = from_u8(full_path.filename().string());
     set_project_name(project_name);
+    RemoteAccess::get().note_project(project_name.ToUTF8().data(), filename.ToUTF8().data());
     // record filename for hint when open exported file/.gcode
     if (q->m_only_gcode)
         q->m_preview_only_filename = std::string((project_name + ".gcode").mb_str());

@@ -24,6 +24,8 @@
 
 #include "AboutDialog.hpp"
 #include "MsgDialog.hpp"
+#include "RemoteAccess.hpp"
+#include <boost/log/trivial.hpp>
 #include "format.hpp"
 
 #include "WebUserLoginDialog.hpp"
@@ -236,6 +238,13 @@ void change_opt_value(DynamicPrintConfig& config, const t_config_option_key& opt
 
 void show_error(wxWindow* parent, const wxString& message, bool monospaced_font)
 {
+    // Ultra: an error raised while a phone/agent request runs must not pop a modal nobody can
+    // click (it would block every later request); hand it back to that request instead.
+    if (RemoteAccess::auto_confirm()) {
+        BOOST_LOG_TRIVIAL(error) << "show_error (remote request, not shown): " << message.ToUTF8().data();
+        RemoteAccess::get().note_error(message.ToUTF8().data());
+        return;
+    }
     wxGetApp().CallAfter([=] {
         ErrorDialog msg(parent, message, monospaced_font);
         msg.ShowModal();

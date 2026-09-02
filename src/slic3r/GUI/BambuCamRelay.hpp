@@ -32,29 +32,7 @@ private:
     void*             m_acceptor { nullptr };
 };
 
-// Manages a bundled go2rtc process (resources/tools/go2rtc) that relays RTSPS
-// LAN Liveview cameras (Bambu X1/H2 series and similar) into browser-playable
-// MSE streams on a localhost API port. Started on demand from the Stream tab.
-class Go2RtcLauncher
-{
-public:
-    static Go2RtcLauncher& get();
-
-    // Spawns go2rtc if it is not running; returns its API port (0 on failure).
-    int  port();
-    void stop();
-
-private:
-    Go2RtcLauncher() = default;
-
-    std::atomic<bool> m_started { false };
-    std::atomic<int>  m_port { 0 };
-    long              m_pid { 0 };
-    // Windows Job Object (HANDLE as void*) with KILL_ON_JOB_CLOSE: our go2rtc is
-    // assigned to it so it dies with THIS app instance even on crash/force-quit — and
-    // only ours (each instance has its own job; other instances' go2rtc are untouched).
-    void*             m_job { nullptr };
-};
+// The bundled go2rtc relay (RTSP/ONVIF cameras) is owned by the hub process, see RemoteHub.hpp.
 
 } // namespace GUI
 } // namespace Slic3r

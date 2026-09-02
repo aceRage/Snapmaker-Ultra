@@ -9240,6 +9240,25 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->tooltip = L("Use the named filament presets, in extruder order, instead of --load-filaments files.");
     def->cli_params = "\"name1;name2;...\"";
     def->set_default_value(new ConfigOptionStrings());
+
+    // Ultra: the hub process (phone access, camera relays, instance list) — see RemoteHub.hpp
+    def = this->add("hub", coBool);
+    def->label = L("Run as the hub");
+    def->tooltip = L("Run the phone-access / camera-relay hub for this data directory instead of the slicer. Started automatically by the slicer when needed.");
+    def->cli_params = "option";
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("hub_token", coString);
+    def->label = L("Hub phone-access token");
+    def->tooltip = L("With --hub: reuse this token for the phone link.");
+    def->cli_params = "token";
+    def->set_default_value(new ConfigOptionString());
+
+    def = this->add("hub_phone", coBool);
+    def->label = L("Hub phone access on");
+    def->tooltip = L("With --hub: start with phone access (the LAN listener) enabled.");
+    def->cli_params = "option";
+    def->set_default_value(new ConfigOptionBool(false));
 }
 
 const CLIActionsConfigDef    cli_actions_config_def;

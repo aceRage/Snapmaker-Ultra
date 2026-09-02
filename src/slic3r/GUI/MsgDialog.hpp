@@ -109,6 +109,8 @@ public:
 	ErrorDialog &operator=(const ErrorDialog &) = delete;
 	virtual ~ErrorDialog() = default;
 
+	int ShowModal() override; // auto-dismissed while a phone/agent request runs
+
 private:
 	wxString msg;
 };

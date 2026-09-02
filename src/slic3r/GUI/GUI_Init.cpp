@@ -15,6 +15,7 @@
 
 #include <boost/nowide/iostream.hpp>
 #include <boost/nowide/convert.hpp>
+#include <cstdlib>
 
 #ifdef _WIN32
     #include <Windows.h>
@@ -48,6 +49,10 @@ int GUI_Run(GUI_InitParams &params)
         //if (gui->get_app_mode() != GUI::GUI_App::EAppMode::GCodeViewer) {
             // G-code viewer is currently not performing instance check, a new G-code viewer is started every time.
             bool gui_single_instance_setting = gui->app_config->get("app", "single_instance") == "true";
+            // Ultra: the hub starts extra instances on request (a file opened from the phone
+            // with "New"); those must not be folded into the running one.
+            if (const char* force_new = std::getenv("SNORCA_NEW_INSTANCE"); force_new && *force_new)
+                gui_single_instance_setting = false;
             if (Slic3r::instance_check(params.argc, params.argv, gui_single_instance_setting)) {
                 //TODO: do we have delete gui and other stuff?
                 return -1;

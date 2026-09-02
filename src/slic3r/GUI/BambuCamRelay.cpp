@@ -3,29 +3,13 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/log/trivial.hpp>
-#include <boost/nowide/fstream.hpp>
-#include <boost/filesystem.hpp>
 
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
-
-#include <wx/utils.h>
-#include <wx/process.h>
-
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h> // Job Object: kill our go2rtc child with this app instance
-#endif
-
-#include "libslic3r/Utils.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -194,78 +178,6 @@ void BambuCamRelay::ensure_started()
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(error) << "BambuCamRelay: failed to start: " << e.what();
         m_port = 0;
-    }
-}
-
-static const int GO2RTC_API_PORT = 21984;
-
-Go2RtcLauncher& Go2RtcLauncher::get()
-{
-    static Go2RtcLauncher instance;
-    return instance;
-}
-
-int Go2RtcLauncher::port()
-{
-    bool expected = false;
-    if (!m_started.compare_exchange_strong(expected, true))
-        return m_port.load();
-
-    const std::string exe = resources_dir() + "/tools/go2rtc/go2rtc.exe";
-    if (!boost::filesystem::exists(exe)) {
-        BOOST_LOG_TRIVIAL(error) << "Go2RtcLauncher: missing " << exe;
-        return 0;
-    }
-    // Config: API (with the MSE websocket) on localhost only, all other listeners off.
-    const std::string cfg_path = data_dir() + "/go2rtc.yaml";
-    {
-        boost::nowide::ofstream cfg(cfg_path);
-        cfg << "api:\n  listen: \"127.0.0.1:" << GO2RTC_API_PORT << "\"\n  origin: \"*\"\n"
-            << "rtsp:\n  listen: \"\"\n"
-            << "webrtc:\n  listen: \"\"\n"
-            << "srtp:\n  listen: \"\"\n";
-    }
-    wxString cmd = wxString::Format("\"%s\" -config \"%s\"", wxString::FromUTF8(exe), wxString::FromUTF8(cfg_path));
-    long pid = wxExecute(cmd, wxEXEC_ASYNC | wxEXEC_HIDE_CONSOLE);
-    if (pid <= 0) {
-        BOOST_LOG_TRIVIAL(error) << "Go2RtcLauncher: failed to start go2rtc";
-        return 0;
-    }
-    m_pid  = pid;
-    m_port = GO2RTC_API_PORT;
-
-#ifdef _WIN32
-    // Assign OUR go2rtc to a kill-on-close Job Object so it terminates when this app
-    // instance exits by ANY means (graceful, crash, or force-quit) — stop() below only
-    // runs on a clean shutdown. The job is per-instance, so it never touches a go2rtc
-    // spawned by another running copy of the app.
-    if (!m_job) {
-        HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
-        if (job) {
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
-            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
-            m_job = job;
-        }
-    }
-    if (m_job) {
-        HANDLE hProc = ::OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, (DWORD) pid);
-        if (hProc) {
-            ::AssignProcessToJobObject((HANDLE) m_job, hProc);
-            ::CloseHandle(hProc);
-        }
-    }
-#endif
-
-    BOOST_LOG_TRIVIAL(info) << "Go2RtcLauncher: go2rtc pid " << pid << " on 127.0.0.1:" << GO2RTC_API_PORT;
-    return m_port.load();
-}
-
-void Go2RtcLauncher::stop()
-{
-    if (m_pid > 0) {
-        wxProcess::Kill(m_pid, wxSIGKILL, wxKILL_CHILDREN);
-        m_pid = 0;
     }
 }
 
