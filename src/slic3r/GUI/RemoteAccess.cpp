@@ -12,6 +12,8 @@
 #include "RemoteHub.hpp"
 #include "Selection.hpp"
 #include "Tab.hpp"
+#include "IMSlider.hpp"
+#include <set>
 #include <climits>
 #include "libslic3r/FilamentColorLibrary.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
@@ -327,6 +329,116 @@ RemoteAccess::ApiResponse RemoteAccess::api_plate_thumbnail(int plate)
     ApiResponse r;
     if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
     if (!data->is_valid()) { r.status = 404; r.body = json_error("no thumbnail for this plate"); return r; }
+    auto png = GCodeThumbnails::compress_thumbnail(*data, GCodeThumbnailsFormat::PNG);
+    r.type   = "image/png";
+    r.body.assign(static_cast<const char*>(png->data), png->size);
+    return r;
+}
+
+// ------------------------------------------------------------ slice preview ----
+
+// Put plate `plate`'s sliced result into the PC's preview (current plate + Preview tab, like the
+// toolbar's Slice does) so the G-code viewer holds its toolpaths and layers. "" = ready.
+static std::string ensure_preview_loaded(int plate)
+{
+    Plater*        plater = wxGetApp().plater();
+    PartPlateList& plates = plater->get_partplate_list();
+    if (plate < 0 || plate >= plates.get_plate_count())
+        return "no such plate";
+    if (plater->is_background_process_slicing())
+        return "the slicer is slicing";
+    PartPlate* p = plates.get_plate(plate);
+    if (!p->is_slice_result_valid() || p->get_slice_result() == nullptr)
+        return "this plate is not sliced";
+    if (plates.get_curr_plate_index() != plate)
+        plater->select_plate(plate, false);
+    if (!plater->is_preview_shown())
+        plater->select_view_3D("Preview");
+    GLCanvas3D*  canvas = plater->get_preview_canvas3D();
+    GCodeViewer& viewer = canvas->get_gcode_viewer();
+    if (!viewer.has_data() || viewer.loaded_result_id() != p->get_slice_result()->id)
+        plater->refresh_print();
+    if (!viewer.has_data() || viewer.get_layers_zs().empty())
+        return "no toolpaths to show";
+    return "";
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_plate_preview(int plate)
+{
+    auto out = std::make_shared<nlohmann::json>();
+    auto err = std::make_shared<std::string>();
+    bool ok  = run_on_main([out, err, plate]() {
+        Plater*         plater = wxGetApp().plater();
+        PartPlateList&  plates = plater->get_partplate_list();
+        nlohmann::json& j      = *out;
+        if (plate < 0 || plate >= plates.get_plate_count()) { *err = "no such plate"; return; }
+        PartPlate* p       = plates.get_plate(plate);
+        const bool sliced  = p->is_slice_result_valid() && p->get_slice_result() != nullptr;
+        const bool slicing = plater->is_background_process_slicing();
+        j["index"]   = plate;
+        j["name"]    = p->get_plate_name();
+        j["objects"] = p->get_objects_on_this_plate().size();
+        j["sliced"]  = sliced;
+        j["slicing"] = slicing;
+        j["views"]   = { "front", "rear", "left", "right" };
+        if (!sliced || slicing)
+            return;
+        const std::string e = ensure_preview_loaded(plate);
+        if (!e.empty()) { *err = e; return; }
+        GCodeViewer& v = plater->get_preview_canvas3D()->get_gcode_viewer();
+        j["result_id"] = v.loaded_result_id();
+        j["layers"]    = v.get_layers_zs();
+        j["range"]     = v.get_layers_z_range();
+        const BoundingBoxf3& b = v.get_paths_bounding_box();
+        j["box"] = { b.min.x(), b.min.y(), b.min.z(), b.max.x(), b.max.y(), b.max.z() };
+    }, 60000);
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    if (!err->empty()) { r.status = *err == "no such plate" ? 404 : 409; r.body = json_error(*err); return r; }
+    r.body = out->dump();
+    return r;
+}
+
+// One frame of the PC's G-code preview: the toolpaths of layers 0..layer (the PC's layer slider is
+// moved there too) from a named orthographic view, on a transparent background.
+RemoteAccess::ApiResponse RemoteAccess::api_plate_preview_png(int plate, const std::string& view_in, int layer, int w, int h)
+{
+    static const std::set<std::string> views = { "front", "rear", "left", "right", "top", "bottom", "iso" };
+    const std::string view = views.count(view_in) ? view_in : "front";
+    w = std::max(64, std::min(2048, w));
+    h = std::max(64, std::min(2048, h));
+    auto data = std::make_shared<ThumbnailData>();
+    auto err  = std::make_shared<std::string>();
+    bool ok   = run_on_main([data, err, plate, view, layer, w, h]() {
+        const std::string e = ensure_preview_loaded(plate);
+        if (!e.empty()) { *err = e; return; }
+        Plater*      plater = wxGetApp().plater();
+        GLCanvas3D*  canvas = plater->get_preview_canvas3D();
+        GCodeViewer& v      = canvas->get_gcode_viewer();
+        const std::vector<double>& zs = v.get_layers_zs();
+        const int          last  = (int) zs.size() - 1;
+        const unsigned int top   = (unsigned int) std::max(0, std::min(last, layer < 0 ? last : layer));
+        const std::array<unsigned int, 2> range = { 0u, top };
+        if (v.get_layers_z_range() != range) {
+            IMSlider* slider = v.get_layers_slider();
+            slider->SetSelectionSpan(0, (int) top);
+            slider->set_as_dirty(false);
+            v.set_layers_z_range(range);
+            canvas->set_volumes_z_range({ slider->GetLowerValueD(), slider->GetHigherValueD() });
+            canvas->set_as_dirty();
+            canvas->request_extra_frame();
+        }
+        BoundingBoxf3 box = v.get_paths_bounding_box();
+        if (!box.defined) { *err = "no toolpaths to show"; return; }
+        box.min.z() = std::min(box.min.z(), -1.0);
+        const BoundingBoxf3& pb = plater->get_partplate_list().get_plate(plate)->get_bounding_box();
+        const BoundingBoxf3  bed(Vec3d(pb.min.x(), pb.min.y(), -1.0), Vec3d(pb.max.x(), pb.max.y(), 0.0));
+        canvas->render_gcode_preview_image(*data, (unsigned int) w, (unsigned int) h, view, box, bed);
+    }, 30000);
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    if (!err->empty()) { r.status = *err == "no such plate" ? 404 : 409; r.body = json_error(*err); return r; }
+    if (!data->is_valid()) { r.status = 500; r.body = json_error("the preview could not be rendered"); return r; }
     auto png = GCodeThumbnails::compress_thumbnail(*data, GCodeThumbnailsFormat::PNG);
     r.type   = "image/png";
     r.body.assign(static_cast<const char*>(png->data), png->size);
@@ -1105,6 +1217,8 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "GET"},  {"path", "/api/plates"},                 {"description", "project, printer preset, filaments and every plate with objects, slice state, time and filament estimates"} },
             { {"method", "GET"},  {"path", "/api/plates/{index}/thumbnail.png"}, {"description", "rendered plate preview"} },
             { {"method", "GET"},  {"path", "/api/plates/{index}/layout"},  {"description", "top-down layout: plate box, exclude areas, every instance with its convex hull (mm), bbox, position, Z rotation, scale, colour"} },
+            { {"method", "GET"},  {"path", "/api/plates/{index}/preview"}, {"description", "slice preview state: sliced flag, layer heights, current layer range; loads that plate's G-code into the PC's preview"} },
+            { {"method", "GET"},  {"path", "/api/plates/{index}/preview.png?view=front|rear|left|right&layer={index}&w=&h="}, {"description", "orthographic render of the toolpaths up to that layer (the PC's layer slider follows)"} },
             { {"method", "POST"}, {"path", "/api/objects/transform"},       {"description", "form obj=&inst=[&x=&y=][&rz=][&scale=][&center=1]: move / rotate / scale one instance like the sidebar (undoable)"} },
             { {"method", "GET"},  {"path", "/api/printers"},               {"description", "known printers with live status"} },
             { {"method", "POST"}, {"path", "/api/slice?plate={index}|all"}, {"description", "start slicing one plate (selects it) or all; returns a job id; 409 while slicing"} },
@@ -1157,6 +1271,11 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             return api_plate_thumbnail(num(rest.substr(0, slash), -1));
         if (slash != std::string::npos && rest.substr(slash) == "/layout")
             return api_plate_layout(num(rest.substr(0, slash), -1));
+        if (slash != std::string::npos && rest.substr(slash) == "/preview")
+            return api_plate_preview(num(rest.substr(0, slash), -1));
+        if (slash != std::string::npos && rest.substr(slash) == "/preview.png")
+            return api_plate_preview_png(num(rest.substr(0, slash), -1), query_param(query, "view"), num(query_param(query, "layer"), -1),
+                                         num(query_param(query, "w"), 800), num(query_param(query, "h"), 800));
     }
     if (path == "/objects/transform" && method == "POST")
         return api_object_transform(body.empty() ? query : body);

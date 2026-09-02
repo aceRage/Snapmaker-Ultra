@@ -827,6 +827,10 @@ public:
     void render_calibration_thumbnail(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, OpenGLManager& opengl_manager);
 
     bool has_data() const { return !m_roles.empty(); }
+    // Snapmaker-Ultra phone preview (GLCanvas3D::render_gcode_preview_image): the toolpaths alone,
+    // with whatever camera is current on the Plater; no legend, sliders or other ImGui.
+    void render_toolpaths_for_capture();
+    unsigned int loaded_result_id() const { return m_last_result_id; }
     bool can_export_toolpaths() const;
     std::vector<int> get_plater_extruder();
 

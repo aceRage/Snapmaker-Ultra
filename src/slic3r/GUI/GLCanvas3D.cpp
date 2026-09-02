@@ -21,6 +21,8 @@
 #include "Tab.hpp"
 #include "GUI_Preview.hpp"
 #include "OpenGLManager.hpp"
+#include "GLModel.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 #include "Plater.hpp"
 #include "MainFrame.hpp"
 #include "GUI_App.hpp"
@@ -6634,6 +6636,132 @@ void GLCanvas3D::render_thumbnail_framebuffer_ext(ThumbnailData& thumbnail_data,
 
     //if (!multisample)
     //    glsafe(::glDisable(GL_MULTISAMPLE));
+}
+
+// Snapmaker-Ultra phone preview: the loaded toolpaths (current layer range) from a named view into
+// an RGBA image with a transparent background. Same framebuffer recipe as the plate thumbnails.
+void GLCanvas3D::render_gcode_preview_image(ThumbnailData& data, unsigned int w, unsigned int h, const std::string& view, const BoundingBoxf3& box, const BoundingBoxf3& bed)
+{
+    data.set(w, h);
+    if (!data.is_valid())
+        return;
+    if (!_set_current() || !wxGetApp().init_opengl() || (!is_initialized() && !init())) {
+        data.reset();
+        return;
+    }
+
+    const bool multisample = OpenGLManager::can_multisample();
+    GLint max_samples = 0;
+    glsafe(::glGetIntegerv(GL_MAX_SAMPLES, &max_samples));
+    const GLsizei num_samples = std::max(1, max_samples / 2);
+
+    GLuint render_fbo = 0;
+    glsafe(::glGenFramebuffers(1, &render_fbo));
+    glsafe(::glBindFramebuffer(GL_FRAMEBUFFER, render_fbo));
+    GLuint render_tex = 0, render_tex_buffer = 0;
+    if (multisample) {
+        glsafe(::glGenRenderbuffers(1, &render_tex_buffer));
+        glsafe(::glBindRenderbuffer(GL_RENDERBUFFER, render_tex_buffer));
+        glsafe(::glRenderbufferStorageMultisample(GL_RENDERBUFFER, num_samples, GL_RGBA8, w, h));
+        glsafe(::glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, render_tex_buffer));
+    } else {
+        glsafe(::glGenTextures(1, &render_tex));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, render_tex));
+        glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+        glsafe(::glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, render_tex, 0));
+    }
+    GLuint render_depth = 0;
+    glsafe(::glGenRenderbuffers(1, &render_depth));
+    glsafe(::glBindRenderbuffer(GL_RENDERBUFFER, render_depth));
+    if (multisample)
+        glsafe(::glRenderbufferStorageMultisample(GL_RENDERBUFFER, num_samples, GL_DEPTH_COMPONENT24, w, h));
+    else
+        glsafe(::glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, w, h));
+    glsafe(::glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, render_depth));
+    const GLenum draw_bufs[] = { GL_COLOR_ATTACHMENT0 };
+    glsafe(::glDrawBuffers(1, draw_bufs));
+
+    bool rendered = false;
+    if (::glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        // The toolpath shaders read the Plater's camera, so ours is swapped in for the draw.
+        BoundingBoxf3 scene = box;
+        scene.merge(bed);
+        Camera&      live  = wxGetApp().plater()->get_camera();
+        const Camera saved = live;
+        Camera       cam;
+        cam.set_type(Camera::EType::Ortho);
+        cam.set_scene_box(scene);
+        cam.set_viewport(0, 0, w, h);
+        cam.apply_viewport();
+        cam.select_view(view);
+        cam.zoom_to_box(box, 1.1);
+        cam.set_type(Camera::EType::Ortho);
+        cam.apply_projection(scene);
+        live = cam;
+
+        glsafe(::glClearColor(0.0f, 0.0f, 0.0f, 0.0f));
+        glsafe(::glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
+        glsafe(::glEnable(GL_DEPTH_TEST));
+
+        // A 1 mm slab under the plate: side views then show where the bed is.
+        if (bed.defined && bed.size().x() > 0.0 && bed.size().y() > 0.0) {
+            if (GLShaderProgram* flat = wxGetApp().get_shader("flat"); flat != nullptr) {
+                GLModel slab;
+                slab.init_from(its_make_cube(bed.size().x(), bed.size().y(), 1.0));
+                slab.set_color(ColorRGBA(0.30f, 0.30f, 0.33f, 1.0f));
+                Transform3d model = Transform3d::Identity();
+                model.translate(Vec3d(bed.min.x(), bed.min.y(), -1.0));
+                flat->start_using();
+                flat->set_uniform("view_model_matrix", cam.get_view_matrix() * model);
+                flat->set_uniform("projection_matrix", cam.get_projection_matrix());
+                slab.render();
+                flat->stop_using();
+            }
+        }
+        m_gcode_viewer.render_toolpaths_for_capture();
+        live = saved;
+
+        if (multisample) {
+            GLuint resolve_fbo = 0;
+            glsafe(::glGenFramebuffers(1, &resolve_fbo));
+            glsafe(::glBindFramebuffer(GL_FRAMEBUFFER, resolve_fbo));
+            GLuint resolve_tex = 0;
+            glsafe(::glGenTextures(1, &resolve_tex));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, resolve_tex));
+            glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+            glsafe(::glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, resolve_tex, 0));
+            glsafe(::glDrawBuffers(1, draw_bufs));
+            if (::glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, render_fbo));
+                glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolve_fbo));
+                glsafe(::glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_LINEAR));
+                glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, resolve_fbo));
+                glsafe(::glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, (void*) data.pixels.data()));
+                rendered = true;
+            }
+            glsafe(::glDeleteTextures(1, &resolve_tex));
+            glsafe(::glDeleteFramebuffers(1, &resolve_fbo));
+        } else {
+            glsafe(::glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, (void*) data.pixels.data()));
+            rendered = true;
+        }
+    }
+
+    glsafe(::glBindFramebuffer(GL_FRAMEBUFFER, 0));
+    glsafe(::glDeleteRenderbuffers(1, &render_depth));
+    if (render_tex_buffer != 0)
+        glsafe(::glDeleteRenderbuffers(1, &render_tex_buffer));
+    if (render_tex != 0)
+        glsafe(::glDeleteTextures(1, &render_tex));
+    glsafe(::glDeleteFramebuffers(1, &render_fbo));
+    if (!rendered)
+        data.reset();
+    else
+        set_as_dirty(); // the live canvas repaints with its own viewport and camera
 }
 
 void GLCanvas3D::render_thumbnail_legacy(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h, const ThumbnailsParams& thumbnail_params, PartPlateList &partplate_list, ModelObjectPtrs& model_objects, const GLVolumeCollection& volumes, std::vector<ColorRGBA>& extruder_colors, GLShaderProgram* shader, Camera::EType camera_type)

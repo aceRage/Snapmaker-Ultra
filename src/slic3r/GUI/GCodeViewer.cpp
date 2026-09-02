@@ -4083,6 +4083,14 @@ void GCodeViewer::render_toolpaths()
     }
 }
 
+void GCodeViewer::render_toolpaths_for_capture()
+{
+    if (m_roles.empty())
+        return;
+    glsafe(::glEnable(GL_DEPTH_TEST));
+    render_toolpaths();
+}
+
 void GCodeViewer::render_shells(int canvas_width, int canvas_height)
 {
     //BBS: add shell previewing logic

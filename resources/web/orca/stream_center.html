@@ -155,6 +155,20 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #plate .rot-grab.active { fill: #5fd08a; }
 #plate .ctl .sel-name { color: #fff; font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #plate .ctl .hint { color: #888; font-size: 12px; }
+#plate .seg { display: inline-flex; border-radius: 6px; overflow: hidden; border: 1px solid #555; flex: none; }
+#plate .seg span { padding: 7px 12px; background: #3a3a3a; color: #ccc; font-size: 12px; cursor: pointer; user-select: none; white-space: nowrap; }
+#plate .seg span.active { background: #0a9e50; color: #fff; }
+#plate .pv { display: flex; width: 100%; height: 100%; }
+#plate .pv-img { flex: 1; min-width: 0; position: relative; display: flex; align-items: center; justify-content: center; }
+#plate .pv-img img { max-width: 100%; max-height: 100%; object-fit: contain; }
+#plate .pv-img .status { position: absolute; left: 10px; top: 10px; color: #bbb; font-size: 12px; background: rgba(0,0,0,.45); padding: 3px 8px; border-radius: 6px; pointer-events: none; }
+#plate .pv-img .status:empty { display: none; }
+#plate .pv-slider { width: 64px; flex: none; display: flex; flex-direction: column; align-items: center; padding: 10px 0; touch-action: none; user-select: none; cursor: pointer; }
+#plate .pv-slider .track { position: relative; flex: 1; width: 6px; background: #444; border-radius: 3px; margin: 14px 0; }
+#plate .pv-slider .fill { position: absolute; left: 0; right: 0; bottom: 0; background: #0a9e50; border-radius: 3px; }
+#plate .pv-slider .thumb { position: absolute; left: 50%; width: 46px; height: 28px; margin: -14px 0 0 -23px; background: #0a9e50; color: #fff; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+#plate .pv-slider .end { color: #888; font-size: 11px; }
+#plate .pv-empty { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 24px; text-align: center; }
 #modal .url { font-family: Consolas, monospace; font-size: 12px; color: #9ed; text-align: center; word-break: break-all; user-select: all; }
 @media (max-width: 640px) {
     #topbar { padding: 6px 8px; gap: 6px; }
@@ -1145,8 +1159,14 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 var st = card.querySelector('.state');
                 if (st && mine && j.state === 'running') st.textContent = 'Slicing… ' + j.percent + '%' + (j.text ? ' — ' + j.text.replace(/^Slicing/, '').trim() : '');
             });
+            var ps = document.querySelector('#plate .pv-slicing');
+            if (ps && (j.plate === -1 || j.plate === plateIndex)) ps.textContent = j.state === 'running' ? 'Slicing… ' + j.percent + '%' : '';
             if (j.state === 'running') jobTimer = setTimeout(pollJob, 1000);
-            else { activeJob = null; thumbStamp = Date.now(); lastPresetsJson = ''; refreshPrepare(); if (j.state === 'error') fail(new Error('Slicing failed: ' + j.error)); }
+            else {
+                activeJob = null; thumbStamp = Date.now(); lastPresetsJson = ''; refreshPrepare();
+                if (j.state === 'error') fail(new Error('Slicing failed: ' + j.error));
+                if (plateOpen() && plateMode === 'preview') openPreview();
+            }
         }).catch(function() { jobTimer = setTimeout(pollJob, 2000); });
     }
     // Any change made here goes through the slicer's own sidebar code path.
@@ -1365,16 +1385,45 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     // ---- Plate layout editor: accurate top-down footprints from /api/plates/{i}/layout; a tap
     // selects, a drag moves, the bar below rotates / scales / centres via /api/objects/transform ----
     var plateData = null, plateSel = null, plateIndex = -1, plateBusy = false;
+    // The sheet has two modes: Prepare (arrange the objects) and Preview (scrub the sliced layers).
+    var plateMode = 'prepare';
+    try { plateMode = localStorage.getItem('snorca_plate_mode') === 'preview' ? 'preview' : 'prepare'; } catch (e) {}
+    function plateOpen() { return document.getElementById('plate').style.display === 'flex'; }
     function openPlate(index) {
         plateIndex = index; plateSel = null; plateZoom = 1; plateCenter = null;
         var sheet = document.getElementById('plate');
         sheet.style.display = 'flex';
         sheet.querySelector('.canvas').innerHTML = '<div class="hint" style="color:#888">Loading plate…</div>';
-        loadPlate();
+        sheet.querySelector('.ctl').innerHTML = '';
+        if (plateMode === 'preview') openPreview(); else loadPlate();
     }
     function closePlate() {
         document.getElementById('plate').style.display = 'none';
+        pvStop();
         plateData = null; thumbStamp = Date.now(); lastPresetsJson = ''; refreshPrepare();
+    }
+    function setPlateMode(mode) {
+        if (mode === plateMode) return;
+        plateMode = mode;
+        try { localStorage.setItem('snorca_plate_mode', mode); } catch (e) {}
+        pvStop();
+        var sheet = document.getElementById('plate');
+        sheet.querySelector('.canvas').innerHTML = '<div class="hint" style="color:#888">Loading…</div>';
+        sheet.querySelector('.ctl').innerHTML = '';
+        if (mode === 'preview') openPreview(); else loadPlate();
+    }
+    function renderPlateHead(title, showFit) {
+        var head = document.querySelector('#plate .head'); head.innerHTML = '';
+        head.appendChild(el('div', 'name', title));
+        var seg = el('span', 'seg');
+        [['prepare', 'Prepare'], ['preview', 'Preview']].forEach(function(m) {
+            var s = el('span', m[0] === plateMode ? 'active' : '', m[1]);
+            s.onclick = function() { setPlateMode(m[0]); };
+            seg.appendChild(s);
+        });
+        head.appendChild(seg);
+        if (showFit) { var fit = el('span', 'btn small', 'Fit'); fit.title = 'Reset zoom'; fit.onclick = function() { plateZoom = 1; plateCenter = null; renderPlate(); }; head.appendChild(fit); }
+        var close = el('span', 'btn small', 'Close'); close.onclick = closePlate; head.appendChild(close);
     }
     function loadPlate() {
         api('/plates/' + plateIndex + '/layout').then(function(d) {
@@ -1416,10 +1465,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
     function renderPlate() {
         var d = plateData, sheet = document.getElementById('plate');
-        var head = sheet.querySelector('.head'); head.innerHTML = '';
-        head.appendChild(el('div', 'name', (d.name ? d.name : 'Plate ' + (d.index + 1)) + ' · ' + d.objects.length + ' object' + (d.objects.length === 1 ? '' : 's')));
-        var fit = el('span', 'btn small', 'Fit'); fit.title = 'Reset zoom'; fit.onclick = function() { plateZoom = 1; plateCenter = null; renderPlate(); }; head.appendChild(fit);
-        var close = el('span', 'btn small', 'Close'); close.onclick = closePlate; head.appendChild(close);
+        renderPlateHead((d.name ? d.name : 'Plate ' + (d.index + 1)) + ' · ' + d.objects.length + ' object' + (d.objects.length === 1 ? '' : 's'), true);
         // Canvas: plate box in mm, Y flipped so +Y is up like the slicer's top view.
         var b = d.plate_box, W = b[2] - b[0], H = b[3] - b[1];
         var fy = function(y) { return b[3] + b[1] - y; };
@@ -1550,6 +1596,143 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         var canvas = sheet.querySelector('.canvas'); canvas.innerHTML = ''; canvas.appendChild(svg);
         renderPlateCtl();
     }
+    // ---- Slice preview: the PC renders its own G-code preview (toolpaths up to the chosen layer,
+    // orthographic side view) to a PNG through /api/plates/{i}/preview.png; the PC's preview and its
+    // layer slider follow the phone. ----
+    var pv = { view: 'front', layer: 0, info: null, timer: null, busy: false, pending: false, url: null };
+    try { pv.view = localStorage.getItem('snorca_pv_view') || 'front'; } catch (e) {}
+    function pvStop() {
+        if (pv.timer) { clearTimeout(pv.timer); pv.timer = null; }
+        pv.pending = false; pv.info = null;
+        if (pv.url) { URL.revokeObjectURL(pv.url); pv.url = null; }
+    }
+    function openPreview() {
+        var canvas = document.querySelector('#plate .canvas'), ctl = document.querySelector('#plate .ctl');
+        var index = plateIndex;
+        renderPlateHead('Plate ' + (index + 1), false);
+        canvas.innerHTML = '<div class="hint" style="color:#888">Loading preview…</div>'; ctl.innerHTML = '';
+        api('/plates/' + index + '/preview').then(function(info) {
+            if (plateMode !== 'preview' || index !== plateIndex || !plateOpen()) return;
+            pv.info = info;
+            renderPlateHead((info.name ? info.name : 'Plate ' + (info.index + 1)) + ' · ' + (info.sliced ? 'sliced' : 'not sliced'), false);
+            if (!info.sliced || !info.layers || !info.layers.length) { renderPvUnsliced(info); return; }
+            var n = info.layers.length;
+            pv.layer = Math.max(0, Math.min(n - 1, (info.range && info.range.length === 2) ? info.range[1] : n - 1));
+            renderPv();
+            requestFrame(true);
+        }).catch(function(e) {
+            if (plateMode !== 'preview' || index !== plateIndex || !plateOpen()) return;
+            canvas.innerHTML = ''; canvas.appendChild(el('div', 'hint', 'Cannot load the preview: ' + e.message));
+        });
+    }
+    function renderPvUnsliced(info) {
+        var canvas = document.querySelector('#plate .canvas'); canvas.innerHTML = '';
+        var box = el('div', 'pv-empty');
+        box.appendChild(el('div', 'hint', info.slicing ? 'Slicing on the PC…' : 'This plate has not been sliced yet.'));
+        if (!info.slicing) {
+            var b = el('span', 'btn', 'Slice');
+            b.onclick = function() { if (activeJob !== null) return; b.classList.add('dim'); startSlice(plateIndex); };
+            box.appendChild(b);
+        }
+        box.appendChild(el('div', 'hint pv-slicing', ''));
+        canvas.appendChild(box);
+        // Slicing started on the PC: look again until the result is there.
+        if (info.slicing && activeJob === null) pv.timer = setTimeout(function() { pv.timer = null; if (plateMode === 'preview' && plateOpen()) openPreview(); }, 2000);
+    }
+    function renderPv() {
+        var n = pv.info.layers.length;
+        var canvas = document.querySelector('#plate .canvas'); canvas.innerHTML = '';
+        var wrap = el('div', 'pv');
+        var imgBox = el('div', 'pv-img');
+        var img = el('img'); img.alt = 'Slice preview'; imgBox.appendChild(img);
+        imgBox.appendChild(el('div', 'status', ''));
+        wrap.appendChild(imgBox);
+        // Vertical layer slider like the slicer's: top = last layer, bottom = first.
+        var sl = el('div', 'pv-slider');
+        sl.appendChild(el('div', 'end', String(n)));
+        var track = el('div', 'track'); track.appendChild(el('div', 'fill')); track.appendChild(el('div', 'thumb')); sl.appendChild(track);
+        sl.appendChild(el('div', 'end', '1'));
+        wrap.appendChild(sl);
+        canvas.appendChild(wrap);
+        var setFromY = function(clientY) {
+            var r = track.getBoundingClientRect();
+            if (!(r.height > 0)) return; // not laid out yet (hidden tab)
+            var f = 1 - (clientY - r.top) / r.height;
+            var L = Math.round(Math.max(0, Math.min(1, f)) * (n - 1));
+            if (L !== pv.layer) { pv.layer = L; updatePvSlider(); requestFrame(false); }
+        };
+        var active = null;
+        sl.addEventListener('pointerdown', function(ev) { ev.preventDefault(); active = ev.pointerId; try { sl.setPointerCapture(ev.pointerId); } catch (e) {} setFromY(ev.clientY); });
+        sl.addEventListener('pointermove', function(ev) { if (active !== ev.pointerId) return; setFromY(ev.clientY); });
+        var end = function(ev) { if (active !== ev.pointerId) return; active = null; requestFrame(true); };
+        sl.addEventListener('pointerup', end);
+        sl.addEventListener('pointercancel', end);
+        renderPvCtl();
+    }
+    function updatePvSlider() {
+        if (!pv.info) return;
+        var n = pv.info.layers.length, f = n > 1 ? pv.layer / (n - 1) : 1;
+        var thumb = document.querySelector('#plate .pv-slider .thumb'), fill = document.querySelector('#plate .pv-slider .fill');
+        if (thumb) { thumb.style.top = ((1 - f) * 100) + '%'; thumb.textContent = String(pv.layer + 1); }
+        if (fill) fill.style.height = (f * 100) + '%';
+        var ro = document.querySelector('#plate .ctl .pv-readout');
+        if (ro) ro.textContent = 'Layer ' + (pv.layer + 1) + ' / ' + n + ' · Z ' + pv.info.layers[pv.layer].toFixed(2) + ' mm';
+    }
+    function renderPvCtl() {
+        var ctl = document.querySelector('#plate .ctl'); ctl.innerHTML = '';
+        var r1 = el('div', 'row');
+        r1.appendChild(el('span', 'k', 'View'));
+        var seg = el('span', 'seg');
+        [['front', 'Front'], ['rear', 'Rear'], ['left', 'Left'], ['right', 'Right']].forEach(function(v) {
+            var s = el('span', v[0] === pv.view ? 'active' : '', v[1]);
+            s.onclick = function() { pv.view = v[0]; try { localStorage.setItem('snorca_pv_view', pv.view); } catch (e) {} renderPvCtl(); requestFrame(true); };
+            seg.appendChild(s);
+        });
+        r1.appendChild(seg);
+        ctl.appendChild(r1);
+        var r2 = el('div', 'row');
+        r2.appendChild(el('span', 'k', 'Layer'));
+        var down = el('span', 'btn small', '▼'); down.title = 'One layer down'; down.onclick = function() { stepLayer(-1); }; r2.appendChild(down);
+        var up = el('span', 'btn small', '▲'); up.title = 'One layer up'; up.onclick = function() { stepLayer(1); }; r2.appendChild(up);
+        r2.appendChild(el('span', 'hint pv-readout', ''));
+        ctl.appendChild(r2);
+        ctl.appendChild(el('div', 'hint', 'Drag the slider to scrub layers; the preview on the PC follows.'));
+        updatePvSlider();
+    }
+    function stepLayer(d) {
+        if (!pv.info) return;
+        var n = pv.info.layers.length, L = Math.max(0, Math.min(n - 1, pv.layer + d));
+        if (L !== pv.layer) { pv.layer = L; updatePvSlider(); requestFrame(true); }
+    }
+    // One render in flight at a time; a newer layer/view waits for it and is sent once, debounced.
+    function requestFrame(now) {
+        if (pv.timer) clearTimeout(pv.timer);
+        pv.timer = setTimeout(fetchFrame, now ? 0 : 120);
+    }
+    function fetchFrame() {
+        pv.timer = null;
+        if (!pv.info || plateMode !== 'preview' || !plateOpen()) return;
+        if (pv.busy) { pv.pending = true; return; }
+        var box = document.querySelector('#plate .pv-img'); if (!box) return;
+        // Right after the sheet or mode changes the box can still measure 0: wait for layout.
+        if (box.clientWidth < 32 || box.clientHeight < 32) { pv.timer = setTimeout(fetchFrame, 100); return; }
+        var dpr = Math.min(2, window.devicePixelRatio || 1);
+        var w = Math.max(64, Math.min(1600, Math.round(box.clientWidth * dpr))), h = Math.max(64, Math.min(1600, Math.round(box.clientHeight * dpr)));
+        var url = instBase() + 'api/plates/' + plateIndex + '/preview.png?view=' + pv.view + '&layer=' + pv.layer + '&w=' + w + '&h=' + h + '&v=' + (pv.info.result_id || 0);
+        var status = box.querySelector('.status'); if (status) status.textContent = 'Rendering…';
+        pv.busy = true;
+        fetch(url).then(function(r) { if (!r.ok) return r.json().then(function(j) { throw new Error(j.error || ('HTTP ' + r.status)); }); return r.blob(); })
+            .then(function(blob) {
+                var img = box.querySelector('img'); if (!img) return;
+                var old = pv.url; pv.url = URL.createObjectURL(blob);
+                img.onload = function() { if (old) URL.revokeObjectURL(old); };
+                img.src = pv.url;
+                if (status) status.textContent = '';
+            })
+            .catch(function(e) { if (status) status.textContent = e.message; })
+            .then(function() { pv.busy = false; if (pv.pending) { pv.pending = false; fetchFrame(); } });
+    }
+    window.addEventListener('resize', function() { if (pv.info && plateMode === 'preview' && plateOpen()) requestFrame(false); });
     function svgPoint(svg, ev) {
         var p = svg.createSVGPoint(); p.x = ev.clientX; p.y = ev.clientY;
         return p.matrixTransform(svg.getScreenCTM().inverse());

@@ -937,6 +937,11 @@ public:
                                  ThumbnailView             view,
                                  bool                      for_picking  = false,
                                  bool                      ban_light    = false);
+    // Snapmaker-Ultra phone preview: the loaded G-code toolpaths (current layer range) from a named
+    // orthographic view ("front", "rear", "left", "right", "top", "bottom", "iso"), framed on `box`
+    // (world mm) with a thin floor slab spanning `bed`, into an RGBA image (transparent background).
+    void render_gcode_preview_image(ThumbnailData& data, unsigned int w, unsigned int h, const std::string& view, const BoundingBoxf3& box, const BoundingBoxf3& bed);
+
     static void render_thumbnail_internal(ThumbnailData& thumbnail_data, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, ModelObjectPtrs& model_objects,
         const GLVolumeCollection& volumes, std::vector<ColorRGBA>& extruder_colors,
         GLShaderProgram* shader, Camera::EType camera_type, bool use_top_view = false, bool for_picking = false, bool ban_light = false, ThumbnailView view = ThumbnailView::Iso);
