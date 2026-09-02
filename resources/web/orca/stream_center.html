@@ -489,10 +489,17 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             cell.appendChild(f2);
         }
     }
+    // Off the LAN (a tailnet https address) a printer's own LAN page cannot be embedded; cameras
+    // that also offer raw H.264 (Snapmaker U1) then play through the hub's go2rtc relay instead.
+    function relayPreferred() {
+        if (location.protocol === 'https:') return true;
+        var h = location.hostname;
+        return !(/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.)/.test(h) || h === 'localhost');
+    }
     // Phone mode cells: everything comes through the slicer's token-gated listener.
     function remoteCell(h, cell) {
         var msg = null;
-        if (h.rkind === 'go2rtc') {
+        if (h.rkind === 'go2rtc' || (h.rkind === 'url' && h.relay && h.rname && relayPreferred())) {
             var f = document.createElement('iframe');
             f.allow = 'autoplay';
             f.setAttribute('scrolling', 'no'); // iOS otherwise grows the frame to its content

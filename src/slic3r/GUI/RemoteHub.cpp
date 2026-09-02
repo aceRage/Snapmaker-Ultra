@@ -632,6 +632,139 @@ static std::string go2rtc_head(const std::string& head, const std::string& auth)
     return out;
 }
 
+// Snapmaker U1 (camera-streamer behind nginx): the Stream tab embeds http://<ip>/webcam/webrtc,
+// which only a browser on the LAN can reach. The same server offers raw H.264 at
+// /webcam/stream.h264, which go2rtc can carry to a phone anywhere - via the relay below.
+static std::string u1_h264_url(const json& host)
+{
+    const std::string rurl = host.value("rurl", "");
+    const std::string tail = "/webcam/webrtc";
+    if (rurl.compare(0, 7, "http://") != 0) return "";
+    std::string u = rurl;
+    while (!u.empty() && u.back() == '/') u.pop_back();
+    if (u.size() <= tail.size() || u.compare(u.size() - tail.size(), tail.size(), tail) != 0) return "";
+    const std::string hostport = u.substr(7, u.size() - 7 - tail.size());
+    if (hostport.empty() || hostport.find('/') != std::string::npos) return "";
+    return "http://" + hostport + "/webcam/stream.h264";
+}
+
+static std::string u1_stream_name(const std::string& id)
+{
+    std::string n = "u1_";
+    for (unsigned char c : id) n += std::isalnum(c) ? (char) c : '_';
+    return n;
+}
+
+static std::string encode_component(const std::string& s)
+{
+    static const char* hx = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char) c;
+        else { out += '%'; out += hx[c >> 4]; out += hx[c & 15]; }
+    }
+    return out;
+}
+
+// GET a raw H.264 stream from a camera server and re-serve it from the first SPS onward (a
+// stream that starts mid-GOP begins with a slice byte that also reads as an HEVC header, and
+// go2rtc then decodes nothing). Chunked transfer is undone; the client gets a plain body.
+static void relay_h264(tcp::socket& client, const std::string& url)
+{
+    std::string rest  = url.substr(7);
+    const size_t sl   = rest.find('/');
+    std::string hostport = rest.substr(0, sl), path = sl == std::string::npos ? "/" : rest.substr(sl);
+    std::string host = hostport, port = "80";
+    const size_t colon = hostport.rfind(':');
+    if (colon != std::string::npos) { host = hostport.substr(0, colon); port = hostport.substr(colon + 1); }
+    asio::io_context          ioc;
+    tcp::resolver             resolver(ioc);
+    boost::system::error_code ec;
+    auto endpoints = resolver.resolve(host, port, ec);
+    if (ec) { respond(client, 502, "text/plain", "camera address did not resolve"); return; }
+    tcp::socket up(ioc);
+    asio::connect(up, endpoints, ec);
+    if (ec) { respond(client, 502, "text/plain", "camera did not answer"); return; }
+    up.set_option(tcp::no_delay(true));
+    write_all(up, "GET " + path + " HTTP/1.1\r\nHost: " + hostport + "\r\nConnection: close\r\n\r\n");
+    std::string buf;
+    char        tmp[16384];
+    while (buf.find("\r\n\r\n") == std::string::npos) {
+        const size_t n = up.read_some(asio::buffer(tmp), ec);
+        if (ec || buf.size() > 65536) { respond(client, 502, "text/plain", "bad answer from the camera"); return; }
+        buf.append(tmp, n);
+    }
+    const size_t      he   = buf.find("\r\n\r\n") + 4;
+    const std::string head = lower(buf.substr(0, he));
+    if (head.compare(0, 12, "http/1.1 200") != 0 && head.compare(0, 12, "http/1.0 200") != 0) {
+        respond(client, 502, "text/plain", "camera answered " + buf.substr(0, buf.find("\r\n")));
+        return;
+    }
+    const bool chunked = head.find("transfer-encoding: chunked") != std::string::npos;
+    write_all(client, "HTTP/1.1 200 OK\r\nContent-Type: video/h264\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+
+    bool        started = false;
+    std::string pend; // unforwarded bytes while waiting for the first SPS
+    auto emit = [&](const char* p, size_t n) -> bool {
+        boost::system::error_code e;
+        if (started) { asio::write(client, asio::buffer(p, n), e); return !e; }
+        pend.append(p, n);
+        size_t at = std::string::npos;
+        for (size_t k = 0; k + 3 < pend.size(); ++k)
+            if (pend[k] == 0 && pend[k + 1] == 0 && pend[k + 2] == 1 && ((unsigned char) pend[k + 3] & 0x1f) == 7) {
+                at = (k > 0 && pend[k - 1] == 0) ? k - 1 : k;
+                break;
+            }
+        if (at == std::string::npos) { if (pend.size() > 4) pend.erase(0, pend.size() - 4); return true; }
+        started = true;
+        asio::write(client, asio::buffer(pend.data() + at, pend.size() - at), e);
+        pend.clear();
+        return !e;
+    };
+    std::string acc = buf.substr(he);
+    auto more = [&]() -> bool {
+        const size_t n = up.read_some(asio::buffer(tmp), ec);
+        if (ec) return false;
+        acc.append(tmp, n);
+        return true;
+    };
+    if (!chunked) {
+        for (;;) {
+            if (!acc.empty() && !emit(acc.data(), acc.size())) break;
+            acc.clear();
+            if (!more()) break;
+        }
+    } else {
+        size_t need = 0;
+        bool   alive = true;
+        while (alive) {
+            if (need == 0) {
+                const size_t nl = acc.find("\r\n");
+                if (nl == std::string::npos) { if (!more()) break; continue; }
+                std::string line = acc.substr(0, nl);
+                acc.erase(0, nl + 2);
+                const size_t semi = line.find(';');
+                if (semi != std::string::npos) line.resize(semi);
+                need = (size_t) std::strtoul(line.c_str(), nullptr, 16);
+                if (need == 0) break; // last chunk
+                continue;
+            }
+            if (acc.empty()) { if (!more()) break; continue; }
+            const size_t take = std::min(need, acc.size());
+            if (!emit(acc.data(), take)) { alive = false; break; }
+            acc.erase(0, take);
+            need -= take;
+            if (need == 0) {
+                while (acc.size() < 2 && alive) alive = more();
+                if (alive) acc.erase(0, 2); // CRLF after the chunk data
+            }
+        }
+    }
+    boost::system::error_code ig;
+    up.shutdown(tcp::socket::shutdown_both, ig);
+    client.shutdown(tcp::socket::shutdown_both, ig);
+}
+
 static void tunnel(tcp::socket& client, int port, const std::string& head, const std::string& pending)
 {
     asio::io_context ioc;
@@ -770,6 +903,7 @@ private:
     std::pair<int, std::string> onvif_discover(); // GET /api/onvif on go2rtc: {status, body}
     std::string state_for_phone();
     bool  lookup_host(const std::string& id, std::string& ip, std::string& code);
+    std::string relay_h264_url(const std::string& id); // the U1 raw stream behind /relay/h264?id=, or ""
     static Instance probe_instance(Instance inst);
 
     std::mutex                     m_mutex;
@@ -926,17 +1060,25 @@ void HubServer::start_go2rtc()
 
 void HubServer::register_streams()
 {
-    std::string state, base;
+    std::string state, base, secret;
+    int         port = 0;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        state = m_state;
-        base  = go2rtc_base_locked();
+        state  = m_state;
+        base   = go2rtc_base_locked();
+        secret = m_secret;
+        port   = m_port;
     }
     if (base.empty() || state.empty()) return;
     try {
         json j = json::parse(state);
         for (const auto& h : j.value("hosts", json::array())) {
-            const std::string name = h.value("rname", ""), src = h.value("rsrc", "");
+            std::string name = h.value("rname", ""), src = h.value("rsrc", "");
+            if (!u1_h264_url(h).empty() && port > 0) {
+                // The U1 raw stream, fetched by go2rtc from this hub (SPS-first), never from the printer directly.
+                name = u1_stream_name(h.value("id", ""));
+                src  = "http://127.0.0.1:" + std::to_string(port) + "/relay/h264?id=" + encode_component(h.value("id", "")) + "&lt=" + secret;
+            }
             if (name.empty() || src.empty()) continue;
             // Http::put() is a file-upload PUT (its read callback dereferences the missing
             // file and crashes); put2() is a plain PUT with no body, which is what go2rtc wants.
@@ -1000,6 +1142,10 @@ std::string HubServer::state_for_phone()
             p["rkind"] = h.value("rkind", "");
             p["rname"] = h.value("rname", "");
             p["rurl"]  = h.value("rurl", "");
+            if (!u1_h264_url(h).empty()) {
+                p["rname"] = u1_stream_name(h.value("id", "")); // the go2rtc stream fed by /relay/h264
+                p["relay"] = true;                               // rurl still works on the LAN
+            }
             out["hosts"].push_back(p);
         }
         out["active"] = j.value("active", json::array());
@@ -1024,6 +1170,21 @@ bool HubServer::lookup_host(const std::string& id, std::string& ip, std::string&
             }
     } catch (...) {}
     return false;
+}
+
+std::string HubServer::relay_h264_url(const std::string& id)
+{
+    std::string state;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        state = m_state;
+    }
+    try {
+        json j = json::parse(state);
+        for (const auto& h : j.value("hosts", json::array()))
+            if (h.value("id", "") == id) return u1_h264_url(h);
+    } catch (...) {}
+    return "";
 }
 
 Instance HubServer::probe_instance(Instance inst)
@@ -1371,6 +1532,14 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner)
             if (!player_ok) { respond(client, 404, "text/plain", "not found"); return; }
             if (go2rtc_port == 0) { respond(client, 503, "text/plain", "stream relay is not running"); return; }
             tunnel(client, go2rtc_port, force_close(go2rtc_head(r.head, auth)), r.pending);
+            return;
+        }
+        // go2rtc pulls a printer's raw H.264 through here (loopback + hub secret; see relay_h264).
+        if (r.path == "/relay/h264") {
+            if (!(peer.is_loopback() && !secret.empty() && query_param(r.query, "lt") == secret)) { respond(client, 404, "text/plain", "not found"); return; }
+            const std::string url = relay_h264_url(query_param(r.query, "id"));
+            if (url.empty()) { respond(client, 404, "text/plain", "unknown camera"); return; }
+            relay_h264(client, url);
             return;
         }
         // Control routes for the slicer instances and the hub page on this PC: loopback peer,
