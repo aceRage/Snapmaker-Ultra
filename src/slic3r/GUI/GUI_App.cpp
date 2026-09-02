@@ -2,6 +2,7 @@
 #include "libslic3r/FilamentHotBedNozzleRules.hpp"
 #include "GUI_App.hpp"
 #include "RemoteAccess.hpp"
+#include "RemoteHub.hpp"
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
 #include "GUI_Factories.hpp"
@@ -2550,6 +2551,20 @@ bool GUI_App::on_init_inner()
 #endif
     StartupProfiler profiler("GUI_App::on_init_inner");
 
+    // Ultra: hidden launch. Precedence: SNORCA_HIDDEN (1/0, lets the hub or a test force
+    // either way) > --hidden on the command line > app_config "start_hidden".
+    {
+        wxString env;
+        if (wxGetEnv("SNORCA_HIDDEN", &env) && !env.empty())
+            m_hub_managed = env != "0";
+        else if (init_params != nullptr && init_params->start_hidden)
+            m_hub_managed = true;
+        else
+            m_hub_managed = app_config->get_bool("start_hidden");
+        if (m_hub_managed)
+            BOOST_LOG_TRIVIAL(info) << "starting hidden: no splash, no window until the hub shows it";
+    }
+
     wxLog::SetActiveTarget(new wxBoostLog());
 #if BBL_RELEASE_TO_PUBLIC
     wxLog::SetLogLevel(wxLOG_Message);
@@ -2736,7 +2751,7 @@ bool GUI_App::on_init_inner()
     }
 
     SplashScreen * scrn = nullptr;
-    if (app_config->get("show_splash_screen") == "true") {
+    if (!m_hub_managed && app_config->get("show_splash_screen") == "true") {
         // make a bitmap with dark grey banner on the left side
         //BBS make BBL splash screen bitmap
         wxBitmap bmp = SplashScreen::MakeBitmap();
@@ -3053,8 +3068,12 @@ bool GUI_App::on_init_inner()
 #ifdef __WINDOWS__
     mainframe->topbar()->SaveNormalRect();
 #endif
-    mainframe->Show(true);
-    BOOST_LOG_TRIVIAL(info) << "main frame firstly shown";
+    if (!m_hub_managed) {
+        mainframe->Show(true);
+        BOOST_LOG_TRIVIAL(info) << "main frame firstly shown";
+    } else {
+        BOOST_LOG_TRIVIAL(info) << "main frame kept hidden (hub-managed instance)";
+    }
     profiler.mark("mainframe->Show");
 
     obj_list()->set_min_height();
@@ -3120,6 +3139,9 @@ bool GUI_App::on_init_inner()
     });
 
     m_initialized = true;
+
+    // Ultra: register with the hub now; a hidden instance never builds the Stream tab.
+    start_remote_access();
 
     flush_logs();
 
@@ -3906,6 +3928,28 @@ void GUI_App::schedule_recreate_gui_when_no_modal(const wxString &msg_name)
     });
 }
 
+void GUI_App::start_remote_access()
+{
+    RemoteAccess::get().set_hidden(m_hub_managed); // before start(): goes into <pid>.json
+    RemoteAccess::get().start();
+
+    // Phone access left on last time: bring the hub up with the same link. SNORCA_PHONE_ACCESS=<token>
+    // in the environment does the same without touching the saved settings (headless/agent use).
+    wxString    env_token;
+    std::string token;
+    bool        phone = false;
+    if (wxGetEnv("SNORCA_PHONE_ACCESS", &env_token) && !env_token.empty()) {
+        token = env_token.ToStdString();
+        phone = true;
+    } else if (app_config->get("stream_phone_access") == "1") {
+        token = app_config->get("stream_phone_token");
+        phone = true;
+    }
+    // The hub (tray icon, camera relays, phone access) starts with the first slicer and stays
+    // until quit from its tray menu. Off the GUI thread: spawning it takes a moment.
+    std::thread([token, phone]() { RemoteHub::ensure_running(token, phone); }).detach();
+}
+
 void GUI_App::recreate_GUI(const wxString &msg_name)
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "recreate_GUI enter";
@@ -3950,7 +3994,8 @@ void GUI_App::recreate_GUI(const wxString &msg_name)
     dlg.Update(80, _L("Loading current presets") + dots);
     m_printhost_job_queue.reset(new PrintHostJobQueue(mainframe->printhost_queue_dlg()));
     load_current_presets();
-    mainframe->Show(true);
+    if (!m_hub_managed)
+        mainframe->Show(true);
 
     dlg.Update(90, _L("Loading a mode view") + dots);
 

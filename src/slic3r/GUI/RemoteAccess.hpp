@@ -26,6 +26,11 @@ public:
     void stop(); // removes the instance file; the listener dies with the process
     int  port();
 
+    // Ultra: window visibility, mirrored into <pid>.json and /api/info so the hub can list
+    // and toggle it. GUI thread (or before start()).
+    void set_hidden(bool hidden);
+    bool hidden();
+
     // What the hub shows in its instance list (GUI thread, from the Plater's title code).
     void note_project(const std::string& title, const std::string& path);
     // An error the GUI wanted to show while a request ran (show_error); the request reports it.
@@ -62,6 +67,8 @@ private:
     };
     ApiResponse handle_api(const std::string& method, const std::string& path, const std::string& query, const std::string& body);
     ApiResponse api_info();
+    ApiResponse api_window(const std::string& show); // "" = query only, "1"/"0" = set
+    ApiResponse api_quit(bool discard);
     ApiResponse api_project_open(const std::string& path, const std::string& mode);
     ApiResponse api_plates();
     ApiResponse api_plate_thumbnail(int plate);
@@ -99,6 +106,7 @@ private:
     int              m_next_job { 1 };
     std::string      m_title, m_path, m_last_error;
     bool             m_slicing { false };
+    bool             m_hidden { false };
 };
 
 } // namespace GUI

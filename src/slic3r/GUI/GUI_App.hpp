@@ -310,6 +310,10 @@ private:
 
     //BBS
     bool m_is_closing {false};
+    // Ultra: this instance was started hidden (--hidden / SNORCA_HIDDEN / app_config
+    // "start_hidden"). It has no window until the hub shows it, closing hides it again,
+    // and only an explicit quit (tray, hub page, POST /api/quit, File > Quit) ends it.
+    bool m_hub_managed { false };
     Slic3r::DeviceManager* m_device_manager { nullptr };
     Slic3r::UserManager* m_user_manager { nullptr };
     Slic3r::TaskManager* m_task_manager { nullptr };
@@ -421,6 +425,9 @@ private:
     bool is_editor() const { return m_app_mode == EAppMode::Editor; }
     bool is_gcode_viewer() const { return m_app_mode == EAppMode::GCodeViewer; }
     bool is_recreating_gui() const { return m_is_recreating_gui; }
+    bool is_hub_managed() const { return m_hub_managed; }
+    // Ultra: this instance's loopback API + the hub handshake (was the Stream tab's job).
+    void start_remote_access();
     bool flutter_web_config_update_dlg_open() const
     {
         return m_flutter_web_config_update_dlg_open.load(std::memory_order_acquire);

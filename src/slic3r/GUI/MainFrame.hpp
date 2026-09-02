@@ -197,6 +197,7 @@ class MainFrame : public DPIFrame
 protected:
     virtual void on_dpi_changed(const wxRect &suggested_rect) override;
     virtual void on_sys_color_changed() override;
+    bool m_quit_requested { false }; // consumed by the next close attempt
 
 #ifdef __WIN32__
     WXLRESULT MSWWindowProc(WXUINT nMsg, WXWPARAM wParam, WXLPARAM lParam) override;
@@ -212,6 +213,10 @@ public:
 
     // BBS: auto-save the project to its own file on a timer, in addition to auto-backup
     void update_autosave_timer();
+
+    // Ultra: the only way a hub-managed (hidden-launch) instance really closes; a plain
+    // close just hides it. discard = skip the unsaved-project handling (Close(true)).
+    void request_quit(bool discard = false);
 
     //BBS GUI refactor
     enum TabPosition

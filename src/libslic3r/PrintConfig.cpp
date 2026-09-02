@@ -9259,6 +9259,13 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->tooltip = L("With --hub: start with phone access (the LAN listener) enabled.");
     def->cli_params = "option";
     def->set_default_value(new ConfigOptionBool(false));
+
+    // Ultra: start without a window; the hub's tray menu shows it on demand (RemoteHub.hpp).
+    def = this->add("hidden", coBool);
+    def->label = L("Start hidden");
+    def->tooltip = L("Start the slicer without a window and without a taskbar button; the hub's tray menu can show it later.");
+    def->cli_params = "option";
+    def->set_default_value(new ConfigOptionBool(false));
 }
 
 const CLIActionsConfigDef    cli_actions_config_def;

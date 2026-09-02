@@ -1400,6 +1400,7 @@ int CLI::run(int argc, char **argv)
         params.argv = argv;
         params.load_configs = load_configs;
         params.extra_config = std::move(m_extra_config);
+        params.start_hidden = m_config.opt_bool("hidden");
 
         std::vector<std::string>    gcode_files;
         std::vector<std::string>    non_gcode_files;

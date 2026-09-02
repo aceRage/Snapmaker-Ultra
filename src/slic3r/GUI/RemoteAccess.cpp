@@ -191,6 +191,10 @@ void RemoteAccess::write_instance_file()
     j["port"]    = m_port;
     j["started"] = (long long) std::time(nullptr);
     j["version"] = std::string(SLIC3R_VERSION);
+    // What the hub's cheap (non-probing) listing shows: the tray menu never has to do HTTP.
+    j["hidden"]  = m_hidden;
+    j["title"]   = m_title;
+    j["path"]    = m_path;
     boost::nowide::ofstream f((fs::path(RemoteHub::instances_dir()) / (std::to_string(wxGetProcessId()) + ".json")).string(), std::ios::trunc);
     f << j.dump(2);
 }
@@ -200,6 +204,21 @@ void RemoteAccess::note_project(const std::string& title, const std::string& pat
     std::lock_guard<std::mutex> lock(m_mutex);
     m_title = title;
     m_path  = path;
+    if (m_on) write_instance_file(); // the tray menu label follows the project
+}
+
+void RemoteAccess::set_hidden(bool hidden)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_hidden == hidden && m_on) return;
+    m_hidden = hidden;
+    if (m_on) write_instance_file();
+}
+
+bool RemoteAccess::hidden()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_hidden;
 }
 
 void RemoteAccess::note_error(const std::string& message)
@@ -1163,8 +1182,76 @@ RemoteAccess::ApiResponse RemoteAccess::api_info()
     j["title"]   = m_title;
     j["path"]    = m_path;
     j["slicing"] = m_slicing;
+    j["hidden"]  = m_hidden;
     j["version"] = std::string(SLIC3R_VERSION);
     r.body       = j.dump();
+    return r;
+}
+
+// Show or hide this instance's window. Without `show` it only reports.
+RemoteAccess::ApiResponse RemoteAccess::api_window(const std::string& show)
+{
+    ApiResponse r;
+    const int want = show.empty() ? -1 : ((show == "0" || show == "false") ? 0 : 1);
+    auto out = std::make_shared<nlohmann::json>();
+    bool ok  = run_on_main([out, want]() {
+        MainFrame* mf = wxGetApp().mainframe;
+        if (mf == nullptr) return;
+        if (want == 1) {
+            if (mf->IsIconized()) mf->Iconize(false);
+            mf->Show(true);
+            mf->Raise();
+#ifdef _WIN32
+            ::SetForegroundWindow((HWND) mf->GetHandle()); // the hub called AllowSetForegroundWindow(pid)
+#endif
+        } else if (want == 0) {
+            mf->Hide();
+        }
+        const bool hidden = !mf->IsShown();
+        RemoteAccess::get().set_hidden(hidden);
+        (*out)["hidden"]   = hidden;
+        (*out)["iconized"] = mf->IsIconized();
+    }, 5000);
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    if (out->empty()) { r.status = 503; r.body = json_error("no main window"); return r; }
+    r.body = out->dump();
+    return r;
+}
+
+// End this instance. discard=1 skips the unsaved-project handling; otherwise the usual close
+// path runs and its auto-confirmed Yes saves - so an unnamed dirty project first gets a name
+// under <datadir>/hub/saves (never a file dialog), exactly as api_project_open does.
+RemoteAccess::ApiResponse RemoteAccess::api_quit(bool discard)
+{
+    ApiResponse r;
+    auto result = std::make_shared<std::pair<int, std::string>>(500, "not run");
+    bool ok     = run_on_main([result, discard]() {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr || wxGetApp().mainframe == nullptr) { *result = { 500, "no main window" }; return; }
+        if (!discard && plater->is_background_process_slicing()) { *result = { 409, "slicing in progress" }; return; }
+        if (!discard && plater->is_project_dirty() && plater->get_project_filename(".3mf").IsEmpty() && !plater->model().objects.empty()) {
+            boost::system::error_code ig;
+            fs::create_directories(RemoteHub::saves_dir(), ig);
+            std::time_t t = std::time(nullptr);
+            std::tm     tm {};
+#ifdef _WIN32
+            localtime_s(&tm, &t);
+#else
+            localtime_r(&t, &tm);
+#endif
+            char stamp[32];
+            std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
+            plater->set_project_filename(wxString::FromUTF8((fs::path(RemoteHub::saves_dir()) / (std::string("Untitled_") + stamp + ".3mf")).string()));
+        }
+        *result = { 200, "" };
+    }, 15000);
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    if (result->first != 200) { r.status = result->first; r.body = json_error(result->second); return r; }
+    // The close runs after this response has been written.
+    wxGetApp().CallAfter([discard]() {
+        if (wxGetApp().mainframe) wxGetApp().mainframe->request_quit(discard);
+    });
+    r.body = "{\"ok\":true}";
     return r;
 }
 
@@ -1247,7 +1334,10 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
         j["version"] = 2;
         j["routes"]  = nlohmann::json::array({
             { {"method", "GET"},  {"path", "/api"},                        {"description", "this manifest"} },
-            { {"method", "GET"},  {"path", "/api/info"},                   {"description", "this instance: pid, project title and path, slicing flag"} },
+            { {"method", "GET"},  {"path", "/api/info"},                   {"description", "this instance: pid, project title and path, slicing flag, hidden flag"} },
+            { {"method", "GET"},  {"path", "/api/window"},                 {"description", "is this instance's window shown? {hidden, iconized}"} },
+            { {"method", "POST"}, {"path", "/api/window?show=1|0"},        {"description", "show (and raise) or hide this instance's window"} },
+            { {"method", "POST"}, {"path", "/api/quit[?discard=1]"},       {"description", "close this instance; without discard the unsaved project is saved first (an unnamed one under <datadir>/hub/saves)"} },
             { {"method", "POST"}, {"path", "/api/project/open"},           {"description", "form body path={file uploaded through the hub}&mode=load|import; load (.3mf) saves the current project first, import adds the model to the plate"} },
             { {"method", "GET"},  {"path", "/api/plates"},                 {"description", "project, printer preset, filaments and every plate with objects, slice state, time and filament estimates"} },
             { {"method", "GET"},  {"path", "/api/plates/{index}/thumbnail.png"}, {"description", "rendered plate preview"} },
@@ -1274,6 +1364,16 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
     }
     if (path == "/info" && method == "GET")
         return api_info();
+    if (path == "/window" && (method == "GET" || method == "POST")) {
+        std::string show = query_param(query, "show");
+        if (show.empty()) show = query_param(body, "show");
+        return api_window(method == "GET" ? std::string() : show);
+    }
+    if (path == "/quit" && method == "POST") {
+        std::string d = query_param(query, "discard");
+        if (d.empty()) d = query_param(body, "discard");
+        return api_quit(d == "1" || d == "true");
+    }
     if (path == "/project/open" && method == "POST") {
         auto get = [&](const char* k) { std::string v = query_param(body, k); return v.empty() ? query_param(query, k) : v; };
         return api_project_open(get("path"), get("mode"));

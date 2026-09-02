@@ -11134,6 +11134,11 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
         for (size_t i = 0; i < evt.data.size(); ++i) {
             input_files.push_back(from_u8(evt.data[i].string()));
         }
+        // Ultra: a file forwarded from Explorer to a hidden (hub-managed) instance must not vanish.
+        if (!wxGetApp().mainframe->IsShown()) {
+            wxGetApp().mainframe->Show(true);
+            RemoteAccess::get().set_hidden(false);
+        }
         wxGetApp().mainframe->Raise();
         this->q->load_files(input_files);
     });

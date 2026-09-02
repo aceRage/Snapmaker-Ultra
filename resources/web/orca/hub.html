@@ -33,6 +33,7 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
 </div>
 <div class="card" style="margin-top:16px"><h2>Hub</h2>
   <span class="btn dim" id="new">Open a new slicer window</span>
+  <span class="btn dim" id="newhidden">Open a hidden slicer</span>
   <span class="btn warn" id="quit">Quit hub</span>
   <div class="note">Quitting stops phone access and the camera relays; the next slicer window starts the hub again.</div>
   <div class="note" id="status"></div>
@@ -79,8 +80,17 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
         if (!list.length) { body.appendChild(el('div', 'note', 'No slicer window is open.')); return; }
         list.forEach(function(i) {
             var d = el('div', 'inst');
-            d.appendChild(el('div', 't', i.index + ' · ' + (i.title || 'Untitled') + (i.slicing ? ' (slicing)' : '')));
+            d.appendChild(el('div', 't', i.index + ' · ' + (i.title || 'Untitled') + (i.hidden ? ' (hidden)' : '') + (i.slicing ? ' (slicing)' : '')));
             d.appendChild(el('div', 'm', i.path || 'not saved yet'));
+            var b = el('span', 'btn' + (i.hidden ? '' : ' dim'), i.hidden ? 'Show' : 'Hide');
+            b.onclick = function() { post('/hub/instances/' + i.pid + '/window?show=' + (i.hidden ? '1' : '0')).then(refresh); };
+            d.appendChild(b);
+            var q = el('span', 'btn warn', 'Quit');
+            q.onclick = function() {
+                if (!confirm('Quit slicer window ' + i.index + '? Unsaved work is saved first.')) return;
+                post('/hub/instances/' + i.pid + '/quit').then(function() { setTimeout(refresh, 2000); });
+            };
+            d.appendChild(q);
             body.appendChild(d);
         });
     }
@@ -89,6 +99,7 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
         fetch('/hub/instances').then(function(r) { return r.json(); }).then(function(j) { renderSlicers(j.instances || []); }).catch(function() {});
     }
     document.getElementById('new').onclick = function() { post('/hub/new').then(function() { setTimeout(refresh, 3000); }); };
+    document.getElementById('newhidden').onclick = function() { post('/hub/new?hidden=1').then(function() { setTimeout(refresh, 3000); }); };
     document.getElementById('quit').onclick = function() {
         if (!confirm('Quit the hub? Phone access and the camera relays stop until a slicer window starts it again.')) return;
         post('/hub/quit').then(function() { document.body.innerHTML = '<h1>Hub stopped</h1><div class="sub">You can close this page.</div>'; });

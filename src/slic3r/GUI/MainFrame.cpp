@@ -40,6 +40,7 @@
 #include "I18N.hpp"
 #include "GLCanvas3D.hpp"
 #include "Plater.hpp"
+#include "RemoteAccess.hpp"
 #include "FlashForge/FFDeviceTab.hpp"
 #include "WebViewDialog.hpp"
 #include "../Utils/Process.hpp"
@@ -490,6 +491,17 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
     // declare events
     Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& event) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< ": mainframe received close_widow event";
+        // Ultra: a hub-managed instance closes to the hub's tray menu, not to the grave. Only
+        // request_quit() (tray, hub page, POST /api/quit, File > Quit) really ends it.
+        const bool quit_requested = m_quit_requested;
+        m_quit_requested = false;
+        if (wxGetApp().is_hub_managed() && !quit_requested && event.CanVeto()) {
+            event.Veto();
+            Hide();
+            RemoteAccess::get().set_hidden(true);
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": hub-managed instance: the close hid the window, still running";
+            return;
+        }
         if (event.CanVeto() && m_plater->get_view3D_canvas3D()->get_gizmos_manager().is_in_editing_mode(true)) {
             // prevents to open the save dirty project dialog
             event.Veto();
@@ -1012,6 +1024,12 @@ void MainFrame::update_autosave_timer()
 }
 
 // Called when closing the application and when switching the application language.
+void MainFrame::request_quit(bool discard)
+{
+    m_quit_requested = true;
+    Close(discard); // discard -> CanVeto() == false -> no prompts at all
+}
+
 void MainFrame::shutdown(bool isRecreate)
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "MainFrame::shutdown enter";
@@ -2733,10 +2751,10 @@ void MainFrame::init_menubar_as_editor()
 
 #ifndef __APPLE__
         append_menu_item(fileMenu, wxID_EXIT, _L("Quit"), wxString::Format(_L("Quit")),
-            [this](wxCommandEvent&) { Close(false); }, "menu_exit", nullptr);
+            [this](wxCommandEvent&) { request_quit(false); }, "menu_exit", nullptr);
 #else
         append_menu_item(fileMenu, wxID_EXIT, _L("Quit"), wxString::Format(_L("Quit")),
-            [this](wxCommandEvent&) { Close(false); }, "", nullptr);
+            [this](wxCommandEvent&) { request_quit(false); }, "", nullptr);
 #endif
     }
 
@@ -3441,7 +3459,7 @@ void MainFrame::init_menubar_as_gcodeviewer()
             []() {return true; }, this);
         fileMenu->AppendSeparator();
         append_menu_item(fileMenu, wxID_EXIT, _L("&Quit"), wxString::Format(_L("Quit %s"), SLIC3R_APP_NAME),
-            [this](wxCommandEvent&) { Close(false); });
+            [this](wxCommandEvent&) { request_quit(false); });
     }
 
     // View menu

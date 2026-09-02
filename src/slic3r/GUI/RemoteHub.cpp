@@ -628,6 +628,7 @@ struct Instance
     long long   started { 0 };
     std::string title, path;
     bool        slicing { false };
+    bool        hidden { false };
     bool        alive { false };
 };
 
@@ -647,10 +648,15 @@ public:
         int         port { 0 };
         std::string token, url;
         int         instances { 0 };
+        int         hidden { 0 };
     };
     Snapshot snapshot();
     bool     set_phone(bool on, const std::string& token); // rebinds the listener, persists
-    long     spawn_slicer(const std::string& file);        // "" = an empty window
+    long     spawn_slicer(const std::string& file, bool hidden = false); // "" = an empty window
+    // One request to an instance's loopback API (HTTP: never on the tray's GUI thread).
+    std::pair<int, std::string> instance_post(long pid, const std::string& sub);
+    bool     instance_window(long pid, bool show);
+    bool     instance_quit(long pid, bool discard);
     std::vector<Instance> instances(bool probe);
 
 private:
@@ -900,6 +906,7 @@ Instance HubServer::probe_instance(Instance inst)
                 inst.title    = j.value("title", "");
                 inst.path     = j.value("path", "");
                 inst.slicing  = j.value("slicing", false);
+                inst.hidden   = j.value("hidden", inst.hidden);
             } catch (...) {}
         })
         .perform_sync();
@@ -921,6 +928,9 @@ std::vector<Instance> HubServer::instances(bool probe)
             inst.pid     = j.value("pid", 0L);
             inst.port    = j.value("port", 0);
             inst.started = j.value("started", 0LL);
+            inst.hidden  = j.value("hidden", false);
+            inst.title   = j.value("title", "");
+            inst.path    = j.value("path", "");
         } catch (...) {}
         if (inst.pid <= 0 || inst.port <= 0 || !pid_alive(inst.pid)) {
             boost::system::error_code ig;
@@ -953,6 +963,7 @@ json HubServer::instances_json()
         ji["title"]   = inst.title;
         ji["path"]    = inst.path;
         ji["slicing"] = inst.slicing;
+        ji["hidden"]  = inst.hidden;
         j["instances"].push_back(ji);
     }
     return j;
@@ -971,7 +982,10 @@ HubServer::Snapshot HubServer::snapshot()
         const std::vector<std::string> ips = lan_ips();
         if (!ips.empty()) s.url = "http://" + ips.front() + ":" + std::to_string(s.port) + "/r/" + s.token + "/";
     }
-    s.instances = (int) instances(false).size();
+    for (const Instance& inst : instances(false)) {
+        ++s.instances;
+        if (inst.hidden) ++s.hidden;
+    }
     return s;
 }
 
@@ -993,14 +1007,43 @@ bool HubServer::set_phone(bool on, const std::string& token)
     return ok;
 }
 
-long HubServer::spawn_slicer(const std::string& file)
+long HubServer::spawn_slicer(const std::string& file, bool hidden)
 {
     std::vector<std::string> args = { current_exe() };
     if (!file.empty()) args.push_back(file);
-    const long pid = spawn_process(args, { { "SNORCA_NEW_INSTANCE", "1" } }, false, nullptr);
-    BOOST_LOG_TRIVIAL(info) << "RemoteHub: new instance pid " << pid << (file.empty() ? std::string() : " for " + file);
+    std::vector<std::pair<std::string, std::string>> env { { "SNORCA_NEW_INSTANCE", "1" } };
+    env.emplace_back("SNORCA_HIDDEN", hidden ? "1" : "0"); // explicit either way
+    const long pid = spawn_process(args, env, false, nullptr);
+    BOOST_LOG_TRIVIAL(info) << "RemoteHub: new " << (hidden ? "hidden" : "visible") << " instance pid " << pid
+                            << (file.empty() ? std::string() : " for " + file);
     return pid;
 }
+
+std::pair<int, std::string> HubServer::instance_post(long pid, const std::string& sub)
+{
+    Instance target;
+    for (const Instance& inst : instances(false))
+        if (inst.pid == pid) target = inst;
+    if (!target.alive) return { 404, json_error("no such slicer instance") };
+#ifdef _WIN32
+    ::AllowSetForegroundWindow((DWORD) pid); // let the instance raise its own window
+#endif
+    int         status = 502;
+    std::string body   = json_error("the slicer did not answer");
+    // Http::post only sets the POST fields when a body is present; without one libcurl falls
+    // back to its default read callback (stdin) and the hub faults. Always send a body.
+    Http::post("http://127.0.0.1:" + std::to_string(target.port) + sub)
+        .timeout_connect(2).timeout_max(120)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .set_post_body(std::string("via=hub"))
+        .on_complete([&](std::string b, unsigned s) { status = (int) s; body = b; })
+        .on_error([&](std::string b, std::string err, unsigned s) { status = s ? (int) s : 502; body = b.empty() ? json_error(err) : b; })
+        .perform_sync();
+    return { status, body };
+}
+
+bool HubServer::instance_window(long pid, bool show) { return instance_post(pid, std::string("/api/window?show=") + (show ? "1" : "0")).first == 200; }
+bool HubServer::instance_quit(long pid, bool discard) { return instance_post(pid, std::string("/api/quit") + (discard ? "?discard=1" : "")).first == 200; }
 
 // Loopback-only: the slicer instances and the hub's own page (GET /hub/) talk to these.
 void HubServer::handle_hub(tcp::socket& client, Request& r)
@@ -1014,7 +1057,7 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
     } else if (r.path == "/hub/instances" && r.method == "GET") {
         respond_json(client, 200, instances_json().dump());
     } else if (r.path == "/hub/new" && r.method == "POST") {
-        const long pid = spawn_slicer("");
+        const long pid = spawn_slicer("", query_param(r.query, "hidden") == "1");
         json j;
         j["ok"]  = pid > 0;
         j["pid"] = pid;
@@ -1035,6 +1078,21 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
     } else if (r.path == "/hub/quit" && r.method == "POST") {
         respond_json(client, 200, "{\"ok\":true}");
         m_quit = true;
+    } else if (r.path.compare(0, 15, "/hub/instances/") == 0 && r.method == "POST") {
+        // /hub/instances/<pid>/window?show=1|0 and /hub/instances/<pid>/quit[?discard=1]
+        const std::string rest  = r.path.substr(15);
+        const size_t      slash = rest.find('/');
+        const long        pid   = std::atol(rest.substr(0, slash).c_str());
+        const std::string sub   = slash == std::string::npos ? "" : rest.substr(slash);
+        if (sub == "/window") {
+            auto res = instance_post(pid, std::string("/api/window?show=") + (query_param(r.query, "show") == "0" ? "0" : "1"));
+            respond_json(client, res.first, res.second);
+        } else if (sub == "/quit") {
+            auto res = instance_post(pid, std::string("/api/quit") + (query_param(r.query, "discard") == "1" ? "?discard=1" : ""));
+            respond_json(client, res.first, res.second);
+        } else {
+            respond_json(client, 404, json_error("no such hub route"));
+        }
     } else {
         respond_json(client, 404, json_error("no such hub route"));
     }
@@ -1049,7 +1107,7 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
         j["version"] = 2;
         j["routes"]  = json::array({
             { {"method", "GET"},  {"path", "/api/instances"},       {"description", "running slicer instances: id (pid), index, title, project path, slicing"} },
-            { {"method", "POST"}, {"path", "/api/instances/open"},  {"description", "body = a .3mf/.stl/.obj/.step file, header X-File-Name = its name; starts a new slicer instance with it"} },
+            { {"method", "POST"}, {"path", "/api/instances/open"},  {"description", "body = a .3mf/.stl/.obj/.step file, header X-File-Name = its name; starts a new (hidden) slicer instance with it; ?visible=1 opens a window"} },
             { {"method", "POST"}, {"path", "/i/{id}/open?mode=load|import"}, {"description", "same upload, opened in instance {id}: load = save the current project, then open this project (default for .3mf); import = add the model to the current plate (default otherwise)"} },
             { {"method", "*"},    {"path", "/i/{id}/api/..."},      {"description", "the instance's own API (see GET /i/{id}/api)"} },
             { {"method", "GET"},  {"path", "/state"},               {"description", "camera list for the stream wall"} }
@@ -1064,7 +1122,7 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
     if (rest == "/api/instances/open" && r.method == "POST") {
         std::string path, error;
         if (!spool_upload(client, r, path, error)) { respond_json(client, 400, json_error(error)); return; }
-        const long pid = spawn_slicer(path);
+        const long pid = spawn_slicer(path, query_param(r.query, "visible") != "1");
         json j;
         j["ok"]      = pid > 0;
         j["file"]    = path;
@@ -1264,13 +1322,27 @@ void HubServer::shutdown()
 class HubTaskBarIcon : public wxTaskBarIcon
 {
 public:
-    enum { ID_STATUS = wxID_HIGHEST + 100, ID_PHONE, ID_PAGE, ID_NEW, ID_QUIT };
+    enum { ID_STATUS = wxID_HIGHEST + 100, ID_PHONE, ID_PAGE, ID_NEW, ID_NEW_HIDDEN, ID_QUIT,
+           ID_INST_FIRST = wxID_HIGHEST + 200, ID_INST_PER = 3, ID_INST_MAX = 32,
+           ID_INST_LAST = ID_INST_FIRST + ID_INST_PER * ID_INST_MAX };
 
     HubTaskBarIcon(HubServer& server, std::function<void()> on_quit) : m_server(server), m_on_quit(std::move(on_quit))
     {
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_server.set_phone(!m_server.snapshot().phone, ""); refresh(); }, ID_PHONE);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { open_page(); }, ID_PAGE);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_server.spawn_slicer(""); }, ID_NEW);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_server.spawn_slicer("", true); }, ID_NEW_HIDDEN);
+        Bind(wxEVT_MENU, [this](wxCommandEvent& e) {
+            const int n = (e.GetId() - ID_INST_FIRST) / ID_INST_PER, what = (e.GetId() - ID_INST_FIRST) % ID_INST_PER;
+            if (n < 0 || n >= (int) m_menu_pids.size()) return;
+            const long pid = m_menu_pids[n];
+            HubServer* s   = &m_server;
+            // HTTP: never on the tray's (GUI) thread.
+            std::thread([s, pid, what]() {
+                if (what == 2) s->instance_quit(pid, false);
+                else           s->instance_window(pid, what == 0);
+            }).detach();
+        }, ID_INST_FIRST, ID_INST_LAST);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_on_quit(); }, ID_QUIT);
         Bind(wxEVT_TASKBAR_LEFT_DCLICK, [this](wxTaskBarIconEvent&) { open_page(); });
     }
@@ -1287,6 +1359,7 @@ public:
         wxString tip = "Snapmaker-Ultra Hub";
         tip += st.phone ? "\nPhone access on" : "\nPhone access off";
         tip += wxString::Format("\n%d slicer window%s open", st.instances, st.instances == 1 ? "" : "s");
+        if (st.hidden > 0) tip += wxString::Format(" (%d hidden)", st.hidden);
         if (m_icon.IsOk()) SetIcon(m_icon, tip);
     }
 
@@ -1299,6 +1372,26 @@ public:
         menu->AppendCheckItem(ID_PHONE, "Phone access")->Check(st.phone);
         menu->Append(ID_PAGE, st.phone ? "Open hub page (QR code, link, slicers)" : "Open hub page");
         menu->Append(ID_NEW, "Open a new slicer window");
+        menu->Append(ID_NEW_HIDDEN, "Open a new hidden slicer");
+        // Cheap: pid / title / hidden all come from <datadir>/hub/instances/<pid>.json.
+        m_menu_pids.clear();
+        auto* subs = new wxMenu;
+        int   n    = 0;
+        for (const Instance& inst : m_server.instances(false)) {
+            if (n >= ID_INST_MAX) break;
+            const int base = ID_INST_FIRST + n * ID_INST_PER;
+            auto*     one  = new wxMenu;
+            one->Append(base + 0, "Show window")->Enable(inst.hidden);
+            one->Append(base + 1, "Hide window")->Enable(!inst.hidden);
+            one->AppendSeparator();
+            one->Append(base + 2, "Quit this window");
+            subs->AppendSubMenu(one, wxString::Format("%d \xC2\xB7 %s%s", n + 1,
+                inst.title.empty() ? wxString("Untitled") : wxString::FromUTF8(inst.title), inst.hidden ? wxString("  (hidden)") : wxString()));
+            m_menu_pids.push_back(inst.pid);
+            ++n;
+        }
+        if (n == 0) subs->Append(wxID_ANY, "No slicer is running")->Enable(false);
+        menu->AppendSubMenu(subs, "Slicer windows");
         menu->AppendSeparator();
         menu->Append(ID_QUIT, "Quit hub (stops phone access and camera relays)");
         return menu;
@@ -1313,6 +1406,7 @@ private:
     HubServer&            m_server;
     std::function<void()> m_on_quit;
     wxIcon                m_icon;
+    std::vector<long>     m_menu_pids; // menu order -> pid, rebuilt with every popup
 };
 
 // A wxApp with no windows: the tray icon plus the server running on its own thread.

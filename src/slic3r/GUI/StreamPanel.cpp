@@ -40,24 +40,8 @@ StreamPanel::StreamPanel(wxWindow* parent)
     sizer->Add(m_browser, wxSizerFlags().Expand().Proportion(1));
     SetSizer(sizer);
 
-    // This instance's loopback API: the hub lists and proxies it (phone Prepare/Devices tabs).
-    RemoteAccess::get().start();
-
-    // Phone access left on last time: bring the hub up with the same link. SNORCA_PHONE_ACCESS=<token>
-    // in the environment does the same without touching the saved settings (headless/agent use).
-    wxString env_token;
-    std::string token;
-    bool        phone = false;
-    if (wxGetEnv("SNORCA_PHONE_ACCESS", &env_token) && !env_token.empty()) {
-        token = env_token.ToStdString();
-        phone = true;
-    } else if (wxGetApp().app_config->get("stream_phone_access") == "1") {
-        token = wxGetApp().app_config->get("stream_phone_token");
-        phone = true;
-    }
-    // The hub (tray icon, camera relays, phone access) starts with the first slicer window and
-    // stays until quit from its tray menu. Off the GUI thread: spawning it takes a moment.
-    std::thread([token, phone]() { RemoteHub::ensure_running(token, phone); }).detach();
+    // The instance API and the hub handshake used to start here; they now start from
+    // GUI_App::start_remote_access() so a hidden instance (no Stream tab) registers too.
 }
 
 void StreamPanel::OnScriptMessage(wxWebViewEvent& evt)

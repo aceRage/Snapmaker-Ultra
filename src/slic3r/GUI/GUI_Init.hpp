@@ -23,6 +23,8 @@ struct GUI_InitParams
     //BBS: remove start_as_gcodeviewer logic
 	//bool	                    start_as_gcodeviewer;
 	bool                        input_gcode { false };
+    // Ultra: --hidden / SNORCA_HIDDEN: no splash, no main-frame Show; the hub owns visibility.
+    bool                        start_hidden { false };
 };
 
 int GUI_Run(GUI_InitParams &params);
