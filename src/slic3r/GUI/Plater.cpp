@@ -12541,6 +12541,9 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
         wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(deferred_preferred_printer, false, "", true);
         if (!deferred_print_dirty.empty())
             wxGetApp().get_tab(Preset::TYPE_PRINT)->load_config(deferred_print_dirty);
+        // A smaller bed leaves models that sat near the old bed's edge outside the plate:
+        // re-centre such plates' layouts (no-op when everything already fits).
+        partplate_list.center_layout_of_overflowing_plates();
     }
 
     //BBS: add gcode loading logic in the end

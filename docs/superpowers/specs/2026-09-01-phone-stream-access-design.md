@@ -45,7 +45,7 @@ Manifest at `GET /api`.
 
 | Route | Purpose |
 |---|---|
-| `GET /api/plates` | project, printer preset, filaments (name/colour), plates: objects, printable/locked, sliced/ready, slicing percent, time (s), filament (mm³, g from `filament_density`) |
+| `GET /api/plates` | project, printer preset, filaments (name/colour), plates: objects, `boxes` (per object `[min_x, min_y, max_x, max_y]`) and `plate_box`, printable/locked, sliced/ready, slicing percent, time (s), filament (mm³, g from `filament_density`) |
 | `GET /api/plates/{i}/thumbnail.png` | plate render (`update_all_plate_thumbnails(false)` on the GUI thread, PNG via `compress_thumbnail`) |
 | `GET /api/printers` | `DeviceManager` machines (my + local): online/connected, status, percent, time left, layers, bed/nozzle temps, task, selected |
 | `POST /api/slice?plate={i}\|all` | selects the plate and posts the same toolbar event as the Slice button; returns a job id; 409 while slicing |

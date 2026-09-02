@@ -268,8 +268,14 @@ RemoteAccess::ApiResponse RemoteAccess::api_plates()
             jp["index"]   = i;
             jp["name"]    = p->get_plate_name();
             jp["objects"] = nlohmann::json::array();
-            for (const ModelObject* o : p->get_objects_on_this_plate())
+            jp["boxes"]   = nlohmann::json::array(); // per object: [min_x, min_y, max_x, max_y] in plate-list mm
+            for (const ModelObject* o : p->get_objects_on_this_plate()) {
                 jp["objects"].push_back(o->name);
+                const BoundingBoxf3 bb = o->bounding_box_exact();
+                jp["boxes"].push_back({ bb.min.x(), bb.min.y(), bb.max.x(), bb.max.y() });
+            }
+            const BoundingBoxf3& pb = p->get_bounding_box();
+            jp["plate_box"] = { pb.min.x(), pb.min.y(), pb.max.x(), pb.max.y() };
             jp["printable"]       = p->has_printable_instances();
             jp["locked"]          = p->is_locked();
             jp["sliced"]          = p->is_slice_result_valid();

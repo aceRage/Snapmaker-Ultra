@@ -3618,6 +3618,43 @@ void PartPlateList::reset_size(int width, int depth, int height, bool reload_obj
 	return;
 }
 
+// Ultra: a switch to a smaller bed keeps every object where it was relative to the plate
+// centre, so models that sat near the edge of the bigger bed end up outside. For each plate
+// (membership by the instance's centre) whose objects do not all fit, move the whole group so
+// its bounding box is centred on the plate; the layout itself is preserved.
+int PartPlateList::center_layout_of_overflowing_plates()
+{
+	if (!m_model) return 0;
+	int moved = 0;
+	for (PartPlate* plate : m_plate_list) {
+		const BoundingBoxf3& pb = plate->get_bounding_box(false);
+		BoundingBoxf3 group;
+		bool outside = false;
+		std::vector<std::pair<ModelObject*, ModelInstance*>> members;
+		for (ModelObject* object : m_model->objects) {
+			for (size_t i = 0; i < object->instances.size(); ++i) {
+				const BoundingBoxf3 bb = object->instance_bounding_box(i);
+				const Vec3d c = bb.center();
+				if (c.x() < pb.min.x() || c.x() > pb.max.x() || c.y() < pb.min.y() || c.y() > pb.max.y()) continue;
+				group.merge(bb);
+				if (bb.min.x() < pb.min.x() || bb.max.x() > pb.max.x() || bb.min.y() < pb.min.y() || bb.max.y() > pb.max.y()) outside = true;
+				members.emplace_back(object, object->instances[i]);
+			}
+		}
+		if (!outside || members.empty()) continue;
+		Vec3d delta = pb.center() - group.center();
+		delta.z() = 0;
+		for (auto& m : members) {
+			m.second->set_offset(m.second->get_offset() + delta);
+			m.first->invalidate_bounding_box();
+		}
+		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%: %2% instance(s) did not fit, layout moved by {%3%,%4%}") % plate->get_index() % members.size() % delta.x() % delta.y();
+		++moved;
+	}
+	if (moved > 0) reload_all_objects();
+	return moved;
+}
+
 //clear all the instances in the plate, but keep the plates
 void PartPlateList::clear(bool delete_plates, bool release_print_list, bool except_locked, int plate_index)
 {

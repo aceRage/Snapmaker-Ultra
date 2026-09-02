@@ -652,6 +652,9 @@ public:
 
     //this may be happened after machine changed
     void reset_size(int width, int depth, int height, bool reload_objects = true, bool update_shapes = false, bool move_instances = false);
+    // Ultra: after a bed-size change, re-centre the layout of every plate that has an object
+    // sticking out (positions are kept relative to each other). Returns the number of plates moved.
+    int  center_layout_of_overflowing_plates();
     //clear all the instances in the plate, but keep the plates
     void clear(bool delete_plates = false, bool release_print_list = false, bool except_locked = false, int plate_index = -1);
     //clear all the instances in the plate, and delete the plates, only keep the first default plate
