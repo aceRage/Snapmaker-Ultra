@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.8 (after adversarial review; §3.1a/§3.4/§3.6/§3.9/§7 refined during planning, Tasks 3–7) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.9 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–8) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -83,6 +83,14 @@ rounds, floor d = h). After construction each shell is checked with `MeshBoolean
 a still self-intersecting component halves its d uniformly and rebuilds; if it still fails at its floor depth the
 component is skipped with a warning naming the filament (§7, rev 2.3) so one micro-feature cannot block the split. Small convex features (fillets, bosses, spheres with r < D) thus
 get a thin skin instead of a folded shell; their interiors come back through §3.8.
+
+**3.4a Mitred offsets (rev 2.9, Ruling 24).** d(v) is a depth measured perpendicular to the patch. A segment
+that travels along the vertex bisector n(v) is therefore given the length d / max(n(v)·n_P, 0.5) — the classic
+mitre, limited at a 60° half-angle — and only then clamped by the half-thickness probe along that direction.
+Without the mitre a face whose only vertices are its corners (a plain cube face) received d/√3 of depth: the
+Task 8 parity measurement showed 45.9 mm²/layer against the 2D claim's 54.4 (= 40·D − D²). With it the corner
+offsets land at the 45° Voronoi diagonal the 2D segmentation produces, and the two agree to the interlocking-notch
+amplitude. Segments along n_P (Case A, Case B's first segment, concave and same-state walls) are unaffected.
 
 **3.5 Depth groups (flat cap).** Transliteration of the live 2D rule (`flat_cap_component_ex`,
 MultiMaterialSegmentation.cpp:1493-1578; tests test_paint_depth_clamp.cpp:5107-5200): a facet is flat iff

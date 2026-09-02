@@ -1690,7 +1690,38 @@ Check the accessor names (`Layer::regions()`, `LayerRegion::region()`, `LayerReg
 
 ---
 
-### Task 9: GUI — Plater action, dialog, job, menu
+### Task 9: Mitred offsets (Ruling 24, spec rev 2.9)
+
+**Files:**
+- Modify: `src/libslic3r/ColorSplitShell.cpp` (the offset-length computation used by `side_offsets`/`bottom_offset` for every segment that travels along a bisector n(v)), `src/libslic3r/ColorSplit.hpp` (comment on the depth model), `tests/libslic3r/test_color_split.cpp` (re-derived expectations, tightened parity bound)
+
+**Interfaces:**
+- Consumes: everything from Tasks 1-8.
+- Produces: no API change. Behaviour: a segment of nominal depth d that travels along the vertex bisector n(v) has length `min(d / max(n(v)·n_P, 0.5), t_dir/2 − δ)` where n_P is the patch's mean normal at the vertex and `t_dir/2 − δ` is the half-thickness probe along that very direction (what `compute_vertex_depths` measures along −n(v)); i.e. the depth measured PERPENDICULAR to the patch equals d wherever the mid-thickness allows, with a mitre limit of 2 (60° half-angle). Segments along n_P (Case A, concave, same-state, Case B's first segment) are unchanged. Interior vertices of a smooth patch have n(v)·n_P ≥ cos 15°, so their factor is ≤ 1.035.
+
+- [ ] **Step 1: Write / re-derive the failing tests**
+
+Re-derive (do not observe) every expectation that pinned a bisector offset:
+- Block-top shell (`colorsplit: shell of a painted top face is a closed slab of depth D`, `no_cap_no_step()`): the four corner bottoms now sit at z = 20 − 1.5 with x/y inset 1.5 (45° taper) → frustum volume `h/3·(A₁ + A₂ + √(A₁A₂))` with A₁ = 40², A₂ = 37², h = 1.5 → 2224.5 mm³ (WithinRel 1e-4).
+- Flat cap step-off (`colorsplit: flat top is capped at the solid shell depth...`): zmin = 20 − 0.6 = 19.4 both with and without the step (the step-on value was already 19.4).
+- `depth_override_mm` test: min z = 20 − 0.7 = 19.3.
+- Two-sided plate / 0.3 mm plate / 1.2 mm plate tests: unchanged — their corner offsets are clamped by the half-thickness probe along the diagonal (1.037 on the 1.2 mm plate), verify they still pass without edits and say so.
+- Parity (`colorsplit e2e: split parts slice like the 2D paint-depth claim on a painted side face`): the 3D per-layer area becomes 40·D − D² = the 2D odd-layer value; tighten the bound to 4.0 mm² (the 2D even/odd interlocking-notch amplitude is ≈3.7 mm²) and WARN the per-layer numbers.
+- Add one direct pin: on the +X-painted plain cube with `no_cap_no_step()`, every bottom vertex of the shell has x = 40 − 1.5 ± 1e-4 and its y and z are inset exactly 1.5 from the face's edges (the corner lands at (38.5, 1.5, 1.5) etc.).
+
+- [ ] **Step 2: Build, verify failure** (the block-top volume, 19.4, 19.3 and the parity bound fail against the current 1/√3 offsets).
+
+- [ ] **Step 3: Implement**
+
+In `ColorSplitShell.cpp`, where the bisector segment length is chosen (plain boundary bottom and ring, Case B's second segment, interior vertices): `const float cosang = std::max(0.5f, normals[v].dot(n_p_unit)); float length = std::min(d / cosang, half_thickness_along_bisector(v))` where the second term is the existing per-vertex clamp `compute_vertex_depths` produced (it already measures along −n(v)); keep `d ≤ cap` handling before the division; the ring segment h is mitred the same way (h / cosang). For interior (non-boundary) vertices n_P is the patch mean normal at that vertex (already available for boundary vertices — extend the per-vertex accumulation to all group vertices or fall back to the group mean normal). Update the header comment on `compute_vertex_depths`/§3.4 to say the mitred length is what is applied. Re-record S1/S3/S4 in `.superpowers/sdd/2026-09-01-color-split/spike-report.md`.
+
+- [ ] **Step 4: Build and run** `[colorsplit]`, `[colorsplit_spike]`, `[paintdepth]` → all pass.
+
+- [ ] **Step 5: Commit** — `feat(color-split): mitred bisector offsets so the perpendicular depth equals D (Ruling 24)`.
+
+---
+
+### Task 10: GUI — Plater action, dialog, job, menu
 
 **Files:**
 - Create: `src/slic3r/GUI/ColorSplitDialog.hpp/.cpp`, `src/slic3r/GUI/Jobs/ColorSplitJob.hpp/.cpp`
@@ -1902,7 +1933,7 @@ Report to the user with instructions: open a painted project, right-click → Sp
 
 ---
 
-### Task 10: Verification, docs and ledger
+### Task 11: Verification, docs and ledger
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-09-01-color-split-design.md` (status line + any spike-driven changes), `.superpowers/sdd/2026-09-01-color-split/progress.md`
@@ -1930,6 +1961,6 @@ Expected: all green (the full run has 2 known xfail cases from before). Run `[co
 
 ## Self-review notes (done while writing)
 
-- Spec coverage (after the Task-5 insertion, 2026-09-02): 3.1/3.1a → Tasks 1/5 (smooth patches); 3.2–3.4 → Task 2/3; 3.5–3.7 → Task 3/5/6; 3.8 → Task 4; 3.9 + §4 → Task 7; §5 → Task 9; §6/§8.7 → Task 8; §7 errors → Tasks 3/4/9; §8 tests → Tasks 1–8; §9 spike → Task 4 step 5 (verdict: engine A) + Task 5 re-measure + Task 8 S4; §10 fallback engine → not needed; §11 deferred → out of scope.
+- Spec coverage (after the Task-5 and Task-9 insertions, 2026-09-02): 3.1/3.1a → Tasks 1/5 (smooth patches); 3.4 mitre → Task 9; 3.2–3.4 → Task 2/3; 3.5–3.7 → Task 3/5/6; 3.8 → Task 4; 3.9 + §4 → Task 7; §5 → Task 10; §6/§8.7 → Task 8; §7 errors → Tasks 3/4/10; §8 tests → Tasks 1–9; §9 spike → Task 4 step 5 (verdict: engine A) + Tasks 5/9 re-measure + Task 8 S4; §10 fallback engine → not needed; §11 deferred → out of scope.
 - Type consistency: `ColorSplitProgress`, `ColorSplitDepths`, `ColorSplitParams`, `ColorShell`, `ShellCheck`, `ColorSplitResult`, `ColorSplitSpace` are defined once (Tasks 1–6) and used with the same names later; `apply_color_split` takes `(ModelObject&, size_t, ColorSplitResult&&, const ColorSplitSpace&, bool, bool)` everywhere.
 - Known verification points for implementers (marked "check" in the code): `its_face_neighbors` edge convention, `TriangleSelector::select_patch` overload, `NormalUtils::Normals` type, `AABBMesh::query_ray_hits` ordering, `Manifold::Split` pair order, `LayerRegion::slices` accessor, `ModelVolume` member names for text/emboss/cut info, `Plater::TakeSnapshot` and `show_error` signatures.
