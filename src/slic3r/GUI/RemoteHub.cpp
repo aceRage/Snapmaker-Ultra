@@ -1815,7 +1815,16 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner)
             respond(client, 200, "text/html; charset=utf-8", read_file(resources_dir() + "/web/orca/stream_center.html"),
                     "Set-Cookie: rt=" + token + "; Path=/; SameSite=Lax" + cookie_flags + "\r\n");
         } else if (rest == "/state") {
-            respond_json(client, 200, state_for_phone());
+            // Through Tailscale Serve the phone learns who it is signed in as (shown in its top bar).
+            std::string st = state_for_phone();
+            if (via_serve) {
+                try {
+                    json j            = json::parse(st);
+                    j["remote_login"] = r.ts_login;
+                    st                = j.dump();
+                } catch (...) {}
+            }
+            respond_json(client, 200, st);
         } else if (rest == "/bambu") {
             std::string ip, code;
             if (!lookup_host(query_param(r.query, "id"), ip, code) || code.empty()) { respond(client, 404, "text/plain", "unknown camera"); return; }

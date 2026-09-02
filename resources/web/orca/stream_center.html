@@ -44,6 +44,8 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
 .cell.over { outline: 2px solid #5fd08a; outline-offset: -2px; }
 body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #note { color: #999; font-size: 12px; }
+#via { color: #5fd08a; font-size: 12px; margin-right: 10px; white-space: nowrap; }
+#via:empty { display: none; }
 #modal-bg { display: none; position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; }
 #modal { background: #333; border-radius: 8px; padding: 18px; min-width: 360px; max-width: 480px; max-height: 92vh; overflow-y: auto; color: #fff; box-shadow: 0 6px 24px rgba(0,0,0,0.5); }
 #modal h3 { font-size: 15px; margin-bottom: 12px; font-weight: 600; }
@@ -195,6 +197,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
   <span class="chip" id="addchip">+ Add</span>
   <span class="chip" id="phonechip" title="Open this camera wall on your phone">&#128241; Phone</span>
   <span id="spacer"></span>
+  <span id="via" title="Connected through your Tailscale network"></span>
   <span id="note"></span>
   <span id="layoutbox" title="Grid layout: columns x rows (drag a name to reorder)">
     <select id="cols"></select><span>&times;</span><select id="rows"></select>
@@ -318,6 +321,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 save(); render();
             }
             document.getElementById('note').textContent = state.hosts.length === 0 ? 'No cameras set up on the PC yet' : '';
+            // Remote via Tailscale: the hub reports the tailnet sign-in it admitted.
+            var via = document.getElementById('via');
+            if (via) via.textContent = s && s.remote_login ? 'Remote · ' + s.remote_login : '';
         }).catch(function(e) {
             console.error('state refresh failed', e);
             document.getElementById('note').textContent = 'Lost contact with the slicer';
