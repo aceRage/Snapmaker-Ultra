@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2 (after adversarial review) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.1 (after adversarial review; §3.6 refined during planning) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -77,16 +77,25 @@ d_cap = max(h, N_eff·h), i.e. a zero-shell object keeps only its surface layer;
 (n_z < 0) use the bottom_* keys. The cap applies only when D ≥ ws and d_cap < D (the 2D gates,
 MultiMaterialSegmentation.cpp:1874-1877, 2228); capped groups use min(d(v), d_cap). Flat cap off ⇒ one group per patch.
 
-**3.6 Side walls and the wall-stack step.** For a boundary edge (a,b) of a group (neighbour facet outside the
-group): if the painted facet P is more horizontal than its outside neighbour Q (|n_P·z| > |n_Q·z|) — a painted top
-meeting a side face, a painted floor meeting a wall — the wall first steps one wall stack into the painted face
-while dropping one layer: a₁ = a + ws·t_in(a) − h·n_P, then continues a′ = a₁ − (d(a) − h)·n_P, where t_in is the
-unit inward tangent of P at the boundary. This is the 2D F1 contour inset: the surface layer claims to the edge,
-every layer below stays one wall stack away from the side surface, so the side face keeps a body-coloured
-outer wall (without it a zero-width body wedge grows at 45° from the edge and the painted colour shows on the
-side face for the top ≈ws). Otherwise (paint boundary inside a smooth face, or a painted side face meeting a
-more horizontal neighbour) the wall is the plain bisector projection a′ = a − d(a)·n(a). Known approximation:
-for side surfaces that lean inward going down, the inset shrinks below ws at depth (2D re-insets per layer).
+**3.6 Side walls at creases (rev 2.1).** Every boundary vertex a of a group gets an intermediate ring vertex a₁
+and a bottom vertex a′; the side of the shell is two strips (b,a,a₁,b₁) and (b₁,a₁,a′,b′). Let n_P be the mean
+normal of the group's facets at a and n_Q the mean normal of the outside facets across a's boundary edges. A
+boundary is a **crease** when n_P·n_Q < cos 15°.
+- Plain boundary (no crease — a paint edge inside a smooth face): a₁ = a − h·n(a), a′ = a − d(a)·n(a).
+- Crease, P more horizontal than Q (|n_P·z| > |n_Q·z|: painted top meets a side face, painted floor meets a
+  wall): a₁ = a + ws·t_in(a) − h·n_P, a′ = a₁ − (d(a) − h)·n_P, with t_in the unit inward tangent of P at the
+  boundary (t_in = normalize(n_P × (b − a)) for the group's CCW boundary edge a→b). This is the 2D F1 contour
+  inset: the surface layer claims to the edge, every layer below stays one wall stack away from the side
+  surface, so the side face keeps a body-coloured outer wall (without it a zero-width body wedge grows at 45°
+  from the edge and the painted colour shows on the side face for the top ≈ws).
+- Crease, P less horizontal (painted side face meets a more horizontal neighbour, e.g. the top): a₁ = a − ws·n_P,
+  a′ = a₁ − (d(a) − ws)·n(a). The painted side keeps its full outer wall stack right up to the edge (a plain
+  bisector would thin the piece to a sliver there and show body colour on the side face's top ≈ws); after that
+  the bisector taper limits the painted rim on the neighbouring top face to one wall stack, where the 2D band
+  would paint a D-wide rim — a deliberate, documented deviation.
+When d(a) leaves no room for the second strip (d(a) − first segment ≤ h) a′ collapses onto a₁ and only the first
+strip is emitted. Known approximation: for side surfaces that lean inward going down, the inset shrinks below
+ws at depth (2D re-insets per layer).
 
 **3.7 Shell construction.** For every edge-connected component C of every depth group: top = C's triangles;
 bottom = the same triangles on the offset vertices with reversed winding; sides = for each boundary edge (a,b)
