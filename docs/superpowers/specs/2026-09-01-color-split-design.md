@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.5 (after adversarial review; §3.1a/§3.4/§3.6/§7 refined during planning, Tasks 3–5) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.6 (after adversarial review; §3.1a/§3.4/§3.6/§7 refined during planning, Tasks 3–5) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -40,15 +40,17 @@ States above the printer's filament count: physical overflow is skipped with a w
 unpainted); mixed-filament virtual ids are kept and become the part's extruder, as the 2D path does
 (PrintApply.cpp:1885-1893) — the plan verifies the extruder clamp in `region_config_from_model_volume` accepts them.
 
-**3.1a Refinement pre-pass (rev 2.5, Rulings 13/17).** Before normals and shells, F is refined by
-edge-selective longest-edge bisection: every edge longer than L = max(ws, min(D_eff, bbox_diagonal/20)) is
-split at its midpoint and both incident facets are bisected (conforming, 2-manifold), children inheriting the
-parent facet's state; short edges are never touched. Reason: STL cylinders, pins and bosses have only two vertex
-rings, so every side vertex is a junction bisector and no offset is radial — without interior vertices a painted
-boss became a cup (spike S1). Uniform per-facet subdivision (Manifold's `RefineToLength`) was tried and rejected:
-it also splits the short circumferential chords, and chord-interior vertices carry facet normals that disorder
-the bottom ring near the axis (Task 5 measurements). Refinement adds vertices only where edges are longer than L,
-so ordinary meshes are barely touched, and normals are computed on the refined surface.
+**3.1a Smooth-patch decomposition (rev 2.6, Ruling 18; replaces the refinement pre-pass of rev 2.4/2.5).**
+A single offset surface cannot represent two claims that overlap inside the part: on a painted boss the top
+cap's bottom disc crosses the side wall's bottom tube near the axis, the shell self-intersects, the fold guard
+shortens it and a hidden core survives. Therefore a state's facets are grouped by edge connectivity only across
+edges whose dihedral angle is below 30° (n₁·n₂ > cos 30°): each **smooth patch** becomes its own shell, and the
+sequential Split (§3.8) takes the overlapping patch shells one after another. At a boundary edge whose outside
+facet carries the SAME state (a crease inside the painted region) the wall follows the patch's own mean normal
+n_P with no step and no bisector, so the top slab's walls go straight down and the side tube's walls straight
+inward; a coarse two-ring STL cylinder therefore needs no extra vertices (its ring vertices' patch normals are
+radial). Uniform (Manifold `RefineToLength`) and edge-selective refinement were both measured in Task 5 and
+rejected: neither helps, and chord-interior vertices disorder the bottom ring near the axis.
 
 **3.2 Normals.** n(v) = `NormalUtils::create_normals(F, VertexNormalType::AngleWeighted)` — angle weighting is
 triangulation-independent, so a cube edge gets the exact 45° bisector; always computed on the FULL surface F,
