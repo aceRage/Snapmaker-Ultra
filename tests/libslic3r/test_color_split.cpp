@@ -560,6 +560,48 @@ TEST_CASE("colorsplit: three adjacent colours tile the top face, lower filament 
         }
 }
 
+TEST_CASE("colorsplit: a filament left with no solid of its own is reported", "[colorsplit]")
+{
+    // Spec 3.8/7: overlaps settle by filament order, so a colour can lose ALL of its area to a lower one -
+    // and then it never reaches the pieces at all, because the second Split finds nothing left to cut. Two
+    // identical shells, filaments 2 and 3: filament 2 takes the whole slab and filament 3 must come back as a
+    // warning rather than silently disappearing.
+    TriangleMesh block = make_cube(40., 40., 20.);
+    ColorPatches p = extract_color_patches(block.its, paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
+    std::vector<ColorShell> shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(shells.size() == 1);
+    shells.push_back({3, shells[0].capped, shells[0].mesh});   // the very same solid, one filament higher
+    ColorSplitResult r = partition_by_shells(p.surface, shells, /*absorb_islands=*/true, nullptr);
+    REQUIRE(r.pieces.size() == 1);
+    REQUIRE(r.pieces[0].first == 2);
+    REQUIRE(r.warnings.size() == 1);
+    REQUIRE(r.warnings[0] == "Filament 3: painted area produced no solid (fully covered by lower filaments).");
+}
+
+TEST_CASE("colorsplit: the island where two colours meet is absorbed, not left in the body", "[colorsplit]")
+{
+    // Two hemispheres in different colours at UNLIMITED depth: each shell stops delta short of the
+    // mid-surface, so what survives in the middle is one tiny island enclosed by both of them. Spec 3.8 hands
+    // it to the colour that contributed most of its surface (ties -> the lower filament); either way it has
+    // to end up inside a piece rather than as a stray speck of body colour in the centre of the part.
+    TriangleMesh sphere(its_make_sphere(2.0, PI / 18.));
+    TriangleSelector sel(sphere);
+    for (int f = 0; f < int(sphere.its.indices.size()); ++f) {
+        const Vec3i32 &t = sphere.its.indices[f];
+        const float cz = (sphere.its.vertices[t[0]].z() + sphere.its.vertices[t[1]].z() + sphere.its.vertices[t[2]].z()) / 3.f;
+        sel.set_facet(f, cz > 0.f ? EnforcerBlockerType::Extruder2 : EnforcerBlockerType::Extruder3);
+    }
+    ColorSplitResult r = split_volume_by_paint(sphere.its, sel.serialize(),
+                                               depths_for_test(std::numeric_limits<double>::infinity()), no_cap_no_step(), nullptr);
+    REQUIRE(r.pieces.size() == 2);
+    REQUIRE(r.pieces[0].first == 2);
+    REQUIRE(r.pieces[1].first == 3);
+    REQUIRE(volume_of(r.body) < 1e-6);                       // absorbed into one of the two, whichever won
+    double total = volume_of(r.body);
+    for (auto &pc : r.pieces) total += volume_of(pc.second);
+    REQUIRE_THAT(total, WithinRel(volume_of(sphere.its), 1e-4));
+}
+
 TEST_CASE("colorsplit: painted sphere smaller than D is wholly its colour (island absorption)", "[colorsplit]")
 {
     TriangleMesh sphere(its_make_sphere(1.0, PI / 18.));
@@ -579,6 +621,9 @@ TEST_CASE("colorsplit: cancellation aborts without a result", "[colorsplit]")
     TriangleMesh block = make_cube(40., 40., 20.);
     auto data = paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
     REQUIRE_THROWS_AS(split_volume_by_paint(block.its, data, depths_for_test(1.5), no_cap_no_step(), [](int) { return false; }), ColorSplitCancelled);
+    // And once the partition itself is under way: build_color_shells owns the 10..50 band and
+    // partition_by_shells 50..95, so a callback that only refuses above 50 cancels inside the Split loop.
+    REQUIRE_THROWS_AS(split_volume_by_paint(block.its, data, depths_for_test(1.5), no_cap_no_step(), [](int percent) { return percent <= 50; }), ColorSplitCancelled);
 }
 
 TEST_CASE("colorsplit: an ultra-thin plate never asks for a negative depth", "[colorsplit]")
@@ -729,5 +774,4 @@ TEST_CASE("colorsplit spike: S3 stage breakdown and the CGAL check share", "[col
          << (100. * check_s / std::max(1e-9, patches_s + shells_s + partition_s)) << "% of the whole split), partition "
          << partition_s << " s; shell warnings " << warnings.size());
     for (const std::string &w : warnings) WARN("S3 breakdown warning: " << w);
-    REQUIRE(std::chrono::duration<double>(t3 - t2).count() >= 0.);
 }

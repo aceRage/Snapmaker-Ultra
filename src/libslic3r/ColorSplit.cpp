@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <set>
 #include <sstream>
 
 namespace Slic3r {
@@ -136,6 +137,16 @@ std::vector<float> compute_vertex_depths(const ColorPatches &p, const std::vecto
 }
 
 namespace {
+
+// The dialog's depth override wins over both the depth AND the unlimited flag. Both entry points have to
+// apply it identically - build_color_shells to cut with, split_volume_by_paint to report back - so neither
+// gets to spell the rule out for itself.
+ColorSplitDepths effective_depths(const ColorSplitDepths &depths, const ColorSplitParams &params)
+{
+    ColorSplitDepths out = depths;
+    if (params.depth_override_mm > 0.) { out.D = params.depth_override_mm; out.unlimited = false; }
+    return out;
+}
 
 // Ruling 8: how far each wedge's copies of a pinch vertex move along that wedge's inward tangent bisector,
 // capped per vertex at a tenth of its shortest boundary edge (Ruling 11).
@@ -393,8 +404,7 @@ ShellCheck check_shell(const indexed_triangle_set &shell)
 
 std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSplitDepths &depths_in, const ColorSplitParams &params, const ColorSplitProgress &progress, std::vector<std::string> *warnings)
 {
-    ColorSplitDepths depths = depths_in;
-    if (params.depth_override_mm > 0.) { depths.D = params.depth_override_mm; depths.unlimited = false; }
+    const ColorSplitDepths depths = effective_depths(depths_in, params);
     const double D = depths.unlimited ? std::numeric_limits<double>::infinity() : depths.D;
     std::vector<Vec3i32> nbrs    = its_face_neighbors(p.surface);
     std::vector<Vec3f>   normals = color_split_normals(p.surface);
@@ -456,7 +466,7 @@ namespace {
 // bottom sits microns below the surface must not be simplified away. AsOriginal() (manifold.h:198-200) stamps
 // a fresh OriginalID on the result; that ID is what the island pass below reads back off the Split output to
 // tell which input each face came from.
-manifold::Manifold to_manifold64(const indexed_triangle_set &its)
+manifold::Manifold to_manifold64(const indexed_triangle_set &its, manifold::ExecutionContext &ctx)
 {
     manifold::MeshGL64 m;
     m.numProp = 3;
@@ -472,14 +482,22 @@ manifold::Manifold to_manifold64(const indexed_triangle_set &its)
         m.triVerts.push_back(uint64_t(t[1]));
         m.triVerts.push_back(uint64_t(t[2]));
     }
-    m.tolerance = 1e-5;   // mm; well below any print resolution, above float noise
+    // mesh.h:159-162: the tolerance actually used is the MAXIMUM of this and a baseline derived from the
+    // bounding box, and any edge shorter than it may be collapsed - so this cannot switch simplification off,
+    // it only pins the floor at the spec's value (3.7). 1e-5 mm is well below any print resolution and above
+    // float noise on part-sized coordinates.
+    m.tolerance = 1e-5;
     m.Merge();            // fuse duplicated vertices so a triangle soup can still form a topological manifold
-    return manifold::Manifold(m).AsOriginal();
+    // FromMeshGL (common.h:262-271) is the ctx-aware ingest: its heavy phases check for cancellation, which
+    // plain Manifold(m) does not. AsOriginal() then stamps the provenance ID and drops the attachment, so
+    // callers re-attach with WithContext.
+    return ctx.FromMeshGL(m).AsOriginal();
 }
 
-indexed_triangle_set from_manifold(const manifold::Manifold &m)
+// Exporting a MeshGL64 is the expensive step, so callers that already hold one (the island pass needs it
+// for the provenance runs) convert straight from it rather than asking the Manifold for a second copy.
+indexed_triangle_set from_meshgl64(const manifold::MeshGL64 &out)
 {
-    manifold::MeshGL64 out = m.GetMeshGL64();
     indexed_triangle_set its;
     const size_t stride = size_t(out.numProp);                                    // mesh.h:110 - always >= 3
     const size_t nv     = stride > 0 ? out.vertProperties.size() / stride : 0;
@@ -492,6 +510,8 @@ indexed_triangle_set from_manifold(const manifold::Manifold &m)
         its.indices.emplace_back(int(out.triVerts[i]), int(out.triVerts[i + 1]), int(out.triVerts[i + 2]));
     return its;
 }
+
+indexed_triangle_set from_manifold(const manifold::Manifold &m) { return from_meshgl64(m.GetMeshGL64()); }
 
 void require_ok(const manifold::Manifold &m, const char *what)
 {
@@ -530,34 +550,41 @@ ColorSplitResult partition_by_shells(const indexed_triangle_set &mesh, const std
     manifold::ExecutionContext ctx;
     auto tick = [&](int pct) { if (progress && !progress(pct)) { ctx.Cancel(); throw ColorSplitCancelled(); } };
 
-    manifold::Manifold original = to_manifold64(mesh).WithContext(ctx);
+    manifold::Manifold original = to_manifold64(mesh, ctx).WithContext(ctx);
     require_ok(original, "source mesh");
     const uint32_t original_id  = uint32_t(original.OriginalID());
     const double   vol_original = original.Volume();
 
     ColorSplitResult r;
-    std::map<int, std::vector<manifold::Manifold>> piece_parts;   // filament -> Split results
-    std::map<uint32_t, int>                        shell_state;   // shell OriginalID -> filament
+    // (volume, mesh): every Manifold is exported to a MeshGL64 exactly once, where we first have one in hand.
+    using Part = std::pair<double, indexed_triangle_set>;
+    std::map<int, std::vector<Part>> piece_parts;   // filament -> its share of the part
+    std::map<uint32_t, int>          shell_state;   // shell OriginalID -> filament
+    // Spec 3.8/7: a filament can lose ALL of its area to a lower one, in which case piece_parts never gains a
+    // key for it. The states have to be remembered up front or that colour would vanish without a word.
+    std::set<int> shell_states;
+    for (const ColorShell &s : shells) shell_states.insert(s.state);
     manifold::Manifold rest = original;
     for (size_t i = 0; i < shells.size(); ++i) {
-        manifold::Manifold shell = to_manifold64(shells[i].mesh).WithContext(ctx);
+        manifold::Manifold shell = to_manifold64(shells[i].mesh, ctx).WithContext(ctx);
         require_ok(shell, "shell");
         shell_state[uint32_t(shell.OriginalID())] = shells[i].state;
         // manifold.cpp:950-967: Split returns (intersection, difference) - the piece first, the remainder
         // second, from one evaluation, so the two are complementary with no epsilon mismatch between them.
         auto [piece, remainder] = rest.Split(shell);
         require_ok(piece, "split piece"); require_ok(remainder, "split remainder");
-        if (!piece.IsEmpty()) piece_parts[shells[i].state].push_back(piece);
+        if (!piece.IsEmpty()) piece_parts[shells[i].state].emplace_back(piece.Volume(), from_manifold(piece));
         rest = remainder;
         tick(int(50 + 40 * double(i + 1) / double(shells.size())));
     }
 
     // Spec 3.8: enclosed body islands -> the colour that contributed most of their surface. A component none
     // of whose faces come from the source mesh is completely wrapped by colour pieces and therefore invisible.
-    std::vector<manifold::Manifold> body_parts;
+    std::vector<Part> body_parts;
     for (manifold::Manifold &comp : rest.Decompose()) {
         require_ok(comp, "body component");
-        const std::map<uint32_t, size_t> faces = faces_by_original_id(comp.GetMeshGL64());
+        const manifold::MeshGL64         gl    = comp.GetMeshGL64();   // one export, used for both purposes
+        const std::map<uint32_t, size_t> faces = faces_by_original_id(gl);
         const bool touches_original = faces.count(original_id) != 0;
         if (absorb_islands && !touches_original && !faces.empty()) {
             uint32_t best = 0; size_t best_n = 0; int best_state = std::numeric_limits<int>::max();
@@ -570,20 +597,24 @@ ColorSplitResult partition_by_shells(const indexed_triangle_set &mesh, const std
                 }
             }
             auto winner = shell_state.find(best);
-            if (winner != shell_state.end()) { piece_parts[winner->second].push_back(comp); continue; }
+            if (winner != shell_state.end()) { piece_parts[winner->second].emplace_back(comp.Volume(), from_meshgl64(gl)); continue; }
         }
-        body_parts.push_back(comp);
+        body_parts.emplace_back(comp.Volume(), from_meshgl64(gl));
     }
 
     double total = 0.;
-    for (manifold::Manifold &b : body_parts) { total += b.Volume(); its_merge(r.body, from_manifold(b)); }
+    for (Part &b : body_parts) { total += b.first; its_merge(r.body, b.second); }
     for (auto &[state, parts] : piece_parts) {
         indexed_triangle_set its;
-        for (manifold::Manifold &m : parts) { total += m.Volume(); its_merge(its, from_manifold(m)); }
-        if (its.indices.empty()) { r.warnings.push_back("Filament " + std::to_string(state) + ": painted area produced no solid (fully covered by lower filaments)."); continue; }
+        for (Part &part : parts) { total += part.first; its_merge(its, part.second); }
         r.pieces.emplace_back(state, std::move(its));
     }
-    if (std::abs(total - vol_original) > 1e-4 * vol_original + 1e-9)
+    // Spec 3.8: empty pieces are dropped with a warning - the colour was painted but a lower filament claimed
+    // every last bit of it (or its shell fell outside the part), and the user has to hear about that.
+    for (int state : shell_states)
+        if (piece_parts.count(state) == 0)
+            r.warnings.push_back("Filament " + std::to_string(state) + ": painted area produced no solid (fully covered by lower filaments).");
+    if (std::abs(total - vol_original) > 1e-4 * std::abs(vol_original) + 1e-9)
         throw ColorSplitError("Volume check failed after splitting (" + std::to_string(total) + " vs " + std::to_string(vol_original) + " mm^3).");
     tick(95);
     return r;
@@ -601,8 +632,7 @@ ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const T
     std::vector<ColorShell> shells = build_color_shells(patches, depths, params, progress, &shell_warnings);
     ColorSplitResult r = partition_by_shells(patches.surface, shells, params.absorb_islands, progress);
     r.warnings.insert(r.warnings.begin(), shell_warnings.begin(), shell_warnings.end());
-    r.depths = depths;
-    if (params.depth_override_mm > 0.) { r.depths.D = params.depth_override_mm; r.depths.unlimited = false; }
+    r.depths = effective_depths(depths, params);
     if (progress) progress(100);
     return r;
 }
