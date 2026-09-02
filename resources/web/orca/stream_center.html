@@ -2,13 +2,17 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1f1f1f">
 <title>Stream</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { width: 100%; height: 100%; background: #2b2b2b; font-family: 'Segoe UI', Roboto, sans-serif; overflow: hidden; }
-#topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 12px; background: #1f1f1f; }
-.chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 16px; background: #4a4a4a; color: #fff; font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }
+html, body { width: 100%; height: 100%; background: #2b2b2b; font-family: 'Segoe UI', Roboto, -apple-system, sans-serif; overflow: hidden; touch-action: manipulation; -webkit-text-size-adjust: 100%; }
+#topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 12px; background: #1f1f1f; padding-top: calc(10px + env(safe-area-inset-top)); padding-left: calc(12px + env(safe-area-inset-left)); padding-right: calc(12px + env(safe-area-inset-right)); }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 16px; background: #4a4a4a; color: #fff; font-size: 13px; cursor: pointer; user-select: none; -webkit-user-select: none; white-space: nowrap; }
 .chip.active { background: #0a9e50; }
 .chip.over { outline: 2px solid #5fd08a; }
 .chip .icon { opacity: 0.7; font-size: 12px; padding: 0 2px; }
@@ -17,13 +21,19 @@ html, body { width: 100%; height: 100%; background: #2b2b2b; font-family: 'Segoe
 #spacer { flex: 1; }
 select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
 #layoutbox { display: inline-flex; align-items: center; gap: 4px; color: #aaa; font-size: 12px; }
-#grid { position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; display: grid; gap: 4px; padding: 4px; background: #2b2b2b; overflow-y: auto; overflow-x: hidden; align-content: start; }
+#grid { position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; display: grid; gap: 4px; padding: 4px; padding-bottom: calc(4px + env(safe-area-inset-bottom)); padding-left: calc(4px + env(safe-area-inset-left)); padding-right: calc(4px + env(safe-area-inset-right)); background: #2b2b2b; overflow-y: auto; overflow-x: hidden; align-content: start; -webkit-overflow-scrolling: touch; }
 #grid::-webkit-scrollbar { width: 10px; }
 #grid::-webkit-scrollbar-track { background: #222; }
 #grid::-webkit-scrollbar-thumb { background: #555; border-radius: 5px; }
 #grid::-webkit-scrollbar-thumb:hover { background: #777; }
 .cell { position: relative; background: #000; border-radius: 4px; overflow: hidden; }
 .cell iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+.cell .label { -webkit-touch-callout: none; }
+@media (min-width: 641px) and (max-width: 1100px) and (pointer: coarse) { /* tablets */
+    .chip { font-size: 14px; padding: 8px 12px; }
+    select { font-size: 14px; padding: 7px 10px; }
+    .cell .label { font-size: 13px; padding: 3px 10px; }
+}
 .cell .label { position: absolute; left: 8px; top: 6px; z-index: 2; padding: 2px 8px; border-radius: 10px; background: rgba(0,0,0,0.55); color: #fff; font-size: 12px; cursor: grab; user-select: none; }
 .cell.empty { border: 1px dashed #555; background: #262626; }
 .cell.over { outline: 2px solid #5fd08a; outline-offset: -2px; }
@@ -84,12 +94,19 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
 
     function newId() { return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+    // Phone/tablet default grid from the screen: phones 1x2 / 2x1, tablets 2x3 / 3x2. Used until
+    // the viewer picks a layout, and re-applied when the device is rotated.
+    var remoteAutoLayout = true;
+    function remoteDefaultLayout() {
+        var w = window.innerWidth, h = window.innerHeight, tablet = Math.min(w, h) >= 600;
+        return w > h ? (tablet ? '3x2' : '2x1') : (tablet ? '2x3' : '1x2');
+    }
     function load() {
         if (REMOTE) {
-            state = { hosts: [], active: [], layout: window.innerWidth > window.innerHeight ? '2x1' : '1x2' };
+            state = { hosts: [], active: [], layout: remoteDefaultLayout() };
             try {
                 var r = JSON.parse(localStorage.getItem(REMOTE_KEY));
-                if (r && r.layout) state.layout = r.layout;
+                if (r && r.layout && r.auto === false) { state.layout = r.layout; remoteAutoLayout = false; }
                 if (r && Array.isArray(r.active)) state.active = r.active;
             } catch (e) {}
             return;
@@ -120,7 +137,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
     function save() {
         if (REMOTE) {
-            try { localStorage.setItem(REMOTE_KEY, JSON.stringify({ layout: state.layout, active: state.active })); } catch (e) {}
+            try { localStorage.setItem(REMOTE_KEY, JSON.stringify({ layout: state.layout, active: state.active, auto: remoteAutoLayout })); } catch (e) {}
             return;
         }
         try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
@@ -329,6 +346,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         if (h.rkind === 'go2rtc') {
             var f = document.createElement('iframe');
             f.allow = 'autoplay';
+            f.setAttribute('scrolling', 'no'); // iOS otherwise grows the frame to its content
             f.src = '/stream.html?src=' + encodeURIComponent(h.rname) + '&mode=mse';
             cell.appendChild(f);
         } else if (h.rkind === 'p1') {
@@ -339,6 +357,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         } else if (h.rkind === 'url' && h.rurl) {
             var f2 = document.createElement('iframe');
             f2.allow = 'autoplay';
+            f2.setAttribute('scrolling', 'no');
             f2.src = h.rurl;
             cell.appendChild(f2);
         } else {
@@ -751,13 +770,14 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             ? (state.active.length - lay.n) + ' more below — scroll'
             : (state.hosts.length === 0 ? 'Add a printer or camera to start' : '');
 
-        // Reuse existing cells where the camera has not changed to avoid reconnecting.
-        var existing = {};
+        // Keep live cells in place: moving an iframe in the DOM reloads it (and reconnects the
+        // stream), so cells are positioned with CSS `order` and only added or removed here.
+        var existing = {}, spare = [];
         Array.prototype.slice.call(grid.children).forEach(function(cell) {
-            if (cell.dataset.id) existing[cell.dataset.id] = cell;
+            if (cell.dataset.id && shown.indexOf(cell.dataset.id) !== -1) existing[cell.dataset.id] = cell;
+            else if (!cell.dataset.id && cell.classList.contains('empty')) spare.push(cell);
+            else cell.remove();
         });
-        var scrollTop = grid.scrollTop;
-        grid.innerHTML = '';
         for (var i = 0; i < count; i++) {
             var id = shown[i];
             var cell;
@@ -768,6 +788,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                     cell = document.createElement('div');
                     cell.className = 'cell';
                     cell.dataset.id = id;
+                    grid.appendChild(cell);
                     var hh   = h || { id: id, ip: id };
                     var kind = kindOf(hh);
                     if (REMOTE) {
@@ -800,8 +821,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 }
                 cell.querySelector('.label').textContent = (h && h.alias) ? h.alias : (h ? (h.ip || 'Camera') : id);
             } else {
-                cell = document.createElement('div');
-                cell.className = 'cell empty';
+                cell = spare.shift();
+                if (!cell) {
+                    cell = document.createElement('div');
+                    cell.className = 'cell empty';
+                    grid.appendChild(cell);
+                }
             }
             // Cells are reused across renders, so bind the drop handlers once and read
             // the cell's current position at drop time.
@@ -814,9 +839,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 })(cell);
             }
             cell.dataset.index = i;
-            grid.appendChild(cell);
+            cell.style.order = i;
         }
-        grid.scrollTop = scrollTop;
+        spare.forEach(function(cell) { cell.remove(); });
     }
     document.getElementById('addchip').onclick = function() {
         hostDialog('Add printer or camera', {}, function(r) {
@@ -838,10 +863,14 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         }
         sel.onchange = function() {
             state.layout = document.getElementById('cols').value + 'x' + document.getElementById('rows').value;
+            remoteAutoLayout = false;
             save(); render();
         };
     });
-    window.addEventListener('resize', function() { render(); });
+    window.addEventListener('resize', function() {
+        if (REMOTE && remoteAutoLayout && state.layout !== remoteDefaultLayout()) { state.layout = remoteDefaultLayout(); save(); }
+        render();
+    });
 
     load();
     // Default: first host active in the default single-stream layout.
