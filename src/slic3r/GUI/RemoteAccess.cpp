@@ -759,23 +759,6 @@ static nlohmann::json combo_items(PresetComboBox* combo, Preset::Type type)
     return items;
 }
 
-static bool select_in_combo(PlaterPresetComboBox* combo, Preset::Type type, const std::string& value)
-{
-    if (!combo)
-        return false;
-    for (unsigned int i = 0; i < combo->GetCount(); ++i) {
-        if (is_label_item(combo, i) || combo_item_value(combo, i, type) != value)
-            continue;
-        combo->SetSelection((int) i);
-        wxCommandEvent evt(wxEVT_COMBOBOX, combo->GetId());
-        evt.SetEventObject(combo);
-        evt.SetInt((int) i);
-        combo->GetEventHandler()->ProcessEvent(evt);
-        return true;
-    }
-    return false;
-}
-
 RemoteAccess::ApiResponse RemoteAccess::api_presets()
 {
     auto out = std::make_shared<nlohmann::json>();
@@ -808,43 +791,91 @@ RemoteAccess::ApiResponse RemoteAccess::api_presets()
     return r;
 }
 
-RemoteAccess::ApiResponse RemoteAccess::api_select_preset(const std::string& type, const std::string& name, int index)
+// Unsaved modifications of a preset collection, ready to be re-applied to the newly selected
+// preset (what the transfer/discard dialog's "Transfer" button does).
+static DynamicPrintConfig capture_dirty(PresetCollection& presets)
+{
+    DynamicPrintConfig dirty;
+    if (!presets.current_is_dirty())
+        return dirty;
+    const Preset& edited = presets.get_edited_preset();
+    for (const std::string& opt : presets.current_dirty_options())
+        if (const ConfigOption* o = edited.config.option(opt))
+            dirty.set_key_value(opt, o->clone());
+    return dirty;
+}
+
+// Phone selections never raise the transfer/discard dialog: modifications are carried over to
+// the new preset (they stay "modified" there, so Revert on the PC still discards them).
+RemoteAccess::ApiResponse RemoteAccess::api_select_preset(const std::string& type, const std::string& name_in, int index)
 {
     auto result = std::make_shared<std::pair<int, std::string>>(500, "");
-    bool ok     = run_on_main([result, type, name, index]() {
+    bool ok     = run_on_main([result, type, name_in, index]() {
+        const std::string& name = name_in;
         Sidebar&      sb     = wxGetApp().sidebar();
+        Plater*       plater = wxGetApp().plater();
         PresetBundle* bundle = wxGetApp().preset_bundle;
-        if (wxGetApp().plater()->is_background_process_slicing()) { *result = { 409, "slicing in progress" }; return; }
-        PlaterPresetComboBox* combo = nullptr;
-        Preset::Type          t     = Preset::TYPE_INVALID;
-        bool                  dirty = false;
-        const bool any_dirty = bundle->printers.current_is_dirty() || bundle->prints.current_is_dirty() || bundle->filaments.current_is_dirty();
+        if (plater->is_background_process_slicing()) { *result = { 409, "slicing in progress" }; return; }
+        auto reapply = [](Preset::Type t, const DynamicPrintConfig& dirty) {
+            if (!dirty.empty())
+                wxGetApp().get_tab(t)->load_config(dirty);
+        };
         if (type == "printer") {
+            std::string name = name_in;
             if (name == bundle->printers.get_selected_preset_name()) { *result = { 200, "" }; return; }
-            // A printer switch re-validates process and filaments: any unsaved change would raise the
-            // transfer/discard dialog on the PC and block the GUI thread.
-            if (any_dirty) { *result = { 409, "there are unsaved preset changes on the PC; save or discard them there before switching printers" }; return; }
-            combo = sb.combo_printer(); t = Preset::TYPE_PRINTER;
-        }
-        else if (type == "process" && name == bundle->prints.get_selected_preset_name()) { *result = { 200, "" }; return; }
-        else if (type == "process") {
-            // Same steps as Plater::priv::on_select_preset for TYPE_PRINT, minus the sidebar combo.
-            if (bundle->prints.current_is_dirty()) { *result = { 409, "the process preset has unsaved changes on the PC; save or discard them there first" }; return; }
-            if (!bundle->prints.find_preset(name)) { *result = { 404, "preset not in the list: " + name }; return; }
-            wxGetApp().get_tab(Preset::TYPE_PRINT)->select_preset(name);
-            wxGetApp().plater()->on_config_change(bundle->full_config());
-            wxGetApp().plater()->record_preferred_print_profile();
+            if (!bundle->printers.find_preset(name)) {
+                // The sidebar lists printer models ("Bambu Lab H2D") as well as presets; resolve a
+                // model to its preset the way Plater::priv::on_select_preset does.
+                Preset* similar = bundle->get_similar_printer_preset(name, {});
+                if (!similar) { *result = { 404, "preset not in the list: " + name }; return; }
+                similar->is_visible = true;
+                name = similar->name;
+                if (name == bundle->printers.get_selected_preset_name()) { *result = { 200, "" }; return; }
+            }
+            const DynamicPrintConfig printer_dirty = capture_dirty(bundle->printers);
+            const DynamicPrintConfig process_dirty = capture_dirty(bundle->prints);
+            const DynamicPrintConfig filament_dirty = capture_dirty(bundle->filaments);
+            bundle->physical_printers.unselect_printer();
+            // force_select: no dialogs; incompatible process/filament presets are remapped silently.
+            wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(name, false, "", true);
+            reapply(Preset::TYPE_PRINTER, printer_dirty);
+            reapply(Preset::TYPE_PRINT, process_dirty);
+            reapply(Preset::TYPE_FILAMENT, filament_dirty);
+            plater->on_config_change(bundle->full_config());
+            wxGetApp().app_config->set("preferred_printer", bundle->printers.get_selected_preset_name());
             *result = { 200, "" };
-            return;
-        }
-        else if (type == "filament") {
+        } else if (type == "process") {
+            if (name == bundle->prints.get_selected_preset_name()) { *result = { 200, "" }; return; }
+            if (!bundle->prints.find_preset(name)) { *result = { 404, "preset not in the list: " + name }; return; }
+            const DynamicPrintConfig process_dirty = capture_dirty(bundle->prints);
+            wxGetApp().get_tab(Preset::TYPE_PRINT)->select_preset(name, false, "", true);
+            reapply(Preset::TYPE_PRINT, process_dirty);
+            plater->on_config_change(bundle->full_config());
+            plater->record_preferred_print_profile();
+            *result = { 200, "" };
+        } else if (type == "filament") {
             auto& combos = sb.combos_filament();
             if (index < 0 || index >= (int) combos.size()) { *result = { 404, "no such filament slot" }; return; }
             if (index < (int) bundle->filament_presets.size() && bundle->filament_presets[index] == name) { *result = { 200, "" }; return; }
-            combo = combos[index]; t = Preset::TYPE_FILAMENT; dirty = bundle->filaments.current_is_dirty();
-        } else { *result = { 404, "type must be printer, process or filament" }; return; }
-        if (dirty) { *result = { 409, "the " + type + " preset has unsaved changes on the PC; save or discard them there first" }; return; }
-        *result = select_in_combo(combo, t, name) ? std::make_pair(200, std::string()) : std::make_pair(404, "preset not in the list: " + name);
+            if (!bundle->filaments.find_preset(name)) { *result = { 404, "preset not in the list: " + name }; return; }
+            // Same steps as Plater::priv::on_select_preset for TYPE_FILAMENT, with force on the tab.
+            const DynamicPrintConfig filament_dirty = capture_dirty(bundle->filaments);
+            bundle->set_filament_preset(index, name);
+            plater->update_project_dirty_from_presets();
+            bundle->export_selections(*wxGetApp().app_config);
+            sb.update_dynamic_filament_list();
+            sb.update_color_mix_panel();
+            if (sb.is_multifilament())
+                combos[index]->update();
+            else {
+                wxGetApp().get_tab(Preset::TYPE_FILAMENT)->select_preset(name, false, "", true);
+                reapply(Preset::TYPE_FILAMENT, filament_dirty);
+            }
+            plater->on_config_change(bundle->full_config());
+            *result = { 200, "" };
+        } else {
+            *result = { 404, "type must be printer, process or filament" };
+        }
     });
     ApiResponse r;
     if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }

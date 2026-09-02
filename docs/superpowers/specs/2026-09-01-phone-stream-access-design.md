@@ -51,7 +51,7 @@ Manifest at `GET /api`.
 | `POST /api/slice?plate={i}\|all` | selects the plate and posts the same toolbar event as the Slice button; returns a job id; 409 while slicing |
 | `GET /api/jobs[/{id}]` | job state (running/done/error/cancelled, percent, text) fed by hooks in `Plater::priv::on_slicing_update` / `on_process_completed` |
 | `GET /api/presets` | printer / process choices exactly as the sidebar and Process tab list them (label rows skipped), filament choices, filament slots with colours, dirty flags |
-| `POST /api/presets/select?type=printer\|process\|filament&name=…[&index=…]` | selects through the sidebar combo (printer, filament slot) or `Tab::select_preset` (process); same name → no-op; 409 when the preset (or, for a printer switch, any preset) has unsaved changes on the PC, since that would raise a modal there |
+| `POST /api/presets/select?type=printer\|process\|filament&name=…[&index=…]` | `Tab::select_preset(name, force)` (printer, process) or `PresetBundle::set_filament_preset` + the sidebar's follow-ups (filament slot); same name → no-op. Never shows the transfer/discard dialog: unsaved modifications are captured first and re-applied to the new preset (auto-transfer; Revert on the PC still discards them) |
 | `POST /api/presets/filament_color?index=…&color=%23RRGGBB` | `PlaterPresetComboBox::ApplyFilamentColor` on that slot |
 | `POST /api/presets/filament_add` | `Sidebar::add_filament()` |
 
