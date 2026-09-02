@@ -7,12 +7,14 @@
 #include "AABBMesh.hpp"
 #include "Flow.hpp"
 #include "MeshBoolean.hpp"
+#include "Model.hpp"
 #include "NormalUtils.hpp"
 #include "PrintConfig.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Slic3r {
@@ -183,6 +185,109 @@ ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const T
     r.depths = ColorSplitDetail::effective_depths(depths, params);
     if (progress) progress(100);
     return r;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Spec 3.9 / 4: coordinate space and the model mutation.
+
+ColorSplitSpace color_split_space(const ModelObject &object, const ModelVolume &volume)
+{
+    ColorSplitSpace s;
+    // The first instance stands for all of them: with an isotropic scale the mesh-space depths below are
+    // exact for every instance sharing that scale, and an anisotropic one is a documented approximation
+    // for the rest (spec 3.9).
+    const Transform3d T = (object.instances.empty() ? Transform3d::Identity() : object.instances.front()->get_matrix()) * volume.get_matrix();
+    // Isotropic iff the three column norms of the linear part agree - a rotation times a uniform scale times
+    // any mirror leaves them equal, so this admits rotation and mirroring and rejects only real anisotropy.
+    const Matrix3d L  = T.linear();
+    const double   sx = L.col(0).norm(), sy = L.col(1).norm(), sz = L.col(2).norm();
+    if (std::abs(sx - sy) < 1e-6 * sx && std::abs(sx - sz) < 1e-6 * sx) {
+        s.depth_scale = sx;
+        return s;                                  // mesh-space path, identity transforms
+    }
+    s.world_path = true;
+    s.to_split   = T;
+    s.from_split = T.inverse();
+    return s;
+}
+
+ColorSplitDepths scale_depths(const ColorSplitDepths &d, double s)
+{
+    ColorSplitDepths o = d;
+    o.D /= s; o.ws /= s; o.cap_top /= s; o.cap_bottom /= s; o.layer_height /= s;
+    return o;
+}
+
+// One output volume of the split, in the source's own slot-to-be. `its` is in split space.
+static ModelVolume *add_split_volume(ModelObject &object, const ModelVolume &src, indexed_triangle_set &&its,
+                                     const ColorSplitSpace &space, const std::string &name)
+{
+    TriangleMesh mesh(std::move(its));
+    // TriangleMesh::transform(t, fix_left_handed = true) flips the winding itself when the transform mirrors
+    // (TriangleMesh.cpp:337-347); the caller carried the mesh out under the same flag, so the two flips cancel
+    // and the piece comes back outward-facing.
+    if (space.world_path)
+        mesh.transform(space.from_split, /*fix_left_handed=*/true);
+    // The public overload is the only way in: the (other, mesh&&) constructor is private. It copies the
+    // source's name, config, type and transformation, leaves the facet annotations empty (asserted in the
+    // constructor, Model.hpp:1162-1164) and centres the mesh.
+    ModelVolume *v = object.add_volume(src, std::move(mesh));
+    // Placement: centring translated the mesh by -shift and then added `shift` straight onto the offset
+    // (ModelVolume::translate, Model.cpp:2901-2904), which is only right when the volume matrix has no
+    // rotation or scale. The shift lives in MESH space, so it has to travel through the linear part.
+    v->set_offset(src.get_offset() + src.get_transformation().get_matrix_no_offset() * v->mesh().get_init_shift());
+    v->name = name;
+    // The constructor copies these three; a split part is not a text or SVG volume any more (it must not be
+    // regenerable from its glyphs) and it is not a cut connector either.
+    v->text_configuration.reset();
+    v->emboss_shape.reset();
+    v->cut_info = ModelVolume::CutInfo();          // invalidate_cut_info() only clears is_connector
+    v->source   = ModelVolume::Source();           // synthetic geometry: no reload from disk
+    v->set_type(ModelVolumeType::MODEL_PART);
+    return v;
+}
+
+std::vector<ModelVolume *> apply_color_split(ModelObject &object, size_t src_idx, ColorSplitResult &&r,
+                                             const ColorSplitSpace &space, bool solid_interfaces, bool keep_base_sparse_infill)
+{
+    ModelVolume      &src        = *object.volumes[src_idx];
+    const std::string src_name   = src.name;
+    const int         body_extruder = src.extruder_id();          // resolves volume -> object -> 0
+    // An explicit zero means "inherit" just as much as a missing key does (ModelVolume::extruder_id).
+    const bool        src_has_extruder = src.config.has("extruder") && src.config.extruder() != 0;
+    const size_t      first_new  = object.volumes.size();
+    std::vector<ModelVolume *> created;
+
+    if (!r.body.indices.empty()) {
+        ModelVolume *body = add_split_volume(object, src, std::move(r.body), space, src_name);
+        // The body only carries an extruder of its own if the source did: otherwise it inherits the object's,
+        // and the Ultra outer_wall_filament reset (PrintObject.cpp:3257-3259) is not re-triggered.
+        if (src_has_extruder) body->config.set("extruder", body_extruder);
+        else                  body->config.erase("extruder");
+        created.push_back(body);
+    }
+    for (auto &piece : r.pieces) {
+        ModelVolume *part = add_split_volume(object, src, std::move(piece.second), space,
+                                             src_name + " F" + std::to_string(piece.first));
+        part->config.set("extruder", piece.first);
+        // "Keep base-colour sparse infill": only the part's walls change colour, its interior stays the
+        // body's filament - the 2D behaviour at PrintApply.cpp:1096-1103.
+        if (keep_base_sparse_infill) part->config.set("sparse_infill_filament", std::max(1, body_extruder));
+        created.push_back(part);
+    }
+    if (created.empty())
+        return created;    // nothing to put in the source's place: leave the object exactly as it was
+
+    // Move the new volumes from the back into the source's slot (body first, then the parts ascending) so the
+    // modifiers and negatives behind it keep their relative order and the body-first slice-time clipping order
+    // holds. delete_volume takes an index - it is the only removal API ModelObject offers.
+    std::rotate(object.volumes.begin() + src_idx + 1, object.volumes.begin() + first_new, object.volumes.end());
+    object.delete_volume(src_idx);
+    // Explicitly, not through the paint: has_bounded_paint_depth() needs is_mm_painted() (Print.hpp:514) and
+    // there is no paint left on the part now.
+    if (solid_interfaces) object.config.set("interface_shells", true);
+    object.invalidate_bounding_box();
+    return created;
 }
 
 } // namespace Slic3r

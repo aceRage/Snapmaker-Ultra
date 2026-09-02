@@ -14,6 +14,7 @@ namespace Slic3r {
 
 class DynamicPrintConfig;
 class ModelObject;
+class ModelVolume;
 
 class ColorSplitError : public std::runtime_error { public: using std::runtime_error::runtime_error; };
 class ColorSplitCancelled : public ColorSplitError { public: ColorSplitCancelled() : ColorSplitError("cancelled") {} };
@@ -87,5 +88,29 @@ ColorSplitResult partition_by_shells(const indexed_triangle_set &mesh, const std
 // The one-shot entry point: paint -> patches -> shells -> partition.
 ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const TriangleSelector::TriangleSplittingData &paint,
                                        const ColorSplitDepths &depths, const ColorSplitParams &params, const ColorSplitProgress &progress);
+
+// Spec 3.9: which space the split runs in. D, ws and h are WORLD millimetres, the volume's mesh is not.
+// Let T = instance x volume matrix. An isotropic T (scale s, any rotation, mirror allowed) needs no transform
+// at all - the split runs on the mesh as it stands with the depths divided by s, which is exact and shared by
+// every instance of that scale. An anisotropic T has no single depth scale, so the mesh is carried into world
+// space by `to_split` and the pieces come back through `from_split`.
+struct ColorSplitSpace {
+    Transform3d to_split    = Transform3d::Identity();   // mesh -> split space (identity on the mesh-space path)
+    Transform3d from_split  = Transform3d::Identity();   // split space -> mesh
+    double      depth_scale = 1.;                        // divide world depths by this on the mesh-space path
+    bool        world_path  = false;
+};
+ColorSplitSpace color_split_space(const ModelObject &object, const ModelVolume &volume);
+// World depths -> split-space depths: D, ws, both caps and the layer height all divide by `s`.
+ColorSplitDepths scale_depths(const ColorSplitDepths &depths, double s);
+
+// Spec 4: replace the painted source volume by the split's output, in its own slot - body first (unless it is
+// empty), then one MODEL_PART per filament ascending. Every output is a NEW volume, so undo/redo sees fresh
+// ObjectIDs; the source is deleted. `solid_interfaces` sets the object's `interface_shells`;
+// `keep_base_sparse_infill` pins each colour part's sparse infill to the body's filament. The result is
+// consumed (its meshes are moved into the model). Returns the created volumes, empty if there was nothing to
+// create - in which case the object is left untouched.
+std::vector<ModelVolume *> apply_color_split(ModelObject &object, size_t source_volume_idx, ColorSplitResult &&result,
+                                             const ColorSplitSpace &space, bool solid_interfaces, bool keep_base_sparse_infill);
 
 } // namespace Slic3r

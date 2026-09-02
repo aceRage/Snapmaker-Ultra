@@ -1148,3 +1148,228 @@ TEST_CASE("colorsplit spike: S3 stage breakdown and the CGAL check share", "[col
          << partition_s << " s; shell warnings " << warnings.size());
     for (const std::string &w : warnings) WARN("S3 breakdown warning: " << w);
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Task 7 - spec 3.9 (coordinate space) and spec 4 (model changes).
+
+// An object carrying ONE painted MODEL_PART: the shape apply_color_split is asked to replace.
+static Model painted_model(const TriangleMesh &mesh, const std::vector<std::pair<int, EnforcerBlockerType>> &facets, int extruder = 1)
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name = "split-test";
+    ModelVolume *volume = object->add_volume(mesh);
+    // add_volume(const TriangleMesh &) leaves the volume unnamed (Model.hpp:1090), so name it here - the
+    // body's name is asserted against the SOURCE VOLUME's name, not the object's.
+    volume->name = "split-test";
+    volume->config.set("extruder", extruder);
+    // add_volume centres the mesh, which is a translation: facet indices (and so CUBE_TOP) still hold.
+    TriangleSelector selector(volume->mesh());
+    for (auto [f, st] : facets) selector.set_facet(f, st);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+    object->add_instance();
+    object->ensure_on_bed();
+    return model;
+}
+
+static BoundingBoxf3 world_bbox(const ModelObject &o) { return o.instance_bounding_box(0, false); }
+
+TEST_CASE("colorsplit: apply replaces the source by body + parts in place with extruders set", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    ModelVolume &src = *object.volumes.front();
+    const ObjectID src_id = src.id();
+    BoundingBoxf3 before = world_bbox(object);
+    ColorSplitSpace space = color_split_space(object, src);
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               scale_depths(depths_for_test(1.5), space.depth_scale), ColorSplitParams{}, nullptr);
+    auto created = apply_color_split(object, 0, std::move(r), space, /*solid_interfaces=*/true, /*keep_base_sparse=*/false);
+    REQUIRE(object.volumes.size() == 2);
+    REQUIRE(created.size() == 2);
+    REQUIRE(object.volumes[0] == created[0]);
+    REQUIRE(object.volumes[1] == created[1]);
+    REQUIRE(object.volumes[0]->name == "split-test");
+    REQUIRE(object.volumes[1]->name == "split-test F2");
+    REQUIRE(object.volumes[0]->config.has("extruder"));
+    REQUIRE(object.volumes[0]->config.extruder() == 1);
+    REQUIRE(object.volumes[1]->config.extruder() == 2);
+    REQUIRE(object.volumes[0]->is_model_part());
+    REQUIRE(object.volumes[1]->is_model_part());
+    REQUIRE(!object.volumes[0]->is_mm_painted());
+    REQUIRE(!object.volumes[1]->is_mm_painted());
+    REQUIRE(object.config.get().opt_bool("interface_shells"));
+    // Undo/redo safety: every new volume (and its config) carries its own fresh ObjectID.
+    REQUIRE(created[0]->id() != src_id);
+    REQUIRE(created[1]->id() != src_id);
+    REQUIRE(created[0]->id() != created[1]->id());
+    REQUIRE(created[0]->config.id() != created[1]->config.id());
+    BoundingBoxf3 after = world_bbox(object);
+    REQUIRE((after.min - before.min).norm() < 1e-4);
+    REQUIRE((after.max - before.max).norm() < 1e-4);
+}
+
+TEST_CASE("colorsplit: a rotated, scaled and mirrored PART stays in place", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    ModelVolume &src = *object.volumes.front();
+    src.set_rotation(Vec3d(0.3, 0.2, 0.7));
+    src.set_scaling_factor(Vec3d(1.5, 1.5, 1.5));
+    src.set_mirror(Vec3d(-1., 1., 1.));
+    src.set_offset(Vec3d(5., -3., 2.));
+    object.invalidate_bounding_box();
+    BoundingBoxf3 before = world_bbox(object);
+    ColorSplitSpace space = color_split_space(object, src);
+    REQUIRE(!space.world_path);                       // isotropic: mesh-space path
+    REQUIRE_THAT(space.depth_scale, WithinRel(1.5, 1e-5));
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               scale_depths(depths_for_test(1.5), space.depth_scale), ColorSplitParams{}, nullptr);
+    apply_color_split(object, 0, std::move(r), space, false, false);
+    object.invalidate_bounding_box();
+    BoundingBoxf3 after = world_bbox(object);
+    REQUIRE((after.min - before.min).norm() < 1e-3);
+    REQUIRE((after.max - before.max).norm() < 1e-3);
+}
+
+// The whole top face of a grid box: its INTERIOR vertices carry vertical normals, so the piece really is D
+// deep in z (a plain make_cube's top has nothing but corner bisectors, which drop only D/sqrt(3)).
+static std::vector<std::pair<int, EnforcerBlockerType>> grid_box_top(int n)
+{
+    std::vector<int> top;
+    for (int f = 2; f < 2 + 2 * n * n; ++f) top.push_back(f);
+    return all_with(top, EnforcerBlockerType::Extruder2);
+}
+
+TEST_CASE("colorsplit: anisotropic instance scale takes the world path", "[colorsplit]")
+{
+    Model model = painted_model(make_grid_box(40., 40., 20., 6, 6), grid_box_top(6));
+    ModelObject &object = *model.objects.front();
+    object.instances.front()->set_scaling_factor(Vec3d(2., 1., 1.));
+    ModelVolume &src = *object.volumes.front();
+    ColorSplitSpace space = color_split_space(object, src);
+    REQUIRE(space.world_path);
+    TriangleMesh world = src.mesh();
+    world.transform(space.to_split, /*fix_left_handed=*/true);      // world mm
+    ColorSplitResult r = split_volume_by_paint(world.its, src.mmu_segmentation_facets.get_data(),
+                                               depths_for_test(1.5), no_cap_no_step(), nullptr);
+    BoundingBoxf3 before = world_bbox(object);
+    apply_color_split(object, 0, std::move(r), space, false, false);
+    object.invalidate_bounding_box();
+    BoundingBoxf3 after = world_bbox(object);
+    REQUIRE((after.min - before.min).norm() < 1e-3);
+    REQUIRE((after.max - before.max).norm() < 1e-3);
+    // The piece is 1.5mm deep in WORLD z (instance scale is in x only) and, back in mesh space, spans the
+    // full 40mm top - proof that from_split undid the x2 the split ran under.
+    const ModelVolume *piece = object.volumes.back();
+    BoundingBoxf3 pb = piece->mesh().bounding_box();
+    REQUIRE_THAT(pb.size().z(), WithinRel(1.5, 0.02));
+    REQUIRE_THAT(pb.size().x(), WithinRel(40., 0.02));
+}
+
+TEST_CASE("colorsplit: the world path brings a mirrored part back outward-facing", "[colorsplit]")
+{
+    // Anisotropic instance AND a mirrored volume: det(T) < 0, so both legs of the round trip flip the
+    // winding. Getting only one of them right would hand the model an inside-out (negative volume) part.
+    Model model = painted_model(make_grid_box(40., 40., 20., 6, 6), grid_box_top(6));
+    ModelObject &object = *model.objects.front();
+    object.instances.front()->set_scaling_factor(Vec3d(2., 1., 1.));
+    ModelVolume &src = *object.volumes.front();
+    src.set_mirror(Vec3d(-1., 1., 1.));
+    object.invalidate_bounding_box();
+    ColorSplitSpace space = color_split_space(object, src);
+    REQUIRE(space.world_path);
+    REQUIRE(space.to_split.linear().determinant() < 0.);
+    TriangleMesh world = src.mesh();
+    world.transform(space.to_split, /*fix_left_handed=*/true);
+    REQUIRE(its_volume(world.its) > 0.f);
+    ColorSplitResult r = split_volume_by_paint(world.its, src.mmu_segmentation_facets.get_data(),
+                                               depths_for_test(1.5), no_cap_no_step(), nullptr);
+    BoundingBoxf3 before = world_bbox(object);
+    auto created = apply_color_split(object, 0, std::move(r), space, false, false);
+    object.invalidate_bounding_box();
+    BoundingBoxf3 after = world_bbox(object);
+    REQUIRE((after.min - before.min).norm() < 1e-3);
+    REQUIRE((after.max - before.max).norm() < 1e-3);
+    for (const ModelVolume *v : created)
+        REQUIRE(its_volume(v->mesh().its) > 0.f);     // outward winding survived the round trip
+}
+
+TEST_CASE("colorsplit: empty body removes the source and keeps only pieces", "[colorsplit]")
+{
+    TriangleMesh sphere(its_make_sphere(1.0, PI / 18.));
+    Model model;
+    ModelObject *object = model.add_object();
+    ModelVolume *volume = object->add_volume(sphere);
+    TriangleSelector selector(volume->mesh());
+    for (int f = 0; f < int(volume->mesh().its.indices.size()); ++f) selector.set_facet(f, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+    object->add_instance();
+    ColorSplitSpace space = color_split_space(*object, *volume);
+    ColorSplitResult r = split_volume_by_paint(volume->mesh().its, volume->mmu_segmentation_facets.get_data(),
+                                               depths_for_test(1.5), ColorSplitParams{}, nullptr);
+    REQUIRE(r.body.indices.empty());
+    apply_color_split(*object, 0, std::move(r), space, false, false);
+    REQUIRE(object->volumes.size() == 1);
+    REQUIRE(object->volumes[0]->config.extruder() == 2);
+}
+
+TEST_CASE("colorsplit: the new volumes take the source's slot, between the modifiers around it", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    ModelVolume *first_mod = object.add_volume(make_cube(5., 5., 5.), ModelVolumeType::PARAMETER_MODIFIER);
+    first_mod->name = "stay-first";
+    ModelVolume *last_mod = object.add_volume(make_cube(5., 5., 5.), ModelVolumeType::PARAMETER_MODIFIER);
+    last_mod->name = "stay-last";
+    std::swap(object.volumes[0], object.volumes[1]);   // [modifier, source, modifier]: src_idx is NOT zero
+    ModelVolume &src = *object.volumes[1];
+    ColorSplitSpace space = color_split_space(object, src);
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               scale_depths(depths_for_test(1.5), space.depth_scale), ColorSplitParams{}, nullptr);
+    auto created = apply_color_split(object, 1, std::move(r), space, false, false);
+    REQUIRE(created.size() == 2);
+    REQUIRE(object.volumes.size() == 4);
+    REQUIRE(object.volumes[0] == first_mod);           // the volumes around the source keep their order
+    REQUIRE(object.volumes[1] == created[0]);          // body first, so slice-time clipping order holds
+    REQUIRE(object.volumes[2] == created[1]);
+    REQUIRE(object.volumes[3] == last_mod);
+    REQUIRE(object.volumes[0]->is_modifier());
+    REQUIRE(object.volumes[3]->is_modifier());
+    REQUIRE(!object.config.get().has("interface_shells"));   // solid_interfaces = false touches nothing
+}
+
+TEST_CASE("colorsplit: a source with no extruder key of its own leaves the body inheriting the object's", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    object.config.set("extruder", 3);
+    ModelVolume &src = *object.volumes.front();
+    src.config.erase("extruder");
+    ColorSplitSpace space = color_split_space(object, src);
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               scale_depths(depths_for_test(1.5), space.depth_scale), ColorSplitParams{}, nullptr);
+    auto created = apply_color_split(object, 0, std::move(r), space, false, /*keep_base_sparse_infill=*/true);
+    REQUIRE(created.size() == 2);
+    // No explicit key on the body: it inherits the object's, so the Ultra outer_wall_filament reset
+    // (PrintObject.cpp:3257-3259) is not re-triggered.
+    REQUIRE(!created[0]->config.has("extruder"));
+    REQUIRE(created[0]->extruder_id() == 3);
+    REQUIRE(created[1]->config.extruder() == 2);
+    // "Keep base-colour sparse infill": the part's interior stays the body's filament (PrintApply.cpp:1096-1103).
+    REQUIRE(created[1]->config.opt_int("sparse_infill_filament") == 3);
+    REQUIRE(!created[0]->config.has("sparse_infill_filament"));
+}
+
+TEST_CASE("colorsplit: an empty result leaves the object untouched", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    ModelVolume *src = object.volumes.front();
+    ColorSplitSpace space = color_split_space(object, *src);
+    auto created = apply_color_split(object, 0, ColorSplitResult{}, space, true, false);
+    REQUIRE(created.empty());
+    REQUIRE(object.volumes.size() == 1);
+    REQUIRE(object.volumes[0] == src);                       // nothing produced, nothing deleted
+    REQUIRE(!object.config.get().has("interface_shells"));
+}
