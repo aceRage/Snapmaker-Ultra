@@ -29,3 +29,6 @@ Rulings:
 - Ruling 2 (fold guard): the area criterion becomes "bottom area < 1e-6 × top area" (truly collapsed only); the orientation criterion nb·(−nt) ≤ 0 stays. — Cost if wrong: a few more CGAL-check retries.
 - Ruling 3 (spec rev 2.2): §3.4 text updated to Ruling 1 in both copies (worktree spec is binding).
 - Ruling 4 (models): implementers T1/T2 sonnet, T3–T8 opus; task reviewers sonnet for T1/T2/T6/T7/T9, opus for T3/T4/T5/T8; final whole-branch review fable.
+- 2026-09-01: build gate on feat/color-split (libslic3r_tests target) EXIT=0; [paintdepth] 94 cases / 1568 assertions green. BASE for Task 1 = d3a1084b7c. Task 1 dispatched (sonnet).
+- Task 1: review clean (spec ✅, quality Approved). ⚠️ trailer verified by controller (present). Minor (deferred): (1) report overstated test_mixed_filament's matcher consistency — no action; (2) test_color_split.cpp:96 still uses Approx → folded into Task 2; (3) assert-only guard on the shared-vertex-pool invariant (ColorSplit.cpp:34) → folded into Task 2 as a ColorSplitError throw; (4) its_merge_vertices never exercised with duplicate vertices — coverage gap for the final review; (5) make_grid_box/paint_by_predicate unexercised until later tasks — expected; (6) test 1 does not assert remainder facets are state 0 → folded into Task 2.
+- Task 1: complete (commits d3a1084b7c..0bb0997d9f, review clean)
