@@ -1404,6 +1404,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         svg.setAttribute('viewBox', vb.join(' '));
     }
     function snap15(v) { var n = Math.round(v / 15) * 15; return Math.abs(v - n) <= 4 ? n : v; }
+    function wrap180(v) { v = ((v + 180) % 360 + 360) % 360 - 180; return v === -180 ? 180 : v; }
     // Live preview of a rotation (degrees, model CCW) around the object's centre: the SVG is
     // y-down, so a visually counter-clockwise turn is rotate(-deg) there.
     function previewRotate(g, o, deg) {
@@ -1499,7 +1500,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 previewRotate(gsel, o, rot.deg);
                 var r = document.querySelector('#plate .ctl input[type=range]'), t = document.querySelector('#plate .ctl input[data-rz]');
                 var v = o.rz + rot.deg;
-                if (r) r.value = Math.max(-90, Math.min(90, v));
+                if (r) r.value = wrap180(v);
                 if (t) t.value = v.toFixed(1);
             });
             var endRot = function(ev) {
@@ -1562,17 +1563,17 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         r1.appendChild(el('span', 'sel-name', o.name));
         r1.appendChild(el('span', 'hint', Math.round(o.size[0]) + ' × ' + Math.round(o.size[1]) + ' × ' + Math.round(o.size[2]) + ' mm' + (o.outside ? ' · outside the plate' : '')));
         ctl.appendChild(r1);
-        // Rotation: slider -90..+90 with 15° ticks (snaps within 4°), plus the exact value.
+        // Rotation: slider -180..+180 with 15° ticks (snaps within 4°), plus the exact value.
         var r2 = el('div', 'row');
         r2.appendChild(el('span', 'k', 'Rotate'));
         var sl = el('div', 'slider');
-        var range = el('input'); range.type = 'range'; range.min = -90; range.max = 90; range.step = 0.5;
-        range.value = Math.max(-90, Math.min(90, o.rz)); range.setAttribute('list', 'rzticks');
+        var range = el('input'); range.type = 'range'; range.min = -180; range.max = 180; range.step = 0.5;
+        range.value = wrap180(o.rz); range.setAttribute('list', 'rzticks');
         var dl = el('datalist'); dl.id = 'rzticks';
-        for (var a = -90; a <= 90; a += 15) { var op = el('option'); op.value = a; dl.appendChild(op); }
+        for (var a = -180; a <= 180; a += 15) { var op = el('option'); op.value = a; dl.appendChild(op); }
         sl.appendChild(range); sl.appendChild(dl);
         var ticks = el('div', 'ticks');
-        for (var a2 = -90; a2 <= 90; a2 += 15) ticks.appendChild(el('span', '', a2 % 45 === 0 ? String(a2) : '·'));
+        for (var a2 = -180; a2 <= 180; a2 += 15) ticks.appendChild(el('span', '', a2 % 90 === 0 ? String(a2) : (a2 % 45 === 0 ? '|' : '·')));
         sl.appendChild(ticks);
         r2.appendChild(sl);
         var rin = el('input'); rin.type = 'text'; rin.inputMode = 'decimal'; rin.value = o.rz.toFixed(1); rin.title = 'Rotation around Z, degrees'; rin.dataset.rz = '1';
