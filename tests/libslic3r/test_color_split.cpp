@@ -16,8 +16,10 @@ using namespace Slic3r;
 using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
 
-// Facet indices of its_make_cube(x, y, z) (same table as test_paint_depth_clamp.cpp:39-52):
-// 0,1 = bottom (-Z); 2,3 = top (+Z); 4,5 = +X; 6,7 = +Y; 8,9 = -X; 10,11 = -Y.
+// Facet indices of its_make_cube(x, y, z) (TriangleMesh.cpp:886-896):
+// 0,1 = bottom (-Z); 2,3 = top (+Z); 4,5 = +X; 6,7 = -Y; 8,9 = -X; 10,11 = +Y.
+// (The Y pair is the other way round from the table test_paint_depth_clamp.cpp:39-52 carries: facets 6,7 are
+// {1,7,6} and {1,6,2}, whose three vertices all have y = 0. Nothing had painted a Y face until now.)
 static const std::vector<int> CUBE_TOP    = {2, 3};
 static const std::vector<int> CUBE_BOTTOM = {0, 1};
 static const std::vector<int> CUBE_PLUS_X = {4, 5};
@@ -809,6 +811,23 @@ TEST_CASE("colorsplit: flat top is capped at the solid shell depth, slopes are n
     REQUIRE(build_color_shells(p1, d, params, nullptr)[0].capped);
 }
 
+TEST_CASE("colorsplit: a painted flat bottom is capped at the bottom shell depth", "[colorsplit]")
+{
+    // The down-facing half of spec 3.5: the same rule with n_z < 0, cap_bottom instead of cap_top (0.6 in
+    // depths_for_test), and an XY projection that comes out clockwise until the core gate flips its winding.
+    TriangleMesh block = make_cube(40., 40., 20.);
+    ColorPatches p = extract_color_patches(block.its, paint_data(block, all_with(CUBE_BOTTOM, EnforcerBlockerType::Extruder2)));
+    auto shells = build_color_shells(p, depths_for_test(1.5), cap_and_step(), nullptr);
+    REQUIRE(shells.size() == 1);
+    REQUIRE(shells[0].capped);
+    float zmax = -1e9f;
+    for (const Vec3f &v : shells[0].mesh.vertices) zmax = std::max(zmax, v.z());
+    REQUIRE_THAT(zmax, WithinAbs(0.6f, 1e-4f));      // case A walks straight UP n_P here, by cap_bottom
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+}
+
 TEST_CASE("colorsplit: narrow flat strip (core < 3 wall stacks) is not capped", "[colorsplit]")
 {
     TriangleMesh box = make_grid_box(40., 2., 20., 1, 1);   // top is 40 x 2mm: inward offset by 1.5*0.87 = 1.3 kills it
@@ -872,6 +891,71 @@ TEST_CASE("colorsplit: the crease step's own descent stops at mid-thickness on a
         REQUIRE(c.closed);
         REQUIRE(!c.self_intersects);
     }
+}
+
+TEST_CASE("colorsplit: the wall-stack step never crosses a thin wall's mid-plane", "[colorsplit]")
+{
+    // Ruling 21: case B steps a wall stack straight in along n_P, but d(v) is measured along n(v). This
+    // wall's top-edge corners get d = 1*sqrt(3)/2 - delta = 0.864 from their bisector probe while the wall is
+    // 1 mm thick, so an unclamped step (min(d, ws) = 0.864) would land at y = 0.136 - and the taper after it
+    // further still. The step and the taper share one budget now: the n_P mid-thickness, 0.498.
+    const std::vector<int> PLUS_Y{10, 11}, MINUS_Y{6, 7};
+    ColorSplitDepths d    = depths_for_test(1.5, 0.2, 0.87);
+    TriangleMesh     wall = make_cube(40., 1.0, 20.);
+    ColorPatches     p    = extract_color_patches(wall.its, paint_data(wall, all_with(PLUS_Y, EnforcerBlockerType::Extruder2)));
+    auto shells = build_color_shells(p, d, cap_and_step(), nullptr);
+    REQUIRE(shells.size() == 1);
+    for (const Vec3f &v : shells[0].mesh.vertices)
+        REQUIRE(v.y() >= 0.5f - 0.002f - 1e-4f);     // never past the mid-plane, less spec 3.4's delta
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+
+    // Both faces painted, one filament each: the two slabs stop 2*delta short of each other (spec 3.4), so
+    // neither loses its band and body + pieces still add up to the whole wall.
+    std::vector<std::pair<int, EnforcerBlockerType>> both = all_with(PLUS_Y, EnforcerBlockerType::Extruder2);
+    for (int f : MINUS_Y) both.emplace_back(f, EnforcerBlockerType::Extruder3);
+    ColorPatches p2 = extract_color_patches(wall.its, paint_data(wall, both));
+    REQUIRE(build_color_shells(p2, d, cap_and_step(), nullptr).size() == 2);
+    ColorSplitResult r = split_volume_by_paint(wall.its, paint_data(wall, both), d, cap_and_step(), nullptr);
+    REQUIRE(r.pieces.size() == 2);
+    const double wall_volume = 40. * 1.0 * 20.;
+    double       total       = volume_of(r.body);
+    for (const std::pair<int, indexed_triangle_set> &piece : r.pieces) {
+        REQUIRE(volume_of(piece.second) >= 0.45 * wall_volume);      // neither filament loses its band
+        total += volume_of(piece.second);
+    }
+    REQUIRE_THAT(total, WithinRel(wall_volume, 1e-4));
+}
+
+TEST_CASE("colorsplit: a painted top narrower than two wall stacks falls back to the bisector", "[colorsplit]")
+{
+    // Ruling 22: case A insets the ring one wall stack from every side, which on a group narrower than 2 ws
+    // makes the two insets cross - the ring inverts, the fold guard fights it and the group is dropped. The
+    // group's own outline decides: when it cannot survive an inward offset of ws, its case A vertices use the
+    // plain bisector rule instead. This top is 1.5 mm wide, so 2 * 0.87 does not fit.
+    ColorSplitDepths d     = depths_for_test(1.5, 0.2, 0.87);
+    TriangleMesh     block = make_cube(40., 1.5, 20.);
+    ColorPatches     p     = extract_color_patches(block.its, paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
+    std::vector<std::string> warnings;
+    auto shells = build_color_shells(p, d, cap_and_step(), nullptr, &warnings);
+    REQUIRE(shells.size() == 1);
+    REQUIRE(warnings.empty());                        // no "too small to split" - the shell is built, not lost
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+    REQUIRE(c.volume > 0.);
+    // Plain bisector rule at all four corners: the ring one layer down it, the bottom the full depth down it.
+    // (The flat cap does not fire either - 1.5 mm is under its 3-wall-stack core gate.)
+    REQUIRE(!shells[0].capped);
+    const float dep = float(1.5 * std::sqrt(3.) / 2. - 0.002);   // half the bisector thickness of a 1.5 mm wall
+    const float bot = dep / std::sqrt(3.f), rng = 0.2f / std::sqrt(3.f);   // spread over x, y and z alike
+    require_vertices_are(shells[0].mesh,
+                         {{0.f, 0.f, 20.f}, {40.f, 0.f, 20.f}, {40.f, 1.5f, 20.f}, {0.f, 1.5f, 20.f},
+                          {rng, rng, 20.f - rng}, {40.f - rng, rng, 20.f - rng},
+                          {40.f - rng, 1.5f - rng, 20.f - rng}, {rng, 1.5f - rng, 20.f - rng},
+                          {bot, bot, 20.f - bot}, {40.f - bot, bot, 20.f - bot},
+                          {40.f - bot, 1.5f - bot, 20.f - bot}, {bot, 1.5f - bot, 20.f - bot}}, 1e-3f);
 }
 
 TEST_CASE("colorsplit: painted side face keeps its full wall stack up to the top edge", "[colorsplit]")

@@ -83,25 +83,49 @@ std::vector<std::vector<int>> connected_components(const ColorPatches &p, const 
     return comps;
 }
 
-// Spec 3.5's core gate, transliterated from the 2D rule (flat_cap_component_ex,
-// MultiMaterialSegmentation.cpp:1493-1578): a flat component may only be capped when its XY projection
-// survives an inward offset of 1.5 wall stacks, i.e. when it is at least three wall stacks wide somewhere.
-// A narrower strip has no core to cap - capping it would lift the whole strip to the shell depth and leave
-// the body colour under a feature that is nothing but walls.
-bool flat_core_survives(const ColorPatches &p, const std::vector<int> &comp, double ws)
+// Does the group still cover anything when its outline is pulled `delta` in from every side? The outline is
+// the group's triangles projected onto the plane perpendicular to `axis` and unioned; a group narrower than
+// 2*delta anywhere in that plane loses those parts, and one narrower everywhere comes back empty.
+// Two rules ask this question: spec 3.5's core gate (axis = +Z, delta = 1.5 ws - the 2D rule's own XY
+// projection, flat_cap_component_ex, MultiMaterialSegmentation.cpp:1493-1578) and Ruling 22's case A gate
+// (axis = the group's mean normal, delta = ws).
+bool projection_survives(const ColorPatches &p, const std::vector<int> &comp, const Vec3f &axis, double delta)
 {
-    Polygons tris;
+    const Vec3f u = axis.unitOrthogonal(), v = axis.cross(u);
+    Polygons    tris;
     tris.reserve(comp.size());
     for (int f : comp) {
         const Vec3i32 &t = p.surface.indices[f];
         Polygon poly;
-        for (int k = 0; k < 3; ++k)
-            poly.points.emplace_back(scaled<coord_t>(p.surface.vertices[t[k]].x()), scaled<coord_t>(p.surface.vertices[t[k]].y()));
-        if (poly.area() < 0)   // a down-facing component projects clockwise; union_ex wants them all one way
+        for (int k = 0; k < 3; ++k) {
+            const Vec3f &q = p.surface.vertices[t[k]];
+            poly.points.emplace_back(scaled<coord_t>(q.dot(u)), scaled<coord_t>(q.dot(v)));
+        }
+        if (poly.area() < 0)   // a facet facing the other way projects clockwise; union_ex wants one winding
             poly.reverse();
         tris.push_back(std::move(poly));
     }
-    return ! offset_ex(union_ex(tris), - scaled<float>(1.5 * ws)).empty();
+    return ! offset_ex(union_ex(tris), - scaled<float>(delta)).empty();
+}
+
+// Spec 3.5's core gate: a flat component may only be capped when its XY projection survives an inward offset
+// of 1.5 wall stacks, i.e. when it is at least three wall stacks wide somewhere. A narrower strip has no core
+// to cap - capping it would lift the whole strip to the shell depth and leave the body colour under a feature
+// that is nothing but walls.
+bool flat_core_survives(const ColorPatches &p, const std::vector<int> &comp, double ws)
+{
+    return projection_survives(p, comp, Vec3f::UnitZ(), 1.5 * ws);
+}
+
+// The group's area-weighted mean normal - the axis its outline is measured across.
+Vec3f group_mean_normal(const ColorPatches &p, const std::vector<int> &group)
+{
+    Vec3f n = Vec3f::Zero();
+    for (int f : group) {
+        const Vec3i32 &t = p.surface.indices[f];
+        n += (p.surface.vertices[t[1]] - p.surface.vertices[t[0]]).cross(p.surface.vertices[t[2]] - p.surface.vertices[t[0]]);
+    }
+    return n.squaredNorm() > 0.f ? Vec3f(n.normalized()) : Vec3f(Vec3f::UnitZ());
 }
 
 // Spec 3.5: split ONE smooth patch (spec 3.1a) into (facet group, cap depth) pairs - cap depth 0 means the
@@ -135,8 +159,9 @@ std::vector<std::pair<std::vector<int>, double>> classify_depth_groups(
     for (int dir = 0; dir < 2; ++dir) {
         const std::vector<char> &flat = dir == 0 ? flat_up : flat_down;
         const double             cap  = dir == 0 ? depths.cap_top : depths.cap_bottom;
-        if (cap >= D)
-            continue;      // spec 3.5's second gate: a cap that reaches as deep as D has nothing to cap
+        if (cap <= 0. || cap >= D)
+            continue;      // spec 3.5's second gate: a cap that reaches as deep as D has nothing to cap,
+                           // and a cap of zero would ask for a shell with no depth at all
         for (std::vector<int> &comp : connected_components(p, nbrs, flat, can_cross)) {
             if (!flat_core_survives(p, comp, depths.ws))
                 continue;
@@ -170,12 +195,13 @@ struct CreaseWall {
 struct CreaseStep {
     Vec3f n_p{Vec3f::Zero()};      // unit mean normal of the group's facets there
     Vec3f t_miter{Vec3f::Zero()};  // case A only: the inward step per unit of wall stack (mitred, see below)
-    // Ruling 20: case A's descent runs along n_P, but d(v) was measured along the vertex normal n(v), so on a
-    // thin painted top it says nothing about how much material lies UNDER the wall (a 1.2 mm plate's corner
-    // has d = 1.037 along its bisector while the vertical half-thickness is 0.598). Case A therefore
-    // re-probes, like the concave and same-state walls do, at the RING's own position - the wall does not
-    // descend at the boundary vertex, it descends one wall stack inside it. Case B's second segment runs
-    // along n(v), whose depth is already that probe, so it needs nothing.
+    // Rulings 20 and 21: BOTH cases move along n_P, but d(v) was measured along the vertex normal n(v), so it
+    // says nothing about how much material lies that way. A 1.2 mm plate's top corner has d = 1.037 along its
+    // bisector while the vertical half-thickness is 0.598; a 1 mm wall's top-edge corner has d = 0.864 while
+    // half its thickness is 0.498, and case B's wall-stack step alone would land 0.372 past the mid-surface.
+    // So each case re-probes the mid-thickness along n_P - exactly as the concave and same-state walls do -
+    // and spends at most that: case A from the RING's position (the wall descends one wall stack inside the
+    // boundary, not at it), case B from the boundary vertex itself (that is where it steps in).
     float half_thickness = 0.f;
     bool  case_a = false;
 };
@@ -310,8 +336,11 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
     //     block top. A bisector there would carry a hidden painted skirt into the neighbouring body and cost
     //     toolchanges on layers that carry no paint at all.
     //   * The SAME-STATE crease (spec 3.1a, Ruling 18): the facet across the boundary carries this very
-    //     state, so the boundary is a crease INSIDE the painted region and the patch on the other side of it
-    //     is claiming the material right behind this wall. Straight is what makes the two claims meet - the
+    //     state, so the boundary is inside the painted region - either a crease between two patches or, once
+    //     spec 3.5 has cut a capped group out of a patch, the seam between that group and the rest of it -
+    //     and the group on the other side of it is claiming the material right behind this wall (there the
+    //     rule is not about a crease at all: it is what makes a capped top and the uncapped slope beside it
+    //     meet). Straight is what makes the two claims meet - the
     //     top slab's walls go straight down, the side tube's straight inward - and it is what lets a coarse
     //     two-ring cylinder come out solid with no extra vertices at all. A bisector would tilt this wall
     //     into the neighbour's claim and leave the feature hollow.
@@ -328,6 +357,10 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
     // idea (ClipperUtils' default miter limit is 3): at a needle-sharp corner the exact mitre runs away and
     // would fling the ring vertex clear of the patch.
     constexpr float CREASE_MITER_LIMIT = 4.f;
+    // Ruling 22's gate, answered at most once per group and only when a case A vertex actually asks for it -
+    // it costs a Clipper union of the whole group.
+    enum class CaseAGate { Unknown, Allowed, Denied };
+    CaseAGate case_a_gate = CaseAGate::Unknown;
     for (const std::pair<const std::pair<int, int>, BoundaryInfo> &entry : boundary) {
         const BoundaryInfo &info = entry.second;
         // n_P is all the same-state rule needs, so only the concave test may demand n_Q and t_in as well
@@ -356,16 +389,32 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
         step.n_p    = n_p;
         step.case_a = std::abs(n_p.z()) > std::abs(n_q.z());
         if (step.case_a) {
-            const float len = info.t_in.norm();
-            step.t_miter    = info.t_in * (std::min(float(info.edges) / len, CREASE_MITER_LIMIT) / len);
-            // Ruling 20: the mid-thickness clamp of the direction this wall really descends, measured where
-            // it descends. The probe starts at the ring's position ON the surface (the mitred step is
-            // tangential, so that is the vertex moved a wall stack along the patch) - not one layer down at
-            // a1 itself, since half_thickness_along measures the thickness of the part from a surface point
-            // and starting inside it would halve only the material BELOW the ring and cross the mid-surface.
-            const Vec3f ring_on_surface = p.surface.vertices[entry.first.first] + float(depths.ws) * step.t_miter;
-            step.half_thickness         = ColorSplitDetail::half_thickness_along(aabb, ring_on_surface, n_p);
+            // Ruling 22: case A's inset only makes sense on a group that HAS a wall stack to give. On one
+            // narrower than 2 ws - an embossed text stroke, a rib - the insets from opposite sides cross,
+            // the ring inverts and the group is dropped by the validity fallback. Where the group's own
+            // outline cannot survive the inset, its case A vertices fall back to the plain bisector rule.
+            if (case_a_gate == CaseAGate::Unknown)
+                case_a_gate = projection_survives(p, group, group_mean_normal(p, group), depths.ws)
+                                  ? CaseAGate::Allowed : CaseAGate::Denied;
+            if (case_a_gate == CaseAGate::Denied)
+                continue;
         }
+        const float len = info.t_in.norm();
+        step.t_miter    = info.t_in * (std::min(float(info.edges) / len, CREASE_MITER_LIMIT) / len);
+        // Rulings 20 and 21: the mid-thickness of the direction this step travels, measured ONE WALL STACK
+        // INTO the patch. Two reasons for the inset: case A's wall really does descend there rather than at
+        // the boundary, and a probe launched from the boundary vertex itself grazes the neighbouring faces
+        // that vertex also sits on - measured on a 1 mm wall, the ray along -n_P from a top corner slides
+        // along both the top and the end face and reports NO hit, so the clamp silently became +inf.
+        // The inset point is tangential, so it is generally not ON the surface (on a convex patch it floats
+        // ws^2/2R above it, where the probe would measure the air gap); snapping it to the nearest surface
+        // point first is what makes half_thickness_along - which measures a thickness from a surface point -
+        // answer the right question. Starting one layer down at a1 itself would be worse still: it would
+        // halve only the material BELOW the ring and cross the mid-surface anyway.
+        int   face    = 0;
+        Vec3d closest = Vec3d::Zero();
+        aabb.squared_distance((p.surface.vertices[entry.first.first] + float(depths.ws) * step.t_miter).cast<double>(), face, closest);
+        step.half_thickness = ColorSplitDetail::half_thickness_along(aabb, closest.cast<float>(), n_p);
         topo.step.emplace(entry.first, step);
     }
     return topo;
@@ -420,9 +469,14 @@ struct ShellBuilder {
             ring   = ws * step->second.t_miter - first * step->second.n_p;
             bottom = ring - (d_p - first) * step->second.n_p;
         } else {                                           // painted face less horizontal: a full stack in
-            const float first = std::min(d, ws);
+            // Ruling 21: the wall stack is spent along n_P, so it is the n_P mid-thickness that bounds it -
+            // and the SAME budget bounds what is left for the taper, since the bottom's depth along n_P is
+            // first + (d_p - first) * (n(v) . n_P) <= d_p. Clamping only the step would still walk the
+            // second segment across the mid-surface on a thin wall.
+            const float d_p   = std::min(d, step->second.half_thickness);
+            const float first = std::min(d_p, ws);
             ring   = -first * step->second.n_p;
-            bottom = ring - (d - first) * normals[v];
+            bottom = ring - (d_p - first) * normals[v];
         }
         // Spec 3.6: when the depth leaves no room for a second strip - less than a layer of it - the bottom
         // collapses onto the ring and only the first strip is emitted.
@@ -540,6 +594,8 @@ struct ShellBuilder {
     // depth still has room below the clamp. One EFFECTIVE halving per round is what both callers want.
     bool halve(std::vector<int> vertices, const std::vector<int> &group, double cap_depth)
     {
+        if (vertices.empty())
+            return false;                             // nothing was asked for: no snapshot, no rebuild
         std::sort(vertices.begin(), vertices.end());
         vertices.erase(std::unique(vertices.begin(), vertices.end()), vertices.end());
         const std::vector<std::pair<int, int>> keys = corners(group);

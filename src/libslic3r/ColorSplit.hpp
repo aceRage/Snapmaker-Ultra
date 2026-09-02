@@ -47,10 +47,11 @@ std::vector<Vec3f> color_split_normals(const indexed_triangle_set &surface);
 std::vector<float> compute_vertex_depths(const ColorPatches &patches, const std::vector<Vec3f> &normals, double D);
 
 // The split's optional refinements; the dialog owns them. flat_cap gives an up- or down-facing flat group
-// with a core at least three wall stacks wide the solid-shell depth instead of D (spec 3.5); crease_step adds
-// spec 3.6's ring vertex at the two CONVEX crease cases, so a painted top stays one wall stack clear of the
-// side faces below its surface layer and a painted side keeps its full wall stack up to the top edge. Spec
-// 3.6's concave and same-state creases are always on, whatever crease_step says.
+// with a core at least three wall stacks wide the solid-shell depth instead of D (spec 3.5). crease_step adds
+// spec 3.6's intermediate ring vertex to every boundary vertex of a group: at the two CONVEX crease cases it
+// is a real step - a painted top stays one wall stack clear of the side faces below its surface layer, and a
+// painted side keeps its full wall stack up to the top edge - and at a plain boundary it just subdivides the
+// side one layer down. Spec 3.6's concave and same-state creases are always on, whatever crease_step says.
 struct ColorSplitParams {
     bool   flat_cap          = true;   // spec 3.5
     bool   absorb_islands    = true;   // spec 3.8
