@@ -394,6 +394,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/StreamPanel.hpp
     GUI/BambuCamRelay.cpp
     GUI/BambuCamRelay.hpp
+    GUI/RemoteAccess.cpp
+    GUI/RemoteAccess.hpp
     GUI/PrintHostDialogs.cpp
     GUI/PrintHostDialogs.hpp
     GUI/PrintOptionsDialog.cpp

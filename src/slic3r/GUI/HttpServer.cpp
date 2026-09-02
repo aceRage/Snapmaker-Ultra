@@ -230,7 +230,10 @@ void HttpServer::IOServer::stop_all()
 HttpServer::IOServer::IOServer(HttpServer& server) : server(server), acceptor(io_service)
 {
     try {
-        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::tcp::v4(), server.port);
+        // Loopback only: these servers exist for the app's own web views and the local
+        // login redirect. Binding every interface exposed /localfile/<any path> to the LAN;
+        // phone access goes through the token-gated RemoteAccess listener instead.
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::make_address_v4("127.0.0.1"), server.port);
         acceptor.open(endpoint.protocol());
         acceptor.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
         acceptor.bind(endpoint);

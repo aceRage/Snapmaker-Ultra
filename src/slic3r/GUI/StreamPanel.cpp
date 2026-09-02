@@ -1,6 +1,7 @@
 #include "StreamPanel.hpp"
 
 #include "BambuCamRelay.hpp"
+#include "RemoteAccess.hpp"
 #include "GUI_App.hpp"
 #include "HttpServer.hpp"
 #include "slic3r/GUI/Widgets/WebView.hpp"
@@ -39,6 +40,14 @@ StreamPanel::StreamPanel(wxWindow* parent)
     auto* sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(m_browser, wxSizerFlags().Expand().Proportion(1));
     SetSizer(sizer);
+
+    // Phone access left on last time: bring it back with the same link. SNORCA_PHONE_ACCESS=<token>
+    // in the environment does the same without touching the saved settings (headless/agent use).
+    wxString env_token;
+    if (wxGetEnv("SNORCA_PHONE_ACCESS", &env_token) && !env_token.empty())
+        RemoteAccess::get().start(env_token.ToStdString());
+    else if (wxGetApp().app_config->get("stream_phone_access") == "1")
+        RemoteAccess::get().start(wxGetApp().app_config->get("stream_phone_token"));
 }
 
 void StreamPanel::OnScriptMessage(wxWebViewEvent& evt)
@@ -46,6 +55,25 @@ void StreamPanel::OnScriptMessage(wxWebViewEvent& evt)
     if (evt.GetString() == "start_go2rtc") {
         const int port = Go2RtcLauncher::get().port();
         WebView::RunScript(m_browser, wxString::Format("if (window.__go2rtcReady) window.__go2rtcReady(%d);", port));
+    } else if (evt.GetString().StartsWith("stream_state:")) {
+        // The page's full camera list (with credentials) - kept in-process for phone access.
+        RemoteAccess::get().set_state(evt.GetString().Mid(13).ToStdString(wxConvUTF8));
+    } else if (evt.GetString() == "remote_on" || evt.GetString() == "remote_off" || evt.GetString() == "remote_info") {
+        // The toggle is remembered (with its token, so a scanned link survives restarts).
+        RemoteAccess::Info info;
+        auto*              cfg = wxGetApp().app_config;
+        if (evt.GetString() == "remote_on") {
+            info = RemoteAccess::get().start();
+            cfg->set("stream_phone_access", info.on ? "1" : "0");
+            cfg->set("stream_phone_token", info.token);
+        } else if (evt.GetString() == "remote_off") {
+            RemoteAccess::get().stop();
+            info = RemoteAccess::get().info();
+            cfg->set("stream_phone_access", "0");
+            cfg->set("stream_phone_token", "");
+        } else
+            info = RemoteAccess::get().info();
+        WebView::RunScript(m_browser, wxString::Format("if (window.__remoteInfo) window.__remoteInfo(%s);", wxString::FromUTF8(info.json())));
     } else if (evt.GetString().StartsWith("ff_detail:")) {
         // Flashforge new-gen LAN API: POST http://<ip>:8898/detail returns device
         // detail JSON including cameraStreamUrl (rtsp:// on Creator 5, MJPEG http://

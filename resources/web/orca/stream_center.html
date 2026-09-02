@@ -40,12 +40,20 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #modal .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 #modal .buttons span, #modal .field .btn { display: inline-block; padding: 7px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; user-select: none; background: #555; }
 #modal .ok { background: #0a9e50 !important; }
+#modal .qr { display: block; margin: 10px auto; background: #fff; border-radius: 6px; }
+#modal .url { font-family: Consolas, monospace; font-size: 12px; color: #9ed; text-align: center; word-break: break-all; user-select: all; }
+@media (max-width: 640px) {
+    #topbar { padding: 6px 8px; gap: 6px; }
+    .chip { font-size: 12px; padding: 5px 8px; }
+    #modal { min-width: 0; width: 92vw; }
+}
 </style>
 </head>
 <body>
 <div id="topbar">
   <span id="chips"></span>
   <span class="chip" id="addchip">+ Add</span>
+  <span class="chip" id="phonechip" title="Open this camera wall on your phone">&#128241; Phone</span>
   <span id="spacer"></span>
   <span id="note"></span>
   <span id="layoutbox" title="Grid layout: columns x rows (drag a name to reorder)">
@@ -61,16 +69,42 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     // hosts: [{id, ip, alias, kind, code, user, pass, profile, name}]; active: [id] in display order.
     var state = { hosts: [], active: [], layout: '1x1' };
 
+    // Remote (phone) mode: the slicer serves this same page at http://<pc>:<port>/r/<token>/
+    // (see RemoteAccess.cpp). The camera list then comes from the PC, read-only; only the
+    // layout and order are kept on the phone.
+    var REMOTE = (function() {
+        var m = /^(\/r\/[a-z0-9]+)\/(?:index\.html)?$/.exec(location.pathname);
+        return m ? m[1] + '/' : '';
+    })();
+    var REMOTE_KEY = 'snorca_remote_v1';
+    if (REMOTE) {
+        try { document.cookie = 'rt=' + REMOTE.split('/')[2] + '; path=/; SameSite=Lax'; } catch (e) {}
+        document.getElementById('addchip').style.display = 'none';
+        document.getElementById('phonechip').style.display = 'none';
+    }
+
     function newId() { return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
     function load() {
+        if (REMOTE) {
+            state = { hosts: [], active: [], layout: window.innerWidth > window.innerHeight ? '2x1' : '1x2' };
+            try {
+                var r = JSON.parse(localStorage.getItem(REMOTE_KEY));
+                if (r && r.layout) state.layout = r.layout;
+                if (r && Array.isArray(r.active)) state.active = r.active;
+            } catch (e) {}
+            return;
+        }
         try {
             var s = JSON.parse(localStorage.getItem(KEY));
             if (s && Array.isArray(s.hosts)) state = s;
         } catch (e) {}
         if (!Array.isArray(state.active)) state.active = [];
         if (!state.layout) state.layout = '1x1';
-        // Older versions keyed everything by IP: adopt the IP as the id so stored lists keep working.
-        state.hosts.forEach(function(h) { if (!h.id) h.id = h.ip; });
+        // Older versions keyed everything by IP: give those entries opaque ids (the phone only
+        // ever sees ids) and remap the active list.
+        var remap = {};
+        state.hosts.forEach(function(h) { if (!h.id) { h.id = newId(); remap[h.ip] = h.id; } });
+        state.active = state.active.map(function(a) { return remap[a] || a; });
         // Merge hosts handed over by the slicer (?seed=ip1,ip2)
         try {
             var seed = new URLSearchParams(location.search).get('seed');
@@ -85,7 +119,58 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         state.active = state.active.filter(function(id, i, a) { return ids[id] && a.indexOf(id) === i; });
     }
     function save() {
+        if (REMOTE) {
+            try { localStorage.setItem(REMOTE_KEY, JSON.stringify({ layout: state.layout, active: state.active })); } catch (e) {}
+            return;
+        }
         try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+        pushState();
+    }
+    // Hand the slicer the full list plus, per host, what a phone needs: the source kind, the
+    // go2rtc stream name/source or the direct page URL. Credentials stay inside the app.
+    function remoteDescriptor(h) {
+        var kind = kindOf(h);
+        if (kind === 'flashforge') {
+            var u = ffUrls[h.ip];
+            if (u && /^rtsps?:\/\//i.test(u)) kind = 'rtsp-url', h = { ip: u };
+            else if (u) return { rkind: 'url', rurl: u };
+            else return { rkind: 'flashforge' };
+        }
+        if (kind === 'p1') return { rkind: 'p1' };
+        if (kind === 'url') return { rkind: 'url', rurl: streamSrc(h) };
+        var src = go2rtcSrc(h, kind);
+        return { rkind: 'go2rtc', rname: 's' + hashStr(src), rsrc: src };
+    }
+    function pushState() {
+        var hosts = state.hosts.map(function(h) {
+            var d = remoteDescriptor(h), out = {};
+            for (var k in h) out[k] = h[k];
+            for (var k2 in d) out[k2] = d[k2];
+            return out;
+        });
+        postToSlicer('stream_state:' + JSON.stringify({ hosts: hosts, active: state.active }));
+    }
+    // Phone mode: pull the list from the PC now and every 15 s.
+    function fetchRemoteState() {
+        fetch(REMOTE + 'state').then(function(r) { return r.json(); }).then(function(s) {
+            var hosts = (s && s.hosts) || [];
+            var known = {};
+            hosts.forEach(function(h) { known[h.id] = true; });
+            var changed = JSON.stringify(hosts) !== JSON.stringify(state.hosts);
+            state.hosts = hosts;
+            var before = state.active.join(',');
+            state.active = state.active.filter(function(id) { return known[id]; });
+            if (state.active.length === 0) state.active = ((s && s.active) || []).filter(function(id) { return known[id]; });
+            if (changed || before !== state.active.join(',')) {
+                // Cells built before the list arrived (or for changed entries) must be rebuilt.
+                if (changed) document.querySelectorAll('#grid .cell').forEach(function(cell) { cell.remove(); });
+                save(); render();
+            }
+            document.getElementById('note').textContent = state.hosts.length === 0 ? 'No cameras set up on the PC yet' : '';
+        }).catch(function(e) {
+            console.error('state refresh failed', e);
+            document.getElementById('note').textContent = 'Lost contact with the slicer';
+        });
     }
     function hostById(id) { return state.hosts.filter(function(x) { return x.id === id; })[0]; }
     function validHost(ip) {
@@ -131,6 +216,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     function wyzeSrc(h) {
         if (h.name) return 'rtsp://' + userInfo(h) + withPort(h.ip, 8554) + '/' + encodeURIComponent(h.name);
         return 'rtsp://' + userInfo(h) + h.ip + '/live';
+    }
+    function go2rtcSrc(h, kind) {
+        return kind === 'rtsp-url' ? h.ip
+             : kind === 'ipcam'    ? onvifSrc(h)
+             : kind === 'wyze'     ? wyzeSrc(h)
+             : 'rtspx://bblp:' + encodeURIComponent(h.code) + '@' + h.ip + ':322/streaming/live/1';
     }
 
     // go2rtc relay (RTSP/ONVIF sources): started by the slicer on request.
@@ -199,6 +290,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     window.__ffDetail = function(ip, url) {
         ffUrls[ip] = url || '';
         render();
+        pushState(); // the phone can use the probed URL too
     };
     function ffCell(h, cell) {
         var url = ffUrls[h.ip];
@@ -231,6 +323,126 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             cell.appendChild(f2);
         }
     }
+    // Phone mode cells: everything comes through the slicer's token-gated listener.
+    function remoteCell(h, cell) {
+        var msg = null;
+        if (h.rkind === 'go2rtc') {
+            var f = document.createElement('iframe');
+            f.allow = 'autoplay';
+            f.src = '/stream.html?src=' + encodeURIComponent(h.rname) + '&mode=mse';
+            cell.appendChild(f);
+        } else if (h.rkind === 'p1') {
+            var im = document.createElement('img');
+            im.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
+            im.src = REMOTE + 'bambu?id=' + encodeURIComponent(h.id);
+            cell.appendChild(im);
+        } else if (h.rkind === 'url' && h.rurl) {
+            var f2 = document.createElement('iframe');
+            f2.allow = 'autoplay';
+            f2.src = h.rurl;
+            cell.appendChild(f2);
+        } else {
+            msg = h.rkind === 'flashforge' ? 'Open this printer on the PC first' : 'Not available on the phone';
+        }
+        if (msg) {
+            var d = document.createElement('div');
+            d.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:13px;text-align:center;padding:8px;';
+            d.textContent = msg;
+            cell.appendChild(d);
+        }
+    }
+
+    // "Phone" modal on the PC: toggle the LAN listener and show its address as a QR code.
+    var remoteInfo = null, phoneModalOpen = false;
+    window.__remoteInfo = function(info) {
+        remoteInfo = info || null;
+        if (phoneModalOpen) showPhoneModal();
+    };
+    function drawQr(canvas, text) {
+        if (typeof qrcode !== 'function') return false;
+        var qr = qrcode(0, 'M');
+        qr.addData(text);
+        qr.make();
+        var n = qr.getModuleCount(), scale = 6, margin = 4 * scale, size = n * scale + 2 * margin;
+        canvas.width = canvas.height = size;
+        var ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, size, size);
+        ctx.fillStyle = '#000';
+        for (var r = 0; r < n; r++)
+            for (var c = 0; c < n; c++)
+                if (qr.isDark(r, c)) ctx.fillRect(margin + c * scale, margin + r * scale, scale, scale);
+        return true;
+    }
+    function showPhoneModal() {
+        phoneModalOpen = true;
+        var bg = document.getElementById('modal-bg');
+        var modal = document.getElementById('modal');
+        modal.innerHTML = '';
+        var h = document.createElement('h3');
+        h.textContent = 'Watch on your phone';
+        modal.appendChild(h);
+        var info = document.createElement('div');
+        info.className = 'field';
+        var on = !!(remoteInfo && remoteInfo.on && remoteInfo.url);
+        var txt = document.createElement('div');
+        txt.className = 'info';
+        txt.textContent = on
+            ? 'Phone access is on. Scan the code (or type the address) on a phone connected to the same Wi-Fi. ' +
+              'The link only works while the slicer is running and phone access stays on; a new link is made each time it is turned on.'
+            : 'Turn on phone access to get a link for phones on the same Wi-Fi. The cameras\' addresses and passwords stay on this PC; ' +
+              'anyone who has the link can watch the streams while it is on.';
+        info.appendChild(txt);
+        modal.appendChild(info);
+        if (on) {
+            var canvas = document.createElement('canvas');
+            canvas.className = 'qr';
+            modal.appendChild(canvas);
+            if (!drawQr(canvas, remoteInfo.url)) {
+                canvas.remove();
+                var s = document.createElement('script');
+                s.src = 'qrcode.js';
+                s.onload = function() { if (phoneModalOpen) showPhoneModal(); };
+                document.head.appendChild(s);
+            }
+            var url = document.createElement('div');
+            url.className = 'url';
+            url.textContent = remoteInfo.url;
+            modal.appendChild(url);
+            if (remoteInfo.ips && remoteInfo.ips.length > 1) {
+                var alt = document.createElement('div');
+                alt.className = 'status';
+                alt.style.textAlign = 'center';
+                alt.textContent = 'Other addresses of this PC: ' + remoteInfo.ips.slice(1).join(', ');
+                modal.appendChild(alt);
+            }
+        } else if (remoteInfo && remoteInfo.on && !remoteInfo.url) {
+            var warn = document.createElement('div');
+            warn.className = 'status';
+            warn.textContent = 'Phone access is on, but no network address was found on this PC.';
+            modal.appendChild(warn);
+        }
+        var buttons = document.createElement('div');
+        buttons.className = 'buttons';
+        var toggle = document.createElement('span');
+        toggle.className = on || (remoteInfo && remoteInfo.on) ? 'cancel' : 'ok';
+        toggle.textContent = (remoteInfo && remoteInfo.on) ? 'Turn off' : 'Turn on';
+        toggle.onclick = function() { postToSlicer((remoteInfo && remoteInfo.on) ? 'remote_off' : 'remote_on'); };
+        buttons.appendChild(toggle);
+        var close = document.createElement('span');
+        close.className = 'cancel';
+        close.textContent = 'Close';
+        close.onclick = function() { phoneModalOpen = false; bg.style.display = 'none'; modal.innerHTML = ''; };
+        buttons.appendChild(close);
+        modal.appendChild(buttons);
+        bg.style.display = 'flex';
+        modal.onkeydown = function(e) { if (e.key === 'Escape') close.onclick(); };
+    }
+    document.getElementById('phonechip').onclick = function() {
+        showPhoneModal();
+        postToSlicer('remote_info');
+    };
+
     // In-page modal: the embedded WebView does not service prompt()/confirm() dialogs.
     // opts = { title, message, fields: [{key, label, type, value, placeholder, options, showIf(values), onClick(ctx)}] }
     // types: text (default), password, select, button, info. cb(null | {key: value})
@@ -479,6 +691,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             edit.className = 'icon';
             edit.textContent = '✎';
             edit.title = 'Edit';
+            if (REMOTE) edit.style.display = 'none';
             edit.onclick = function(e) {
                 e.stopPropagation();
                 hostDialog('Edit ' + (h.alias || h.ip), h, function(r) {
@@ -499,6 +712,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             del.className = 'icon';
             del.textContent = '✕';
             del.title = 'Remove';
+            if (REMOTE) del.style.display = 'none';
             del.onclick = function(e) {
                 e.stopPropagation();
                 showModal({ title: 'Remove camera', message: 'Remove ' + (h.alias ? h.alias + ' (' + h.ip + ')' : h.ip) + ' from the list?' }, function(r) {
@@ -556,18 +770,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                     cell.dataset.id = id;
                     var hh   = h || { id: id, ip: id };
                     var kind = kindOf(hh);
-                    if (kind === 'flashforge') {
+                    if (REMOTE) {
+                        remoteCell(hh, cell);
+                    } else if (kind === 'flashforge') {
                         ffCell(hh, cell);
                     } else if (kind === 'rtsp-url' || kind === 'rtsps' || kind === 'ipcam' || kind === 'wyze') {
-                        if (go2rtcPort) {
-                            var src = kind === 'rtsp-url' ? hh.ip
-                                    : kind === 'ipcam'    ? onvifSrc(hh)
-                                    : kind === 'wyze'     ? wyzeSrc(hh)
-                                    : 'rtspx://bblp:' + encodeURIComponent(hh.code) + '@' + hh.ip + ':322/streaming/live/1';
-                            go2rtcCell(cell, src);
-                        } else {
-                            relayWaitCell(cell);
-                        }
+                        if (go2rtcPort) go2rtcCell(cell, go2rtcSrc(hh, kind)); else relayWaitCell(cell);
                     } else if (kind === 'p1') {
                         // The relay serves MJPEG, which renders in a plain <img>.
                         var im = document.createElement('img');
@@ -590,7 +798,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                     })(id);
                     cell.appendChild(lab);
                 }
-                cell.querySelector('.label').textContent = (h && h.alias) ? h.alias : (h ? h.ip : id);
+                cell.querySelector('.label').textContent = (h && h.alias) ? h.alias : (h ? (h.ip || 'Camera') : id);
             } else {
                 cell = document.createElement('div');
                 cell.className = 'cell empty';
@@ -640,6 +848,10 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     if (state.active.length === 0 && state.hosts.length > 0) state.active = [state.hosts[0].id];
     save();
     render();
+    if (REMOTE) {
+        fetchRemoteState();
+        setInterval(fetchRemoteState, 15000);
+    }
 })();
 </script>
 </body>

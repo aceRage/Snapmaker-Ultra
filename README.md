@@ -58,7 +58,7 @@ Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Art
 - **Auto-Save project**, **Keep my printer when opening project files**, **Skip Settings Mapping Warnings**, **Prefer Last Used Print Profile**, **Seamless System Filament Edits**.
 - **Compare Slices** (View menu) — settings, time and filament diff plus per-layer toolpath comparison of any two slices or sliced files.
 - **Import Config from G-code**, `orcaslicer://` links, silent exit.
-- **Stream tab** — live camera wall up to 9×9 for Snapmaker U1, Moonraker, Bambu Lab (LAN liveview) and Flashforge cameras, plus any RTSP / ONVIF IP camera (Reolink, Amcrest, Hikvision, Tapo, …; Wyze via RTSP firmware or wyze-bridge) with LAN discovery; drag names to reorder; bundles the open-source [go2rtc](https://github.com/AlexxIT/go2rtc) helper.
+- **Stream tab** — live camera wall up to 9×9 for Snapmaker U1, Moonraker, Bambu Lab (LAN liveview) and Flashforge cameras, plus any RTSP / ONVIF IP camera (Reolink, Amcrest, Hikvision, Tapo, …; Wyze via RTSP firmware or wyze-bridge) with LAN discovery; drag names to reorder; **Phone access** — scan a QR code to watch the same wall on a phone on your Wi-Fi (token-protected link, camera passwords never leave the PC); bundles the open-source [go2rtc](https://github.com/AlexxIT/go2rtc) helper.
 
 ![Auto-Save project setting on the Ultra preferences tab](docs/images/options-autosave.png)
 ![Compare Slices window: time and filament deltas, the changed setting, and a per-layer toolpath overlay](docs/images/compare-slices.png)
