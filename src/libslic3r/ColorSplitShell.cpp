@@ -410,9 +410,20 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
         }
         if (!crease || !params.crease_step)
             continue;                                  // plain boundary, or the option is off: no step
+        // Ruling 25: both convex cases are about the ASYMMETRY between the painted face and a neighbour that
+        // is more (case A) or less (case B) horizontal than it - case B exists so a painted SIDE face keeps
+        // its outer wall stack up to the TOP edge, where the layers above it end. Between two equally
+        // horizontal faces - two vertical faces meeting at a vertical edge - there is no such asymmetry and
+        // no layer argument, and the 2D segmentation simply draws its 45 degree Voronoi diagonal down the
+        // shared edge. A tie therefore keeps the plain mitred bisector (spec 3.4a), which is that diagonal,
+        // instead of falling into case B on the tie-break of a strict comparison.
+        constexpr float CREASE_TIE_EPS = 1e-3f;
+        const float p_z = std::abs(n_p.z()), q_z = std::abs(n_q.z());
+        if (std::abs(p_z - q_z) <= CREASE_TIE_EPS)
+            continue;
         CreaseStep step;
         step.n_p    = n_p;
-        step.case_a = std::abs(n_p.z()) > std::abs(n_q.z());
+        step.case_a = p_z > q_z;
         if (step.case_a) {
             // Ruling 22: case A's inset only makes sense on a group that HAS a wall stack to give. On one
             // narrower than 2 ws - an embossed text stroke, a rib - the insets from opposite sides cross,

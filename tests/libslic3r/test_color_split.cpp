@@ -94,6 +94,32 @@ static TriangleMesh make_grid_box(double x, double y, double z, int nx, int ny)
     return mesh;
 }
 
+// A box x*y*z whose four SIDE faces are each split by a ring of vertices at half height. A plain box's
+// vertical edges run corner to corner, so every boundary vertex of a painted side face also touches the top
+// or the bottom; this is the smallest fixture that offers a boundary vertex whose whole neighbourhood is
+// vertical - Ruling 25's tie. All faces CCW outward.
+static TriangleMesh make_ringed_box(double x, double y, double z)
+{
+    indexed_triangle_set its;
+    auto V = [&](double px, double py, double pz) { its.vertices.emplace_back(float(px), float(py), float(pz)); return int(its.vertices.size()) - 1; };
+    const double corner[4][2] = {{0., 0.}, {x, 0.}, {x, y}, {0., y}};    // CCW seen from +Z
+    int lo[4], mid[4], hi[4];
+    for (int i = 0; i < 4; ++i) lo[i]  = V(corner[i][0], corner[i][1], 0.);
+    for (int i = 0; i < 4; ++i) mid[i] = V(corner[i][0], corner[i][1], z / 2.);
+    for (int i = 0; i < 4; ++i) hi[i]  = V(corner[i][0], corner[i][1], z);
+    auto T = [&](int a, int b, int c) { its.indices.emplace_back(a, b, c); };
+    T(lo[0], lo[2], lo[1]); T(lo[0], lo[3], lo[2]);                      // bottom (-Z)
+    T(hi[0], hi[1], hi[2]); T(hi[0], hi[2], hi[3]);                      // top (+Z)
+    for (int i = 0; i < 4; ++i) {                                        // each side, two stacked quads
+        const int j = (i + 1) % 4;
+        T(lo[i],  lo[j],  mid[j]); T(lo[i],  mid[j], mid[i]);
+        T(mid[i], mid[j], hi[j]);  T(mid[i], hi[j],  hi[i]);
+    }
+    TriangleMesh mesh(std::move(its));
+    REQUIRE(its_num_open_edges(mesh.its) == 0);
+    return mesh;
+}
+
 TEST_CASE("colorsplit: strict patches share boundary vertices and cover the surface", "[colorsplit]")
 {
     TriangleMesh cube = make_cube(40., 40., 20.);
@@ -1041,6 +1067,41 @@ TEST_CASE("colorsplit: painted side face keeps its full wall stack up to the top
     REQUIRE(check_shell(shallow[0].mesh).closed);
 }
 
+TEST_CASE("colorsplit: a vertical crease between two side faces takes the plain bisector, not case B", "[colorsplit]")
+{
+    // Ruling 25. Spec 3.6's two convex cases are about the ASYMMETRY between a painted face and a neighbour
+    // that is more (case A) or less (case B) horizontal than it: case B exists so a painted SIDE face keeps
+    // its full outer wall stack up to the TOP edge. Between two vertical faces there is no such asymmetry -
+    // and the 2D segmentation just draws its 45 degree Voronoi diagonal down the shared edge - so a tie in
+    // |n_P.z| vs |n_Q.z| must not fall into case B by the tie-break of a strict comparison.
+    //
+    // This box's side faces are split at half height, so the +X patch has SIX boundary vertices of two kinds:
+    //  * the four corners, which each carry one vertical boundary edge AND one horizontal one (against the
+    //    top or bottom face), so |n_Q.z| = 0.707 against the patch's 0 - genuine case B, ring a wall stack
+    //    in along n_P and then the mitred taper: (39.13, 0, 0) -> (38.5, 0.63, 0.63).
+    //  * the two at half height, whose only neighbour is the vertical face across the edge, |n_Q.z| = 0 = the
+    //    patch's own - the TIE, which now takes the plain mitred bisector: n(v) = (1,-1,0)/sqrt(2), the ring
+    //    0.2*sqrt(2) down it (0.2 per axis) and the bottom 1.5*sqrt(2) (1.5 per axis), landing on the 45
+    //    degree diagonal at (38.5, 1.5, 10). Before Ruling 25 it was case B and landed at (38.5, 0.63, 10).
+    ColorSplitDepths d = depths_for_test(1.5, 0.2, 0.87);
+    TriangleMesh     box = make_ringed_box(40., 40., 20.);
+    ColorPatches     p   = extract_color_patches(box.its, paint_by_predicate(box, [](const Vec3f &, const Vec3f &n) { return n.x() > 0.9f; }, EnforcerBlockerType::Extruder2));
+    auto shells = build_color_shells(p, d, cap_and_step(), nullptr);
+    REQUIRE(shells.size() == 1);                       // the two stacked quads are one smooth patch
+    require_vertices_are(shells[0].mesh,
+                         {{40.f, 0.f, 0.f},  {40.f, 40.f, 0.f},  {40.f, 0.f, 10.f},
+                          {40.f, 40.f, 10.f}, {40.f, 0.f, 20.f}, {40.f, 40.f, 20.f},
+                          {39.13f, 0.f, 0.f},  {39.13f, 40.f, 0.f},                       // case B rings
+                          {39.13f, 0.f, 20.f}, {39.13f, 40.f, 20.f},
+                          {39.8f, 0.2f, 10.f}, {39.8f, 39.8f, 10.f},                      // tie: plain ring
+                          {38.5f, 0.63f, 0.63f},   {38.5f, 39.37f, 0.63f},                // case B bottoms
+                          {38.5f, 0.63f, 19.37f},  {38.5f, 39.37f, 19.37f},
+                          {38.5f, 1.5f, 10.f}, {38.5f, 38.5f, 10.f}}, 1e-3f);             // tie: 45 deg diagonal
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+}
+
 TEST_CASE("colorsplit: a capped group and the uncapped group beside it meet along a straight wall", "[colorsplit]")
 {
     // Both options on, the shipping default, on the fixture that carries all four spec 3.6 cases at once:
@@ -1704,6 +1765,13 @@ TEST_CASE("colorsplit e2e: split parts slice like the 2D paint-depth claim on a 
     //    depth of ws instead of 0: 40*D - (D - ws)^2. The gap between the two, ws * (2D - ws) = 1.61 mm^2, is
     //    that deliberate deviation and nothing else. (Before the mitre the piece was only
     //    ws + (D - ws)/sqrt(3) = 1.150 mm deep against the band's 1.409, and fell 8.48 mm^2 short.)
+    //    Ruling 25 does NOT reach this fixture: a plain cube face has no vertices but its four corners, and
+    //    each corner carries a HORIZONTAL boundary edge (against the top or the bottom face) as well as a
+    //    vertical one, so its mean n_Q has |n_Q.z| = 0.707 against the patch's 0 - a genuine case B, and the
+    //    one "painted side face keeps its full wall stack up to the top edge" pins. The ws ring those corners
+    //    earn at the caps is then inherited by the whole +-Y edge between them, since a vertex has one ring
+    //    copy. Give the +-Y edges a vertex of their own (make_ringed_box) and it IS a tie, lands on the 2D
+    //    45 degree diagonal, and this gap closes there - see the vertical-crease case above.
     const double claim_2d = 40. * D - D * D;
     const double claim_3d = 40. * D - (D - ws) * (D - ws);
     // The 2D path also notches every other layer by mmu_segmented_region_interlocking_depth (the interlocking
