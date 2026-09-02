@@ -853,7 +853,7 @@ Verify the `its_face_neighbors` edge convention (MeshSplitImpl.hpp `create_face_
 - Produces: `struct ColorSplitResult { indexed_triangle_set body; std::vector<std::pair<int, indexed_triangle_set>> pieces; std::vector<std::string> warnings; ColorSplitDepths depths; }`,
   `ColorSplitResult partition_by_shells(const indexed_triangle_set &mesh, const std::vector<ColorShell> &shells, bool absorb_islands, const ColorSplitProgress &)`,
   `ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const TriangleSelector::TriangleSplittingData &paint, const ColorSplitDepths &, const ColorSplitParams &, const ColorSplitProgress &)`.
-- Consumes: Tasks 1–3.
+- Consumes: Tasks 1–3. Note `build_color_shells` has a trailing optional `std::vector<std::string> *warnings = nullptr` (Ruling 10): pass `&shell_warnings` and merge into the result's warnings.
 
 - [ ] **Step 1: Write the failing tests (partition + spike measurements)**
 
@@ -1094,8 +1094,10 @@ ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const T
     ColorPatches patches = extract_color_patches(mesh, paint);
     if (patches.states.empty()) throw ColorSplitError("The part has no painted colours.");
     if (progress && !progress(10)) throw ColorSplitCancelled();
-    std::vector<ColorShell> shells = build_color_shells(patches, depths, params, progress);
+    std::vector<std::string> shell_warnings;
+    std::vector<ColorShell> shells = build_color_shells(patches, depths, params, progress, &shell_warnings);   // Ruling 10: skipped micro-components are warnings, not errors
     ColorSplitResult r = partition_by_shells(patches.surface, shells, params.absorb_islands, progress);
+    r.warnings.insert(r.warnings.begin(), shell_warnings.begin(), shell_warnings.end());
     r.depths = depths;
     if (params.depth_override_mm > 0.) { r.depths.D = params.depth_override_mm; r.depths.unlimited = false; }
     if (progress) progress(100);
