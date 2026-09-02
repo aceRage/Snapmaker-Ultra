@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.3 (after adversarial review; §3.4/§3.6/§7 refined during planning and Task 3) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.4 (after adversarial review; §3.1a/§3.4/§3.6/§7 refined during planning, Task 3 and the Task 4 spike) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -39,6 +39,13 @@ compactify per piece only. Adjacency = `its_face_neighbors(F)`; F must have zero
 States above the printer's filament count: physical overflow is skipped with a warning (those facets count as
 unpainted); mixed-filament virtual ids are kept and become the part's extruder, as the 2D path does
 (PrintApply.cpp:1885-1893) — the plan verifies the extruder clamp in `region_config_from_model_volume` accepts them.
+
+**3.1a Refinement pre-pass (rev 2.4, Ruling 13).** Before normals and shells, F is refined flat (linearly)
+so that no edge exceeds L = max(ws, min(D_eff, bbox_diagonal/20)), using Manifold's `RefineToLength`; each
+refined facet takes the state of the original facet it lies on (nearest facet of F to its centroid). Reason:
+STL cylinders, pins and bosses have only two vertex rings, so every side vertex is a junction bisector and no
+offset is radial — without interior vertices a painted boss became a cup (spike S1). Refinement adds vertices
+only where edges are longer than L, so ordinary meshes are barely touched.
 
 **3.2 Normals.** n(v) = `NormalUtils::create_normals(F, VertexNormalType::AngleWeighted)` — angle weighting is
 triangulation-independent, so a cube edge gets the exact 45° bisector; always computed on the FULL surface F,
@@ -98,6 +105,10 @@ boundary is a **crease** when n_P·n_Q < cos 15°.
   bisector would thin the piece to a sliver there and show body colour on the side face's top ≈ws); after that
   the bisector taper limits the painted rim on the neighbouring top face to one wall stack, where the 2D band
   would paint a D-wide rim — a deliberate, documented deviation.
+- Concave crease (n_Q · t_in > 0: the outside neighbour rises over the painted face, e.g. a painted boss side
+  meeting the block top, Ruling 14): a′ = a − d(a)·n_P with no step and no bisector, so the piece never leaves the
+  painted feature's own footprint (a bisector would carry a hidden painted skirt into the neighbouring body and cost
+  toolchanges on layers that carry no paint). This rule is always on, independent of the crease-step option.
 When d(a) leaves no room for the second strip (d(a) − first segment ≤ h) a′ collapses onto a₁ and only the first
 strip is emitted. Known approximation: for side surfaces that lean inward going down, the inset shrinks below
 ws at depth (2D re-insets per layer).
