@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.6 (after adversarial review; §3.1a/§3.4/§3.6/§7 refined during planning, Tasks 3–5) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.7 (after adversarial review; §3.1a/§3.4/§3.6/§7 refined during planning, Tasks 3–6) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -114,6 +114,15 @@ boundary is a **crease** when n_P·n_Q < cos 15°.
   meeting the block top, Ruling 14): a′ = a − d(a)·n_P with no step and no bisector, so the piece never leaves the
   painted feature's own footprint (a bisector would carry a hidden painted skirt into the neighbouring body and cost
   toolchanges on layers that carry no paint). This rule is always on, independent of the crease-step option.
+- Width guard (rev 2.7, Ruling 22): the Case A inset is applied to a group only if the group's projection onto
+  the plane perpendicular to its mean normal survives an inward offset of ws (the flat cap's own yardstick);
+  otherwise the group's Case A vertices use the plain bisector rule. A painted stroke narrower than 2·ws
+  (embossed text) therefore keeps a valid tapered shell instead of inverting its ring and being dropped — a
+  deliberate deviation from 2D parity, which would claim only the surface layer under such a stroke.
+- Mid-thickness on every path (Rulings 20/21): the depth of each segment is re-probed along the direction it
+  actually travels (Case A along n_P from the ring's surface position projected back onto the surface, Case B's
+  first segment along n_P from the vertex, concave and same-state walls along n_P), so no wall ever passes the
+  mid-thickness whatever the vertex's bisector normal says.
 When d(a) leaves no room for the second strip (d(a) − first segment ≤ h) a′ collapses onto a₁ and only the first
 strip is emitted. Known approximation: for side surfaces that lean inward going down, the inset shrinks below
 ws at depth (2D re-insets per layer).
