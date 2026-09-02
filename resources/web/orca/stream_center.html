@@ -373,9 +373,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     // The relays live in the hub process (RemoteHub.cpp): go2rtc for RTSP/ONVIF sources and
     // the MJPEG relay for Bambu P1/A1 cameras. The slicer starts the hub on request and
     // reports both ports here; streams then keep running after this window is closed.
-    var go2rtcPort = 0, hubAsked = false, hubAnswered = false, go2rtcFailed = false, go2rtcStreams = {};
-    window.__hubReady = function(go2rtc, relay) {
-        go2rtcPort = go2rtc || 0;
+    // go2rtcPort is the hub's port once the relay runs (the page never talks to go2rtc itself);
+    // hubSecret lets the PC page open the player through the hub.
+    var go2rtcPort = 0, hubSecret = '', hubAsked = false, hubAnswered = false, go2rtcFailed = false, go2rtcStreams = {};
+    window.__hubReady = function(hub, relay, secret) {
+        go2rtcPort = hub || 0;
+        hubSecret = secret || '';
         relayPort = relay || 0;
         go2rtcFailed = !go2rtcPort;
         hubAnswered = true;
@@ -390,14 +393,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     var ensureHub = ensureGo2rtc;
     function go2rtcCell(cell, src) {
         var name = 's' + hashStr(src);
-        if (!go2rtcStreams[name]) {
-            go2rtcStreams[name] = true;
-            fetch('http://127.0.0.1:' + go2rtcPort + '/api/streams?name=' + name + '&src=' + encodeURIComponent(src), { method: 'PUT' })
-                .catch(function() { go2rtcStreams[name] = false; });
-        }
+        // The hub registers streams from the pushed state; go2rtc's API is the hub's alone.
+        if (!go2rtcStreams[name]) { go2rtcStreams[name] = true; pushState(); }
         var f = document.createElement('iframe');
         f.allow = 'autoplay';
-        f.src = 'http://127.0.0.1:' + go2rtcPort + '/stream.html?src=' + name + '&mode=mse';
+        f.src = 'http://127.0.0.1:' + go2rtcPort + '/stream.html?src=' + name + '&mode=mse&lt=' + encodeURIComponent(hubSecret);
         cell.appendChild(f);
     }
     function relayWaitCell(cell, failed) {
@@ -407,6 +407,16 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         wait.textContent = failed ? 'Stream relay failed to start - check <data dir>/hub/hub.log.' : 'Starting stream relay…';
         cell.appendChild(wait);
         cell.dataset.id = ''; // rebuild this cell once the relay reports in
+    }
+    // ONVIF WS-Discovery runs in go2rtc, reached through the slicer and the hub (the page never
+    // talks to go2rtc's API): one request in flight, every waiter gets the answer.
+    var onvifWaiters = [];
+    window.__onvifResult = function(status, text) {
+        var w = onvifWaiters; onvifWaiters = [];
+        w.forEach(function(f) { f({ ok: status >= 200 && status < 300, text: text || '' }); });
+    };
+    function onvifRequest() {
+        return new Promise(function(resolve) { onvifWaiters.push(resolve); if (onvifWaiters.length === 1) postToSlicer('onvif_discover'); });
     }
     // ONVIF WS-Discovery on the LAN, answered by go2rtc: cb(list | null, errorText)
     function discoverOnvif(cb) {
@@ -418,8 +428,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             setTimeout(wait, 250);
         })();
         function doFetch() {
-            fetch('http://127.0.0.1:' + go2rtcPort + '/api/onvif')
-                .then(function(r) { return r.text().then(function(t) { return { ok: r.ok, text: t }; }); })
+            onvifRequest()
                 .then(function(res) {
                     if (!res.ok) return cb([], /no sources/i.test(res.text) ? '' : res.text.trim());
                     var list = [];

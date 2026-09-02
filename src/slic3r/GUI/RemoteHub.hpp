@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Slic3r {
@@ -31,6 +32,7 @@ struct Info
     int                      port { 0 };      // the listener port (LAN when phone is on, loopback otherwise)
     bool                     phone { false }; // LAN listener + /r/<token>/ routes enabled
     std::string              token;
+    std::string              secret;          // hub.json's per-run secret for /hub/* (client side only)
     int                      go2rtc_port { 0 };
     int                      relay_port { 0 };
     std::string              version;
@@ -44,6 +46,7 @@ int run_server(const std::string& token_hint, bool phone_on);
 
 // ---- client side (a slicer instance) ----
 Info query();                                                       // is a hub running? (~1 s worst case)
+std::pair<int, std::string> onvif_discover();                       // ONVIF WS-Discovery via the hub's go2rtc: {http status, body}
 Info ensure_running(const std::string& token_hint, bool phone_on); // spawn one if needed; waits for it
 Info set_phone(bool on, const std::string& token = ""); // a valid token keeps a remembered link
 bool post_state(const std::string& json); // full Stream-tab state; remembered for a hub started later

@@ -15,6 +15,8 @@
 
 #include <thread>
 
+#include <nlohmann/json.hpp>
+
 namespace Slic3r {
 namespace GUI {
 
@@ -56,7 +58,22 @@ void StreamPanel::OnScriptMessage(wxWebViewEvent& evt)
             wxGetApp().CallAfter([weak, info]() {
                 if (weak == nullptr || weak->m_browser == nullptr)
                     return;
-                WebView::RunScript(weak->m_browser, wxString::Format("if (window.__hubReady) window.__hubReady(%d, %d);", info.go2rtc_port, info.relay_port));
+                // The page embeds the player through the hub (never go2rtc directly) and proves
+                // itself with the hub secret; 0 means the relay is not available.
+                WebView::RunScript(weak->m_browser, wxString::Format("if (window.__hubReady) window.__hubReady(%d, %d, '%s');",
+                    info.go2rtc_port ? info.port : 0, info.relay_port, wxString::FromUTF8(info.secret)));
+            });
+        }).detach();
+    } else if (msg == "onvif_discover") {
+        // ONVIF discovery runs in go2rtc; the page reaches it through us and the hub.
+        wxWeakRef<StreamPanel> weak(this);
+        std::thread([weak]() {
+            const auto res = RemoteHub::onvif_discover();
+            wxGetApp().CallAfter([weak, res]() {
+                if (weak == nullptr || weak->m_browser == nullptr)
+                    return;
+                WebView::RunScript(weak->m_browser, wxString::Format("if (window.__onvifResult) window.__onvifResult(%d, %s);",
+                    res.first, wxString::FromUTF8(nlohmann::json(res.second).dump())));
             });
         }).detach();
     } else if (msg.StartsWith("stream_state:")) {

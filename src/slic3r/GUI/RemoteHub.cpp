@@ -8,6 +8,7 @@
 #include "slic3r/Utils/Http.hpp"
 
 #include <boost/asio.hpp>
+#include <boost/beast/core/detail/base64.hpp>
 #include <boost/dll/runtime_symbol_info.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
@@ -64,8 +65,12 @@ using tcp      = asio::ip::tcp;
 using json     = nlohmann::json;
 
 static const int         HUB_PORT           = 13640;
-static const int         GO2RTC_API_PORT    = 21984;
-static const char* const GO2RTC_PASSTHROUGH[] = { "/stream.html", "/video-stream.js", "/video-rtc.js", "/api/ws" };
+// The stream player is served by the hub itself (resources/web/orca/player.html plus verbatim
+// copies of go2rtc's two scripts); only its WebSocket goes on to go2rtc, with the hub's
+// credentials attached. go2rtc's own API is never reachable from a browser.
+static const char* const PLAYER_PAGE = "/stream.html";
+static const char* const PLAYER_JS[] = { "/video-stream.js", "/video-rtc.js" };
+static const char* const GO2RTC_WS   = "/api/ws";
 static const size_t      MAX_API_BODY       = 64 * 1024;
 static const uint64_t    MAX_UPLOAD         = 2ull * 1024 * 1024 * 1024;
 static const int         IDLE_EXIT_SECONDS  = 60;
@@ -227,6 +232,7 @@ static const char* status_text(int status)
     switch (status) {
     case 200: return "200 OK";                   case 202: return "202 Accepted";
     case 302: return "302 Found";                case 400: return "400 Bad Request";
+    case 403: return "403 Forbidden";            case 415: return "415 Unsupported Media Type";
     case 404: return "404 Not Found";            case 409: return "409 Conflict";
     case 413: return "413 Payload Too Large";    case 502: return "502 Bad Gateway";
     case 503: return "503 Service Unavailable";  default:  return "500 Internal Server Error";
@@ -442,6 +448,7 @@ static long spawn_process(const std::vector<std::string>& args, const std::vecto
 struct Request
 {
     std::string method, target, path, query, head, pending, cookies, file_name;
+    std::string host, secret, sec_fetch_site, content_type; // Host, X-Hub-Secret, Sec-Fetch-Site, Content-Type (lower-cased where compared)
     size_t      content_length { 0 };
 };
 
@@ -472,6 +479,10 @@ static bool read_request(tcp::socket& client, Request& r)
             if (key == "cookie") r.cookies = val;
             else if (key == "content-length") r.content_length = (size_t) std::max(0LL, std::atoll(val.c_str()));
             else if (key == "x-file-name") r.file_name = val;
+            else if (key == "host") r.host = lower(val);
+            else if (key == "x-hub-secret") r.secret = val;
+            else if (key == "sec-fetch-site") r.sec_fetch_site = lower(val);
+            else if (key == "content-type") r.content_type = lower(val);
         }
         pos = nl + 2;
     }
@@ -539,6 +550,88 @@ static void pump(tcp::socket& from, tcp::socket& to)
 
 // Splice the client onto 127.0.0.1:<port>, replaying the (rewritten) request head first.
 // Works for plain responses and WebSocket upgrades alike.
+// Per-run secrets (std::random_device is the OS CSPRNG on every platform we build).
+static std::string random_hex(int bytes)
+{
+    static const char* hx = "0123456789abcdef";
+    std::random_device rd;
+    std::string        s;
+    for (int i = 0; i < bytes; ++i) { const unsigned v = rd() & 0xffu; s += hx[v >> 4]; s += hx[v & 15]; }
+    return s;
+}
+
+static std::string basic_auth(const std::string& user, const std::string& pass)
+{
+    const std::string raw = user + ":" + pass;
+    std::string       out(boost::beast::detail::base64::encoded_size(raw.size()), '\0');
+    out.resize(boost::beast::detail::base64::encode(out.data(), raw.data(), raw.size()));
+    return "Basic " + out;
+}
+
+// A free loopback port for go2rtc (bound and released; the race with another process is
+// theoretical on a PC and go2rtc simply fails to start, which the log shows).
+static int free_loopback_port()
+{
+    try {
+        asio::io_context ioc;
+        tcp::acceptor    a(ioc);
+        a.open(tcp::v4());
+        a.bind(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+        return (int) a.local_endpoint().port();
+    } catch (...) { return 0; }
+}
+
+// The Host header must name this PC's loopback (a DNS-rebound name is not accepted).
+static bool loopback_host(const std::string& host)
+{
+    if (host.empty()) return false;
+    std::string h = host;
+    if (h[0] == '[') { const size_t e = h.find(']'); if (e != std::string::npos) h = h.substr(0, e + 1); }
+    else { const size_t c = h.find(':'); if (c != std::string::npos) h = h.substr(0, c); }
+    return h == "127.0.0.1" || h == "localhost" || h == "[::1]";
+}
+
+// Rewrite a request head for go2rtc: drop the client's Cookie and Authorization, drop the hub's
+// own `lt` query parameter, attach the hub's go2rtc credentials.
+static std::string go2rtc_head(const std::string& head, const std::string& auth)
+{
+    std::string out;
+    size_t      pos   = 0;
+    bool        first = true;
+    while (pos < head.size()) {
+        size_t nl = head.find("\r\n", pos);
+        if (nl == std::string::npos) nl = head.size();
+        const std::string line = head.substr(pos, nl - pos);
+        pos = nl + 2;
+        if (first) {
+            first = false;
+            std::istringstream is(line);
+            std::string        m, t, v;
+            is >> m >> t >> v;
+            const size_t q = t.find('?');
+            if (q != std::string::npos) {
+                const std::string  path = t.substr(0, q);
+                std::istringstream qs(t.substr(q + 1));
+                std::string        kv, kept;
+                while (std::getline(qs, kv, '&')) {
+                    if (kv.compare(0, 3, "lt=") == 0) continue;
+                    if (!kept.empty()) kept += '&';
+                    kept += kv;
+                }
+                t = kept.empty() ? path : path + "?" + kept;
+            }
+            out += m + " " + t + " " + v + "\r\n";
+            continue;
+        }
+        if (line.empty()) break;
+        const std::string key = lower(line.substr(0, line.find(':')));
+        if (key == "cookie" || key == "authorization") continue;
+        out += line + "\r\n";
+    }
+    out += "Authorization: " + auth + "\r\n\r\n";
+    return out;
+}
+
 static void tunnel(tcp::socket& client, int port, const std::string& head, const std::string& pending)
 {
     asio::io_context ioc;
@@ -673,6 +766,8 @@ private:
     void  handle_phone(tcp::socket& client, Request& r, const std::string& rest);
     void  start_go2rtc();
     void  register_streams();
+    std::string go2rtc_base_locked() const; // http://user:pass@127.0.0.1:port ("" while go2rtc is down); m_mutex held
+    std::pair<int, std::string> onvif_discover(); // GET /api/onvif on go2rtc: {status, body}
     std::string state_for_phone();
     bool  lookup_host(const std::string& id, std::string& ip, std::string& code);
     static Instance probe_instance(Instance inst);
@@ -685,6 +780,8 @@ private:
     asio::io_context               m_ioc;
     std::shared_ptr<tcp::acceptor> m_acceptor;
     std::string                    m_state; // full Stream-tab state JSON (with credentials)
+    std::string                    m_secret;      // per run; in hub.json and the hub page, required as X-Hub-Secret on /hub/*
+    std::string                    m_go2rtc_user, m_go2rtc_pass, m_go2rtc_auth; // go2rtc credentials, this process only
     int                            m_go2rtc_port { 0 };
     long                           m_go2rtc_pid { 0 };
     void*                          m_job { nullptr };
@@ -722,6 +819,7 @@ void HubServer::write_hub_json()
         j["port"]        = m_port;
         j["phone"]       = m_phone;
         j["token"]       = m_token;
+        j["secret"]      = m_secret;
         j["go2rtc_port"] = m_go2rtc_port;
         j["version"]     = std::string(SLIC3R_VERSION);
     }
@@ -782,21 +880,27 @@ void HubServer::start_go2rtc()
         BOOST_LOG_TRIVIAL(error) << "RemoteHub: missing " << exe;
         return;
     }
-    // An orphan from a crashed hub may still own the port: reuse it rather than fail.
-    bool alive = false;
-    Http::get("http://127.0.0.1:" + std::to_string(GO2RTC_API_PORT) + "/api")
-        .timeout_connect(1).timeout_max(2)
-        .on_complete([&alive](std::string, unsigned status) { alive = status < 500; })
-        .perform_sync();
-    if (alive) {
-        BOOST_LOG_TRIVIAL(info) << "RemoteHub: go2rtc already answering on " << GO2RTC_API_PORT;
-        m_go2rtc_port = GO2RTC_API_PORT;
+    // A random loopback port and per-run credentials: nothing on this PC reaches go2rtc's API
+    // except through the hub. local_auth makes go2rtc check them for loopback peers too, and
+    // allow_paths leaves only the three routes the hub uses registered (go2rtc 1.9.14 then also
+    // drops its built-in player pages, which the hub serves itself), so even a leaked credential
+    // cannot reach /api/config, /api/restart or /api/exit. An orphan go2rtc cannot exist: it is
+    // in a kill-on-close job object.
+    const int port = free_loopback_port();
+    if (port == 0) {
+        BOOST_LOG_TRIVIAL(error) << "RemoteHub: no free loopback port for go2rtc";
         return;
     }
+    m_go2rtc_user = random_hex(8);
+    m_go2rtc_pass = random_hex(16);
+    m_go2rtc_auth = basic_auth(m_go2rtc_user, m_go2rtc_pass);
     const std::string cfg_path = (fs::path(hub_dir()) / "go2rtc.yaml").string();
     {
         boost::nowide::ofstream cfg(cfg_path);
-        cfg << "api:\n  listen: \"127.0.0.1:" << GO2RTC_API_PORT << "\"\n  origin: \"*\"\n"
+        cfg << "api:\n  listen: \"127.0.0.1:" << port << "\"\n"
+            << "  username: \"" << m_go2rtc_user << "\"\n  password: \"" << m_go2rtc_pass << "\"\n"
+            << "  local_auth: true\n"
+            << "  allow_paths: [\"/api/ws\", \"/api/streams\", \"/api/onvif\"]\n"
             << "rtsp:\n  listen: \"\"\n"
             << "webrtc:\n  listen: \"\"\n"
             << "srtp:\n  listen: \"\"\n";
@@ -815,21 +919,20 @@ void HubServer::start_go2rtc()
         BOOST_LOG_TRIVIAL(error) << "RemoteHub: failed to start go2rtc";
         return;
     }
-    m_go2rtc_port = GO2RTC_API_PORT;
-    BOOST_LOG_TRIVIAL(info) << "RemoteHub: go2rtc pid " << m_go2rtc_pid << " on 127.0.0.1:" << GO2RTC_API_PORT;
+    m_go2rtc_port = port;
+    BOOST_LOG_TRIVIAL(info) << "RemoteHub: go2rtc pid " << m_go2rtc_pid << " on 127.0.0.1:" << port << " (credential-only)";
 #endif
 }
 
 void HubServer::register_streams()
 {
-    std::string state;
-    int         port;
+    std::string state, base;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         state = m_state;
-        port  = m_go2rtc_port;
+        base  = go2rtc_base_locked();
     }
-    if (port == 0 || state.empty()) return;
+    if (base.empty() || state.empty()) return;
     try {
         json j = json::parse(state);
         for (const auto& h : j.value("hosts", json::array())) {
@@ -837,7 +940,7 @@ void HubServer::register_streams()
             if (name.empty() || src.empty()) continue;
             // Http::put() is a file-upload PUT (its read callback dereferences the missing
             // file and crashes); put2() is a plain PUT with no body, which is what go2rtc wants.
-            const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/api/streams?name=" + name + "&src=" + percent_encode(src);
+            const std::string url = base + "/api/streams?name=" + name + "&src=" + percent_encode(src);
             std::thread([url]() {
                 for (int attempt = 0; attempt < 3; ++attempt) {
                     bool ok = false;
@@ -848,6 +951,32 @@ void HubServer::register_streams()
             }).detach();
         }
     } catch (...) {}
+}
+
+std::string HubServer::go2rtc_base_locked() const
+{
+    if (m_go2rtc_port == 0) return "";
+    return "http://" + m_go2rtc_user + ":" + m_go2rtc_pass + "@127.0.0.1:" + std::to_string(m_go2rtc_port);
+}
+
+// ONVIF WS-Discovery, run by go2rtc for the PC's Stream tab (through /hub/onvif). go2rtc answers
+// 404 "no sources" when nothing is found; that is passed through as it is.
+std::pair<int, std::string> HubServer::onvif_discover()
+{
+    std::string base;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        base = go2rtc_base_locked();
+    }
+    if (base.empty()) return { 503, json_error("stream relay is not running") };
+    int         status = 0;
+    std::string body;
+    Http::get(base + "/api/onvif")
+        .timeout_connect(2).timeout_max(15)
+        .on_complete([&](std::string b, unsigned s) { status = (int) s; body = b; })
+        .on_error([&](std::string b, std::string err, unsigned s) { status = s ? (int) s : 502; body = b.empty() ? err : b; })
+        .perform_sync();
+    return { status == 0 ? 502 : status, body };
 }
 
 // The phone only sees ids, aliases, the source kind, go2rtc stream names and direct
@@ -1061,7 +1190,18 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
     if (r.path == "/hub/info" && r.method == "GET") {
         respond_json(client, 200, info_json().dump());
     } else if ((r.path == "/hub/" || r.path == "/hub/index.html") && r.method == "GET") {
-        respond(client, 200, "text/html; charset=utf-8", read_file(resources_dir() + "/web/orca/hub.html"));
+        // The page gets the per-run secret and sends it back as X-Hub-Secret on every call.
+        std::string page = read_file(resources_dir() + "/web/orca/hub.html"), secret;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            secret = m_secret;
+        }
+        const std::string ph = "__HUB_SECRET__";
+        for (size_t at = page.find(ph); at != std::string::npos; at = page.find(ph, at + secret.size())) page.replace(at, ph.size(), secret);
+        respond(client, 200, "text/html; charset=utf-8", page, "X-Frame-Options: DENY\r\n");
+    } else if (r.path == "/hub/onvif" && r.method == "GET") {
+        const auto res = onvif_discover();
+        respond(client, res.first, res.first == 200 ? "application/json" : "text/plain; charset=utf-8", res.second);
     } else if (r.path == "/hub/qrcode.js" && r.method == "GET") {
         respond(client, 200, "application/javascript", read_file(resources_dir() + "/web/orca/qrcode.js"));
     } else if (r.path == "/hub/instances" && r.method == "GET") {
@@ -1073,6 +1213,7 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
         j["pid"] = pid;
         respond_json(client, pid > 0 ? 200 : 500, pid > 0 ? j.dump() : json_error("could not start a slicer"));
     } else if (r.path == "/hub/state" && r.method == "POST") {
+        if (r.content_type.compare(0, 16, "application/json") != 0) { respond_json(client, 415, json_error("Content-Type must be application/json")); return; }
         std::string body;
         if (!read_small_body(client, r, body, 4 * 1024 * 1024)) { respond_json(client, 413, json_error("state too large")); return; }
         {
@@ -1201,28 +1342,45 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner)
         Request r;
         if (!read_request(client, r)) return;
 
-        std::string token;
+        std::string token, secret, auth;
         int         go2rtc_port;
         bool        phone;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             token       = m_token;
+            secret      = m_secret;
+            auth        = m_go2rtc_auth;
             go2rtc_port = m_go2rtc_port;
             phone       = m_phone;
         }
 
-        // go2rtc player + websocket at the root, gated by the rt cookie.
-        for (const char* p : GO2RTC_PASSTHROUGH) {
-            if (r.path == p) {
-                if (token.empty() || cookie_value(r.cookies, "rt") != token) { respond(client, 404, "text/plain", "not found"); return; }
-                if (go2rtc_port == 0) { respond(client, 503, "text/plain", "stream relay is not running"); return; }
-                tunnel(client, go2rtc_port, force_close(r.head), r.pending);
-                return;
-            }
+        // The stream player lives at the root so its relative "api/ws" resolves here. Gate: the
+        // phone's rt cookie, or - loopback only - the hub secret as `lt`, which is how the PC's own
+        // Stream tab embeds it. The two scripts are public (verbatim go2rtc files).
+        const bool player_ok = (!token.empty() && cookie_value(r.cookies, "rt") == token) ||
+                               (peer.is_loopback() && !secret.empty() && query_param(r.query, "lt") == secret);
+        if (r.path == PLAYER_PAGE) {
+            if (!player_ok) { respond(client, 404, "text/plain", "not found"); return; }
+            respond(client, 200, "text/html; charset=utf-8", read_file(resources_dir() + "/web/orca/player.html"));
+            return;
         }
-        // Control routes for the slicer instances on this PC.
+        for (const char* p : PLAYER_JS) {
+            if (r.path == p) { respond(client, 200, "application/javascript", read_file(resources_dir() + "/web/orca" + std::string(p))); return; }
+        }
+        if (r.path == GO2RTC_WS) {
+            if (!player_ok) { respond(client, 404, "text/plain", "not found"); return; }
+            if (go2rtc_port == 0) { respond(client, 503, "text/plain", "stream relay is not running"); return; }
+            tunnel(client, go2rtc_port, force_close(go2rtc_head(r.head, auth)), r.pending);
+            return;
+        }
+        // Control routes for the slicer instances and the hub page on this PC: loopback peer,
+        // loopback Host (no DNS rebinding), never cross-site, and the per-run secret as a custom
+        // header - a cross-origin page cannot send one without a preflight we never answer. The
+        // page and its script are the only unauthenticated GETs; the page carries the secret.
         if (r.path.compare(0, 5, "/hub/") == 0) {
-            if (!peer.is_loopback()) { respond(client, 404, "text/plain", "not found"); return; }
+            if (!peer.is_loopback() || !loopback_host(r.host) || r.sec_fetch_site == "cross-site") { respond(client, 404, "text/plain", "not found"); return; }
+            const bool page = r.method == "GET" && (r.path == "/hub/" || r.path == "/hub/index.html" || r.path == "/hub/qrcode.js");
+            if (!page && (secret.empty() || r.secret != secret)) { respond_json(client, 403, json_error("missing or wrong X-Hub-Secret")); return; }
             handle_hub(client, r);
             return;
         }
@@ -1282,7 +1440,8 @@ bool HubServer::start()
         m_phone = m_phone || j.value("phone", false);
     } catch (...) {}
     if (!valid_token(m_token)) m_token = random_token();
-    m_state = read_file(streams_json_path());
+    m_secret = random_hex(16);
+    m_state  = read_file(streams_json_path());
 
     start_go2rtc();
     BambuCamRelay::get().port();
@@ -1554,31 +1713,50 @@ static Info parse_info(const std::string& body)
     return i;
 }
 
-static int hub_port_from_file()
+struct HubFile { int port { 0 }; std::string secret; };
+static HubFile hub_file()
 {
+    HubFile h;
     try {
         json j = json::parse(read_file(hub_json_path()));
-        if (!pid_alive(j.value("pid", 0L))) return 0;
-        return j.value("port", 0);
+        if (!pid_alive(j.value("pid", 0L))) return h;
+        h.port   = j.value("port", 0);
+        h.secret = j.value("secret", "");
     } catch (...) {}
-    return 0;
+    return h;
 }
 
 static Info hub_call(const std::string& method, const std::string& path, const std::string& body, long timeout)
 {
-    const int port = hub_port_from_file();
-    if (port == 0) return Info();
+    const HubFile hf = hub_file();
+    if (hf.port == 0) return Info();
     Info        out;
-    std::string url = "http://127.0.0.1:" + std::to_string(port) + path;
+    std::string url = "http://127.0.0.1:" + std::to_string(hf.port) + path;
     Http        http = method == "POST" ? Http::post(url) : Http::get(url);
     if (method == "POST") http.set_post_body(body).header("Content-Type", body.empty() ? "text/plain" : "application/json");
+    http.header("X-Hub-Secret", hf.secret);
     http.timeout_connect(1).timeout_max(timeout)
-        .on_complete([&out](std::string b, unsigned status) { if (status == 200) out = parse_info(b); })
+        .on_complete([&out, &hf](std::string b, unsigned status) { if (status == 200) { out = parse_info(b); out.secret = hf.secret; } })
         .perform_sync();
     return out;
 }
 
 Info query() { return hub_call("GET", "/hub/info", "", 3); }
+
+std::pair<int, std::string> onvif_discover()
+{
+    const HubFile hf = hub_file();
+    if (hf.port == 0) return { 503, "the hub is not running" };
+    int         status = 0;
+    std::string body;
+    Http::get("http://127.0.0.1:" + std::to_string(hf.port) + "/hub/onvif")
+        .header("X-Hub-Secret", hf.secret)
+        .timeout_connect(1).timeout_max(20)
+        .on_complete([&](std::string b, unsigned s) { status = (int) s; body = b; })
+        .on_error([&](std::string b, std::string err, unsigned s) { status = s ? (int) s : 502; body = b.empty() ? err : b; })
+        .perform_sync();
+    return { status == 0 ? 502 : status, body };
+}
 
 Info set_phone(bool on, const std::string& token)
 {
@@ -1593,12 +1771,13 @@ bool post_state(const std::string& state_json)
         std::lock_guard<std::mutex> lock(s_state_mutex);
         s_last_state = state_json;
     }
-    const int port = hub_port_from_file();
-    if (port == 0) return false;
+    const HubFile hf = hub_file();
+    if (hf.port == 0) return false;
     bool ok = false;
-    Http::post("http://127.0.0.1:" + std::to_string(port) + "/hub/state")
+    Http::post("http://127.0.0.1:" + std::to_string(hf.port) + "/hub/state")
         .timeout_connect(1).timeout_max(5)
         .header("Content-Type", "application/json")
+        .header("X-Hub-Secret", hf.secret)
         .set_post_body(state_json)
         .on_complete([&ok](std::string, unsigned status) { ok = status == 200; })
         .perform_sync();

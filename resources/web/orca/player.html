@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stream</title>
+<style>
+html, body { height: 100%; width: 100%; margin: 0; padding: 0; background: #000; display: flex; }
+</style>
+</head>
+<body>
+<!-- Snapmaker-Ultra: the go2rtc stream player, served by the hub instead of by go2rtc (whose API is
+     credential-only and never reachable from a browser). video-stream.js and video-rtc.js next to
+     this file are verbatim copies from go2rtc 1.9.14 (MIT, see resources/tools/go2rtc/LICENSE-NOTE.txt)
+     and must be refreshed together with go2rtc.exe.
+     ?src=<stream name>&mode=<mse|webrtc|mp4|mjpeg>[&lt=<hub secret; the PC's own Stream tab only>]
+     The WebSocket goes to api/ws on the hub, which attaches go2rtc's credentials. -->
+<script type="module" src="./video-stream.js"></script>
+<script type="module">
+    const params = new URLSearchParams(location.search);
+    const lt = params.get('lt');
+    const video = document.createElement('video-stream');
+    video.background = params.get('background') !== 'false';
+    video.mode = params.get('mode') || video.mode;
+    video.style.flex = '1 0 ' + (params.get('width') || '320px');
+    video.src = new URL('api/ws?src=' + encodeURIComponent(params.get('src') || '') + (lt ? '&lt=' + encodeURIComponent(lt) : ''), location.href);
+    document.body.appendChild(video);
+</script>
+</body>
+</html>

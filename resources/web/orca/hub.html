@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Snapmaker-Ultra Hub</title>
+<meta name="hub-secret" content="__HUB_SECRET__">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: #2b2b2b; color: #ddd; font-family: 'Segoe UI', Roboto, -apple-system, sans-serif; font-size: 14px; padding: 20px; }
@@ -45,7 +46,10 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
 (function() {
     var info = null, lastUrl = null;
     function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
-    function post(path) { return fetch(path, { method: 'POST' }).then(function(r) { return r.json(); }); }
+    // Every /hub/* call carries the per-run secret the hub wrote into this page (the CSRF guard).
+    var SECRET = (document.querySelector('meta[name="hub-secret"]') || {}).content || '';
+    function hdrs() { return { 'X-Hub-Secret': SECRET }; }
+    function post(path) { return fetch(path, { method: 'POST', headers: hdrs() }).then(function(r) { return r.json(); }); }
     function drawQr(canvas, text) {
         if (typeof qrcode !== 'function') return false;
         var qr = qrcode(0, 'M'); qr.addData(text); qr.make();
@@ -103,8 +107,8 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
         });
     }
     function refresh() {
-        fetch('/hub/info').then(function(r) { return r.json(); }).then(function(j) { info = j; renderPhone(); document.getElementById('status').textContent = 'Hub pid ' + j.pid + ', port ' + j.port + ', version ' + j.version; }).catch(function() {});
-        fetch('/hub/instances').then(function(r) { return r.json(); }).then(function(j) { renderSlicers(j.instances || []); }).catch(function() {});
+        fetch('/hub/info', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { info = j; renderPhone(); document.getElementById('status').textContent = 'Hub pid ' + j.pid + ', port ' + j.port + ', version ' + j.version; }).catch(function() {});
+        fetch('/hub/instances', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { renderSlicers(j.instances || []); }).catch(function() {});
     }
     document.getElementById('new').onclick = function() { post('/hub/new').then(function() { setTimeout(refresh, 3000); }); };
     document.getElementById('newhidden').onclick = function() { post('/hub/new?hidden=1').then(function() { setTimeout(refresh, 3000); }); };
