@@ -2,6 +2,7 @@
 #include "TriangleMesh.hpp"
 #include "AABBMesh.hpp"
 #include "Flow.hpp"
+#include "NormalUtils.hpp"
 #include "PrintConfig.hpp"
 #include <algorithm>
 #include <cmath>
@@ -91,41 +92,15 @@ ColorSplitDepths color_split_depths(const DynamicPrintConfig &cfg, const std::ve
     return out;
 }
 
-// The angle a triangle subtends at its i-th vertex (NormalUtils::indice_angle, NormalUtils.cpp:51-69).
-static float triangle_vertex_angle(const indexed_triangle_set &its, const Vec3i32 &tri, int i)
-{
-    const int i1 = (i == 0) ? 2 : (i - 1);
-    const int i2 = (i == 2) ? 0 : (i + 1);
-    const Vec3f v1 = (its.vertices[tri[i1]] - its.vertices[tri[i]]).normalized();
-    const Vec3f v2 = (its.vertices[tri[i2]] - its.vertices[tri[i]]).normalized();
-    return std::acos(std::clamp(v1.dot(v2), -1.f, 1.f));
-}
-
 std::vector<Vec3f> color_split_normals(const indexed_triangle_set &surface)
 {
     // Spec 3.2: angle-weighted vertex normals - triangulation-independent, so a cube edge gets the exact
-    // 45 degree bisector. Reproduces NormalUtils::create_normals_angle_weighted (NormalUtils.cpp:71-94)
-    // rather than calling it: NormalUtils.hpp pulls in Model.hpp for its indexed_triangle_set/stl_vertex
-    // typedefs, and Model.hpp includes Format/STEP.hpp, which needs OpenCASCADE headers that are only on
-    // the include path of the main libslic3r target (CMakeLists.txt:546-548) - not libslic3r_cgal, the
-    // static lib this file (ColorSplit.cpp) is compiled into (CMakeLists.txt:506-514, predates the
-    // OpenCASCADE include-dir setup and never receives it), so #include "NormalUtils.hpp" here fails
-    // with a missing XCAFDoc_DocumentTool.hxx. its_face_normal (TriangleMesh.hpp, already included) gives
-    // the identical per-triangle normal NormalUtils::create_triangle_normal does.
-    std::vector<Vec3f> normals(surface.vertices.size(), Vec3f::Zero());
-    std::vector<float> weight(surface.vertices.size(), 0.f);
-    for (const Vec3i32 &tri : surface.indices) {
-        const Vec3f normal = its_face_normal(surface, tri);
-        const float a0 = triangle_vertex_angle(surface, tri, 0);
-        const float a1 = triangle_vertex_angle(surface, tri, 1);
-        const float w[3] = {a0, a1, float(PI) - a0 - a1};
-        for (int i = 0; i < 3; ++i) {
-            normals[tri[i]] += normal * w[i];
-            weight[tri[i]]  += w[i];
-        }
-    }
-    for (size_t v = 0; v < normals.size(); ++v)
-        normals[v] = weight[v] > 0.f ? Vec3f(normals[v] / weight[v]).normalized() : Vec3f(0.f, 0.f, 1.f);
+    // 45 degree bisector - always computed on the FULL surface F. NormalUtils::Normals is already
+    // std::vector<Vec3f> (NormalUtils.hpp:17), so no copy is needed - but create_normals_angle_weighted
+    // (NormalUtils.cpp:89-92) only divides by the summed angle weight, it does not renormalize to unit
+    // length, so that step is still required here.
+    std::vector<Vec3f> normals = NormalUtils::create_normals(surface, NormalUtils::VertexNormalType::AngleWeighted);
+    for (Vec3f &n : normals) n.normalize();
     return normals;
 }
 
