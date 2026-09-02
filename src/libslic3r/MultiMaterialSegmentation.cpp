@@ -1537,11 +1537,28 @@ static inline ExPolygons exposed_surface_part(const ExPolygons              &pro
 //     1.03/0.55/0.26mm, all under 2*wall_stack_width = 1.757mm) returns EMPTY - the whole ring
 //     stays wholly at D, exactly like any slope above the classic ~6.49deg cliff, never partially
 //     capped into a bullseye.
-//   - The topmost/bottommost origin's own half-ring (Minor 1: a patch with no reference layer at
-//     all is wholly "exposed" by exposed_surface_part()'s own early return, :1502-1503) is itself
-//     narrower than 2*wall_stack_width at every slope this feature targets, so it is opened away
-//     to empty here too - the apex is never wrongly capped, and a slope's descent is
-//     byte-identical to before this whole feature at every layer it can reach, apex included.
+//   - The topmost/bottommost origin's own half-ring (a patch with no reference layer at all is
+//     wholly "exposed" by exposed_surface_part()'s own early return, :1502-1503) is narrower
+//     than a full ring at the SAME run r (its own slab is half a layer's worth, width r/2 against
+//     a full ring's r) - see the Minor-1 fix note just below the survival-threshold asymmetry
+//     this halving used to cause, and how it is closed.
+//
+// Fix-wave 3 (flat-top-cap-fixwave-review.md Minor 1): opening the half-width apex component at
+// the SAME wall_stack_width the full-width case uses makes it survive only past r > 4*
+// wall_stack_width (r/2 > 2*ws), stricter than the r > 3*wall_stack_width (r > 2*ws after the
+// erosion, i.e. the width itself exceeding 2*ws) every full ring below it uses - so a slope with
+// run r in (3ws, 4ws] capped every ring but its own apex, leaving a hidden painted half-ring
+// "fin" inside an otherwise-printable base annulus at the topmost reach (measured: a 2 mm2-scale
+// annulus of 271.8mm2 at 2.0deg / 248.5mm2 at 2.15deg, walls-only paint with an unpainted crown).
+// Opening the half-width component at 0.75*wall_stack_width instead makes it survive iff
+// r/2 > 1.5*ws <=> r > 3*ws - exactly the full-ring rule, so the apex origin's verdict always
+// agrees with its neighbours' and the asymmetry closes. The dilate-back stays 2*wall_stack_width
+// (unchanged, same as the full-ring case) either way - only the SURVIVAL test's own opening
+// delta narrows for this one case. No effect on a genuine free-standing top (also reached via
+// this same early return): F1's own
+// offset_ex(contour, -wall_stack) already leaves nothing sub-surface to claim once a
+// free-standing top is narrower than 2*wall_stack_width, the threshold most real tops meet
+// regardless of which opening delta this function uses.
 static inline ExPolygons flat_cap_component_ex(const ExPolygons              &projected_patch,
                                                 const std::vector<ExPolygons> &input_expolygons,
                                                 size_t                         reference_layer_idx,
@@ -1551,7 +1568,13 @@ static inline ExPolygons flat_cap_component_ex(const ExPolygons              &pr
     const ExPolygons exposed = exposed_surface_part(projected_patch, input_expolygons, reference_layer_idx, num_layers, wall_stack_width);
     if (exposed.empty())
         return ExPolygons{};
-    return intersection_ex(projected_patch, offset_ex(opening_ex(exposed, wall_stack_width), 2.f * wall_stack_width));
+    // Mirrors exposed_surface_part()'s own early-return condition (:1503) exactly - true here
+    // means THAT branch is what produced `exposed` (the whole patch, unopened), i.e. this is the
+    // topmost/bottommost origin's own half-ring/free-standing-top case, not a normal mid-descent
+    // ring with a real reference layer.
+    const bool has_no_reference_layer = reference_layer_idx >= num_layers || input_expolygons[reference_layer_idx].empty() || wall_stack_width <= 0.f;
+    const float opening_delta = has_no_reference_layer ? 0.75f * wall_stack_width : wall_stack_width;
+    return intersection_ex(projected_patch, offset_ex(opening_ex(exposed, opening_delta), 2.f * wall_stack_width));
 }
 
 // WAVE B / OPTION N (.superpowers/sdd/2026-08-31-paint-depth/curved-gap-design.md): the painted
@@ -1605,6 +1628,265 @@ static inline ExPolygons flat_cap_component_ex(const ExPolygons              &pr
 // where the claim stays the lateral band alone. Widening it would mean lowering the #7104
 // sliver guard, which the design deliberately did not propose.
 //
+// Fix-wave 3 (absorb-tail-fixwave2-review.md I-1): per-(layer, colour) statistics, used both by
+// segmentation_top_and_bottom_layers's own top/bottom descent (the erosion widths below) and, as
+// of this fix-wave, by segmentation_by_painting's own interior inter-claim absorb kill-width
+// construction - the SAME struct, filled by the SAME function (compute_layer_color_stat below),
+// so the two can never resolve a different answer for the same (layer, colour) again. Hoisted to
+// file scope (used to be a local struct + lambda inside segmentation_top_and_bottom_layers alone)
+// for exactly that reason - segmentation_by_painting needs it too, and duplicating the resolution
+// logic there would reopen the very defect this fix-wave closes (two separately-approximated
+// per-layer signals - the descent's own erosion width and the absorb's kill width - that could
+// silently drift apart, as I-1 measured: 8.14 / 6.01 mm2 base slivers at the sphere fixture's cap
+// boundary with a gap-fill-off PARAMETER_MODIFIER at print z 2-3, where the pre-fixwave-2 parent
+// commit absorbed them).
+struct LayerColorStat {
+    // Number of regions for a queried color.
+    int     num_regions             { 0 };
+    // Maximum perimeter extrusion width for a queried color.
+    float   extrusion_width         { 0.f };
+    // Minimum radius of a region to be printable. Used to filter regions by morphological opening.
+    float   small_region_threshold  { 0.f };
+    // Maximum number of top layers for a queried color.
+    int     top_shell_layers        { 0 };
+    // Maximum number of bottom layers for a queried color.
+    int     bottom_shell_layers     { 0 };
+    // WAVE B / Option N: total depth (surface layer included) the top/bottom descent runs to -
+    // max(the solid shell above, however many layers the normal thickness D spans). Kept
+    // SEPARATE from *_shell_layers, which stays the pure solid-shell answer, because the
+    // "is anything claimed at all" gates below are C1 contracts about the SHELL (a zero shell
+    // count claims nothing, not even the painted surface facet) and must not be deepened.
+    int     top_descent_layers      { 0 };
+    int     bottom_descent_layers   { 0 };
+    // WAVE B / Option N: whether this colour's descent is a normal-thickness shell on this
+    // layer - i.e. it is a PAINTED colour (not the base) and the bounded depth D is at least
+    // one wall stack. False restores legacy behaviour verbatim: the exposed_surface_part()
+    // slope gate, the shell-count depth bound and the eager break.
+    bool    normal_shell            { false };
+    //BBS: spacing according to width and layer height
+    float   extrusion_spacing{ 0.f };
+    // Fix-wave 3 (I-1): true iff the region that actually won small_region_threshold /
+    // extrusion_spacing below (colour > 0 only - color_idx == 0's aggregate "don't know" case
+    // never sets this) has gap_infill_speed <= 0, i.e. small_region_threshold is genuinely this
+    // LAYER's gap-fill-disabled (wider) arm, not the ordinary one. Lets segmentation_by_
+    // painting's absorb kill-width construction key off exactly the same per-layer resolution
+    // this struct's own small_region_threshold already uses for the descent's own erosion,
+    // instead of maintaining a second, separately-approximated signal.
+    bool    small_region_threshold_gapfill_off { false };
+};
+
+// Fix-wave 3 (absorb-tail-fixwave2-review.md I-1): a painted colour (color_idx > 0) can have MORE
+// THAN ONE PrintRegion matching wall_filament == color_idx on the very same layer - one inherited
+// from the object's own base geometry, another auto-created from a PARAMETER_MODIFIER overriding
+// e.g. gap_infill_speed over a confined Z range (PrintApply.cpp:1082-1123 creates one auto-created
+// painted PrintRegion per distinct parent config). PrintObjectSlice.cpp:5199-5208 gives every
+// layer a LayerRegion for EVERY PrintRegion on the object regardless of whether it has any
+// geometry here, and - the fact that makes "just check the candidate's own slices" unusable - an
+// auto-created painted PrintRegion's OWN LayerRegion::slices is unconditionally EMPTY at this
+// point in the pipeline: apply_mm_segmentation, which writes it, runs strictly after this whole
+// segmentation (see compute_layer_color_stat's own N1 comment below for the same fact, cited
+// there for the same reason). So "does this candidate's own geometry cover this layer" has to be
+// asked of whichever VOLUME actually produced the candidate, which the PrintObjectRegions graph
+// (PrintObjectRegions::PaintedRegion::parent -> LayerRangeRegions::volume_regions[parent],
+// PrintApply.cpp:1116) still remembers, and which - unlike the painted region itself - IS an
+// ordinarily-sliced region with real per-layer slices.
+//
+// Returns true when `candidate` should be treated as applicable on `layer`. For an auto-created
+// painted region this is resolved via its parent's own slices; for anything else (a plain body or
+// modifier directly configured with this wall_filament, never routed through the paint gizmo, so
+// never entered into painted_regions at all) the candidate's own slices already answer this
+// correctly - the same per-layer discipline compute_layer_color_stat's own shell-depth block
+// already relies on for every region type.
+static bool layer_color_stat_variant_applies_here(const PrintObject &print_object, const Layer &layer, const LayerRegion *candidate)
+{
+    const PrintRegion        *candidate_region = &candidate->region();
+    const PrintObjectRegions *shared           = print_object.shared_regions();
+    if (shared != nullptr)
+        for (const PrintObjectRegions::LayerRangeRegions &layer_range : shared->layer_ranges) {
+            if (! (layer_range.layer_height_range.first <= layer.print_z && layer.print_z <= layer_range.layer_height_range.second))
+                continue;
+            auto it = std::find_if(layer_range.painted_regions.begin(), layer_range.painted_regions.end(),
+                                    [candidate_region](const PrintObjectRegions::PaintedRegion &pr) { return pr.region == candidate_region; });
+            if (it != layer_range.painted_regions.end() && it->parent >= 0 && size_t(it->parent) < layer_range.volume_regions.size())
+                if (const PrintRegion *parent_region = layer_range.volume_regions[size_t(it->parent)].region) {
+                    const int parent_id = parent_region->print_object_region_id();
+                    if (parent_id >= 0 && size_t(parent_id) < layer.regions().size())
+                        return ! layer.regions()[size_t(parent_id)]->slices.empty();
+                }
+            break; // found the layer's own range; whether or not it resolved a parent, do not scan the others
+        }
+    // Not a recognised auto-created painted region (or the graph did not resolve it) - the
+    // candidate's own slices are the correct signal, same as every other per-layer gate here.
+    return ! candidate->slices.empty();
+}
+
+static LayerColorStat compute_layer_color_stat(const ConstLayerPtrsAdaptor &layers, const PrintObject &print_object, const float paint_depth_normal_mm, const size_t layer_idx, const size_t color_idx)
+{
+    LayerColorStat out;
+    const Layer &layer = *layers[layer_idx];
+    // Fix-wave 3 (I-1): resolved from ONLY the candidate(s) that actually apply here (colour > 0)
+    // when that can be determined at all; `fallback_*` reproduces the OLD unconditional
+    // last-wins (kept as a safety net for when layer_color_stat_variant_applies_here cannot
+    // resolve anything - shared_regions() unavailable - so behaviour degrades to exactly what it
+    // was before this fix rather than a zeroed-out threshold).
+    float fallback_small_region_threshold = 0.f, fallback_extrusion_spacing = 0.f;
+    bool  fallback_gapfill_off = false;
+    float applicable_small_region_threshold = 0.f, applicable_extrusion_spacing = 0.f;
+    bool  have_applicable = false, applicable_gapfill_off = false;
+    for (const LayerRegion *region : layer.regions()) {
+        const PrintRegionConfig &config = region->region().config();
+        // Fix-wave I2 (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-fix-review.md):
+        // PrintObjectSlice.cpp:5199-5208 gives every layer a LayerRegion for EVERY
+        // PrintRegion on the object, whether or not that region has any geometry on this
+        // particular layer. Without this guard, a region confined to another part of the
+        // object (a modifier, or a Z-stacked volume) still contributes its shell settings
+        // to the max below, inflating the claim depth on layers it never actually touches.
+        // region->slices is populated per-layer at PrintObjectSlice.cpp:5229-5235, before
+        // segmentation runs at :5267, so this is valid and free.
+        //
+        // Fix-wave N1 (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-fixwave-
+        // rereview.md): this guard must scope ONLY the shell-depth max just below, never
+        // the per-colour extrusion-stat block that follows. The auto-created painted
+        // region (the ONLY region with wall_filament == a painted color_idx,
+        // PrintApply.cpp:1088-1090) has empty slices on EVERY layer at this point in the
+        // pipeline - its geometry isn't written until apply_mm_segmentation() runs, AFTER
+        // this segmentation (PrintObjectSlice.cpp:5230 -> :5267 -> :5275). Skipping it
+        // unconditionally (i.e. gating the per-colour block on it too) would zero
+        // num_regions/extrusion_width/extrusion_spacing/small_region_threshold for EVERY
+        // painted colour on EVERY layer, silently disabling the lateral inward taper
+        // (:1542/:1562 below) and the #7104 thin-projection filter, and re-arming
+        // assert(out.num_regions > 0) below. The shell-depth max loses nothing by keeping
+        // the guard scoped to just this block: a painted region always shares its parent
+        // volume region's top/bottom_shell_layers/thickness (PrintApply.cpp:1088-1090
+        // only overrides the filament ids), and the parent DOES have slices on every layer
+        // it occupies, so the max already sees that depth via the parent.
+        if (! region->slices.empty()) {
+            // Vertical paint-depth alignment fix, shell-coverage-investigation.md fix (2): the
+            // solid shell a painted claim must cover is whichever region reaches deepest on
+            // THIS layer, not only the region(s) that happen to carry this paint color right
+            // now - a painted patch can span regions with different shell settings (e.g. a
+            // modifier with its own top_shell_layers), and the shell the base material builds
+            // underneath does not care which color is painted above it. So these two are
+            // maxed over ALL regions on the layer, unconditionally - unlike extrusion_width /
+            // small_region_threshold / extrusion_spacing below, which stay scoped to color_idx
+            // (they size the lateral taper of THIS color's own claim, untouched by this fix).
+            // Effective count = max(configured layer count, however many layers this object's
+            // REAL layer heights need to cover the configured thickness) - see
+            // effective_shell_layers_by_thickness() above, which mirrors discover_vertical_
+            // shells / discover_horizontal_shells exactly, including variable layer height.
+            out.top_shell_layers    = std::max(out.top_shell_layers,
+                                                effective_shell_layers_by_thickness(layers, layer_idx, true,  config.top_shell_layers.value,    config.top_shell_thickness.value));
+            out.bottom_shell_layers = std::max(out.bottom_shell_layers,
+                                                effective_shell_layers_by_thickness(layers, layer_idx, false, config.bottom_shell_layers.value, config.bottom_shell_thickness.value));
+        }
+        if (// color_idx == 0 means "don't know" extruder aka the underlying extruder.
+            // As this region may split existing regions, we collect statistics over all regions for color_idx == 0.
+            color_idx == 0 || config.wall_filament == int(color_idx)) {
+            //BBS: the extrusion line width is outer wall rather than inner wall
+            const double nozzle_diameter = print_object.print()->config().nozzle_diameter.get_at(0);
+            double outer_wall_line_width = config.get_abs_value("outer_wall_line_width", nozzle_diameter);
+            out.extrusion_width     = std::max<float>(out.extrusion_width, outer_wall_line_width);
+            const bool  gapfill_off = ! (config.gap_infill_speed.value > 0.f);
+            float small_region_threshold = config.gap_infill_speed.value > 0 ?
+                                         // Gap fill enabled. Enable a single line of 1/2 extrusion width.
+                                         0.5f * outer_wall_line_width :
+                                         // Gap fill disabled. Enable two lines slightly overlapping.
+                                         outer_wall_line_width + 0.7f * Flow::rounded_rectangle_extrusion_spacing(outer_wall_line_width, float(layer.height));
+            small_region_threshold = scaled<float>(small_region_threshold * 0.5f);
+            const float extrusion_spacing = Flow::rounded_rectangle_extrusion_spacing(float(outer_wall_line_width), float(layer.height));
+            // Fix-wave 3 (I-1): last-region-wins used to overwrite small_region_threshold /
+            // extrusion_spacing here unconditionally, so whichever candidate happened to be
+            // iterated last (region order is print_object_region_id() / creation order, NOT
+            // z-relevance) silently applied its own gap_infill_speed on EVERY layer, not only
+            // the ones its own geometry covers. Now only a candidate that actually applies here
+            // may win; color_idx == 0's aggregate case is untouched (every region always
+            // "applies" to it, same as the shell-depth block above).
+            fallback_small_region_threshold = small_region_threshold;
+            fallback_extrusion_spacing      = extrusion_spacing;
+            fallback_gapfill_off            = gapfill_off;
+            if (color_idx == 0 || layer_color_stat_variant_applies_here(print_object, layer, region)) {
+                applicable_small_region_threshold = small_region_threshold;
+                applicable_extrusion_spacing      = extrusion_spacing;
+                applicable_gapfill_off            = gapfill_off;
+                have_applicable                   = true;
+            }
+            ++ out.num_regions;
+        }
+    }
+    if (have_applicable) {
+        out.small_region_threshold             = applicable_small_region_threshold;
+        out.extrusion_spacing                  = applicable_extrusion_spacing;
+        out.small_region_threshold_gapfill_off = applicable_gapfill_off;
+    } else {
+        // Unresolvable (see header comment) - reproduce the pre-fix unconditional last-wins
+        // exactly, rather than a zeroed-out threshold.
+        out.small_region_threshold             = fallback_small_region_threshold;
+        out.extrusion_spacing                  = fallback_extrusion_spacing;
+        out.small_region_threshold_gapfill_off = fallback_gapfill_off;
+    }
+    assert(out.num_regions > 0);
+    // WAVE B / Option N: deepen the descent from "the solid shell" to "whatever covers a
+    // normal thickness of paint_depth_normal_mm", reusing effective_shell_layers_by_thickness
+    // with a layer count of 1 so the thickness half of its walk runs against this object's
+    // REAL print_z / bottom_z values - variable layer height handled exactly, and the same
+    // "< thickness - EPSILON" boundary the solid-shell generators use, rather than a D /
+    // layer_height division that would silently assume uniform layers (design section 6
+    // hazard 5). max() with the shell count keeps the earlier shell-coverage wave's contract
+    // intact when a user sets D below their solid shell; gating on the shell count being
+    // nonzero keeps C1's "no shell means no claim" intact when they set it to zero.
+    //
+    // PAINTED COLOURS ONLY (color_idx > 0). color_idx 0 is not a paint claim at all - it is
+    // the object's base filament, and its top/bottom claim exists for one reason: to stop a
+    // neighbouring painted colour smearing across the SOLID SHELL under an UNPAINTED top or
+    // bottom face. That contract is written in shell terms (top_shell_layers /
+    // top_shell_thickness) and "how thick is the paint" says nothing about it.
+    //
+    // Deepening it is not merely pointless, it inverts the feature. merge_segmented_layers
+    // trims EVERY extruder's lateral claim by EVERY extruder's top/bottom claim (see its
+    // diff_ex over top_and_bottom_layers), so a base-colour claim that descended D deep would
+    // cut the painted lateral band back to one wall stack on every layer beneath any
+    // unpainted cap. Measured, not reasoned: a 40x40x6mm box with one side painted and
+    // paint_depth_mm = 6 loses its 6mm band down to 0.857mm the moment the unpainted top
+    // cap's base claim is given the same normal thickness. Paint depth bounds paint.
+    //
+    // The same colour test gates N1 and N3 below, for the same reason and with the same
+    // effect: color_idx 0's descent stays byte-identical to legacy, gate and break included.
+    out.extrusion_width = scaled<float>(out.extrusion_width);
+    out.extrusion_spacing = scaled<float>(out.extrusion_spacing);
+    // The D >= wall_stack gate (design section 5). Below one wall stack the lateral band
+    // reaches only D while the F1-inset descent starts at wall_stack, leaving the base region
+    // a closed ring of width wall_stack - D sandwiched between two painted annuli on every
+    // sub-surface layer: a new sliver class. SCALED_EPSILON of slack because on the CLASSIC
+    // generator Wave A's band floor makes D and wall_stack the SAME quantity by construction
+    // (band(1) is floored at ext_perimeter_width + ext_perimeter_spacing) and the two reach
+    // here down different float paths - a rounding ULP must not decide whether a user gets a
+    // normal-thickness shell. On Arachne band(1) = 0.578595 stays genuinely below the floor
+    // and keeps today's behaviour, which is the intent.
+    // Loose end 2 (interclaim-sliver-investigation.md section 7): guard against the
+    // degenerate layer_color_stat path where no region on this layer carries wall_filament
+    // == color_idx (out.num_regions == 0, assert-only in debug - see the N1 comment above).
+    // extrusion_width/extrusion_spacing then stay 0, so wall_stack == 0 and F1's
+    // offset_ex(contour, -0) below is a no-op - but without this term normal_shell still
+    // evaluated true (scaled(D) + eps >= 0 always holds), which would let the claim reach
+    // the contour with no F1 clearance at all, exactly the exterior bleed F1 exists to stop.
+    // Unreachable for a real object per N1, but cheap to close and free of any behavior
+    // change on the reachable path (wall_stack > 0 there always).
+    out.normal_shell = paint_depth_normal_mm > 0.f && color_idx > 0 &&
+                       (out.extrusion_spacing + out.extrusion_width) > 0.f &&
+                       scaled<float>(paint_depth_normal_mm) + float(SCALED_EPSILON) >= out.extrusion_spacing + out.extrusion_width;
+    out.top_descent_layers    = out.top_shell_layers;
+    out.bottom_descent_layers = out.bottom_shell_layers;
+    if (out.normal_shell) {
+        if (out.top_shell_layers > 0)
+            out.top_descent_layers    = std::max(out.top_shell_layers,
+                                                 effective_shell_layers_by_thickness(layers, layer_idx, true,  1, double(paint_depth_normal_mm)));
+        if (out.bottom_shell_layers > 0)
+            out.bottom_descent_layers = std::max(out.bottom_shell_layers,
+                                                 effective_shell_layers_by_thickness(layers, layer_idx, false, 1, double(paint_depth_normal_mm)));
+    }
+    return out;
+}
+
 // Returns segmentation of top and bottom layers based on painting in segmentation gizmos.
 // Fix-wave (wave-b-review.md Important 2): legacy_top_and_bottom_layers_out is filled with the
 // SAME per-colour top/bottom claims, but each one stopped at top_shell_layers/bottom_shell_layers
@@ -1833,159 +2115,12 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
     legacy_shell_triangles_by_color_bottom.assign(num_facets_states, std::vector<ExPolygons>(num_layers * 2));
     legacy_shell_triangles_by_color_top.assign(num_facets_states, std::vector<ExPolygons>(num_layers * 2));
 
-    struct LayerColorStat {
-        // Number of regions for a queried color.
-        int     num_regions             { 0 };
-        // Maximum perimeter extrusion width for a queried color.
-        float   extrusion_width         { 0.f };
-        // Minimum radius of a region to be printable. Used to filter regions by morphological opening.
-        float   small_region_threshold  { 0.f };
-        // Maximum number of top layers for a queried color.
-        int     top_shell_layers        { 0 };
-        // Maximum number of bottom layers for a queried color.
-        int     bottom_shell_layers     { 0 };
-        // WAVE B / Option N: total depth (surface layer included) the top/bottom descent runs to -
-        // max(the solid shell above, however many layers the normal thickness D spans). Kept
-        // SEPARATE from *_shell_layers, which stays the pure solid-shell answer, because the
-        // "is anything claimed at all" gates below are C1 contracts about the SHELL (a zero shell
-        // count claims nothing, not even the painted surface facet) and must not be deepened.
-        int     top_descent_layers      { 0 };
-        int     bottom_descent_layers   { 0 };
-        // WAVE B / Option N: whether this colour's descent is a normal-thickness shell on this
-        // layer - i.e. it is a PAINTED colour (not the base) and the bounded depth D is at least
-        // one wall stack. False restores legacy behaviour verbatim: the exposed_surface_part()
-        // slope gate, the shell-count depth bound and the eager break.
-        bool    normal_shell            { false };
-        //BBS: spacing according to width and layer height
-        float   extrusion_spacing{ 0.f };
-    };
+    // Fix-wave 3 (absorb-tail-fixwave2-review.md I-1): LayerColorStat and its resolution logic
+    // are now file-scope (compute_layer_color_stat, above) so segmentation_by_painting's own
+    // absorb kill-width construction can call the exact same function - this is now a thin
+    // capture-adapting wrapper, not the computation itself.
     auto layer_color_stat = [&layers = std::as_const(layers), &print_object, paint_depth_normal_mm](const size_t layer_idx, const size_t color_idx) -> LayerColorStat {
-        LayerColorStat out;
-        const Layer &layer = *layers[layer_idx];
-        for (const LayerRegion *region : layer.regions()) {
-            const PrintRegionConfig &config = region->region().config();
-            // Fix-wave I2 (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-fix-review.md):
-            // PrintObjectSlice.cpp:5199-5208 gives every layer a LayerRegion for EVERY
-            // PrintRegion on the object, whether or not that region has any geometry on this
-            // particular layer. Without this guard, a region confined to another part of the
-            // object (a modifier, or a Z-stacked volume) still contributes its shell settings
-            // to the max below, inflating the claim depth on layers it never actually touches.
-            // region->slices is populated per-layer at PrintObjectSlice.cpp:5229-5235, before
-            // segmentation runs at :5267, so this is valid and free.
-            //
-            // Fix-wave N1 (.superpowers/sdd/2026-08-31-paint-depth/vertical-depth-fixwave-
-            // rereview.md): this guard must scope ONLY the shell-depth max just below, never
-            // the per-colour extrusion-stat block that follows. The auto-created painted
-            // region (the ONLY region with wall_filament == a painted color_idx,
-            // PrintApply.cpp:1088-1090) has empty slices on EVERY layer at this point in the
-            // pipeline - its geometry isn't written until apply_mm_segmentation() runs, AFTER
-            // this segmentation (PrintObjectSlice.cpp:5230 -> :5267 -> :5275). Skipping it
-            // unconditionally (i.e. gating the per-colour block on it too) would zero
-            // num_regions/extrusion_width/extrusion_spacing/small_region_threshold for EVERY
-            // painted colour on EVERY layer, silently disabling the lateral inward taper
-            // (:1542/:1562 below) and the #7104 thin-projection filter, and re-arming
-            // assert(out.num_regions > 0) below. The shell-depth max loses nothing by keeping
-            // the guard scoped to just this block: a painted region always shares its parent
-            // volume region's top/bottom_shell_layers/thickness (PrintApply.cpp:1088-1090
-            // only overrides the filament ids), and the parent DOES have slices on every layer
-            // it occupies, so the max already sees that depth via the parent.
-            if (! region->slices.empty()) {
-                // Vertical paint-depth alignment fix, shell-coverage-investigation.md fix (2): the
-                // solid shell a painted claim must cover is whichever region reaches deepest on
-                // THIS layer, not only the region(s) that happen to carry this paint color right
-                // now - a painted patch can span regions with different shell settings (e.g. a
-                // modifier with its own top_shell_layers), and the shell the base material builds
-                // underneath does not care which color is painted above it. So these two are
-                // maxed over ALL regions on the layer, unconditionally - unlike extrusion_width /
-                // small_region_threshold / extrusion_spacing below, which stay scoped to color_idx
-                // (they size the lateral taper of THIS color's own claim, untouched by this fix).
-                // Effective count = max(configured layer count, however many layers this object's
-                // REAL layer heights need to cover the configured thickness) - see
-                // effective_shell_layers_by_thickness() above, which mirrors discover_vertical_
-                // shells / discover_horizontal_shells exactly, including variable layer height.
-                out.top_shell_layers    = std::max(out.top_shell_layers,
-                                                    effective_shell_layers_by_thickness(layers, layer_idx, true,  config.top_shell_layers.value,    config.top_shell_thickness.value));
-                out.bottom_shell_layers = std::max(out.bottom_shell_layers,
-                                                    effective_shell_layers_by_thickness(layers, layer_idx, false, config.bottom_shell_layers.value, config.bottom_shell_thickness.value));
-            }
-            if (// color_idx == 0 means "don't know" extruder aka the underlying extruder.
-                // As this region may split existing regions, we collect statistics over all regions for color_idx == 0.
-                color_idx == 0 || config.wall_filament == int(color_idx)) {
-                //BBS: the extrusion line width is outer wall rather than inner wall
-                const double nozzle_diameter = print_object.print()->config().nozzle_diameter.get_at(0);
-                double outer_wall_line_width = config.get_abs_value("outer_wall_line_width", nozzle_diameter);
-                out.extrusion_width     = std::max<float>(out.extrusion_width, outer_wall_line_width);
-                out.small_region_threshold = config.gap_infill_speed.value > 0 ?
-                                             // Gap fill enabled. Enable a single line of 1/2 extrusion width.
-                                             0.5f * outer_wall_line_width :
-                                             // Gap fill disabled. Enable two lines slightly overlapping.
-                                             outer_wall_line_width + 0.7f * Flow::rounded_rectangle_extrusion_spacing(outer_wall_line_width, float(layer.height));
-                out.small_region_threshold = scaled<float>(out.small_region_threshold * 0.5f);
-                out.extrusion_spacing = Flow::rounded_rectangle_extrusion_spacing(float(outer_wall_line_width), float(layer.height));
-                ++ out.num_regions;
-            }
-        }
-        assert(out.num_regions > 0);
-        // WAVE B / Option N: deepen the descent from "the solid shell" to "whatever covers a
-        // normal thickness of paint_depth_normal_mm", reusing effective_shell_layers_by_thickness
-        // with a layer count of 1 so the thickness half of its walk runs against this object's
-        // REAL print_z / bottom_z values - variable layer height handled exactly, and the same
-        // "< thickness - EPSILON" boundary the solid-shell generators use, rather than a D /
-        // layer_height division that would silently assume uniform layers (design section 6
-        // hazard 5). max() with the shell count keeps the earlier shell-coverage wave's contract
-        // intact when a user sets D below their solid shell; gating on the shell count being
-        // nonzero keeps C1's "no shell means no claim" intact when they set it to zero.
-        //
-        // PAINTED COLOURS ONLY (color_idx > 0). color_idx 0 is not a paint claim at all - it is
-        // the object's base filament, and its top/bottom claim exists for one reason: to stop a
-        // neighbouring painted colour smearing across the SOLID SHELL under an UNPAINTED top or
-        // bottom face. That contract is written in shell terms (top_shell_layers /
-        // top_shell_thickness) and "how thick is the paint" says nothing about it.
-        //
-        // Deepening it is not merely pointless, it inverts the feature. merge_segmented_layers
-        // trims EVERY extruder's lateral claim by EVERY extruder's top/bottom claim (see its
-        // diff_ex over top_and_bottom_layers), so a base-colour claim that descended D deep would
-        // cut the painted lateral band back to one wall stack on every layer beneath any
-        // unpainted cap. Measured, not reasoned: a 40x40x6mm box with one side painted and
-        // paint_depth_mm = 6 loses its 6mm band down to 0.857mm the moment the unpainted top
-        // cap's base claim is given the same normal thickness. Paint depth bounds paint.
-        //
-        // The same colour test gates N1 and N3 below, for the same reason and with the same
-        // effect: color_idx 0's descent stays byte-identical to legacy, gate and break included.
-        out.extrusion_width = scaled<float>(out.extrusion_width);
-        out.extrusion_spacing = scaled<float>(out.extrusion_spacing);
-        // The D >= wall_stack gate (design section 5). Below one wall stack the lateral band
-        // reaches only D while the F1-inset descent starts at wall_stack, leaving the base region
-        // a closed ring of width wall_stack - D sandwiched between two painted annuli on every
-        // sub-surface layer: a new sliver class. SCALED_EPSILON of slack because on the CLASSIC
-        // generator Wave A's band floor makes D and wall_stack the SAME quantity by construction
-        // (band(1) is floored at ext_perimeter_width + ext_perimeter_spacing) and the two reach
-        // here down different float paths - a rounding ULP must not decide whether a user gets a
-        // normal-thickness shell. On Arachne band(1) = 0.578595 stays genuinely below the floor
-        // and keeps today's behaviour, which is the intent.
-        // Loose end 2 (interclaim-sliver-investigation.md section 7): guard against the
-        // degenerate layer_color_stat path where no region on this layer carries wall_filament
-        // == color_idx (out.num_regions == 0, assert-only in debug - see the N1 comment above).
-        // extrusion_width/extrusion_spacing then stay 0, so wall_stack == 0 and F1's
-        // offset_ex(contour, -0) below is a no-op - but without this term normal_shell still
-        // evaluated true (scaled(D) + eps >= 0 always holds), which would let the claim reach
-        // the contour with no F1 clearance at all, exactly the exterior bleed F1 exists to stop.
-        // Unreachable for a real object per N1, but cheap to close and free of any behavior
-        // change on the reachable path (wall_stack > 0 there always).
-        out.normal_shell = paint_depth_normal_mm > 0.f && color_idx > 0 &&
-                           (out.extrusion_spacing + out.extrusion_width) > 0.f &&
-                           scaled<float>(paint_depth_normal_mm) + float(SCALED_EPSILON) >= out.extrusion_spacing + out.extrusion_width;
-        out.top_descent_layers    = out.top_shell_layers;
-        out.bottom_descent_layers = out.bottom_shell_layers;
-        if (out.normal_shell) {
-            if (out.top_shell_layers > 0)
-                out.top_descent_layers    = std::max(out.top_shell_layers,
-                                                     effective_shell_layers_by_thickness(layers, layer_idx, true,  1, double(paint_depth_normal_mm)));
-            if (out.bottom_shell_layers > 0)
-                out.bottom_descent_layers = std::max(out.bottom_shell_layers,
-                                                     effective_shell_layers_by_thickness(layers, layer_idx, false, 1, double(paint_depth_normal_mm)));
-        }
-        return out;
+        return compute_layer_color_stat(layers, print_object, paint_depth_normal_mm, layer_idx, color_idx);
     };
 
     // WAVE B, hazard 2 completed. Widening `granularity` (above) is necessary for the double-buffer
@@ -2899,11 +3034,7 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
                                                                    // identical to an object with gap fill enabled everywhere.
                                                                    //
                                                                    // Fix-wave 2 (absorb-tail-fixwave2-review.md I-C): OUTER index is now
-                                                                   // the LAYER, not the colour - i.e. this is PER LAYER *and* PER COLOUR,
-                                                                   // mirroring layer_color_stat's own discipline (segmentation_top_and_
-                                                                   // bottom_layers): a colour's gap-fill-disabled width is resolved only
-                                                                   // from the regions of that colour with actual geometry ON THIS LAYER,
-                                                                   // not MAX'd over every region of that colour anywhere on the object.
+                                                                   // the LAYER, not the colour - i.e. this is PER LAYER *and* PER COLOUR.
                                                                    // Without this, a gap-fill-disabled PARAMETER_MODIFIER confined to a
                                                                    // small Z range widened the absorb's kill width for EVERY layer of
                                                                    // that colour, including layers nowhere near the modifier where every
@@ -2912,6 +3043,22 @@ static std::vector<std::vector<ExPolygons>> merge_segmented_layers(const std::ve
                                                                    // fuzzy-skin caller's value) degrades to "no gap-fill-off data for
                                                                    // this layer", byte-identical to an object with gap fill on
                                                                    // everywhere.
+                                                                   //
+                                                                   // Fix-wave 3 (absorb-tail-fixwave2-review.md I-1): fix-wave 2's own
+                                                                   // per-layer resolution ("the regions of that colour with actual
+                                                                   // geometry on this layer", via a SEPARATE (a)+(b) approximation built
+                                                                   // in segmentation_by_painting) could disagree with what the descent's
+                                                                   // OWN erosion in segmentation_top_and_bottom_layers actually used,
+                                                                   // because that erosion read layer_color_stat's per-colour block,
+                                                                   // which stayed last-region-wins and slice-ungated - so a gap-fill-off
+                                                                   // modifier anywhere on the object could erode the descent claim wide
+                                                                   // on layers this array correctly left narrow, leaving genuine
+                                                                   // (0.45, 0.75]mm base slivers this array's narrower value then failed
+                                                                   // to catch (measured: 8.14 / 6.01 mm2 at the sphere fixture's cap
+                                                                   // boundary). Now built directly from compute_layer_color_stat's own
+                                                                   // small_region_threshold - the SAME per-layer resolution the erosion
+                                                                   // sites themselves use - so this array can no longer disagree with
+                                                                   // the population it exists to catch.
                                                                    const std::vector<std::vector<float>>       &min_claim_width_gapfill_off_by_layer_color,
                                                                    const float                                  wall_stack,
                                                                    const bool                                   bounded_mode,
@@ -3359,12 +3506,16 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               // (absorb-tail-review.md Minor 4 / M4): PER COLOUR (indexed by
                                                               // extruder id), not a single object-wide max - see
                                                               // interclaim_absorb_effective_claim_width. Still OBJECT-WIDE per
-                                                              // colour (not per layer) at this parameter - see this function's body
-                                                              // for fix-wave 2's (absorb-tail-fixwave2-review.md I-C) per-layer
-                                                              // NARROWING of it, built here (using segmented_regions, which this
-                                                              // caller does not have) rather than by the caller. Empty (the fuzzy
-                                                              // skin caller's value, paired with segmentation_wall_stack == 0.f) is
-                                                              // inert either way - the absorb never runs on that path regardless.
+                                                              // colour (not per layer) at THIS parameter - only ever consulted here
+                                                              // as a cheap "does the object have a gap-fill-off region ANYWHERE"
+                                                              // pre-check (see this function's body): when it is entirely empty
+                                                              // (the fuzzy skin caller's value, paired with segmentation_wall_stack
+                                                              // == 0.f, where the absorb never runs regardless) the real per-layer
+                                                              // construction below is skipped outright rather than computed and
+                                                              // discarded. The per-layer values themselves (fix-wave 2, absorb-
+                                                              // tail-fixwave2-review.md I-C) come from compute_layer_color_stat
+                                                              // directly as of fix-wave 3 (I-1) - not from narrowing this array -
+                                                              // so its own per-region values are otherwise unused.
                                                               const std::vector<float>                                        &segmentation_claim_width_gapfill_off_by_color,
                                                               const bool                                                       segmentation_interlocking_beam,
                                                               const IncludeTopAndBottomLayers                                  include_top_and_bottom_layers,
@@ -3575,61 +3726,54 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - layers segmentation in parallel - end";
     throw_on_cancel_callback();
 
-    // Fix-wave 2 (absorb-tail-fixwave2-review.md I-C): NARROW segmentation_claim_width_gapfill_
-    // off_by_color (object-wide per colour - see that parameter's own comment) to PER LAYER,
-    // using `segmented_regions` (just finished above) as the "is this colour actually painted
-    // HERE" signal - the accurate, real per-layer signal a gap-fill-disabled PARAMETER_MODIFIER
-    // confined to a small Z range needs, and the reason this narrowing happens HERE rather than
-    // in the caller (multi_material_segmentation_by_painting), which does not have
-    // `segmented_regions` at all (it is local to this function, built just above).
+    // Fix-wave 3 (absorb-tail-fixwave2-review.md I-1): derive this directly from
+    // compute_layer_color_stat's own small_region_threshold - now correctly resolved PER LAYER
+    // (see layer_color_stat_variant_applies_here) - instead of narrowing a SEPARATE, coarser
+    // object-wide-per-colour signal with the (a)+(b) approximation fix-wave 2 used here. That
+    // approximation was the bug: the top/bottom descent's own openings in
+    // segmentation_top_and_bottom_layers resolve their erosion width from layer_color_stat's
+    // per-colour block, which - unlike this site - stayed LAST-REGION-WINS and slice-ungated, so
+    // a gap-fill-off PARAMETER_MODIFIER anywhere on the object could erode the descent at the
+    // wide (gap-off) width on layers this site correctly judged "no gap-fill-off region nearby"
+    // and left narrow - measured: 8.14 / 6.01 mm2 base slivers at the sphere fixture's cap
+    // boundary (layers 149/150) with a modifier at print z 2-3, where the pre-fix-wave-2 parent
+    // commit absorbed them (both sides tracked the SAME object-wide signal back then). Now that
+    // compute_layer_color_stat itself resolves the applicable variant PER LAYER (via the
+    // variant's PARENT volume region's own slices, not the auto-created painted region's own
+    // - which is unconditionally empty here regardless of Z, see that function's own N1 comment),
+    // calling it again here for the SAME (layer, colour) can never disagree with what the descent
+    // already eroded there - by construction, not by keeping two approximations in sync by hand.
     //
-    // What this is NOT: `LayerRegion::slices` (layer_color_stat's own per-layer discipline)
-    // cannot be used to test "does THIS colour's own gap-fill-disabled PrintRegion variant apply
-    // here" directly - the auto-created painted PrintRegion (config().wall_filament ==
-    // color_idx) has EMPTY slices on EVERY layer at this point in the pipeline (apply_mm_
-    // segmentation, which writes them, runs AFTER this whole function - see layer_color_stat's
-    // own N1 guard comment for the proof). Gating on it regardless (as originally attempted,
-    // caught by this fix-wave's own new mesh-level test regressing an EXISTING gap_infill_speed
-    // =0 regression pin, not merely reasoned about) makes the per-layer data permanently empty
-    // for every layer, silently reverting Item 2's absorb-tracking fix to a no-op.
-    //
-    // So this uses TWO signals instead, combined: (a) segmented_regions[layer_idx][color_idx]
-    // non-empty - real paint presence for THIS colour at THIS layer, always accurate regardless
-    // of pipeline timing (it is what this function itself just computed from projected painted
-    // facets); (b) is a gap-fill-disabled region config Z-APPLICABLE at this layer at all -
-    // checked via ANY region (any wall_filament) on this layer with non-empty slices AND
-    // gap_infill_speed <= 0. (b) is only reliable when the region carrying it is an ordinarily-
-    // sliced one (the object's base-material variant under the SAME modifier, always present
-    // and sliced independently of paint), which is exactly the case a modifier confined to a Z
-    // range produces - its base-material sibling variant IS sliced normally and DOES correctly
-    // reflect that Z range via slices.empty(). The one remaining imprecision this does not
-    // resolve: with MULTIPLE gap-fill-disabled modifiers on DIFFERENT colours at DIFFERENT non-
-    // overlapping Z ranges, a layer where only one of them is Z-applicable still widens every
-    // colour that has a gap-fill-disabled region ANYWHERE on the object, not only the one whose
-    // modifier is actually active there - narrower than the fully object-wide bug this fix-wave
-    // targets (a layer with NO gap-fill-disabled region anywhere nearby, like probe E's z ~
-    // 2.6mm, correctly gets nothing), but not perfectly per-colour precise; documented rather
-    // than silently assumed away.
+    // The old segmented_regions[layer_idx][color_idx].empty() presence gate is dropped too
+    // (review point 3): a colour with nothing resolved here already leaves small_region_
+    // threshold_gapfill_off false (no entry below), and interclaim_absorb_effective_claim_
+    // width's own per-island adjacency test (intersection_ex(dilated, painted_claims[color_idx]))
+    // independently covers "is this colour's FINAL claim actually near this island", regardless
+    // of what this construction resolves - the gate was redundant with it, not a second line of
+    // defence (fix-wave2-review.md I-1, "theoretical, no bite measured").
     std::vector<std::vector<float>> claim_width_gapfill_off_by_layer_color(num_layers);
     if (! segmentation_claim_width_gapfill_off_by_color.empty()) {
-        for (size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-            bool gapfill_off_applies_here = false;
-            for (const LayerRegion *layerm : layers[layer_idx]->regions())
-                if (! layerm->slices.empty() && layerm->region().config().gap_infill_speed.value <= 0.f) {
-                    gapfill_off_applies_here = true;
-                    break;
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&layers, &print_object, segmentation_normal_depth, segmentation_min_claim_width, num_facets_states, &claim_width_gapfill_off_by_layer_color, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
+            for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
+                throw_on_cancel_callback();
+                std::vector<float> &by_color = claim_width_gapfill_off_by_layer_color[layer_idx];
+                for (size_t color_idx = 1; color_idx < num_facets_states; ++color_idx) {
+                    const LayerColorStat stat = compute_layer_color_stat(layers, print_object, segmentation_normal_depth, layer_idx, color_idx);
+                    if (! stat.small_region_threshold_gapfill_off)
+                        continue; // this layer's applicable variant has gap fill ON - min_claim_width alone applies, unchanged
+                    if (color_idx >= by_color.size())
+                        by_color.resize(color_idx + 1, 0.f);
+                    // 2 * unscaled(...): the gap-off arm is exactly ext_perimeter_width +
+                    // 0.7 * spacing (small_region_threshold halves and scales it - see
+                    // compute_layer_color_stat) - i.e. the SAME quantity the erosion sites in
+                    // segmentation_top_and_bottom_layers already used to build this layer's
+                    // claim. Floored at segmentation_min_claim_width defensively (interclaim_
+                    // absorb_effective_claim_width's own final std::max already guarantees this
+                    // floor regardless, since `widened` there starts at 0.f).
+                    by_color[color_idx] = std::max(segmentation_min_claim_width, 2.f * unscaled<float>(stat.small_region_threshold));
                 }
-            if (! gapfill_off_applies_here)
-                continue;
-            std::vector<float> &by_color = claim_width_gapfill_off_by_layer_color[layer_idx];
-            for (size_t color_idx = 1; color_idx < segmented_regions[layer_idx].size() && color_idx < segmentation_claim_width_gapfill_off_by_color.size(); ++color_idx) {
-                if (segmentation_claim_width_gapfill_off_by_color[color_idx] <= 0.f || segmented_regions[layer_idx][color_idx].empty())
-                    continue; // colour has no gap-fill-off region at all, or is not painted on this layer
-                if (color_idx >= by_color.size())
-                    by_color.resize(color_idx + 1, 0.f);
-                by_color[color_idx] = segmentation_claim_width_gapfill_off_by_color[color_idx];
             }
-        }
+        });
     }
 
     // Fix-wave (absorb-tail-review.md Minor 3 / M3): the F2 ladder's own deliberately-preserved
