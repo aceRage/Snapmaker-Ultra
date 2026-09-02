@@ -9,6 +9,8 @@
 #include <chrono>
 
 using namespace Slic3r;
+using Catch::Matchers::WithinAbs;
+using Catch::Matchers::WithinRel;
 
 // Facet indices of its_make_cube(x, y, z) (same table as test_paint_depth_clamp.cpp:39-52):
 // 0,1 = bottom (-Z); 2,3 = top (+Z); 4,5 = +X; 6,7 = +Y; 8,9 = -X; 10,11 = -Y.
@@ -93,10 +95,13 @@ TEST_CASE("colorsplit: strict patches share boundary vertices and cover the surf
     REQUIRE(p.states == std::vector<int>{2});
     REQUIRE(p.facet_state.size() == p.surface.indices.size());
     REQUIRE(its_num_open_edges(p.surface) == 0);
-    REQUIRE(its_volume(p.surface) == Approx(40. * 40. * 20.).epsilon(1e-6));
+    REQUIRE_THAT(its_volume(p.surface), WithinRel(40. * 40. * 20., 1e-6));
     size_t painted = 0;
     for (int s : p.facet_state) painted += (s == 2);
     REQUIRE(painted == 2);
+    size_t unpainted = 0;
+    for (int s : p.facet_state) unpainted += (s == 0);
+    REQUIRE(unpainted == p.surface.indices.size() - painted);
 }
 
 TEST_CASE("colorsplit: a brush stroke cutting through facets still yields a closed surface", "[colorsplit]")
@@ -131,4 +136,96 @@ TEST_CASE("colorsplit: an open mesh is refused", "[colorsplit]")
     TriangleMesh open_mesh(open);
     auto data = paint_data(open_mesh, all_with({0}, EnforcerBlockerType::Extruder2));
     REQUIRE_THROWS_AS(extract_color_patches(open_mesh.its, data), ColorSplitError);
+}
+
+static DynamicPrintConfig split_test_config(PaintDepthMode mode = pdmWalls, int walls = 3, double mm = 1.5)
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_num_extruders(2);
+    config.set_num_filaments(2);
+    config.option<ConfigOptionFloats>("nozzle_diameter")->values = {0.4, 0.4};
+    config.option<ConfigOptionFloats>("filament_diameter")->values = {1.75, 1.75};
+    config.option<ConfigOptionStrings>("filament_colour")->values  = {"#FFFFFF", "#804020"};
+    config.option<ConfigOptionFloatOrPercent>("outer_wall_line_width")->value   = 0.42;
+    config.option<ConfigOptionFloatOrPercent>("outer_wall_line_width")->percent = false;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value   = 0.45;
+    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = false;
+    config.option<ConfigOptionFloat>("layer_height")->value = 0.2;
+    config.option<ConfigOptionInt>("top_shell_layers")->value = 4;
+    config.option<ConfigOptionFloat>("top_shell_thickness")->value = 0.6;
+    config.option<ConfigOptionInt>("bottom_shell_layers")->value = 3;
+    config.option<ConfigOptionFloat>("bottom_shell_thickness")->value = 0.;
+    config.option<ConfigOptionEnum<PaintDepthMode>>("paint_depth_mode")->value = mode;
+    config.option<ConfigOptionInt>("paint_depth_walls")->value = walls;
+    config.option<ConfigOptionFloat>("paint_depth_mm")->value = mm;
+    config.option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator")->value = PerimeterGeneratorType::Classic;
+    return config;
+}
+
+TEST_CASE("colorsplit: depths mirror paint_depth_band_mm and the shell layer rules", "[colorsplit]")
+{
+    DynamicPrintConfig cfg = split_test_config();
+    ColorSplitDepths d = color_split_depths(cfg, {1, 2});
+    Flow ext = Flow::new_from_config_width(frExternalPerimeter, *cfg.option<ConfigOptionFloatOrPercent>("outer_wall_line_width"), 0.4f, 0.2f);
+    Flow per = Flow::new_from_config_width(frPerimeter,         *cfg.option<ConfigOptionFloatOrPercent>("inner_wall_line_width"), 0.4f, 0.2f);
+    float band = paint_depth_band_mm(pdmWalls, 3, 1.5, ext.width(), ext.spacing(), per.spacing());
+    band = paint_depth_band_classic_floor_mm(band, ext.width(), ext.spacing());
+    REQUIRE_THAT(d.D, WithinRel(double(band), 1e-5));
+    REQUIRE_THAT(d.ws, WithinRel(double(ext.width() + ext.spacing()), 1e-5));
+    REQUIRE_THAT(d.layer_height, WithinRel(0.2, 1e-5));
+    REQUIRE(!d.unlimited);
+    // top: max(4 layers, 0.6mm/0.2 = 3 layers) = 4 layers = 0.8mm; bottom: 3 layers, thickness 0 -> 0.6mm
+    REQUIRE_THAT(d.cap_top, WithinRel(0.8, 1e-5));
+    REQUIRE_THAT(d.cap_bottom, WithinRel(0.6, 1e-5));
+
+    cfg.option<ConfigOptionInt>("top_shell_layers")->value = 0;          // zero count = no shell: surface layer only
+    REQUIRE_THAT(color_split_depths(cfg, {1, 2}).cap_top, WithinRel(0.2, 1e-5));
+
+    ColorSplitDepths u = color_split_depths(split_test_config(pdmUnlimited), {1, 2});
+    REQUIRE(u.unlimited);
+    REQUIRE_THAT(color_split_depths(split_test_config(pdmMillimeters, 3, 2.5), {1, 2}).D, WithinRel(2.5, 1e-5));
+}
+
+TEST_CASE("colorsplit: per-vertex depth is min(D, half thickness)", "[colorsplit]")
+{
+    // 40x40x1.2 plate: D = 1.5 must clamp on the top face. A plain make_cube only has CORNER vertices on
+    // that face, and (as the block case below notes) their angle-weighted normal is the (+-1,+-1,+-1)/sqrt3
+    // bisector, not vertical - so the -n ray runs diagonally through the plate rather than straight down:
+    // it covers the 1.2mm of vertical drop over a path of 1.2*sqrt(3) ~= 2.07846mm before exiting the
+    // bottom face, giving t/2 - 0.002 ~= 1.03723mm (still < D = 1.5, so still a real clamp, just not down
+    // to half the nominal thickness - that number only applies where the normal is actually vertical).
+    TriangleMesh plate = make_cube(40., 40., 1.2);
+    ColorPatches pp = extract_color_patches(plate.its, paint_data(plate, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
+    std::vector<Vec3f> np = color_split_normals(pp.surface);
+    std::vector<float> dp = compute_vertex_depths(pp, np, 1.5);
+    for (size_t v = 0; v < pp.surface.vertices.size(); ++v)
+        if (pp.surface.vertices[v].z() > 1.0f) REQUIRE_THAT(dp[v], WithinAbs(1.03723f, 1e-3f));
+
+    // An INTERIOR vertex of a subdivided flat top only touches top-face triangles, so its angle-weighted
+    // normal is exactly vertical and the ray runs straight down: t = 1.2mm exactly, giving the textbook
+    // half-thickness-minus-delta clamp 1.2/2 - 0.002 = 0.598mm (the delta is part of the rule, not noise).
+    TriangleMesh plate_grid = make_grid_box(40., 40., 1.2, 2, 2);
+    ColorPatches pg = extract_color_patches(plate_grid.its, paint_by_predicate(plate_grid, [](Vec3f, Vec3f n) { return n.z() > 0.5f; }, EnforcerBlockerType::Extruder2));
+    std::vector<Vec3f> npg = color_split_normals(pg.surface);
+    std::vector<float> dpg = compute_vertex_depths(pg, npg, 1.5);
+    size_t center = 0;
+    float  best   = std::numeric_limits<float>::max();
+    for (size_t v = 0; v < pg.surface.vertices.size(); ++v) {
+        float dist = (pg.surface.vertices[v] - Vec3f(20.f, 20.f, 1.2f)).squaredNorm();
+        if (dist < best) { best = dist; center = v; }
+    }
+    REQUIRE(best < 1e-6f); // the (20,20,1.2) grid point must survive welding/compaction unmoved
+    REQUIRE_THAT(dpg[center], WithinAbs(0.598f, 1e-3f));
+
+    TriangleMesh block = make_cube(40., 40., 20.);
+    ColorPatches pb = extract_color_patches(block.its, paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
+    std::vector<Vec3f> nb = color_split_normals(pb.surface);
+    std::vector<float> db = compute_vertex_depths(pb, nb, 1.5);
+    // Corner normals are bisectors (angle weighted -> exact (±1,±1,1)/sqrt3); the ray along -n exits far away.
+    for (size_t v = 0; v < pb.surface.vertices.size(); ++v)
+        REQUIRE_THAT(db[v], WithinAbs(1.5f, 1e-4f));
+    // Unlimited (D = inf) -> half thickness along the normal: 10mm at the top-face interior direction is not
+    // sampled on a plain cube (only corner vertices exist), corners see the body diagonal/2.
+    std::vector<float> du = compute_vertex_depths(pb, nb, std::numeric_limits<double>::infinity());
+    for (float x : du) REQUIRE(x > 1.5f);
 }

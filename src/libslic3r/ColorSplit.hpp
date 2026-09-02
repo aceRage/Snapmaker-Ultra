@@ -29,4 +29,21 @@ struct ColorPatches {
 };
 ColorPatches extract_color_patches(const indexed_triangle_set &mesh, const TriangleSelector::TriangleSplittingData &paint);
 
+// Spec 3.3/3.5: world-mm depth model derived from the part's effective config.
+struct ColorSplitDepths {
+    double D            = 0.;   // normal depth; ignored when unlimited
+    double ws           = 0.;   // wall stack = external width + external spacing
+    double cap_top      = 0.;   // capped-group depth for up-facing flats (>= layer_height)
+    double cap_bottom   = 0.;   // same for down-facing flats
+    double layer_height = 0.;
+    bool   unlimited    = false;
+};
+// `filaments` = 1-based ids whose nozzle/flow take part (body extruder + painted filaments); the widest wins.
+ColorSplitDepths color_split_depths(const DynamicPrintConfig &effective, const std::vector<int> &filaments);
+
+// Spec 3.2: angle-weighted vertex normals of the full surface F.
+std::vector<Vec3f> color_split_normals(const indexed_triangle_set &surface);
+// Spec 3.4 (rev 2.2): d(v) = min(D, t(v)/2 - delta), delta = 0.002 mm, t(v) = thickness along -n(v). D may be +inf (unlimited).
+std::vector<float> compute_vertex_depths(const ColorPatches &patches, const std::vector<Vec3f> &normals, double D);
+
 } // namespace Slic3r
