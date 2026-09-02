@@ -22,7 +22,10 @@ ColorSplitDepths effective_depths(const ColorSplitDepths &depths, const ColorSpl
 // other direction - it has to re-measure along the one its wall actually travels.
 float half_thickness_along(const AABBMesh &aabb, const Vec3f &v, const Vec3f &dir);
 // compute_vertex_depths on a tree the caller already holds, so the shell builder and the depth model share one.
-std::vector<float> vertex_depths(const AABBMesh &aabb, const ColorPatches &patches, const std::vector<Vec3f> &normals, double D);
+// `half_thickness`, when given, receives the RAW t(v)/2 - delta of every vertex, before D is applied: spec
+// 3.4a's mitre lengthens a bisector segment past d(v) and needs the clamp on its own to bound it again.
+std::vector<float> vertex_depths(const AABBMesh &aabb, const ColorPatches &patches, const std::vector<Vec3f> &normals, double D,
+                                 std::vector<float> *half_thickness = nullptr);
 
 } // namespace ColorSplitDetail
 } // namespace Slic3r

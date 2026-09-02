@@ -146,12 +146,19 @@ float half_thickness_along(const AABBMesh &aabb, const Vec3f &v, const Vec3f &di
     return float(std::max(0., t / 2. - 0.002));
 }
 
-std::vector<float> vertex_depths(const AABBMesh &aabb, const ColorPatches &p, const std::vector<Vec3f> &normals, double D)
+std::vector<float> vertex_depths(const AABBMesh &aabb, const ColorPatches &p, const std::vector<Vec3f> &normals, double D,
+                                 std::vector<float> *half_thickness)
 {
     const float cap = float(std::isfinite(D) ? D : std::numeric_limits<float>::max());
     std::vector<float> d(p.surface.vertices.size());
-    for (size_t v = 0; v < p.surface.vertices.size(); ++v)
-        d[v] = std::min(cap, half_thickness_along(aabb, p.surface.vertices[v], normals[v]));
+    if (half_thickness) half_thickness->resize(p.surface.vertices.size());
+    for (size_t v = 0; v < p.surface.vertices.size(); ++v) {
+        // One probe answers both questions, so spec 3.4a's clamp costs no extra ray casts: d(v) is this
+        // number capped at D, and the mitred length below is bounded by the number itself.
+        const float half = half_thickness_along(aabb, p.surface.vertices[v], normals[v]);
+        if (half_thickness) (*half_thickness)[v] = half;
+        d[v] = std::min(cap, half);
+    }
     return d;
 }
 

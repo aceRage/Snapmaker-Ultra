@@ -45,6 +45,11 @@ ColorSplitDepths color_split_depths(const DynamicPrintConfig &effective, const s
 // Spec 3.2: angle-weighted vertex normals of the full surface F.
 std::vector<Vec3f> color_split_normals(const indexed_triangle_set &surface);
 // Spec 3.4 (rev 2.2): d(v) = min(D, t(v)/2 - delta), delta = 0.002 mm, t(v) = thickness along -n(v). D may be +inf (unlimited).
+// d(v) is a depth measured PERPENDICULAR to the painted patch, not a distance to travel: spec 3.4a (rev 2.9,
+// Ruling 24) mitres every segment that runs along the bisector n(v) to d(v) / max(n(v).n_P, 0.5) - so a plain
+// cube face, whose only vertices are its corners, really does get D of depth instead of D/sqrt(3) - and then
+// clamps it back to t(v)/2 - delta, the very thickness probed here. Segments that run along the patch normal
+// n_P (spec 3.6's crease cases A and B's first step, the concave and same-state walls) spend d(v) as it stands.
 std::vector<float> compute_vertex_depths(const ColorPatches &patches, const std::vector<Vec3f> &normals, double D);
 
 // The split's optional refinements; the dialog owns them. flat_cap gives an up- or down-facing flat group

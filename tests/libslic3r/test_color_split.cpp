@@ -290,14 +290,14 @@ TEST_CASE("colorsplit: shell of a painted top face is a closed slab of depth D",
     REQUIRE(c.closed);
     REQUIRE(!c.self_intersects);
     // The only vertices of the painted top face are the four cube corners, whose angle-weighted normals are the
-    // (+-1,+-1,1)/sqrt(3) bisectors. d = 1.5 is measured ALONG that normal, so each corner moves 1.5/sqrt(3) =
-    // 0.866mm in x, in y AND in z - the slab is the frustum between the 40x40 top and a 38.268x38.268 bottom
-    // 0.866mm below it, NOT a 1.5mm-deep slab (the brief's 37*37*1.5 lower bound assumed a 1.5mm vertical drop
-    // and is unreachable by construction). Square frustum: h/3 * (A_top + A_bottom + sqrt(A_top*A_bottom)).
-    const double off     = 1.5 / std::sqrt(3.);
-    const double side    = 40. - 2. * off;
-    const double frustum = off / 3. * (1600. + side * side + 40. * side);   // = 1326.507 mm^3
-    REQUIRE(c.volume < 40. * 40. * off);                                    // strictly inside the straight prism
+    // (+-1,+-1,1)/sqrt(3) bisectors. Spec 3.4a (Ruling 24): d = 1.5 is a depth PERPENDICULAR to the patch, so a
+    // segment travelling along the bisector is mitred to d / (n(v).n_P) = 1.5 * sqrt(3) = 2.598mm long, which is
+    // 1.5mm in x, in y AND in z - the 45 degree Voronoi diagonal the 2D segmentation produces. The slab is the
+    // frustum between the 40x40 top and a 37x37 bottom 1.5mm below it. (Without the mitre the corners moved only
+    // 1.5/sqrt(3) = 0.866mm per axis and the piece was a third short of its claim.)
+    // Square frustum: h/3 * (A_top + A_bottom + sqrt(A_top*A_bottom)) = 0.5 * (1600 + 1369 + 1480).
+    const double frustum = 1.5 / 3. * (1600. + 37. * 37. + 40. * 37.);      // = 2224.5 mm^3
+    REQUIRE(c.volume < 40. * 40. * 1.5);                                    // strictly inside the straight prism
     REQUIRE_THAT(c.volume, WithinRel(frustum, 1e-4));                       // its_volume accumulates in float
 }
 
@@ -528,7 +528,8 @@ TEST_CASE("colorsplit: depth_override_mm replaces D and clears unlimited", "[col
 {
     // Unlimited would take every vertex to half the block's thickness; the override has to win over both the
     // depth AND the unlimited flag. The painted top face's only vertices are the cube corners, whose
-    // (+-1,+-1,1)/sqrt(3) bisector normals turn an 0.7mm depth into 0.7/sqrt(3) = 0.40415mm of vertical drop.
+    // (+-1,+-1,1)/sqrt(3) bisector normals carry a mitred 0.7*sqrt(3) = 1.2124mm segment (spec 3.4a) - 0.7mm
+    // of vertical drop, the override read as the perpendicular depth it is.
     TriangleMesh block = make_cube(40., 40., 20.);
     ColorPatches p = extract_color_patches(block.its, paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
     ColorSplitParams params = no_cap_no_step();
@@ -538,7 +539,7 @@ TEST_CASE("colorsplit: depth_override_mm replaces D and clears unlimited", "[col
     float min_z = shells[0].mesh.vertices.front().z(), max_z = min_z;
     for (const Vec3f &v : shells[0].mesh.vertices) { min_z = std::min(min_z, v.z()); max_z = std::max(max_z, v.z()); }
     REQUIRE_THAT(max_z, WithinAbs(20.f, 1e-4f));
-    REQUIRE_THAT(min_z, WithinAbs(20.f - float(0.7 / std::sqrt(3.)), 1e-4f));
+    REQUIRE_THAT(min_z, WithinAbs(20.f - 0.7f, 1e-4f));
 }
 
 TEST_CASE("colorsplit: partition of a painted top is exact and complementary", "[colorsplit]")
@@ -737,10 +738,10 @@ TEST_CASE("colorsplit: a painted cube top and side are two smooth patches with s
     // Every boundary vertex, not just the deepest one (Task 5 review follow-up). Each patch is one quad, so
     // its shell is exactly four top copies and four bottom copies. Ruling 19: a corner that carries the
     // SAME-STATE crease edge (the shared top/+X edge) walks straight down the patch's own normal - 1.5 in z
-    // for the top slab, 1.5 in x for the side slab - while a corner that carries none tapers along the cube's
-    // corner bisector, 1.5/sqrt(3) = 0.866 in each axis. "Every bottom at 18.5" is NOT reachable: the two
-    // corners at x = 0 carry no same-state edge and a vertex has exactly one bottom copy.
-    const float t = 1.5f / std::sqrt(3.f);
+    // for the top slab, 1.5 in x for the side slab. A corner that carries none tapers along the cube's corner
+    // bisector, and spec 3.4a (Ruling 24) mitres that segment to 1.5*sqrt(3) so its PERPENDICULAR depth is
+    // 1.5 as well: 1.5 in each axis, the 45 degree diagonal. Every bottom copy of the top slab is therefore
+    // at z = 18.5 and every bottom copy of the side slab at x = 38.5, by two different rules.
     auto has = [](const indexed_triangle_set &m, const Vec3f &q) {
         return std::any_of(m.vertices.begin(), m.vertices.end(), [&](const Vec3f &v) { return (v - q).norm() < 1e-3f; });
     };
@@ -749,14 +750,39 @@ TEST_CASE("colorsplit: a painted cube top and side are two smooth patches with s
     const indexed_triangle_set &side_slab = zero_is_top ? shells[1].mesh : shells[0].mesh;
     require_vertices_are(top_slab,
                          {{0.f, 0.f, 20.f}, {40.f, 0.f, 20.f}, {40.f, 40.f, 20.f}, {0.f, 40.f, 20.f},
-                          {t, t, 20.f - t}, {40.f, 0.f, 18.5f}, {40.f, 40.f, 18.5f}, {t, 40.f - t, 20.f - t}}, 1e-3f);
+                          {1.5f, 1.5f, 18.5f}, {40.f, 0.f, 18.5f}, {40.f, 40.f, 18.5f}, {1.5f, 38.5f, 18.5f}}, 1e-3f);
     require_vertices_are(side_slab,
                          {{40.f, 0.f, 0.f}, {40.f, 40.f, 0.f}, {40.f, 40.f, 20.f}, {40.f, 0.f, 20.f},
-                          {38.5f, 0.f, 20.f}, {38.5f, 40.f, 20.f}, {40.f - t, t, t}, {40.f - t, 40.f - t, t}}, 1e-3f);
+                          {38.5f, 0.f, 20.f}, {38.5f, 40.f, 20.f}, {38.5f, 1.5f, 1.5f}, {38.5f, 38.5f, 1.5f}}, 1e-3f);
     ColorSplitResult r = split_volume_by_paint(block.its, paint_data(block, facets), depths_for_test(1.5, 0.2, 0.87), params, nullptr);
     REQUIRE(r.pieces.size() == 1);
     double total = volume_of(r.body) + volume_of(r.pieces[0].second);
     REQUIRE_THAT(total, WithinRel(40. * 40. * 20., 1e-4));
+}
+
+TEST_CASE("colorsplit: a plain painted face is D deep perpendicular to itself (mitred bisector)", "[colorsplit]")
+{
+    // Spec 3.4a (Ruling 24), pinned directly on the fixture that motivated it: a plain cube face whose only
+    // vertices are its four corners. Their bisectors make an angle of acos(1/sqrt(3)) = 54.7 degrees with the
+    // face, so an unmitred segment of length d buys only d/sqrt(3) = 0.866 of perpendicular depth. The mitre
+    // divides by n(v).n_P, spending d * sqrt(3) = 2.598 along the bisector instead, which lands every bottom
+    // copy exactly d = 1.5 behind the face and exactly d in from the two faces the corner shares - the 45
+    // degree Voronoi diagonal the 2D segmentation draws at the same edge. Nothing is clamped here: the
+    // half-thickness along the corner diagonal of a 40x40x20 block is 17.3 mm.
+    TriangleMesh block = make_cube(40., 40., 20.);
+    ColorPatches p = extract_color_patches(block.its, paint_data(block, all_with(CUBE_PLUS_X, EnforcerBlockerType::Extruder2)));
+    auto shells = build_color_shells(p, depths_for_test(1.5, 0.2, 0.87), no_cap_no_step(), nullptr);
+    REQUIRE(shells.size() == 1);
+    require_vertices_are(shells[0].mesh,
+                         {{40.f, 0.f, 0.f}, {40.f, 40.f, 0.f}, {40.f, 40.f, 20.f}, {40.f, 0.f, 20.f},
+                          {38.5f, 1.5f, 1.5f}, {38.5f, 38.5f, 1.5f}, {38.5f, 38.5f, 18.5f}, {38.5f, 1.5f, 18.5f}}, 1e-4f);
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+    // ... and the solid between the 40x20 face and the 37x17 rectangle 1.5mm behind it is that prismatoid:
+    // h/6 * (A_top + 4*A_mid + A_bottom) with A_mid = 38.5 x 18.5, i.e. 1069.5 mm^3. (The pyramid-frustum
+    // formula does not apply - 40:20 and 37:17 are not similar rectangles.)
+    REQUIRE_THAT(c.volume, WithinRel(1.5 / 6. * (40. * 20. + 4. * 38.5 * 18.5 + 37. * 17.), 1e-4));
 }
 
 // ---- Spec 3.5 (flat cap) and 3.6 (crease step), both on by default. ----
@@ -772,16 +798,17 @@ TEST_CASE("colorsplit: flat top is capped at the solid shell depth, slopes are n
     ColorPatches p = extract_color_patches(block.its, data);
 
     // Crease step OFF isolates the cap. The only vertices of a plain cube's top face are its four corners,
-    // whose angle-weighted normal is the (+-1,+-1,1)/sqrt(3) bisector, so 0.6 mm of depth ALONG that normal
-    // is 0.6/sqrt(3) = 0.346 mm of z: what shrank is the cap depth (uncapped would be 1.5), not the taper.
+    // whose angle-weighted normal is the (+-1,+-1,1)/sqrt(3) bisector; spec 3.4a mitres the segment along it
+    // to 0.6 * sqrt(3), which is 0.6 mm of z. The cap depth is what this pins (uncapped would be 1.5) - and
+    // since the mitre already makes the perpendicular depth exact, the step does not change the number.
     ColorSplitParams params = cap_and_step(); params.crease_step = false;
     auto shells = build_color_shells(p, d, params, nullptr);
     REQUIRE(shells.size() == 1);
     REQUIRE(shells[0].capped);
-    REQUIRE_THAT(min_z(shells[0].mesh), WithinAbs(20.f - 0.6f / std::sqrt(3.f), 1e-4f));
+    REQUIRE_THAT(min_z(shells[0].mesh), WithinAbs(20.f - 0.6f, 1e-4f));
 
     // Crease step ON (the shipping default): spec 3.6 case A walks the rim straight down n_P after one layer,
-    // so the same cap depth shows up as a vertical 0.6 - the 19.4 the brief pins.
+    // so the same cap depth shows up as a vertical 0.6 - the 19.4 the brief pins, by a different route.
     auto stepped = build_color_shells(p, d, cap_and_step(), nullptr);
     REQUIRE(stepped.size() == 1);
     REQUIRE(stepped[0].capped);
@@ -977,7 +1004,11 @@ TEST_CASE("colorsplit: a painted top narrower than two wall stacks falls back to
     // (The flat cap does not fire either - 1.5 mm is under its 3-wall-stack core gate.)
     REQUIRE(!shells[0].capped);
     const float dep = float(1.5 * std::sqrt(3.) / 2. - 0.002);   // half the bisector thickness of a 1.5 mm wall
-    const float bot = dep / std::sqrt(3.f), rng = 0.2f / std::sqrt(3.f);   // spread over x, y and z alike
+    // Spec 3.4a mitres both segments, then clamps each by the half-thickness along the bisector. The ring's
+    // one layer becomes 0.2*sqrt(3) long - a vertical 0.2, one real layer down - while the bottom's 1.29704
+    // is ALREADY the clamp (1.29704 * sqrt(3) = 2.247 is far past it), so the bottom does not move at all:
+    // this fixture's corners are held by their own mid-thickness, not by D.
+    const float bot = dep / std::sqrt(3.f), rng = 0.2f;          // spread over x, y and z alike
     require_vertices_are(shells[0].mesh,
                          {{0.f, 0.f, 20.f}, {40.f, 0.f, 20.f}, {40.f, 1.5f, 20.f}, {0.f, 1.5f, 20.f},
                           {rng, rng, 20.f - rng}, {40.f - rng, rng, 20.f - rng},
@@ -1023,8 +1054,10 @@ TEST_CASE("colorsplit: a capped group and the uncapped group beside it meet alon
     REQUIRE(shells.size() == 2);
     REQUIRE(shells[0].capped);        // spec 3.8: within a filament the capped groups come first
     REQUIRE(!shells[1].capped);
-    const float s   = 1.f / std::sqrt(3.f);       // a cube corner's angle-weighted normal component
-    const float rim = (1.5f - 0.87f) * s;         // case B: how far the bisector taper below the ring reaches
+    // Case B: how far the mitred bisector taper below the ring reaches. Its length is (1.5 - 0.87)*sqrt(3),
+    // so it spends 1.5 - 0.87 = 0.63 on each axis: the piece's depth along n_P is the wall stack plus that,
+    // i.e. exactly D, and the taper is the 45 degree diagonal (spec 3.4a).
+    const float rim = 1.5f - 0.87f;
     // Top slab, capped at 0.8: the two corners on the shared (same-state) edge walk straight down 0.8, the
     // two at x = 0 take case A - a mitred 0.87 inward and one layer down, then straight down n_P by the rest.
     require_vertices_are(shells[0].mesh,
@@ -1660,18 +1693,45 @@ TEST_CASE("colorsplit e2e: split parts slice like the 2D paint-depth claim on a 
     // The middle half only: near the top and bottom edges the two paths differ BY DESIGN - the 3D shell
     // tapers along the cube's corner bisector where the painted face meets the caps (spec 3.6), which the 2D
     // segmentation, working one layer at a time with no notion of the faces above or below, cannot express.
-    const double one_line = 40. * 0.42;                    // one outer wall line over the 40mm painted edge
+    const ColorSplitDepths depths = color_split_depths(config, {1, 2});
+    const double D = depths.D, ws = depths.ws;             // 1.40885 / 0.79708 mm from e2e_config()
+    const double one_line = 40. * config.option<ConfigOptionFloatOrPercent>("outer_wall_line_width")->value;
+    // What each path claims on a middle layer, both derived, neither observed:
+    //  * 2D: the +X edge's Voronoi cell is a trapezoid D deep whose ends chamfer at 45 degrees where they meet
+    //    the +-Y edges' cells, i.e. D * (40 - D) mm^2.
+    //  * 3D (spec 3.4a): the mitred bisector makes the piece exactly D deep perpendicular to the painted face,
+    //    but spec 3.6 case B holds the full wall stack before that taper starts, so its ends chamfer from a
+    //    depth of ws instead of 0: 40*D - (D - ws)^2. The gap between the two, ws * (2D - ws) = 1.61 mm^2, is
+    //    that deliberate deviation and nothing else. (Before the mitre the piece was only
+    //    ws + (D - ws)/sqrt(3) = 1.150 mm deep against the band's 1.409, and fell 8.48 mm^2 short.)
+    const double claim_2d = 40. * D - D * D;
+    const double claim_3d = 40. * D - (D - ws) * (D - ws);
+    // The 2D path also notches every other layer by mmu_segmented_region_interlocking_depth (the interlocking
+    // teeth), which costs those layers i * (40 - 2D + i) mm^2. The configured i is an upper bound - the classic
+    // notch cap can only shrink it, which brings the two paths closer - so it bounds the worst layer.
+    const double i_lock = config.option<ConfigOptionFloat>("mmu_segmented_region_interlocking_depth")->value;
+    const double notch  = i_lock * (40. - 2. * D + i_lock);
+    const double bound  = (claim_3d - claim_2d) + notch + 0.05;      // 1.611 + 3.728 + slack = 5.389 mm^2
     const size_t first = o2d->layer_count() / 4, last = 3 * o2d->layer_count() / 4;
     REQUIRE(first < last);
+    double worst = 0., a2_odd = 0., a2_even = 0., a3_seen = 0.;
     for (size_t i = first; i < last; ++i) {
         const double a2 = filament_area(o2d->layers()[i], 2), a3 = filament_area(o3d->layers()[i], 2);
         INFO("layer " << i << " print_z " << o2d->layers()[i]->print_z << ": 2D " << a2 << " mm^2, 3D " << a3
-             << " mm^2, diff " << (a2 - a3) << " mm^2 (bound " << one_line << ")");
+             << " mm^2, diff " << (a2 - a3) << " mm^2 (bound " << bound << ", one outer wall line " << one_line << ")");
         REQUIRE(a2 > 0.);                                  // both paths really claim something ...
         REQUIRE(a3 > 0.);
         REQUIRE_THAT(layer_area(o3d->layers()[i]), WithinRel(40. * 40., 1e-3));   // ... and the parts still tile the cube
-        REQUIRE(std::abs(a2 - a3) <= one_line);
+        REQUIRE_THAT(a3, WithinAbs(claim_3d, 0.05));       // the 3D piece is D deep perpendicular to the face
+        REQUIRE(std::abs(a2 - a3) <= bound);               // ... and within the two deviations derived above
+        worst = std::max(worst, std::abs(a2 - a3));
+        (i % 2 ? a2_odd : a2_even) = a2;
+        a3_seen = a3;
     }
+    WARN("parity over layers " << first << ".." << (last - 1) << ": 2D odd " << a2_odd << ", 2D even " << a2_even
+         << ", 3D " << a3_seen << " mm^2; worst diff " << worst << " of " << bound << " (2D claim " << claim_2d
+         << ", 3D claim " << claim_3d << ", case B ring " << (claim_3d - claim_2d) << ", notch " << notch
+         << "; D " << D << ", ws " << ws << ", one outer wall line " << one_line << ")");
 }
 
 TEST_CASE("colorsplit e2e S4: painted cube top keeps a body outer wall on the side faces", "[colorsplit_spike]")

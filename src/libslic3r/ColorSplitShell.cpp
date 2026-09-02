@@ -210,6 +210,7 @@ struct GroupTopology {
     std::vector<int>                             boundary_count;  // per vertex: boundary edges meeting it
     std::map<std::pair<int, int>, int>           wedge_of;        // (vertex, facet) -> wedge; pinch vertices only
     std::map<std::pair<int, int>, Vec3f>         nudge;           // (vertex, wedge) -> Ruling 8 separation
+    std::map<std::pair<int, int>, Vec3f>         n_patch;         // (vertex, wedge) -> unit n_P, zero if degenerate
     std::map<std::pair<int, int>, CreaseWall>    wall;            // (vertex, wedge) -> spec 3.6 crease wall
     std::map<std::pair<int, int>, CreaseStep>    step;            // (vertex, wedge) -> spec 3.6 convex crease
 
@@ -277,21 +278,27 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
     // four spec 3.6 cases are classified from these: the concave and same-state ones become walls, the two
     // convex ones become steps.
     struct BoundaryInfo {
-        Vec3f n_p{Vec3f::Zero()}, n_q{Vec3f::Zero()}, t_in{Vec3f::Zero()};
+        Vec3f n_q{Vec3f::Zero()}, t_in{Vec3f::Zero()};
         int   same_state = 0;    // boundary edges whose OUTSIDE facet carries this group's own state
         int   edges      = 0;    // boundary edges of this wedge meeting the vertex
     };
     std::map<std::pair<int, int>, BoundaryInfo> boundary;
 
     // n_P takes EVERY group facet at the vertex, boundary edge or not: it is the painted surface's own
-    // orientation there, which is what the wall at a crease follows.
+    // orientation there, which is what the wall at a crease follows - and, since spec 3.4a (Ruling 24), the
+    // reference the mitre measures the bisector against, so it is kept for INTERIOR vertices too. An interior
+    // vertex of a curved patch does not share the group's mean normal, so this has to stay per vertex.
     for (int f : group) {
         const Vec3f nf = unit_normal(f);
         for (int k = 0; k < 3; ++k) {
-            const int v = p.surface.indices[f][k];
-            if (topo.boundary_count[v] > 0) boundary[{v, topo.wedge(v, f)}].n_p += nf;
+            const std::pair<int, int> key{p.surface.indices[f][k], topo.wedge(p.surface.indices[f][k], f)};
+            // emplace, not operator[]: an Eigen vector's default constructor leaves it UNINITIALISED, so a
+            // map's value-initialised slot would be garbage to accumulate onto.
+            topo.n_patch.emplace(key, Vec3f(Vec3f::Zero())).first->second += nf;
         }
     }
+    for (std::pair<const std::pair<int, int>, Vec3f> &entry : topo.n_patch)
+        entry.second = entry.second.squaredNorm() > 0.f ? Vec3f(entry.second.normalized()) : Vec3f(Vec3f::Zero());
     for (int f : group)
         for (int k = 0; k < 3; ++k) {
             const int n = nbrs[f][k];
@@ -379,9 +386,9 @@ GroupTopology group_topology(const ColorPatches &p, const std::vector<Vec3i32> &
         const BoundaryInfo &info = entry.second;
         // n_P is all the same-state rule needs, so only the concave test may demand n_Q and t_in as well
         // (an outside neighbourhood whose normals cancel must not cost a patch its straight same-state wall).
-        if (info.n_p.squaredNorm() <= 0.f)
+        const Vec3f n_p = topo.n_patch.at(entry.first);
+        if (n_p.squaredNorm() <= 0.f)
             continue;                                  // degenerate facets: no orientation to judge
-        const Vec3f n_p     = info.n_p.normalized();
         const bool  outside = info.n_q.squaredNorm() > 0.f && info.t_in.squaredNorm() > 0.f;
         const Vec3f n_q     = outside ? Vec3f(info.n_q.normalized()) : Vec3f(Vec3f::Zero());
         const Vec3f t_in    = outside ? Vec3f(info.t_in.normalized()) : Vec3f(Vec3f::Zero());
@@ -432,6 +439,7 @@ struct ShellBuilder {
     const GroupTopology        &topo;          // group_topology(p, nbrs, aabb, depths, params, group, state)
     const std::vector<float>   &d0;            // compute_vertex_depths output; the halving floor may not exceed it
     std::vector<float>          depth;         // working copy of d0 (the fold guard lowers it)
+    const std::vector<float>   &half;          // raw t(v)/2 - delta along n(v); spec 3.4a's clamp on the mitre
     const ColorSplitDepths     &depths;
     bool                        crease_step;   // ColorSplitParams::crease_step (spec 3.6's convex cases)
 
@@ -439,6 +447,21 @@ struct ShellBuilder {
     // says whether the ring is a copy of its own: when it is not, the side of the shell is the single strip
     // (b, a, a', b') this stage built before the ring existed.
     struct SideOffsets { Vec3f ring{Vec3f::Zero()}, bottom{Vec3f::Zero()}; bool stepped = false; };
+
+    // Spec 3.4a (Ruling 24): how far a segment has to travel ALONG THE BISECTOR n(v) to bury `d` of depth
+    // perpendicular to the patch. d is a depth, not a distance: on a plain cube face - whose only vertices
+    // are its corners, at 54.7 degrees to it - spending d along n(v) buried only d/sqrt(3), a third of the
+    // claim (the Task 8 parity measurement: 45.9 mm^2/layer against the 2D band's 54.4). Dividing by
+    // n(v).n_P is the classic mitre, and it lands the corner on the 45 degree diagonal the 2D Voronoi
+    // segmentation draws at the same edge. The 0.5 floor is the mitre limit of 2 (a 60 degree half-angle):
+    // at a needle-sharp spike the exact mitre runs away, and doubling the depth there is already generous.
+    // The half-thickness probe then clamps the LENGTHENED segment - it is measured along n(v), which is
+    // exactly the direction travelled - so no mitred wall can cross the mid-surface (spec 3.4).
+    float bisector_length(int v, const Vec3f &n_p, float d) const
+    {
+        const float cosang = n_p.squaredNorm() > 0.f ? std::max(0.5f, normals[v].dot(n_p)) : 1.f;
+        return std::min(d / cosang, half[v]);
+    }
 
     // build() and fold_guard() share this, so the guard always judges the shell that is actually built.
     SideOffsets side_offsets(int v, int wedge_id, double cap_depth) const
@@ -456,17 +479,22 @@ struct ShellBuilder {
             const Vec3f bottom = -std::min(d, wall->second.half_thickness) * wall->second.n_p;
             return {bottom, bottom, false};
         }
-        if (!crease_step || topo.boundary_count[v] == 0)   // interior vertices are never on a strip
-            return {Vec3f(-d * normals[v]), Vec3f(-d * normals[v]), false};
+        // Spec 3.4a: the three segments below that travel along n(v) are mitred against the patch normal
+        // there, which every group vertex carries - a curved patch's interior does not share one.
+        const Vec3f n_patch = topo.n_patch.at({v, wedge_id});
+        if (!crease_step || topo.boundary_count[v] == 0) { // interior vertices are never on a strip
+            const Vec3f bottom = -bisector_length(v, n_patch, d) * normals[v];
+            return {bottom, bottom, false};
+        }
 
         // Every first segment is clamped to d: the ring may never sink past the bottom, and d is what spec
         // 3.4 measured as the room this vertex has before its mid-surface.
         const auto step = topo.step.find({v, wedge_id});
         Vec3f      ring, bottom;
         if (step == topo.step.end()) {                     // plain boundary: one layer down, then the taper
-            const float first = std::min(d, h);
-            ring   = -first * normals[v];
-            bottom = -d * normals[v];
+            const float first = std::min(d, h);            // mitred alike, so the ring really is a layer down
+            ring   = -bisector_length(v, n_patch, first) * normals[v];
+            bottom = -bisector_length(v, n_patch, d) * normals[v];
         } else if (step->second.case_a) {                  // painted face more horizontal: inset, then n_P
             const float d_p   = std::min(d, step->second.half_thickness);   // Ruling 20: clamped along n_P
             const float first = std::min(d_p, h);
@@ -474,13 +502,14 @@ struct ShellBuilder {
             bottom = ring - (d_p - first) * step->second.n_p;
         } else {                                           // painted face less horizontal: a full stack in
             // Ruling 21: the wall stack is spent along n_P, so it is the n_P mid-thickness that bounds it -
-            // and the SAME budget bounds what is left for the taper, since the bottom's depth along n_P is
-            // first + (d_p - first) * (n(v) . n_P) <= d_p. Clamping only the step would still walk the
-            // second segment across the mid-surface on a thin wall.
+            // and the SAME budget bounds what is left for the taper. Spec 3.4a mitres that second segment,
+            // which makes the equality exact: it buries (d_p - first) of depth along n_P, so the bottom sits
+            // d_p behind the surface, never more. Clamping only the step would still walk the second segment
+            // across the mid-surface on a thin wall.
             const float d_p   = std::min(d, step->second.half_thickness);
             const float first = std::min(d_p, ws);
             ring   = -first * step->second.n_p;
-            bottom = ring - (d_p - first) * normals[v];
+            bottom = ring - bisector_length(v, n_patch, d_p - first) * normals[v];
         }
         // Spec 3.6: when the depth leaves no room for a second strip - less than a layer of it - the bottom
         // collapses onto the ring and only the first strip is emitted.
@@ -636,7 +665,10 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
     // One tree for the whole stage: the depth model probes it per vertex, and spec 3.6's crease walls
     // re-probe it along their own direction.
     const AABBMesh       aabb(p.surface);
-    std::vector<float>   depth   = ColorSplitDetail::vertex_depths(aabb, p, normals, D);
+    // half = the same probe without D applied: spec 3.4a's mitre spends more than d(v) along the bisector and
+    // this is what stops it at the mid-surface all the same.
+    std::vector<float>   half;
+    std::vector<float>   depth   = ColorSplitDetail::vertex_depths(aabb, p, normals, D, &half);
 
     // Materialise every group up front: the progress callback is documented as a 0..100 percentage
     // (ColorSplit.hpp) and this stage owns the 10..50 band, so the tick needs the real group total - a single
@@ -665,7 +697,7 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
         const double            cap_depth = group.cap;
         const GroupTopology topo = group_topology(p, nbrs, aabb, depths, params, comp, s);
         // d0 (reference) and its working copy
-        ShellBuilder sb{p, nbrs, normals, topo, depth, depth, depths, params.crease_step};
+        ShellBuilder sb{p, nbrs, normals, topo, depth, depth, half, depths, params.crease_step};
         for (int round = 0; round < 8 && sb.fold_guard(comp, cap_depth); ++round) {}
         indexed_triangle_set mesh = sb.build(comp, cap_depth);
         ShellCheck check = check_shell(mesh);
