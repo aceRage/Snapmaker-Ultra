@@ -1199,7 +1199,7 @@ ColorPatches refine_color_patches(const ColorPatches &patches, double max_edge_m
 double color_split_refine_length(const ColorSplitDepths &, const ColorSplitParams &, const BoundingBoxf3 &mesh_bbox);
 ```
 
-`refine_color_patches` (ColorSplitPartition.cpp): `manifold::Manifold m = to_manifold64(patches.surface)` (no `AsOriginal` needed) -> `manifold::Manifold r = m.RefineToLength(max_edge_mm)` -> `from_manifold(r)` -> for each refined triangle, centroid -> `AABBMesh(patches.surface).squared_distance(centroid, face_idx, closest)` -> `facet_state[f] = patches.facet_state[face_idx]`; copy `states`; `its_num_open_edges` must stay 0 (throw `ColorSplitError` otherwise). If `RefineToLength` returns a mesh with the same triangle count (nothing to refine), return the input unchanged.
+`refine_color_patches` (ColorSplitPartition.cpp, Ruling 17): edge-selective longest-edge bisection — build an edge map (edge → its two incident facets), repeatedly split every edge longer than `max_edge_mm` at its midpoint and bisect BOTH incident triangles toward the new vertex (conforming, 2-manifold), new sub-facets inherit the parent's `facet_state`; loop until no edge exceeds the limit (bounded number of passes). Copy `states`; `its_num_open_edges` must stay 0 (throw `ColorSplitError` otherwise); return the input unchanged when nothing exceeds the limit. Manifold's uniform `RefineToLength` must NOT be used (it splits short chords too and disorders the offset ring — Task 5 evidence).
 
 `color_split_refine_length`: as specified in Interfaces.
 
