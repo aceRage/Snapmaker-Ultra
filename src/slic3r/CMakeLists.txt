@@ -78,6 +78,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/CameraUtils.hpp
     GUI/CloneDialog.cpp
     GUI/CloneDialog.hpp
+    GUI/ColorSplitDialog.cpp
+    GUI/ColorSplitDialog.hpp
     GUI/ConfigManipulation.cpp
     GUI/ConfigManipulation.hpp
     GUI/ConfigWizard.cpp
@@ -258,6 +260,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Jobs/BoostThreadWorker.cpp
     GUI/Jobs/BoostThreadWorker.hpp
     GUI/Jobs/BusyCursorJob.hpp
+    GUI/Jobs/ColorSplitJob.cpp
+    GUI/Jobs/ColorSplitJob.hpp
     GUI/Jobs/CreateFontNameImageJob.cpp
     GUI/Jobs/CreateFontNameImageJob.hpp
     GUI/Jobs/CreateFontStyleImagesJob.cpp

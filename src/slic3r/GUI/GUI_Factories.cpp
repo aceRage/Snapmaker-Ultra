@@ -1431,9 +1431,12 @@ void MenuFactory::create_object_menu()
     append_menu_item(split_menu, wxID_ANY, _L("To parts"), _L("Split the selected object into multiple parts"),
         [](wxCommandEvent&) { plater()->split_volume(); }, "menu_split_parts", &m_object_menu,
         []() { return plater()->can_split(false); }, m_parent);
+    append_menu_item(split_menu, wxID_ANY, _L("By painted colour"), _L("Convert the part's colour painting into separate parts, one per filament"),
+        [](wxCommandEvent&) { plater()->split_by_color(); }, "menu_split_parts", &m_object_menu,
+        []() { return plater()->can_split_by_color(); }, m_parent);
 
     append_submenu(&m_object_menu, split_menu, wxID_ANY, _L("Split"), _L("Split the selected object"), "",
-        []() { return plater()->can_split(true) || plater()->can_split(false); }, m_parent);
+        []() { return plater()->can_split(true) || plater()->can_split(false) || plater()->can_split_by_color(); }, m_parent);
     m_object_menu.AppendSeparator();
 
     // BBS: remove Layers Editing
@@ -1469,9 +1472,12 @@ void MenuFactory::create_extra_object_menu()
     append_menu_item(split_menu, wxID_ANY, _L("To parts"), _L("Split the selected object into multiple parts"),
         [](wxCommandEvent&) { plater()->split_volume(); }, "menu_split_parts", &m_object_menu,
         []() { return plater()->can_split(false); }, m_parent);
+    append_menu_item(split_menu, wxID_ANY, _L("By painted colour"), _L("Convert the part's colour painting into separate parts, one per filament"),
+        [](wxCommandEvent&) { plater()->split_by_color(); }, "menu_split_parts", &m_object_menu,
+        []() { return plater()->can_split_by_color(); }, m_parent);
 
     append_submenu(&m_object_menu, split_menu, wxID_ANY, _L("Split"), _L("Split the selected object"), "",
-        []() { return plater()->can_split(true); }, m_parent);
+        []() { return plater()->can_split(true) || plater()->can_split_by_color(); }, m_parent);
 
     // Mirror
     append_menu_items_mirror(&m_object_menu);
@@ -1540,6 +1546,9 @@ void MenuFactory::create_part_menu()
     append_menu_item(menu, wxID_ANY, _L("Split"), _L("Split the selected object into multiple parts"),
         [](wxCommandEvent&) { plater()->split_volume(); }, "split_parts", nullptr,
         []() { return plater()->can_split(false); }, m_parent);
+    append_menu_item(menu, wxID_ANY, _L("Split by painted colour"), _L("Convert the part's colour painting into separate parts, one per filament"),
+        [](wxCommandEvent&) { plater()->split_by_color(); }, "split_parts", nullptr,
+        []() { return plater()->can_split_by_color(); }, m_parent);
 
     menu->AppendSeparator();
     append_menu_item_change_type(menu);
@@ -1602,9 +1611,12 @@ void MenuFactory::create_bbl_part_menu()
     append_menu_item(split_menu, wxID_ANY, _L("To parts"), _L("Split the selected object into multiple parts"),
         [](wxCommandEvent&) { plater()->split_volume(); }, "menu_split_parts", menu,
         []() { return plater()->can_split(false); }, m_parent);
+    append_menu_item(split_menu, wxID_ANY, _L("By painted colour"), _L("Convert the part's colour painting into separate parts, one per filament"),
+        [](wxCommandEvent&) { plater()->split_by_color(); }, "menu_split_parts", menu,
+        []() { return plater()->can_split_by_color(); }, m_parent);
 
     append_submenu(menu, split_menu, wxID_ANY, _L("Split"), _L("Split the selected object"), "",
-        []() { return plater()->can_split(true); }, m_parent);
+        []() { return plater()->can_split(true) || plater()->can_split_by_color(); }, m_parent);
     menu->AppendSeparator();
     append_menu_item_per_object_settings(menu);
     append_menu_item_change_type(menu);
@@ -1997,9 +2009,12 @@ wxMenu* MenuFactory::multi_selection_menu()
             append_menu_item(split_menu, wxID_ANY, _L("To parts"), _L("Split the selected object into multiple parts"),
                 [](wxCommandEvent&) { plater()->split_volume(); }, "menu_split_parts", menu,
                 []() { return plater()->can_split(false); }, m_parent);
+            append_menu_item(split_menu, wxID_ANY, _L("By painted colour"), _L("Convert the part's colour painting into separate parts, one per filament"),
+                [](wxCommandEvent&) { plater()->split_by_color(); }, "menu_split_parts", menu,
+                []() { return plater()->can_split_by_color(); }, m_parent);
 
             append_submenu(menu, split_menu, wxID_ANY, _L("Split"), _L("Split the selected object"), "",
-                []() { return plater()->can_split(true); }, m_parent);
+                []() { return plater()->can_split(true) || plater()->can_split_by_color(); }, m_parent);
         }
         menu->AppendSeparator();
         append_menu_item_change_filament(menu);

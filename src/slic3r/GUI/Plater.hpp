@@ -731,6 +731,8 @@ public:
     void mirror(Axis axis);
     void split_object();
     void split_volume();
+    // Ultra: split a painted part into one solid part per filament (docs/superpowers/specs/2026-09-01-color-split-design.md).
+    void split_by_color();
     void optimize_rotation();
     // find all empty cells on the plate and won't overlap with exclusion areas
     static std::vector<Vec2f> get_empty_cells(const Vec2f step);
@@ -762,6 +764,7 @@ public:
     bool can_replace_with_stl() const;
     bool can_mirror() const;
     bool can_split(bool to_objects) const;
+    bool can_split_by_color() const;
 #if ENABLE_ENHANCED_PRINT_VOLUME_FIT
     bool can_scale_to_print_volume() const;
 #endif // ENABLE_ENHANCED_PRINT_VOLUME_FIT
