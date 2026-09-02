@@ -296,11 +296,17 @@ static void tunnel(tcp::socket& client, int port, const std::string& head, const
 // Run fn on the GUI thread and wait for it (Plater, plates and devices are GUI-thread only).
 // Returns false on timeout — e.g. a modal dialog is blocking the app — and fn may still run
 // later, so callers only capture shared state.
+static int s_auto_confirm_depth = 0; // GUI thread only
+bool RemoteAccess::auto_confirm() { return s_auto_confirm_depth > 0; }
+RemoteAccess::AutoConfirmScope::AutoConfirmScope() { ++s_auto_confirm_depth; }
+RemoteAccess::AutoConfirmScope::~AutoConfirmScope() { --s_auto_confirm_depth; }
+
 static bool run_on_main(std::function<void()> fn, int timeout_ms = 15000)
 {
     auto done = std::make_shared<std::promise<void>>();
     auto fut  = done->get_future();
     wxGetApp().CallAfter([done, fn]() {
+        RemoteAccess::AutoConfirmScope auto_yes;
         try { fn(); } catch (...) {}
         done->set_value();
     });

@@ -49,6 +49,16 @@ public:
     // Flashforge new-gen LAN API: pull cameraStreamUrl out of the /detail JSON ("" if absent).
     static std::string ff_camera_url_from_detail(const std::string& body);
 
+    // True while a phone/agent request is being executed on the GUI thread. Confirmation
+    // dialogs raised meanwhile (e.g. "adjust these settings automatically?") answer Yes on
+    // their own instead of blocking a GUI nobody is looking at.
+    static bool auto_confirm();
+    struct AutoConfirmScope
+    {
+        AutoConfirmScope();
+        ~AutoConfirmScope();
+    };
+
     // JSON API under /r/<token>/api (see manifest at GET /r/<token>/api). Requests run on the
     // GUI thread; these two are called by the Plater's slicing handlers (GUI thread) so that
     // /api/jobs can report progress of a slice started through the API.

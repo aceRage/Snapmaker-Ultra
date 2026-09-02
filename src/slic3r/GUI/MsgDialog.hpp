@@ -163,6 +163,9 @@ public:
 	MessageDialog &operator=(MessageDialog&&) = delete;
 	MessageDialog &operator=(const MessageDialog&) = delete;
 	virtual ~MessageDialog() = default;
+
+	// Ultra: answers itself (Yes / OK) while a phone/agent request runs on the GUI thread.
+	int  ShowModal() override;
 };
 
 // Generic rich message dialog, used intead of wxRichMessageDialog

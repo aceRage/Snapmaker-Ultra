@@ -1,4 +1,6 @@
 #include "MsgDialog.hpp"
+#include "RemoteAccess.hpp"
+#include <boost/log/trivial.hpp>
 
 #include <wx/settings.h>
 #include <wx/sizer.h>
@@ -356,6 +358,18 @@ MessageDialog::MessageDialog(wxWindow* parent,
     wxGetApp().UpdateDlgDarkUI(this);
 }
 
+// Ultra: a confirmation raised by a phone/agent request would block a GUI nobody is watching;
+// take the affirmative choice (the user's "always transfer / auto-accept" rule).
+int MessageDialog::ShowModal()
+{
+    if (RemoteAccess::auto_confirm()) {
+        const int answer = get_button(wxID_YES) ? wxID_YES : wxID_OK;
+        BOOST_LOG_TRIVIAL(info) << "MessageDialog auto-answered (" << (answer == wxID_YES ? "Yes" : "OK") << ") during a remote request";
+        return answer;
+    }
+    return MsgDialog::ShowModal();
+}
+
 
 // RichMessageDialog
 
@@ -371,6 +385,11 @@ RichMessageDialog::RichMessageDialog(wxWindow* parent,
 
 int RichMessageDialog::ShowModal()
 {
+    if (RemoteAccess::auto_confirm()) {
+        const int answer = get_button(wxID_YES) ? wxID_YES : wxID_OK;
+        BOOST_LOG_TRIVIAL(info) << "RichMessageDialog auto-answered (" << (answer == wxID_YES ? "Yes" : "OK") << ") during a remote request";
+        return answer;
+    }
     if (!m_checkBoxText.IsEmpty()) {
         show_dsa_button(m_checkBoxText);
         m_checkbox_dsa->SetValue(m_checkBoxValue);
