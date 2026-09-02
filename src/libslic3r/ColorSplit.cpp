@@ -130,6 +130,12 @@ std::vector<float> compute_vertex_depths(const ColorPatches &p, const std::vecto
 
 namespace {
 
+// Ruling 8: how far each wedge's copies of a pinch vertex move along that wedge's inward tangent bisector.
+// Without it the two wedges keep identical coordinates and their side walls are coincident along the pinch
+// segment, which CGAL rightly calls a self-intersection. The uncovered sliver this leaves on the surface is
+// one micron wide - orders of magnitude below slicer resolution.
+constexpr float PINCH_NUDGE_MM = 1e-3f;
+
 // Edge-connected components of the facet subset `in_set` (indices into patches.surface).
 std::vector<std::vector<int>> connected_components(const ColorPatches &p, const std::vector<Vec3i32> &nbrs, const std::vector<char> &in_set)
 {
@@ -159,7 +165,8 @@ struct ShellBuilder {
     const ColorPatches         &p;
     const std::vector<Vec3i32> &nbrs;          // its_face_neighbors(p.surface)
     const std::vector<Vec3f>   &normals;       // color_split_normals
-    std::vector<float>          depth;         // per vertex (copy: the fold guard lowers it)
+    const std::vector<float>   &d0;            // compute_vertex_depths output; the halving floor may not exceed it
+    std::vector<float>          depth;         // working copy of d0 (the fold guard lowers it)
     const ColorSplitDepths     &depths;
 
     // Builds the closed shell of the facet group `group` (indices into p.surface).
@@ -205,13 +212,50 @@ struct ShellBuilder {
                 }
             }
 
+        auto wedge = [&](int v, int f) { return boundary_count[v] > 2 ? wedge_of[{v, f}] : 0; };
+
+        // Ruling 8: separate the wedges of a pinch vertex. Each wedge is bounded at the vertex by exactly two
+        // boundary edges; the unit inward tangent of a boundary edge a->b of facet f is n_f x (b - a), which
+        // lies in the facet's plane and points into the group. Their normalised sum is the wedge's inward
+        // bisector, and every copy of the vertex in that wedge - top and bottom alike - moves PINCH_NUDGE_MM
+        // along it, so the wedges no longer share any geometry.
+        std::map<std::pair<int, int>, Vec3f> nudge;               // (vertex, wedge) -> offset
+        if (!wedge_of.empty()) {
+            auto add_tangent = [&](int v, int f, const Vec3f &tangent) {
+                if (boundary_count[v] <= 2) return;
+                const std::pair<int, int> key{v, wedge(v, f)};
+                auto it = nudge.find(key);
+                if (it == nudge.end()) it = nudge.emplace(key, Vec3f(Vec3f::Zero())).first;
+                it->second += tangent;
+            };
+            for (int f : group)
+                for (int k = 0; k < 3; ++k) {
+                    int n = nbrs[f][k];
+                    if (n >= 0 && in[n]) continue;
+                    const Vec3i32 &t  = p.surface.indices[f];
+                    const Vec3f    nf = (p.surface.vertices[t[1]] - p.surface.vertices[t[0]])
+                                            .cross(p.surface.vertices[t[2]] - p.surface.vertices[t[0]]);
+                    const int   a = p.surface.indices[f][k], b = p.surface.indices[f][(k + 1) % 3];
+                    const Vec3f tangent = nf.cross(p.surface.vertices[b] - p.surface.vertices[a]);
+                    if (tangent.squaredNorm() <= 0.f) continue;   // degenerate facet or edge: nothing to bisect
+                    const Vec3f unit = tangent.normalized();
+                    add_tangent(a, f, unit);
+                    add_tangent(b, f, unit);
+                }
+            for (auto &entry : nudge) {
+                const float len = entry.second.norm();
+                entry.second = len > 0.f ? Vec3f(entry.second * (PINCH_NUDGE_MM / len)) : Vec3f(Vec3f::Zero());
+            }
+        }
+
         // Output vertex ids: top copy and bottom copy per (vertex, wedge). Non-pinch vertices: wedge 0 only.
         indexed_triangle_set out;
         std::map<std::pair<int, int>, std::pair<int, int>> ids;   // (vertex, wedge) -> (top id, bottom id)
         auto vertex_ids = [&](int v, int wedge_id) -> std::pair<int, int> {
             auto it = ids.find({v, wedge_id});
             if (it != ids.end()) return it->second;
-            const Vec3f top = p.surface.vertices[v];
+            auto        nudged = nudge.find({v, wedge_id});
+            const Vec3f top    = nudged == nudge.end() ? p.surface.vertices[v] : Vec3f(p.surface.vertices[v] + nudged->second);
             float d = depth[v];
             if (cap_depth > 0.) d = std::min(d, float(cap_depth));
             const Vec3f bottom = top - d * normals[v];
@@ -219,7 +263,6 @@ struct ShellBuilder {
             int bi = int(out.vertices.size()); out.vertices.push_back(bottom);
             return ids[{v, wedge_id}] = {ti, bi};
         };
-        auto wedge = [&](int v, int f) { return boundary_count[v] > 2 ? wedge_of[{v, f}] : 0; };
 
         // Top triangles keep the surface winding; the bottom copies are reversed so they face into the part.
         for (int f : group) {
@@ -271,17 +314,21 @@ struct ShellBuilder {
         halve(std::move(vertices));
     }
 
-    // Halves the depth of each listed vertex exactly ONCE, floor = one layer. The list is deduplicated first:
-    // a vertex is shared by several facets, and halving it per incident facet would divide by 2^valence and
-    // drop straight to the floor in a single round instead of the spec's one halving per round. Returns false
-    // when nothing moved (every vertex already sat on the floor), which also terminates the caller's loop.
+    // Halves the depth of each listed vertex exactly ONCE. The list is deduplicated first: a vertex is shared
+    // by several facets, and halving it per incident facet would divide by 2^valence and drop straight to the
+    // floor in a single round instead of the spec's one halving per round. Returns false when nothing moved
+    // (every vertex already sat on its floor), which also terminates the caller's loop.
     bool halve(std::vector<int> vertices)
     {
         std::sort(vertices.begin(), vertices.end());
         vertices.erase(std::unique(vertices.begin(), vertices.end()), vertices.end());
         bool changed = false;
         for (int v : vertices) {
-            const float d = std::max(float(depths.layer_height), depth[v] * 0.5f);
+            // Ruling 9: the floor is one layer, but never deeper than the vertex's own mid-thickness clamp -
+            // on a feature thinner than 2h + 2*delta the layer floor would otherwise RAISE the depth and push
+            // the bottom across the mid-surface, breaking the invariant d(v) <= t(v)/2 - delta.
+            const float floor_d = std::min(float(depths.layer_height), d0[v]);
+            const float d       = std::max(floor_d, depth[v] * 0.5f);
             if (d != depth[v]) { depth[v] = d; changed = true; }
         }
         return changed;
@@ -318,7 +365,7 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &p, const ColorSpl
         std::vector<char> in(p.surface.indices.size(), 0);
         for (size_t f = 0; f < in.size(); ++f) in[f] = char(p.facet_state[f] == s);
         for (const std::vector<int> &comp : connected_components(p, nbrs, in)) {
-            ShellBuilder sb{p, nbrs, normals, depth, depths};
+            ShellBuilder sb{p, nbrs, normals, depth, depth, depths};   // d0 (reference) and its working copy
             for (int round = 0; round < 8 && sb.fold_guard(comp); ++round) {}
             indexed_triangle_set mesh = sb.build(comp, cap_depth);
             ShellCheck check = check_shell(mesh);

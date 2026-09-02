@@ -361,3 +361,57 @@ TEST_CASE("colorsplit: concave groove painted across the crease still yields a v
     REQUIRE(c.closed);
     REQUIRE(!c.self_intersects);
 }
+
+TEST_CASE("colorsplit: a self-touching patch builds one valid shell across its pinch vertex", "[colorsplit]")
+{
+    // Cells (2,2) and (3,3) are diagonal neighbours; the path (2,2)-(2,1)-(3,1)-(4,1)-(4,2)-(4,3)-(3,3) joins
+    // them without ever using (3,2) or (2,3), so the painted region is ONE edge-connected component that comes
+    // back and touches itself at grid vertex (3,3). That vertex carries four boundary edges, so the shell
+    // splits it into two wedges - the case spec 3.7's per-wedge duplication exists for, and the case the
+    // "two cells touching at one vertex" fixture above does NOT reach (there the cells are two components,
+    // each with an ordinary two-edge boundary at the shared vertex).
+    // The grid is 6x6 rather than 4x4 so that every painted cell stays off the box's top rim: rim vertices
+    // carry 45 degree bisector normals, which bevel the shell and would cost ~17% of its volume, whereas an
+    // all-interior patch has vertical normals and depth min(1.5, 10/2 - 0.002) = 1.5 everywhere, making the
+    // shell an exact prism of area * 1.5.
+    const int    n    = 6;
+    const double side = 40. / n;
+    TriangleMesh box  = make_grid_box(40., 40., 10., n, n);
+    const std::vector<std::pair<int, int>> path{{2, 2}, {2, 1}, {3, 1}, {4, 1}, {4, 2}, {4, 3}, {3, 3}};
+    std::vector<std::pair<int, EnforcerBlockerType>> facets;
+    for (const auto &ij : path) {
+        const int base = 2 + 2 * (ij.second * n + ij.first);   // cell (i,j) = triangles base, base+1
+        facets.emplace_back(base,     EnforcerBlockerType::Extruder2);
+        facets.emplace_back(base + 1, EnforcerBlockerType::Extruder2);
+    }
+    ColorPatches p = extract_color_patches(box.its, paint_data(box, facets));
+    auto shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(shells.size() == 1);
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);                                       // the pinch nudge keeps the wedges apart
+    REQUIRE_THAT(c.volume, WithinRel(7. * side * side * 1.5, 0.02));
+}
+
+TEST_CASE("colorsplit: a shell on a 0.3mm plate stops short of mid-thickness", "[colorsplit]")
+{
+    // The mid-thickness clamp (and the halving floor that must not exceed it) keeps every shell vertex on the
+    // painted side of the mid-surface, however thin the part is. The only vertices of a plain cube's top face
+    // are its four corners, whose angle-weighted normals are the (+-1,+-1,1)/sqrt(3) bisectors, so the -n ray
+    // crosses 0.3*sqrt(3) = 0.51962mm of plate and d0 = t/2 - 0.002 = 0.25781mm ALONG THE NORMAL - 0.148 is
+    // the vertical-normal figure, which a plain make_cube never samples (the same distinction the per-vertex
+    // depth test above documents). 0.25781mm along the bisector is 0.14885mm of vertical drop, so the bottom
+    // copies land at z = 0.15115, just clear of the z = 0.15 mid-plane.
+    TriangleMesh plate = make_cube(40., 40., 0.3);
+    ColorPatches p = extract_color_patches(plate.its, paint_data(plate, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
+    auto shells = build_color_shells(p, depths_for_test(1.5, 0.2, 0.87), no_cap_no_step(), nullptr);
+    REQUIRE(shells.size() == 1);
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+    const float drop = float(0.3 * std::sqrt(3.) / 2. - 0.002) / std::sqrt(3.f);   // d0 projected onto z
+    for (const Vec3f &v : shells[0].mesh.vertices) {
+        REQUIRE(v.z() > 0.15f);                       // never past mid-thickness, top or bottom copy
+        REQUIRE(0.3f - v.z() <= drop + 1e-4f);        // and never deeper than the vertex's own d0
+    }
+}
