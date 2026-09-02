@@ -449,6 +449,7 @@ struct Request
 {
     std::string method, target, path, query, head, pending, cookies, file_name;
     std::string host, secret, sec_fetch_site, content_type; // Host, X-Hub-Secret, Sec-Fetch-Site, Content-Type (lower-cased where compared)
+    std::string ts_login, fwd_proto; // Tailscale-User-Login, X-Forwarded-Proto: set by Tailscale Serve, trusted from loopback only
     size_t      content_length { 0 };
 };
 
@@ -483,6 +484,8 @@ static bool read_request(tcp::socket& client, Request& r)
             else if (key == "x-hub-secret") r.secret = val;
             else if (key == "sec-fetch-site") r.sec_fetch_site = lower(val);
             else if (key == "content-type") r.content_type = lower(val);
+            else if (key == "tailscale-user-login") r.ts_login = val;
+            else if (key == "x-forwarded-proto") r.fwd_proto = lower(val);
         }
         pos = nl + 2;
     }
@@ -550,6 +553,128 @@ static void pump(tcp::socket& from, tcp::socket& to)
 
 // Splice the client onto 127.0.0.1:<port>, replaying the (rewritten) request head first.
 // Works for plain responses and WebSocket upgrades alike.
+// Run a command to completion and capture what it prints (the tailscale CLI). Windows only for now.
+static bool run_capture(const std::vector<std::string>& args, std::string& out, int& exit_code, int timeout_ms)
+{
+    out.clear();
+    exit_code = -1;
+#ifdef _WIN32
+    std::wstring cmd;
+    for (const std::string& a : args) {
+        if (!cmd.empty()) cmd += L' ';
+        cmd += quote_arg(widen(a));
+    }
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!::CreatePipe(&rd, &wr, &sa, 0)) return false;
+    ::SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si = {};
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESTDHANDLES;
+    si.hStdOutput  = wr;
+    si.hStdError   = wr;
+    PROCESS_INFORMATION  pi = {};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(L'\0');
+    const BOOL ok = ::CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, nullptr, nullptr, &si, &pi);
+    ::CloseHandle(wr);
+    if (!ok) { ::CloseHandle(rd); return false; }
+    std::thread reader([&]() {
+        char  b[4096];
+        DWORD n = 0;
+        while (::ReadFile(rd, b, sizeof(b), &n, nullptr) && n > 0) out.append(b, n);
+    });
+    const DWORD w = ::WaitForSingleObject(pi.hProcess, (DWORD) timeout_ms);
+    if (w != WAIT_OBJECT_0) ::TerminateProcess(pi.hProcess, 1);
+    reader.join();
+    DWORD code = 1;
+    ::GetExitCodeProcess(pi.hProcess, &code);
+    exit_code = (int) code;
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+    ::CloseHandle(rd);
+    return w == WAIT_OBJECT_0;
+#else
+    (void) args; (void) timeout_ms;
+    return false;
+#endif
+}
+
+// ---- Tailscale (remote access): the user's own Tailscale install publishes the hub inside their
+// tailnet with `tailscale serve`; the phone runs the Tailscale app signed in to the same account.
+static std::string tailscale_exe()
+{
+#ifdef _WIN32
+    const char*       pf = std::getenv("ProgramFiles");
+    const std::string p  = std::string(pf ? pf : "C:\\Program Files") + "\\Tailscale\\tailscale.exe";
+    if (fs::exists(p)) return p;
+#endif
+    return "tailscale"; // PATH
+}
+
+struct TailscaleState
+{
+    bool        installed { false };
+    std::string backend;       // Running, NeedsLogin, Stopped, ...
+    std::string dns_name;      // <machine>.<tailnet>.ts.net
+    std::string login;         // the node owner's login
+    bool        https { false }; // the tailnet issues certificates (admin console > DNS > HTTPS)
+    bool        serving { false };
+    int         serving_port { 0 }; // the loopback port the Serve proxy points at
+    std::string error;
+    long long   checked_at { 0 };
+};
+
+static TailscaleState tailscale_query()
+{
+    TailscaleState t;
+    std::string    out;
+    int            code = 0;
+    t.checked_at = (long long) std::time(nullptr);
+    if (!run_capture({ tailscale_exe(), "status", "--json" }, out, code, 15000)) {
+        t.error = "Tailscale is not installed on this PC";
+        return t;
+    }
+    t.installed = true;
+    try {
+        json j    = json::parse(out);
+        t.backend = j.value("BackendState", "");
+        json self = j.value("Self", json::object());
+        t.dns_name = self.value("DNSName", "");
+        while (!t.dns_name.empty() && t.dns_name.back() == '.') t.dns_name.pop_back();
+        if (self.contains("UserID")) {
+            const std::string uid   = std::to_string(self["UserID"].get<long long>());
+            json              users = j.value("User", json::object());
+            if (users.contains(uid)) t.login = lower(users[uid].value("LoginName", ""));
+        }
+        t.https = !j.value("CertDomains", json::array()).empty();
+    } catch (...) {
+        t.error = code == 0 ? "unexpected output from tailscale status" : out.substr(0, 200);
+        return t;
+    }
+    if (t.backend != "Running") {
+        t.error = t.backend == "NeedsLogin" ? "Tailscale is installed but not signed in on this PC" : "Tailscale is not running (" + t.backend + ")";
+        return t;
+    }
+    if (run_capture({ tailscale_exe(), "serve", "status", "--json" }, out, code, 15000) && code == 0) {
+        try {
+            const json s   = json::parse(out);
+            const json web_all = s.value("Web", json::object());
+            for (const auto& web : web_all) {
+                const json handlers = web.value("Handlers", json::object());
+                for (const auto& [path, h] : handlers.items()) {
+                    const std::string proxy = h.value("Proxy", ""), want = "http://127.0.0.1:";
+                    if (path == "/" && proxy.compare(0, want.size(), want) == 0) {
+                        t.serving      = true;
+                        t.serving_port = std::atoi(proxy.c_str() + want.size());
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+    return t;
+}
+
 // Per-run secrets (std::random_device is the OS CSPRNG on every platform we build).
 static std::string random_hex(int bytes)
 {
@@ -904,6 +1029,11 @@ private:
     std::string state_for_phone();
     bool  lookup_host(const std::string& id, std::string& ip, std::string& code);
     std::string relay_h264_url(const std::string& id); // the U1 raw stream behind /relay/h264?id=, or ""
+    TailscaleState remote_state(bool refresh);         // cached ~15 s; runs the tailscale CLI off the lock
+    bool  set_remote(bool on, std::string& error);     // tailscale serve on/off for this hub
+    void  remote_logins(const std::string& add, const std::string& remove);
+    bool  login_allowed(const std::string& login);
+    json  remote_json_locked() const;                  // m_mutex held
     static Instance probe_instance(Instance inst);
 
     std::mutex                     m_mutex;
@@ -916,6 +1046,11 @@ private:
     std::string                    m_state; // full Stream-tab state JSON (with credentials)
     std::string                    m_secret;      // per run; in hub.json and the hub page, required as X-Hub-Secret on /hub/*
     std::string                    m_go2rtc_user, m_go2rtc_pass, m_go2rtc_auth; // go2rtc credentials, this process only
+    bool                           m_remote_on { false };        // publish through Tailscale Serve (persisted)
+    std::vector<std::string>       m_allowed_logins;             // tailnet logins that may connect (lower-case, persisted)
+    TailscaleState                 m_ts;                         // last tailscale_query()
+    std::string                    m_last_login;                 // most recent remote visitor
+    long long                      m_last_login_at { 0 };
     int                            m_go2rtc_port { 0 };
     long                           m_go2rtc_pid { 0 };
     void*                          m_job { nullptr };
@@ -934,6 +1069,7 @@ json HubServer::info_json()
     j["go2rtc_port"] = m_go2rtc_port;
     j["relay_port"]  = BambuCamRelay::get().port();
     j["version"]     = std::string(SLIC3R_VERSION);
+    j["remote"]      = remote_json_locked();
     j["ips"]         = json::array();
     j["url"]         = "";
     if (m_phone) {
@@ -956,6 +1092,8 @@ void HubServer::write_hub_json()
         j["secret"]      = m_secret;
         j["go2rtc_port"] = m_go2rtc_port;
         j["version"]     = std::string(SLIC3R_VERSION);
+        j["remote_on"]      = m_remote_on;
+        j["allowed_logins"] = m_allowed_logins;
     }
     write_file(hub_json_path(), j.dump(2));
 }
@@ -1307,6 +1445,95 @@ bool HubServer::set_phone(bool on, const std::string& token)
     return ok;
 }
 
+TailscaleState HubServer::remote_state(bool refresh)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!refresh && m_ts.checked_at && (long long) std::time(nullptr) - m_ts.checked_at < 15) return m_ts;
+    }
+    TailscaleState t = tailscale_query(); // slow-ish (two CLI runs): never under the lock
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_ts = t;
+    return m_ts;
+}
+
+json HubServer::remote_json_locked() const
+{
+    json r;
+    r["installed"]      = m_ts.installed;
+    r["state"]          = m_ts.backend;
+    r["dns_name"]       = m_ts.dns_name;
+    r["login"]          = m_ts.login;
+    r["https"]          = m_ts.https;
+    r["serving"]        = m_ts.serving;
+    r["on"]             = m_remote_on;
+    r["url"]            = (m_remote_on && m_ts.serving && !m_ts.dns_name.empty()) ? "https://" + m_ts.dns_name + "/r/" + m_token + "/" : "";
+    r["allowed_logins"] = m_allowed_logins;
+    r["last_login"]     = m_last_login;
+    r["last_login_at"]  = m_last_login_at;
+    std::string err = m_ts.error;
+    if (err.empty() && m_remote_on && m_ts.installed && !m_ts.serving) err = "Tailscale is no longer serving this hub; turn remote access off and on again";
+    r["error"] = err;
+    return r;
+}
+
+bool HubServer::set_remote(bool on, std::string& error)
+{
+    int port;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        port = m_port;
+    }
+    std::string out;
+    int         code = 0;
+    if (on) {
+        TailscaleState t = remote_state(true);
+        if (!t.installed || t.backend != "Running") { error = t.error.empty() ? "Tailscale is not ready" : t.error; return false; }
+        if (!t.https) { error = "HTTPS certificates are not enabled for your tailnet: Tailscale admin console > DNS > HTTPS Certificates > Enable, then try again"; return false; }
+        // The first run also fetches the certificate, which can take half a minute.
+        if (!run_capture({ tailscale_exe(), "serve", "--bg", "--https=443", "http://127.0.0.1:" + std::to_string(port) }, out, code, 90000) || code != 0) {
+            error = out.empty() ? "tailscale serve failed" : out.substr(0, 300);
+            return false;
+        }
+        t = remote_state(true);
+        if (!t.serving) { error = "tailscale serve did not take: " + out.substr(0, 200); return false; }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_remote_on = true;
+        if (m_allowed_logins.empty() && !t.login.empty()) m_allowed_logins.push_back(t.login);
+    } else {
+        run_capture({ tailscale_exe(), "serve", "--https=443", "off" }, out, code, 30000);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_remote_on = false;
+    }
+    write_hub_json();
+    if (!on) remote_state(true);
+    BOOST_LOG_TRIVIAL(info) << "RemoteHub: remote access (Tailscale) " << (on ? "on" : "off");
+    return true;
+}
+
+void HubServer::remote_logins(const std::string& add, const std::string& remove)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const std::string a = lower(add), r = lower(remove);
+    if (!a.empty() && a.size() < 200 && a.find_first_of(" \t\r\n\"<>") == std::string::npos &&
+        std::find(m_allowed_logins.begin(), m_allowed_logins.end(), a) == m_allowed_logins.end())
+        m_allowed_logins.push_back(a);
+    if (!r.empty()) m_allowed_logins.erase(std::remove(m_allowed_logins.begin(), m_allowed_logins.end(), r), m_allowed_logins.end());
+}
+
+bool HubServer::login_allowed(const std::string& login)
+{
+    const std::string l = lower(login);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const bool ok = std::find(m_allowed_logins.begin(), m_allowed_logins.end(), l) != m_allowed_logins.end();
+    if (ok && (m_last_login != l || (long long) std::time(nullptr) - m_last_login_at > 600)) {
+        m_last_login    = l;
+        m_last_login_at = (long long) std::time(nullptr);
+        BOOST_LOG_TRIVIAL(info) << "RemoteHub: remote visit by " << l;
+    }
+    return ok;
+}
+
 long HubServer::spawn_slicer(const std::string& file, bool hidden)
 {
     std::vector<std::string> args = { current_exe() };
@@ -1349,7 +1576,19 @@ bool HubServer::instance_quit(long pid, bool discard) { return instance_post(pid
 void HubServer::handle_hub(tcp::socket& client, Request& r)
 {
     if (r.path == "/hub/info" && r.method == "GET") {
+        remote_state(false);
         respond_json(client, 200, info_json().dump());
+    } else if (r.path == "/hub/remote" && r.method == "POST") {
+        // ?on=1|0 turns Tailscale Serve for this hub on or off; ?add= / ?remove= edit the allow-list.
+        const std::string on = query_param(r.query, "on");
+        remote_logins(percent_decode(query_param(r.query, "add")), percent_decode(query_param(r.query, "remove")));
+        std::string error;
+        if (on == "1" || on == "0") set_remote(on == "1", error);
+        else write_hub_json();
+        remote_state(true);
+        json j = info_json();
+        if (!error.empty()) j["remote"]["error"] = error;
+        respond_json(client, error.empty() ? 200 : 409, j.dump());
     } else if ((r.path == "/hub/" || r.path == "/hub/index.html") && r.method == "GET") {
         // The page gets the per-run secret and sends it back as X-Hub-Secret on every call.
         std::string page = read_file(resources_dir() + "/web/orca/hub.html"), secret;
@@ -1515,6 +1754,16 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner)
             phone       = m_phone;
         }
 
+        // Through Tailscale Serve (a loopback peer carrying Tailscale-User-Login, which Serve sets
+        // and strips from clients) only allow-listed tailnet logins get anything at all.
+        const bool via_serve = peer.is_loopback() && !r.ts_login.empty();
+        if (via_serve && !login_allowed(r.ts_login)) {
+            BOOST_LOG_TRIVIAL(warning) << "RemoteHub: tailnet login not allowed: " << r.ts_login;
+            respond(client, 403, "text/plain; charset=utf-8", "This printer hub is not shared with " + r.ts_login + ". Ask its owner to add you on the hub page.");
+            return;
+        }
+        const std::string cookie_flags = (via_serve && r.fwd_proto == "https") ? "; Secure" : "";
+
         // The stream player lives at the root so its relative "api/ws" resolves here. Gate: the
         // phone's rt cookie, or - loopback only - the hub secret as `lt`, which is how the PC's own
         // Stream tab embeds it. The two scripts are public (verbatim go2rtc files).
@@ -1564,7 +1813,7 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner)
         if (rest.empty()) { respond(client, 302, "text/plain", "", "Location: " + prefix + "/\r\n"); return; }
         if (rest == "/" || rest == "/index.html") {
             respond(client, 200, "text/html; charset=utf-8", read_file(resources_dir() + "/web/orca/stream_center.html"),
-                    "Set-Cookie: rt=" + token + "; Path=/; SameSite=Lax\r\n");
+                    "Set-Cookie: rt=" + token + "; Path=/; SameSite=Lax" + cookie_flags + "\r\n");
         } else if (rest == "/state") {
             respond_json(client, 200, state_for_phone());
         } else if (rest == "/bambu") {
@@ -1607,6 +1856,8 @@ bool HubServer::start()
         json j = json::parse(read_file(hub_json_path()));
         if (!valid_token(m_token)) m_token = j.value("token", "");
         m_phone = m_phone || j.value("phone", false);
+        m_remote_on = j.value("remote_on", false);
+        for (const auto& l : j.value("allowed_logins", json::array())) m_allowed_logins.push_back(lower(l.get<std::string>()));
     } catch (...) {}
     if (!valid_token(m_token)) m_token = random_token();
     m_secret = random_hex(16);
@@ -1617,6 +1868,15 @@ bool HubServer::start()
     if (!bind(m_phone)) return false;
     write_hub_json();
     register_streams();
+    if (m_remote_on) {
+        // Serve's config outlives us (it is Tailscale's); make sure it still points at our port.
+        TailscaleState t = remote_state(true);
+        if (t.installed && t.backend == "Running" && (!t.serving || t.serving_port != m_port)) {
+            std::string err;
+            set_remote(true, err);
+            if (!err.empty()) BOOST_LOG_TRIVIAL(warning) << "RemoteHub: remote access could not be restored: " << err;
+        }
+    }
     return true;
 }
 
@@ -1861,6 +2121,7 @@ std::string Info::json() const
     j["token"] = token;
     j["ips"]   = ips;
     j["url"]   = url();
+    j["remote_url"] = remote_url;
     return j.dump();
 }
 
@@ -1876,6 +2137,7 @@ static Info parse_info(const std::string& body)
         i.token       = j.value("token", "");
         i.go2rtc_port = j.value("go2rtc_port", 0);
         i.relay_port  = j.value("relay_port", 0);
+        if (j.contains("remote") && j["remote"].is_object()) i.remote_url = j["remote"].value("url", "");
         i.version     = j.value("version", "");
         for (const auto& ip : j.value("ips", json::array())) i.ips.push_back(ip.get<std::string>());
     } catch (...) {}

@@ -23,13 +23,18 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
 .inst .m { color: #999; font-size: 12px; word-break: break-all; }
 .note { color: #999; font-size: 12px; margin-top: 8px; }
 .err { color: #e88; }
+.login { display: flex; justify-content: space-between; align-items: center; background: #2f2f2f; border-radius: 6px; padding: 4px 8px; margin: 3px 0; font-size: 13px; }
+.btn.small { padding: 2px 8px; font-size: 12px; margin: 0; }
+.addrow { display: flex; gap: 6px; align-items: center; margin: 6px 0; }
+.addrow input { flex: 1; min-width: 0; background: #2a2a2a; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
 </style>
 </head>
 <body>
 <h1>Snapmaker-Ultra Hub</h1>
 <div class="sub">Camera relays, phone access and the list of open slicer windows. This page only works on this PC.</div>
 <div class="row">
-  <div class="card" id="phone"><h2>Phone access</h2><div id="phonebody">Loading…</div></div>
+  <div class="card" id="phone"><h2>Phone access (this Wi-Fi)</h2><div id="phonebody">Loading…</div></div>
+  <div class="card" id="remote"><h2>Remote access (Tailscale)</h2><div id="remotebody">Loading…</div></div>
   <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div>
     <div class="note">A hidden slicer runs without a window and serves the phone; Show puts its window on the desktop, Hide takes it away again (it keeps working). "Needs attention" means it hit something only a person at this PC can answer - a file dialog, first-run setup, a mandatory update - so its window has been shown; Dismiss clears the flag once handled.</div>
   </div>
@@ -80,6 +85,56 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
             var on = el('span', 'btn', 'Turn on'); on.onclick = function() { post('/hub/phone?on=1').then(refresh); }; body.appendChild(on);
         }
     }
+    var lastRemote = null;
+    function renderRemote() {
+        var body = document.getElementById('remotebody');
+        if (!info || !info.remote) return;
+        var rm = info.remote, key = JSON.stringify(rm);
+        if (key === lastRemote && body.dataset.done) return; // keep the canvas
+        lastRemote = key; body.dataset.done = '1';
+        body.innerHTML = '';
+        if (!rm.installed) {
+            body.appendChild(el('div', '', 'Tailscale gives your phone a private, encrypted path to this hub from anywhere - no port forwarding, no hosting fees, and the phone\'s Tailscale sign-in is the second factor.'));
+            body.appendChild(el('div', 'note', 'It is not installed on this PC. Install it from tailscale.com/download and sign in, put the Tailscale app on the phone signed in to the same account, then reload this page.'));
+            return;
+        }
+        if (rm.state !== 'Running') {
+            body.appendChild(el('div', 'err', rm.error || ('Tailscale is ' + rm.state)));
+            body.appendChild(el('div', 'note', 'Open Tailscale from the system tray and sign in, then reload this page.'));
+            return;
+        }
+        if (rm.on && rm.url) {
+            body.appendChild(el('div', '', 'On. Scan this on a phone that has the Tailscale app connected and is signed in as one of the people listed below; it works from anywhere.'));
+            var canvas = el('canvas', 'qr'); body.appendChild(canvas); drawQr(canvas, rm.url);
+            body.appendChild(el('div', 'url', rm.url));
+        } else {
+            body.appendChild(el('div', '', 'Off. Turn it on to reach this hub from outside your Wi-Fi through your Tailscale network' + (rm.dns_name ? ' (' + rm.dns_name + ')' : '') + '.'));
+            if (!rm.https) body.appendChild(el('div', 'err', 'HTTPS certificates are not enabled for your tailnet yet: Tailscale admin console > DNS > HTTPS Certificates > Enable.'));
+        }
+        if (rm.error) body.appendChild(el('div', 'err', rm.error));
+        body.appendChild(el('div', 'note', 'Who may connect (their Tailscale sign-in):'));
+        (rm.allowed_logins || []).forEach(function(l) {
+            var row = el('div', 'login');
+            row.appendChild(el('span', '', l));
+            var x = el('span', 'btn dim small', '\u2715'); x.title = 'Remove';
+            x.onclick = function() { post('/hub/remote?remove=' + encodeURIComponent(l)).then(function(j) { info = j; renderRemote(); }); };
+            row.appendChild(x);
+            body.appendChild(row);
+        });
+        var addrow = el('div', 'addrow');
+        var inp = el('input'); inp.placeholder = 'someone@example.com'; addrow.appendChild(inp);
+        var add = el('span', 'btn dim', 'Add');
+        add.onclick = function() { var v = inp.value.trim(); if (v) post('/hub/remote?add=' + encodeURIComponent(v)).then(function(j) { info = j; renderRemote(); }); };
+        addrow.appendChild(add);
+        body.appendChild(addrow);
+        if (rm.last_login) body.appendChild(el('div', 'note', 'Last remote visit: ' + rm.last_login));
+        var tog = el('span', 'btn' + (rm.on ? ' dim' : ''), rm.on ? 'Turn off' : 'Turn on');
+        tog.onclick = function() {
+            tog.textContent = rm.on ? 'Turning off\u2026' : 'Turning on\u2026 (the first time fetches a certificate, up to a minute)';
+            post('/hub/remote?on=' + (rm.on ? '0' : '1')).then(function(j) { info = j; renderRemote(); }).catch(function() { lastRemote = null; refresh(); });
+        };
+        body.appendChild(tog);
+    }
     function renderSlicers(list) {
         var body = document.getElementById('slicerbody');
         body.innerHTML = '';
@@ -107,7 +162,7 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
         });
     }
     function refresh() {
-        fetch('/hub/info', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { info = j; renderPhone(); document.getElementById('status').textContent = 'Hub pid ' + j.pid + ', port ' + j.port + ', version ' + j.version; }).catch(function() {});
+        fetch('/hub/info', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { info = j; renderPhone(); renderRemote(); document.getElementById('status').textContent = 'Hub pid ' + j.pid + ', port ' + j.port + ', version ' + j.version; }).catch(function() {});
         fetch('/hub/instances', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { renderSlicers(j.instances || []); }).catch(function() {});
     }
     document.getElementById('new').onclick = function() { post('/hub/new').then(function() { setTimeout(refresh, 3000); }); };

@@ -591,6 +591,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 alt.textContent = 'Other addresses of this PC: ' + remoteInfo.ips.slice(1).join(', ');
                 modal.appendChild(alt);
             }
+            if (remoteInfo.remote_url) {
+                var far = document.createElement('div');
+                far.className = 'info';
+                far.textContent = 'Away from home (Tailscale, same account): ' + remoteInfo.remote_url;
+                modal.appendChild(far);
+            }
         } else if (remoteInfo && remoteInfo.on && !remoteInfo.url) {
             var warn = document.createElement('div');
             warn.className = 'status';

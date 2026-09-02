@@ -37,6 +37,7 @@ struct Info
     int                      relay_port { 0 };
     std::string              version;
     std::vector<std::string> ips; // LAN IPv4 addresses, default-route one first (phone on only)
+    std::string              remote_url; // https://<machine>.<tailnet>.ts.net/r/<token>/ while Tailscale remote access is on
     std::string url() const;      // http://<ip>:<port>/r/<token>/ or ""
     std::string json() const;     // what the Stream tab's phone modal shows: {on, port, token, ips, url}
 };
