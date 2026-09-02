@@ -11,6 +11,7 @@
 #include "NormalUtils.hpp"
 #include "PrintConfig.hpp"
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -171,11 +172,19 @@ ShellCheck check_shell(const indexed_triangle_set &shell)
 }
 
 ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const TriangleSelector::TriangleSplittingData &paint,
-                                       const ColorSplitDepths &depths, const ColorSplitParams &params, const ColorSplitProgress &progress)
+                                       const ColorSplitDepths &depths, const ColorSplitParams &params, const ColorSplitProgress &progress,
+                                       const Transform3d &to_split)
 {
     if (progress && !progress(0)) throw ColorSplitCancelled();
-    const ColorPatches patches = extract_color_patches(mesh, paint);
+    // Ruling 23: the paint is resolved in MESH space whatever space the split runs in, then the finished
+    // surface travels. its_transform's left-handed fix swaps two vertices of every facet; doing that to the
+    // RAW mesh would re-order the vertices the paint's sub-facet subdivision is expressed against and mirror
+    // the stroke inside every partially painted facet. On the retriangulated surface the same swap only
+    // reverses a facet's own winding - facet order, and so `facet_state`, is untouched.
+    ColorPatches patches = extract_color_patches(mesh, paint);
     if (patches.states.empty()) throw ColorSplitError("The part has no painted colours.");
+    if (!to_split.isApprox(Transform3d::Identity()))
+        its_transform(patches.surface, to_split, /*fix_left_handed=*/true);
     if (progress && !progress(10)) throw ColorSplitCancelled();
     std::vector<std::string> shell_warnings;
     // Ruling 10: skipped micro-components are warnings, not errors - they have to reach the caller.
@@ -197,11 +206,21 @@ ColorSplitSpace color_split_space(const ModelObject &object, const ModelVolume &
     // exact for every instance sharing that scale, and an anisotropic one is a documented approximation
     // for the rest (spec 3.9).
     const Transform3d T = (object.instances.empty() ? Transform3d::Identity() : object.instances.front()->get_matrix()) * volume.get_matrix();
-    // Isotropic iff the three column norms of the linear part agree - a rotation times a uniform scale times
-    // any mirror leaves them equal, so this admits rotation and mirroring and rejects only real anisotropy.
     const Matrix3d L  = T.linear();
     const double   sx = L.col(0).norm(), sy = L.col(1).norm(), sz = L.col(2).norm();
-    if (std::abs(sx - sy) < 1e-6 * sx && std::abs(sx - sz) < 1e-6 * sx) {
+    // A flattened or otherwise singular transformation has neither a depth scale nor an inverse to bring the
+    // pieces home with, so it is refused here rather than inverted.
+    if (std::min({sx, sy, sz}) <= 1e-9 || std::abs(L.determinant()) <= 1e-9 * sx * sy * sz)
+        throw ColorSplitError("Degenerate part transformation.");
+    // Isotropic iff L^T L is s^2 I. Equal column norms alone are not enough: a rotated anisotropic scale
+    // (R S R^T with R off-axis) can have three columns of the same length that are no longer orthogonal, and
+    // Geometry::Transformation happily carries such a matrix - ModelObject::delete_volume builds one by
+    // multiplying an instance matrix by a volume matrix. The off-diagonal test rejects exactly that, while
+    // rotation and mirroring (which leave L^T L = s^2 I) stay on the cheap mesh-space path.
+    const Matrix3d G   = L.transpose() * L;
+    const double   tol = 1e-6 * sx * sx;
+    if (std::abs(sx - sy) < 1e-6 * sx && std::abs(sx - sz) < 1e-6 * sx &&
+        std::abs(G(0, 1)) < tol && std::abs(G(0, 2)) < tol && std::abs(G(1, 2)) < tol) {
         s.depth_scale = sx;
         return s;                                  // mesh-space path, identity transforms
     }
@@ -215,6 +234,15 @@ ColorSplitDepths scale_depths(const ColorSplitDepths &d, double s)
 {
     ColorSplitDepths o = d;
     o.D /= s; o.ws /= s; o.cap_top /= s; o.cap_bottom /= s; o.layer_height /= s;
+    return o;
+}
+
+ColorSplitParams scale_params(const ColorSplitParams &p, double s)
+{
+    ColorSplitParams o = p;
+    // effective_depths applies the override AFTER the caller has scaled the depths, so on the mesh-space path
+    // an unscaled override would cut at its world value. Zero and negative mean "no override" - leave them.
+    if (o.depth_override_mm > 0.) o.depth_override_mm /= s;
     return o;
 }
 
@@ -250,6 +278,7 @@ static ModelVolume *add_split_volume(ModelObject &object, const ModelVolume &src
 std::vector<ModelVolume *> apply_color_split(ModelObject &object, size_t src_idx, ColorSplitResult &&r,
                                              const ColorSplitSpace &space, bool solid_interfaces, bool keep_base_sparse_infill)
 {
+    assert(src_idx < object.volumes.size() && object.volumes[src_idx]->is_model_part());
     ModelVolume      &src        = *object.volumes[src_idx];
     const std::string src_name   = src.name;
     const int         body_extruder = src.extruder_id();          // resolves volume -> object -> 0
@@ -267,6 +296,8 @@ std::vector<ModelVolume *> apply_color_split(ModelObject &object, size_t src_idx
         created.push_back(body);
     }
     for (auto &piece : r.pieces) {
+        if (piece.second.indices.empty())
+            continue;    // dropped upstream with a warning; an empty volume would only clutter the list
         ModelVolume *part = add_split_volume(object, src, std::move(piece.second), space,
                                              src_name + " F" + std::to_string(piece.first));
         part->config.set("extruder", piece.first);

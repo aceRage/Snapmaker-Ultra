@@ -75,34 +75,52 @@ std::vector<ColorShell> build_color_shells(const ColorPatches &patches, const Co
 
 // Spec 3.8: what one split produces. `body` is the unpainted remainder (may be empty); `pieces` holds one
 // merged mesh per painted filament, ascending; `warnings` are the user-facing notes collected on the way.
+// Everything here is in SPLIT space - the meshes and `depths` alike (multiply the depths by
+// ColorSplitSpace::depth_scale to show them in world millimetres).
 struct ColorSplitResult {
     indexed_triangle_set                              body;      // may be empty
     std::vector<std::pair<int, indexed_triangle_set>> pieces;    // (filament, mesh), ascending filament
     std::vector<std::string>                          warnings;
-    ColorSplitDepths                                  depths;
+    ColorSplitDepths                                  depths;    // as cut, i.e. in split space
 };
 // Spec 3.8: rest <- mesh; each shell is cut out of `rest` in turn, so pieces and body are complementary by
 // construction and overlaps go to the lower filament (the shell order build_color_shells returns).
 ColorSplitResult partition_by_shells(const indexed_triangle_set &mesh, const std::vector<ColorShell> &shells,
                                      bool absorb_islands, const ColorSplitProgress &progress);
-// The one-shot entry point: paint -> patches -> shells -> partition.
+// The one-shot entry point: paint -> patches -> shells -> partition. `mesh` and `paint` are ALWAYS given in
+// mesh space (Ruling 23): the paint's sub-facet subdivision is indexed by the mesh's own facets and read
+// relative to each facet's vertex order, so carrying the raw mesh across a mirroring transform first - which
+// swaps two vertices of every facet to keep the winding outward - would mirror the stroke inside every
+// partially painted facet. `to_split` (spec 3.9's world path) is applied to the RETRIANGULATED surface
+// instead, once the paint has been resolved; the same vertex swap there is harmless, because the per-facet
+// states are indexed by facet and a facet's own vertex order does not carry any state. Everything the result
+// holds is then in split space. The default, identity, keeps the whole split in mesh space.
 ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const TriangleSelector::TriangleSplittingData &paint,
-                                       const ColorSplitDepths &depths, const ColorSplitParams &params, const ColorSplitProgress &progress);
+                                       const ColorSplitDepths &depths, const ColorSplitParams &params, const ColorSplitProgress &progress,
+                                       const Transform3d &to_split = Transform3d::Identity());
 
 // Spec 3.9: which space the split runs in. D, ws and h are WORLD millimetres, the volume's mesh is not.
 // Let T = instance x volume matrix. An isotropic T (scale s, any rotation, mirror allowed) needs no transform
 // at all - the split runs on the mesh as it stands with the depths divided by s, which is exact and shared by
 // every instance of that scale. An anisotropic T has no single depth scale, so the mesh is carried into world
-// space by `to_split` and the pieces come back through `from_split`.
+// space by `to_split` and the pieces come back through `from_split`; T is then the FIRST instance's, and any
+// other instance with a different anisotropic scale gets an approximate depth (spec 3.9's documented limit).
 struct ColorSplitSpace {
     Transform3d to_split    = Transform3d::Identity();   // mesh -> split space (identity on the mesh-space path)
     Transform3d from_split  = Transform3d::Identity();   // split space -> mesh
     double      depth_scale = 1.;                        // divide world depths by this on the mesh-space path
     bool        world_path  = false;
 };
+// Throws ColorSplitError when the transformation is degenerate (a zero or near-singular scale).
 ColorSplitSpace color_split_space(const ModelObject &object, const ModelVolume &volume);
-// World depths -> split-space depths: D, ws, both caps and the layer height all divide by `s`.
+// World -> split space, for the two things the caller feeds the split. On the MESH-SPACE path BOTH must be
+// applied (with `s` = ColorSplitSpace::depth_scale) before calling split_volume_by_paint; on the world path
+// neither is, since the split then runs in world millimetres already.
+// `scale_depths`: D, ws, both caps and the layer height all divide by `s`.
 ColorSplitDepths scale_depths(const ColorSplitDepths &depths, double s);
+// `scale_params`: the dialog's depth override, which effective_depths applies INSIDE the split and which
+// would otherwise cut at its world value in mesh space. Nothing else in the params carries a length.
+ColorSplitParams scale_params(const ColorSplitParams &params, double s);
 
 // Spec 4: replace the painted source volume by the split's output, in its own slot - body first (unless it is
 // empty), then one MODEL_PART per filament ascending. Every output is a NEW volume, so undo/redo sees fresh

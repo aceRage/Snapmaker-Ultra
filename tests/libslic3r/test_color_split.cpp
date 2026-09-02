@@ -1249,10 +1249,9 @@ TEST_CASE("colorsplit: anisotropic instance scale takes the world path", "[color
     ModelVolume &src = *object.volumes.front();
     ColorSplitSpace space = color_split_space(object, src);
     REQUIRE(space.world_path);
-    TriangleMesh world = src.mesh();
-    world.transform(space.to_split, /*fix_left_handed=*/true);      // world mm
-    ColorSplitResult r = split_volume_by_paint(world.its, src.mmu_segmentation_facets.get_data(),
-                                               depths_for_test(1.5), no_cap_no_step(), nullptr);
+    // Ruling 23: mesh and paint go in as they stand; the split carries the retriangulated surface across.
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               depths_for_test(1.5), no_cap_no_step(), nullptr, space.to_split);
     BoundingBoxf3 before = world_bbox(object);
     apply_color_split(object, 0, std::move(r), space, false, false);
     object.invalidate_bounding_box();
@@ -1280,11 +1279,8 @@ TEST_CASE("colorsplit: the world path brings a mirrored part back outward-facing
     ColorSplitSpace space = color_split_space(object, src);
     REQUIRE(space.world_path);
     REQUIRE(space.to_split.linear().determinant() < 0.);
-    TriangleMesh world = src.mesh();
-    world.transform(space.to_split, /*fix_left_handed=*/true);
-    REQUIRE(its_volume(world.its) > 0.f);
-    ColorSplitResult r = split_volume_by_paint(world.its, src.mmu_segmentation_facets.get_data(),
-                                               depths_for_test(1.5), no_cap_no_step(), nullptr);
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               depths_for_test(1.5), no_cap_no_step(), nullptr, space.to_split);
     BoundingBoxf3 before = world_bbox(object);
     auto created = apply_color_split(object, 0, std::move(r), space, false, false);
     object.invalidate_bounding_box();
@@ -1372,4 +1368,203 @@ TEST_CASE("colorsplit: an empty result leaves the object untouched", "[colorspli
     REQUIRE(object.volumes.size() == 1);
     REQUIRE(object.volumes[0] == src);                       // nothing produced, nothing deleted
     REQUIRE(!object.config.get().has("interface_shells"));
+}
+
+TEST_CASE("colorsplit: the depth override is a WORLD length on the mesh-space path", "[colorsplit]")
+{
+    // effective_depths applies params.depth_override_mm INSIDE the split, after the caller has scaled the
+    // depths, so on the mesh-space path it has to be scaled by the caller too - otherwise a 2x volume cuts
+    // 1 mm of MESH, i.e. 2 mm of world. scale_params is that scaling.
+    Model model = painted_model(make_grid_box(40., 40., 20., 6, 6), grid_box_top(6));
+    ModelObject &object = *model.objects.front();
+    ModelVolume &src = *object.volumes.front();
+    src.set_scaling_factor(Vec3d(2., 2., 2.));
+    object.invalidate_bounding_box();
+    ColorSplitSpace space = color_split_space(object, src);
+    REQUIRE(!space.world_path);
+    REQUIRE_THAT(space.depth_scale, WithinRel(2., 1e-9));
+    ColorSplitParams params = no_cap_no_step();
+    params.depth_override_mm = 1.0;                                   // world millimetres, as the dialog gives it
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               scale_depths(depths_for_test(1.5), space.depth_scale),
+                                               scale_params(params, space.depth_scale), nullptr);
+    // The result reports the depths it CUT with, i.e. in split space: half a millimetre of mesh.
+    REQUIRE_THAT(r.depths.D, WithinRel(0.5, 1e-9));
+    REQUIRE_THAT(r.depths.D * space.depth_scale, WithinRel(1.0, 1e-9));
+    auto created = apply_color_split(object, 0, std::move(r), space, false, false);
+    REQUIRE(created.size() == 2);
+    const ModelVolume *piece = created.back();
+    REQUIRE_THAT(piece->mesh().bounding_box().size().z(), WithinRel(0.5, 0.02));        // mesh millimetres
+    const BoundingBoxf3 wb = piece->mesh().transformed_bounding_box(object.instances.front()->get_matrix() * piece->get_matrix());
+    REQUIRE_THAT(wb.size().z(), WithinRel(1.0, 0.02));                                  // world millimetres
+}
+
+TEST_CASE("colorsplit: a partially painted facet is not mirrored by the world path", "[colorsplit]")
+{
+    // Ruling 23. A sphere-cursor stroke splits the facets it crosses, and the sub-facet subdivision is read
+    // against each facet's vertex order. The world path's left-handed fix swaps two vertices per facet, so
+    // running it on the RAW mesh would reflect the stroke inside every partially painted facet. Splitting the
+    // same paint on a plain copy and on a mirrored, anisotropically scaled instance must therefore agree once
+    // the world piece is mapped home - the depth runs along z, which neither the mirror nor the x2 touches.
+    Model model;
+    ModelObject *object = model.add_object();
+    ModelVolume *volume = object->add_volume(make_cube(40., 40., 20.));   // centred: [-20,20] x [-20,20] x [-10,10]
+    TriangleSelector selector(volume->mesh());
+    selector.select_patch(2, std::make_unique<TriangleSelector::Sphere>(Vec3f(0.f, 0.f, 10.f), Vec3f(0.f, 0.f, 100.f), 6.f,
+                                                                        Transform3d::Identity(), TriangleSelector::ClippingPlane()),
+                          EnforcerBlockerType::Extruder2, Transform3d::Identity(), true, 0.f);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+    object->add_instance();
+    const TriangleSelector::TriangleSplittingData paint = volume->mmu_segmentation_facets.get_data();
+
+    // Reference: the same paint, no transform at all.
+    ColorSplitResult ref = split_volume_by_paint(volume->mesh().its, paint, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(ref.pieces.size() == 1);
+    const double ref_volume = volume_of(ref.pieces[0].second);
+    REQUIRE(ref_volume > 0.);
+
+    volume->set_mirror(Vec3d(-1., 1., 1.));
+    object->instances.front()->set_scaling_factor(Vec3d(2., 1., 1.));
+    ColorSplitSpace space = color_split_space(*object, *volume);
+    REQUIRE(space.world_path);
+    REQUIRE(space.to_split.linear().determinant() < 0.);
+    ColorSplitResult r = split_volume_by_paint(volume->mesh().its, paint, depths_for_test(1.5), no_cap_no_step(), nullptr, space.to_split);
+    REQUIRE(r.pieces.size() == 1);
+    TriangleMesh home(r.pieces[0].second);
+    home.transform(space.from_split, /*fix_left_handed=*/true);
+    REQUIRE(its_volume(home.its) > 0.f);                                   // outward winding survived
+    REQUIRE_THAT(double(its_volume(home.its)), WithinRel(ref_volume, 1e-3));
+
+    // And the check has teeth: the contract this replaced - transform the raw mesh, then read the paint -
+    // really does move the stroke, so the equality above is not a tautology. MEASURED on this fixture: the
+    // swapped vertex order does not merely shift the stroke inside each facet, it leaves nothing the split
+    // can build a piece from at all (zero pieces). The assertion stays on "does not reproduce the
+    // reference" rather than pinning that count, which is an artefact of the broken path.
+    TriangleMesh pre = volume->mesh();
+    pre.transform(space.to_split, /*fix_left_handed=*/true);
+    ColorSplitResult bad = split_volume_by_paint(pre.its, paint, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    double bad_volume = 0.;
+    for (const auto &pc : bad.pieces) bad_volume += volume_of(pc.second);
+    INFO("old contract: " << bad.pieces.size() << " piece(s), volume " << bad_volume << " vs reference " << ref_volume);
+    REQUIRE(std::abs(bad_volume - ref_volume) > 1e-3 * ref_volume);
+}
+
+TEST_CASE("colorsplit: a rotated volume on the world path stays in place", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    object.instances.front()->set_scaling_factor(Vec3d(2., 1., 1.));
+    ModelVolume &src = *object.volumes.front();
+    src.set_rotation(Vec3d(0.3, 0.2, 0.7));
+    src.set_offset(Vec3d(5., -3., 2.));
+    object.invalidate_bounding_box();
+    ColorSplitSpace space = color_split_space(object, src);
+    REQUIRE(space.world_path);
+    BoundingBoxf3 before = world_bbox(object);
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               depths_for_test(1.5), no_cap_no_step(), nullptr, space.to_split);
+    apply_color_split(object, 0, std::move(r), space, false, false);
+    object.invalidate_bounding_box();
+    BoundingBoxf3 after = world_bbox(object);
+    REQUIRE((after.min - before.min).norm() < 1e-3);
+    REQUIRE((after.max - before.max).norm() < 1e-3);
+}
+
+TEST_CASE("colorsplit: a rotated anisotropic scale is not mistaken for an isotropic one", "[colorsplit]")
+{
+    // R S R^T with S = diag(2,1,1) and R a 45 degree turn about z: the first two columns come out the same
+    // length, so equal column norms alone would send this down the mesh-space path with a single bogus depth
+    // scale. L^T L is not s^2 I, and that is what decides.
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    ModelVolume &src = *object.volumes.front();
+    const Matrix3d R = Eigen::AngleAxisd(0.25 * PI, Vec3d::UnitZ()).toRotationMatrix();
+    Transform3d skewed = Transform3d::Identity();
+    skewed.linear() = R * Vec3d(2., 1., 1.).asDiagonal() * R.transpose();
+    src.set_transformation(skewed);
+    ColorSplitSpace space = color_split_space(object, src);
+    const Matrix3d L = space.to_split.linear();
+    REQUIRE_THAT(L.col(0).norm(), WithinRel(L.col(1).norm(), 1e-9));      // the trap: equal column norms
+    REQUIRE(space.world_path);                                            // ... and it is still anisotropic
+}
+
+TEST_CASE("colorsplit: a degenerate part transformation is refused", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    ModelVolume &src = *object.volumes.front();
+    Transform3d flat = Transform3d::Identity();
+    flat.linear() = Vec3d(1., 1., 0.).asDiagonal();                       // the part squashed onto a plane
+    src.set_transformation(flat);
+    REQUIRE_THROWS_AS(color_split_space(object, src), ColorSplitError);
+}
+
+TEST_CASE("colorsplit: the new volumes carry no text, emboss or cut state from the source", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    ModelVolume &src = *object.volumes.front();
+    // The (other, mesh&&) constructor copies all three, and a split part must not stay regenerable from its
+    // glyphs or keep being treated as a cut connector.
+    src.text_configuration = TextConfiguration{};
+    src.emboss_shape       = EmbossShape{};
+    src.cut_info           = ModelVolume::CutInfo(CutConnectorType::Plug, 0.5f, 0.5f, /*processed=*/false);
+    REQUIRE(src.is_text());
+    ColorSplitSpace space = color_split_space(object, src);
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               scale_depths(depths_for_test(1.5), space.depth_scale), ColorSplitParams{}, nullptr);
+    auto created = apply_color_split(object, 0, std::move(r), space, false, false);
+    REQUIRE(created.size() == 2);
+    for (const ModelVolume *v : created) {
+        REQUIRE(!v->text_configuration.has_value());
+        REQUIRE(!v->emboss_shape.has_value());
+        REQUIRE(!v->is_text());
+        REQUIRE(!v->is_svg());
+        REQUIRE(!v->cut_info.is_connector);                               // a default CutInfo, not just invalidated
+        REQUIRE(v->cut_info.is_processed);
+        REQUIRE(v->cut_info.is_from_upper);
+    }
+}
+
+TEST_CASE("colorsplit: an explicit extruder 0 on the source is an inherit, not a value", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    object.config.set("extruder", 4);
+    ModelVolume &src = *object.volumes.front();
+    src.config.set("extruder", 0);                                        // "inherit" spelled out
+    ColorSplitSpace space = color_split_space(object, src);
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               scale_depths(depths_for_test(1.5), space.depth_scale), ColorSplitParams{}, nullptr);
+    auto created = apply_color_split(object, 0, std::move(r), space, false, false);
+    REQUIRE(created.size() == 2);
+    REQUIRE(!created[0]->config.has("extruder"));                         // the key is dropped, not copied as 0
+    REQUIRE(created[0]->extruder_id() == 4);
+    REQUIRE(created[1]->config.extruder() == 2);
+}
+
+TEST_CASE("colorsplit: every instance of the object keeps its world bounding box", "[colorsplit]")
+{
+    Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+    ModelObject &object = *model.objects.front();
+    ModelInstance *second = object.add_instance(*object.instances.front());
+    second->set_offset(second->get_offset() + Vec3d(80., 25., 0.));
+    second->set_rotation(Vec3d(0., 0., 0.6));
+    object.invalidate_bounding_box();
+    REQUIRE(object.instances.size() == 2);
+    const BoundingBoxf3 before0 = object.instance_bounding_box(0, false);
+    const BoundingBoxf3 before1 = object.instance_bounding_box(1, false);
+    ModelVolume &src = *object.volumes.front();
+    ColorSplitSpace space = color_split_space(object, src);
+    REQUIRE(!space.world_path);                                           // both instances are unscaled
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               scale_depths(depths_for_test(1.5), space.depth_scale), ColorSplitParams{}, nullptr);
+    apply_color_split(object, 0, std::move(r), space, false, false);
+    object.invalidate_bounding_box();
+    const BoundingBoxf3 after0 = object.instance_bounding_box(0, false);
+    const BoundingBoxf3 after1 = object.instance_bounding_box(1, false);
+    REQUIRE((after0.min - before0.min).norm() < 1e-3);
+    REQUIRE((after0.max - before0.max).norm() < 1e-3);
+    REQUIRE((after1.min - before1.min).norm() < 1e-3);
+    REQUIRE((after1.max - before1.max).norm() < 1e-3);
 }
