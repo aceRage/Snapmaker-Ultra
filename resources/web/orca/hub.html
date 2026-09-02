@@ -10,8 +10,9 @@
 body { background: #2b2b2b; color: #ddd; font-family: 'Segoe UI', Roboto, -apple-system, sans-serif; font-size: 14px; padding: 20px; }
 h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
 .sub { color: #999; font-size: 12px; margin-bottom: 16px; }
-.row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
-.card { background: #333; border-radius: 8px; padding: 14px 16px; min-width: 280px; flex: 1 1 280px; }
+.row { display: flex; flex-direction: column; gap: 16px; align-items: stretch; max-width: 720px; }
+.card.hubcard { max-width: 720px; }
+.card { background: #333; border-radius: 8px; padding: 14px 16px; min-width: 280px; }
 .card h2 { font-size: 13px; color: #9a9a9a; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }
 .btn { display: inline-block; padding: 7px 14px; border-radius: 6px; background: #0a9e50; color: #fff; cursor: pointer; user-select: none; font-size: 13px; margin: 4px 6px 4px 0; }
 .btn.dim { background: #555; }
@@ -33,13 +34,13 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
 <h1>Snapmaker-Ultra Hub</h1>
 <div class="sub">Camera relays, phone access and the list of open slicer windows. This page only works on this PC.</div>
 <div class="row">
-  <div class="card" id="phone"><h2>Phone access (this Wi-Fi)</h2><div id="phonebody">Loading…</div></div>
+  <div class="card" id="phone"><h2>Local access (this Wi-Fi)</h2><div id="phonebody">Loading…</div></div>
   <div class="card" id="remote"><h2>Remote access (Tailscale)</h2><div id="remotebody">Loading…</div></div>
   <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div>
     <div class="note">A hidden slicer runs without a window and serves the phone; Show puts its window on the desktop, Hide takes it away again (it keeps working). "Needs attention" means it hit something only a person at this PC can answer - a file dialog, first-run setup, a mandatory update - so its window has been shown; Dismiss clears the flag once handled.</div>
   </div>
 </div>
-<div class="card" style="margin-top:16px"><h2>Hub</h2>
+<div class="card hubcard" style="margin-top:16px"><h2>Hub</h2>
   <span class="btn dim" id="new">Open a new slicer window</span>
   <span class="btn dim" id="newhidden">Open a hidden slicer</span>
   <span class="btn warn" id="quit">Quit hub</span>
