@@ -265,3 +265,99 @@ TEST_CASE("colorsplit: NormalUtils AngleWeighted normals are the exact corner bi
         REQUIRE_THAT(n[v].z(), WithinAbs(expected.z(), 1e-5f));
     }
 }
+
+static ColorSplitDepths depths_for_test(double D, double h = 0.2, double ws = 0.87)
+{
+    ColorSplitDepths d; d.D = D; d.ws = ws; d.layer_height = h; d.cap_top = 0.8; d.cap_bottom = 0.6; d.unlimited = !std::isfinite(D);
+    return d;
+}
+static ColorSplitParams no_cap_no_step() { ColorSplitParams p; p.flat_cap = false; p.crease_step = false; return p; }
+
+TEST_CASE("colorsplit: shell of a painted top face is a closed slab of depth D", "[colorsplit]")
+{
+    TriangleMesh block = make_cube(40., 40., 20.);
+    ColorPatches p = extract_color_patches(block.its, paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
+    auto shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(shells.size() == 1);
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+    // The only vertices of the painted top face are the four cube corners, whose angle-weighted normals are the
+    // (+-1,+-1,1)/sqrt(3) bisectors. d = 1.5 is measured ALONG that normal, so each corner moves 1.5/sqrt(3) =
+    // 0.866mm in x, in y AND in z - the slab is the frustum between the 40x40 top and a 38.268x38.268 bottom
+    // 0.866mm below it, NOT a 1.5mm-deep slab (the brief's 37*37*1.5 lower bound assumed a 1.5mm vertical drop
+    // and is unreachable by construction). Square frustum: h/3 * (A_top + A_bottom + sqrt(A_top*A_bottom)).
+    const double off     = 1.5 / std::sqrt(3.);
+    const double side    = 40. - 2. * off;
+    const double frustum = off / 3. * (1600. + side * side + 40. * side);   // = 1326.507 mm^3
+    REQUIRE(c.volume < 40. * 40. * off);                                    // strictly inside the straight prism
+    REQUIRE_THAT(c.volume, WithinRel(frustum, 1e-4));                       // its_volume accumulates in float
+}
+
+TEST_CASE("colorsplit: painted sphere smaller than D gets a valid thin shell (fold guard)", "[colorsplit]")
+{
+    TriangleMesh sphere(its_make_sphere(1.0, PI / 18.));
+    ColorPatches p = extract_color_patches(sphere.its, paint_by_predicate(sphere, [](const Vec3f &, const Vec3f &) { return true; }, EnforcerBlockerType::Extruder2));
+    auto shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(shells.size() == 1);
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+    REQUIRE(c.volume > 0.);
+    REQUIRE(c.volume < 4. / 3. * PI);          // hollow shell (bottom = delta-ball at the centre, or thicker after the guard), less than the full ball
+}
+
+TEST_CASE("colorsplit: thin plate painted on both sides gives two shells meeting mid-thickness", "[colorsplit]")
+{
+    TriangleMesh plate = make_cube(40., 40., 1.2);
+    auto data = paint_data(plate, {{2, EnforcerBlockerType::Extruder2}, {3, EnforcerBlockerType::Extruder2}, {0, EnforcerBlockerType::Extruder3}, {1, EnforcerBlockerType::Extruder3}});
+    ColorPatches p = extract_color_patches(plate.its, data);
+    auto shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(shells.size() == 2);
+    for (const ColorShell &s : shells) {
+        ShellCheck c = check_shell(s.mesh);
+        REQUIRE(c.closed);
+        REQUIRE(!c.self_intersects);
+        REQUIRE_THAT(c.volume, WithinRel(40. * 40. * 0.6, 0.08));   // frustum-ish, ~0.6mm deep
+    }
+}
+
+TEST_CASE("colorsplit: pinch boundary (two cells touching at one vertex) builds a closed shell", "[colorsplit]")
+{
+    TriangleMesh box = make_grid_box(40., 40., 10., 4, 4);
+    // cells (1,1) and (2,2) share exactly one vertex; each cell = 2 triangles: index = 2 + 2*(j*4+i) (+1)
+    auto cell = [](int i, int j) { int base = 2 + 2 * (j * 4 + i); return std::vector<int>{base, base + 1}; };
+    std::vector<std::pair<int, EnforcerBlockerType>> facets;
+    for (int f : cell(1, 1)) facets.emplace_back(f, EnforcerBlockerType::Extruder2);
+    for (int f : cell(2, 2)) facets.emplace_back(f, EnforcerBlockerType::Extruder2);
+    ColorPatches p = extract_color_patches(box.its, paint_data(box, facets));
+    auto shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(shells.size() == 2);          // one shell per edge-connected component
+    for (const ColorShell &s : shells) {
+        ShellCheck c = check_shell(s.mesh);
+        REQUIRE(c.closed);
+        REQUIRE(!c.self_intersects);
+        REQUIRE_THAT(c.volume, WithinRel(10. * 10. * 1.5, 0.02));
+    }
+}
+
+TEST_CASE("colorsplit: concave groove painted across the crease still yields a valid shell", "[colorsplit]")
+{
+    // L bracket: 40x40x20 block minus a 40x20x10 notch on the +Y/+Z corner, made with Manifold union of two boxes.
+    TriangleMesh a = make_cube(40., 40., 10.);
+    TriangleMesh b = make_cube(40., 20., 20.);
+    std::vector<TriangleMesh> out;
+    REQUIRE(MeshBoolean::mfd::make_boolean(a, b, out, "UNION"));
+    REQUIRE(out.size() == 1);
+    TriangleMesh bracket = out.front();
+    // paint the floor of the notch (z=10, y in 20..40) and the riser wall (y=20, z in 10..20)
+    auto data = paint_by_predicate(bracket, [](const Vec3f &c, const Vec3f &n) {
+        return (std::abs(n.z() - 1.f) < 1e-3f && c.z() > 9.9f && c.z() < 10.1f && c.y() > 20.f) || (std::abs(n.y() - 1.f) < 1e-3f && c.z() > 10.f);
+    }, EnforcerBlockerType::Extruder2);
+    ColorPatches p = extract_color_patches(bracket.its, data);
+    auto shells = build_color_shells(p, depths_for_test(1.5), no_cap_no_step(), nullptr);
+    REQUIRE(shells.size() == 1);
+    ShellCheck c = check_shell(shells[0].mesh);
+    REQUIRE(c.closed);
+    REQUIRE(!c.self_intersects);
+}

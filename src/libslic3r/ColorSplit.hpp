@@ -46,4 +46,21 @@ std::vector<Vec3f> color_split_normals(const indexed_triangle_set &surface);
 // Spec 3.4 (rev 2.2): d(v) = min(D, t(v)/2 - delta), delta = 0.002 mm, t(v) = thickness along -n(v). D may be +inf (unlimited).
 std::vector<float> compute_vertex_depths(const ColorPatches &patches, const std::vector<Vec3f> &normals, double D);
 
+// The split's optional refinements; the dialog owns them. Spec 3.5 (flat_cap) and 3.6 (crease_step) are not
+// built yet - the shell builder currently behaves as if both were off.
+struct ColorSplitParams {
+    bool   flat_cap          = true;   // spec 3.5
+    bool   absorb_islands    = true;   // spec 3.8
+    bool   crease_step       = true;   // spec 3.6
+    double depth_override_mm = 0.;     // <= 0: use depths.D
+};
+
+// Spec 3.7: one closed, inward-offset shell per edge-connected component of one painted state.
+struct ColorShell { int state = 0; bool capped = false; indexed_triangle_set mesh; };
+// Validity of a shell: closed (no open edge), free of self-intersections, and its signed volume.
+struct ShellCheck { bool closed = false; bool self_intersects = true; double volume = 0.; };
+ShellCheck check_shell(const indexed_triangle_set &shell);
+std::vector<ColorShell> build_color_shells(const ColorPatches &patches, const ColorSplitDepths &depths,
+                                           const ColorSplitParams &params, const ColorSplitProgress &progress);
+
 } // namespace Slic3r
