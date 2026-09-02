@@ -114,33 +114,11 @@ std::vector<Vec3f> color_split_normals(const indexed_triangle_set &surface)
     return normals;
 }
 
-std::vector<float> compute_vertex_depths(const ColorPatches &p, const std::vector<Vec3f> &normals, double D)
-{
-    AABBMesh aabb(p.surface);
-    const double eps = 1e-3;
-    std::vector<float> d(p.surface.vertices.size(), float(std::isfinite(D) ? D : std::numeric_limits<float>::max()));
-    for (size_t v = 0; v < p.surface.vertices.size(); ++v) {
-        const Vec3d n   = normals[v].cast<double>();
-        const Vec3d src = p.surface.vertices[v].cast<double>() - eps * n;
-        double t = std::numeric_limits<double>::infinity();
-        // AABBMesh::query_ray_hits sorts hits by distance (AABBMesh.cpp:187-189), so the first hit past the
-        // self-intersection radius is already the nearest one.
-        for (const AABBMesh::hit_result &hit : aabb.query_ray_hits(src, -n))
-            if (hit.is_hit() && hit.distance() > 5. * eps) { t = hit.distance() + eps; break; }
-        // std::max(0., ...): on a feature thinner than 2 * delta the clamp t/2 - delta turns negative, which
-        // would push the bottom copies OUTSIDE the part. The fold guard cannot catch that - where the offset
-        // is parallel (one flat patch, one normal) a negative depth translates the bottom triangle without
-        // changing its orientation, so the guard's orientation test still passes.
-        d[v] = float(std::max(0., std::min(double(d[v]), t / 2. - 0.002)));
-    }
-    return d;
-}
-
 namespace ColorSplitDetail {
 
-// The dialog's depth override wins over both the depth AND the unlimited flag. Both entry points have to
-// apply it identically - build_color_shells to cut with, split_volume_by_paint to report back - so neither
-// gets to spell the rule out for itself.
+// The dialog's depth override wins over both the depth AND the unlimited flag. Every entry point has to
+// apply it identically - build_color_shells to cut with, color_split_refine_length to size the refinement,
+// split_volume_by_paint to report back - so none of them gets to spell the rule out for itself.
 ColorSplitDepths effective_depths(const ColorSplitDepths &depths, const ColorSplitParams &params)
 {
     ColorSplitDepths out = depths;
@@ -148,7 +126,48 @@ ColorSplitDepths effective_depths(const ColorSplitDepths &depths, const ColorSpl
     return out;
 }
 
+float half_thickness_along(const AABBMesh &aabb, const Vec3f &v, const Vec3f &dir)
+{
+    const double eps = 1e-3;
+    const Vec3d  n   = dir.cast<double>();
+    const Vec3d  src = v.cast<double>() - eps * n;
+    double t = std::numeric_limits<double>::infinity();
+    // AABBMesh::query_ray_hits sorts hits by distance (AABBMesh.cpp:187-189), so the first hit past the
+    // self-intersection radius is already the nearest one.
+    for (const AABBMesh::hit_result &hit : aabb.query_ray_hits(src, -n))
+        if (hit.is_hit() && hit.distance() > 5. * eps) { t = hit.distance() + eps; break; }
+    // std::max(0., ...): on a feature thinner than 2 * delta the clamp t/2 - delta turns negative, which
+    // would push the bottom copies OUTSIDE the part. The fold guard cannot catch that - where the offset
+    // is parallel (one flat patch, one normal) a negative depth translates the bottom triangle without
+    // changing its orientation, so the guard's orientation test still passes.
+    return float(std::max(0., t / 2. - 0.002));
+}
+
+std::vector<float> vertex_depths(const AABBMesh &aabb, const ColorPatches &p, const std::vector<Vec3f> &normals, double D)
+{
+    const float cap = float(std::isfinite(D) ? D : std::numeric_limits<float>::max());
+    std::vector<float> d(p.surface.vertices.size());
+    for (size_t v = 0; v < p.surface.vertices.size(); ++v)
+        d[v] = std::min(cap, half_thickness_along(aabb, p.surface.vertices[v], normals[v]));
+    return d;
+}
+
 } // namespace ColorSplitDetail
+
+std::vector<float> compute_vertex_depths(const ColorPatches &p, const std::vector<Vec3f> &normals, double D)
+{
+    return ColorSplitDetail::vertex_depths(AABBMesh(p.surface), p, normals, D);
+}
+
+double color_split_refine_length(const ColorSplitDepths &depths_in, const ColorSplitParams &params, const BoundingBoxf3 &mesh_bbox)
+{
+    const ColorSplitDepths depths = ColorSplitDetail::effective_depths(depths_in, params);
+    const double D = depths.unlimited ? std::numeric_limits<double>::infinity() : depths.D;
+    // Spec 3.1a: fine enough that a feature of depth D gets vertices inside it, never finer than one wall
+    // stack (below that the extra triangles buy nothing a nozzle can print), and never coarser than a
+    // twentieth of the part - which is what makes the length scale-free on an unlimited-depth split.
+    return std::max(depths.ws, std::min(D, mesh_bbox.size().norm() / 20.));
+}
 
 ShellCheck check_shell(const indexed_triangle_set &shell)
 {
@@ -165,6 +184,12 @@ ColorSplitResult split_volume_by_paint(const indexed_triangle_set &mesh, const T
     if (progress && !progress(0)) throw ColorSplitCancelled();
     ColorPatches patches = extract_color_patches(mesh, paint);
     if (patches.states.empty()) throw ColorSplitError("The part has no painted colours.");
+    if (progress && !progress(5)) throw ColorSplitCancelled();
+    // Spec 3.1a: refine BEFORE the normals and the shells - they are what the missing interior vertices
+    // would have starved (a two-ring cylinder has no side vertex whose normal is radial).
+    BoundingBoxf3 bbox;
+    for (const Vec3f &v : patches.surface.vertices) bbox.merge(v.cast<double>());
+    patches = refine_color_patches(patches, color_split_refine_length(depths, params, bbox));
     if (progress && !progress(10)) throw ColorSplitCancelled();
     std::vector<std::string> shell_warnings;
     // Ruling 10: skipped micro-components are warnings, not errors - they have to reach the caller.
