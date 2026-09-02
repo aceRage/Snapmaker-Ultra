@@ -3,6 +3,7 @@
 #include <libslic3r/TriangleMesh.hpp>
 #include <libslic3r/TriangleSelector.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/Layer.hpp>
 #include <libslic3r/Print.hpp>
 #include <libslic3r/PrintConfig.hpp>
 #include <libslic3r/MeshBoolean.hpp>
@@ -1472,20 +1473,25 @@ TEST_CASE("colorsplit: a rotated volume on the world path stays in place", "[col
 
 TEST_CASE("colorsplit: a rotated anisotropic scale is not mistaken for an isotropic one", "[colorsplit]")
 {
-    // R S R^T with S = diag(2,1,1) and R a 45 degree turn about z: the first two columns come out the same
-    // length, so equal column norms alone would send this down the mesh-space path with a single bogus depth
-    // scale. L^T L is not s^2 I, and that is what decides.
+    // R S R^T with S = diag(2,1,1) and R carrying x onto the (1,1,1) diagonal: a stretch of 2 along that
+    // diagonal, so L = I + a a^T with a = (1,1,1)/sqrt(3) and ALL THREE columns come out sqrt(2) long. Equal
+    // column norms alone would therefore send this down the mesh-space path with a single bogus depth scale.
+    // (A 45 degree turn about z, the fixture this replaces, only matched the first two columns - the third
+    // stayed 1 - so the norm test alone already rejected it and the Gram test was never exercised.)
+    // L^T L = I + ones is not s^2 I, and that off-diagonal is the only thing left to decide it.
     Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
     ModelObject &object = *model.objects.front();
     ModelVolume &src = *object.volumes.front();
-    const Matrix3d R = Eigen::AngleAxisd(0.25 * PI, Vec3d::UnitZ()).toRotationMatrix();
+    const Matrix3d R = Eigen::Quaterniond::FromTwoVectors(Vec3d::UnitX(), Vec3d(1., 1., 1.).normalized()).toRotationMatrix();
     Transform3d skewed = Transform3d::Identity();
     skewed.linear() = R * Vec3d(2., 1., 1.).asDiagonal() * R.transpose();
     src.set_transformation(skewed);
     ColorSplitSpace space = color_split_space(object, src);
     const Matrix3d L = space.to_split.linear();
-    REQUIRE_THAT(L.col(0).norm(), WithinRel(L.col(1).norm(), 1e-9));      // the trap: equal column norms
-    REQUIRE(space.world_path);                                            // ... and it is still anisotropic
+    REQUIRE_THAT(L.col(0).norm(), WithinRel(L.col(1).norm(), 1e-9));      // the trap: three equal column norms
+    REQUIRE_THAT(L.col(0).norm(), WithinRel(L.col(2).norm(), 1e-9));
+    REQUIRE(std::abs(L.col(0).dot(L.col(1))) > 0.5);                      // ... but the columns are not orthogonal
+    REQUIRE(space.world_path);                                            // ... so it is still anisotropic
 }
 
 TEST_CASE("colorsplit: a degenerate part transformation is refused", "[colorsplit]")
@@ -1567,4 +1573,133 @@ TEST_CASE("colorsplit: every instance of the object keeps its world bounding box
     REQUIRE((after0.max - before0.max).norm() < 1e-3);
     REQUIRE((after1.min - before1.min).norm() < 1e-3);
     REQUIRE((after1.max - before1.max).norm() < 1e-3);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Task 8 - spec 8.7 (end-to-end slice parity) and spec 9 S4 (the painted-cube-top wedge). These are the only
+// cases here that run the real Print pipeline: they slice the SPLIT object and read back the per-region layer
+// geometry, the same "gold standard" the paint-depth suite uses (test_paint_depth_clamp.cpp's file header).
+
+// split_test_config's flows and paint-depth settings with the layer grid pinned uniform, so the layers are a
+// plain 0.2mm stack and "the layer just below the surface layer" is exactly print_z = 20 - 0.2.
+static DynamicPrintConfig e2e_config()
+{
+    DynamicPrintConfig c = split_test_config();
+    c.option<ConfigOptionFloat>("layer_height")->value               = 0.2;
+    c.option<ConfigOptionFloat>("initial_layer_print_height")->value = 0.2;
+    return c;
+}
+
+// Area (mm^2) `filament` claims on `layer`. A region's filament is its config().wall_filament - which is what
+// apply_mm_segmentation stamps on the region it carves for a paint claim (the 2D path, see
+// test_paint_depth_clamp.cpp:189-222) and equally what region_config_from_model_volume derives from a
+// volume's own "extruder" key (the 3D path, PrintObject.cpp:3244-3257). One number, both paths.
+static double filament_area(const Layer *layer, int filament)
+{
+    double a = 0.;
+    for (const LayerRegion *lr : layer->regions())
+        if (lr->region().config().wall_filament.value == filament)
+            for (const Surface &s : lr->slices.surfaces)
+                a += unscaled(unscaled(s.expolygon.area()));
+    return a;
+}
+
+// Area of every region on the layer, i.e. the whole sliced cross-section.
+static double layer_area(const Layer *layer)
+{
+    double a = 0.;
+    for (const LayerRegion *lr : layer->regions())
+        for (const Surface &s : lr->slices.surfaces)
+            a += unscaled(unscaled(s.expolygon.area()));
+    return a;
+}
+
+// print.apply + slice, the sequence test_paint_depth_clamp.cpp:97-119 uses. `model` must outlive `print`.
+static PrintObject *slice_one(Print &print, Model &model, const DynamicPrintConfig &config)
+{
+    print.set_status_silent();
+    print.apply(model, config);
+    REQUIRE(print.objects().size() == 1);
+    PrintObject *object = print.objects_mutable().front();
+    object->slice();
+    REQUIRE(object->layer_count() > 0);
+    return object;
+}
+
+// The split exactly as the GUI will drive it (Task 9): depths from the same config the slice will use, the
+// space from the object/volume pair, and the RAW mesh with its paint handed over untransformed - `to_split`
+// carries the world path instead (Ruling 23). Identity on these fixtures, but the call shape is the point.
+static void split_in_place(ModelObject &object, const DynamicPrintConfig &config, const ColorSplitParams &params)
+{
+    ModelVolume &src = *object.volumes.front();
+    const ColorSplitSpace space = color_split_space(object, src);
+    ColorSplitResult r = split_volume_by_paint(src.mesh().its, src.mmu_segmentation_facets.get_data(),
+                                               scale_depths(color_split_depths(config, {1, 2}), space.depth_scale),
+                                               scale_params(params, space.depth_scale), nullptr, space.to_split);
+    std::string notes;                                     // a skipped component would make the areas below meaningless
+    for (const std::string &w : r.warnings) notes += w + "; ";
+    INFO("split warnings: " << notes);
+    REQUIRE(r.warnings.empty());
+    REQUIRE(apply_color_split(object, 0, std::move(r), space, /*solid_interfaces=*/true, /*keep_base_sparse=*/false).size() == 2);
+}
+
+TEST_CASE("colorsplit e2e: split parts slice like the 2D paint-depth claim on a painted side face", "[colorsplit]")
+{
+    const DynamicPrintConfig config = e2e_config();
+    // 2D: the unsplit painted object, whose claim the paint-depth clamp bounds to the band.
+    Model painted = painted_model(make_cube(40., 40., 20.), all_with(CUBE_PLUS_X, EnforcerBlockerType::Extruder2));
+    Print        print_2d;
+    PrintObject *o2d = slice_one(print_2d, painted, config);
+    // 3D: the same paint, split into solid parts first, then sliced through the same pipeline.
+    Model split = painted_model(make_cube(40., 40., 20.), all_with(CUBE_PLUS_X, EnforcerBlockerType::Extruder2));
+    split_in_place(*split.objects.front(), config, ColorSplitParams{});
+    Print        print_3d;
+    PrintObject *o3d = slice_one(print_3d, split, config);
+    REQUIRE(o2d->layer_count() == o3d->layer_count());
+
+    // The middle half only: near the top and bottom edges the two paths differ BY DESIGN - the 3D shell
+    // tapers along the cube's corner bisector where the painted face meets the caps (spec 3.6), which the 2D
+    // segmentation, working one layer at a time with no notion of the faces above or below, cannot express.
+    const double one_line = 40. * 0.42;                    // one outer wall line over the 40mm painted edge
+    const size_t first = o2d->layer_count() / 4, last = 3 * o2d->layer_count() / 4;
+    REQUIRE(first < last);
+    for (size_t i = first; i < last; ++i) {
+        const double a2 = filament_area(o2d->layers()[i], 2), a3 = filament_area(o3d->layers()[i], 2);
+        INFO("layer " << i << " print_z " << o2d->layers()[i]->print_z << ": 2D " << a2 << " mm^2, 3D " << a3
+             << " mm^2, diff " << (a2 - a3) << " mm^2 (bound " << one_line << ")");
+        REQUIRE(a2 > 0.);                                  // both paths really claim something ...
+        REQUIRE(a3 > 0.);
+        REQUIRE_THAT(layer_area(o3d->layers()[i]), WithinRel(40. * 40., 1e-3));   // ... and the parts still tile the cube
+        REQUIRE(std::abs(a2 - a3) <= one_line);
+    }
+}
+
+TEST_CASE("colorsplit e2e S4: painted cube top keeps a body outer wall on the side faces", "[colorsplit_spike]")
+{
+    const DynamicPrintConfig config = e2e_config();
+    const ColorSplitDepths   depths = color_split_depths(config, {1, 2});
+    // The ring spec 3.6's step is meant to leave the body: one wall stack all the way round the 40mm square.
+    // (Taken as the brief states it; the exact ring of an inset square is 4*40*ws - 4*ws^2, 2% less, so the
+    // 0.9 factor below keeps its margin either way.)
+    const double ws_ring = 4. * 40. * depths.ws;
+    double body[2] = {0., 0.};
+    for (bool step : {false, true}) {
+        Model model = painted_model(make_cube(40., 40., 20.), all_with(CUBE_TOP, EnforcerBlockerType::Extruder2));
+        ColorSplitParams params;
+        params.crease_step = step;
+        params.flat_cap    = false;                        // the cap would set the depth, not the step
+        split_in_place(*model.objects.front(), config, params);
+        Print        print;
+        PrintObject *object = slice_one(print, model, config);
+        REQUIRE(object->layer_count() >= 2);
+        const size_t idx   = object->layer_count() - 2;    // just below the surface layer
+        const Layer *layer = object->layers()[idx];
+        body[step ? 1 : 0] = filament_area(layer, 1);
+        WARN("S4 crease_step=" << (step ? "on " : "off") << ": body " << body[step ? 1 : 0] << " mm^2, piece "
+             << filament_area(layer, 2) << " mm^2 on layer " << idx << " (print_z " << layer->print_z
+             << "); one wall stack ring = " << ws_ring << " mm^2 at ws = " << depths.ws << " mm");
+        if (step)
+            REQUIRE(body[1] >= 0.9 * ws_ring);
+    }
+    REQUIRE(body[1] > body[0]);                            // the step is what buys the body that outer wall
 }
