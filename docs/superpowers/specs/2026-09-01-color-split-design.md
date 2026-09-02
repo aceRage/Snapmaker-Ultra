@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.1 (after adversarial review; §3.6 refined during planning) · Status: awaiting user review, spike pending
+Date: 2026-09-01 · Rev 2.2 (after adversarial review; §3.6 and §3.4 refined during planning) · Status: awaiting user review, spike pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -56,12 +56,17 @@ D = max_f D_f and ws = max_f (ext_w + ext_s) — the same "widest region wins" r
 Unlimited mode → D = ∞ (the per-vertex clamp below then bounds every depth). A public helper
 `color_split_depths(config) → {D, ws, cap_top, cap_bottom}` feeds the dialog; the user may override D.
 
-**3.4 Per-vertex depth d(v).** d(v) = min(D, t(v)/2), where t(v) is the thickness of M along −n(v) from v
-(`AABBMesh::query_ray_hit` from v − ε·n(v); no hit → t = ∞). The half-thickness clamp reproduces the 2D
-Voronoi split: a wall thinner than 2D is shared at mid-thickness with whatever faces it (another colour or the
-unpainted far side), and Unlimited = "everything up to mid-thickness", exactly what the 2D unlimited mode gives.
+**3.4 Per-vertex depth d(v) (rev 2.2).** d(v) = min(D, t(v)/2 − δ) with δ = 0.002 mm, where t(v) is the
+thickness of M along −n(v) from v (`AABBMesh::query_ray_hits` from v − ε·n(v), first hit farther than 5ε; no
+hit → t = ∞). The half-thickness clamp reproduces the 2D Voronoi split: a wall thinner than 2D is shared at
+mid-thickness with whatever faces it (another colour or the unpainted far side), and Unlimited = "everything up
+to mid-thickness", exactly what the 2D unlimited mode gives. Because no bottom ever crosses the mid-surface,
+shells never nest or invert, so Manifold only ever sees ordinary solids. A feature painted the same colour on
+both sides (a pin, a boss, a thin plate) becomes two half-shells whose bottoms stop δ short of each other; the
+2δ sliver between them is an enclosed body island (absorbed into the colour by §3.8) or, where it connects to
+the body, a sub-resolution sliver the slicer drops — the pin still prints entirely in its colour.
 Fold guard: for every group triangle compare the reversed bottom triangle's normal with the top's; where the
-dot product ≤ 0 or the bottom area < 10⁻³ of the top's, halve d at that triangle's vertices and repeat (≤ 8
+dot product ≤ 0 or the bottom area < 10⁻⁶ of the top's, halve d at that triangle's vertices and repeat (≤ 8
 rounds, floor d = h). After construction each shell is checked with `MeshBoolean::cgal::does_self_intersect`;
 a still self-intersecting component halves its d uniformly and rebuilds; if it fails at d = h the split is
 refused with an error naming the filament (§7). Small convex features (fillets, bosses, spheres with r < D) thus

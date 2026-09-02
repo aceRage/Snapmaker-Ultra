@@ -325,7 +325,7 @@ git commit -m "feat(color-split): patch extraction from paint data (T-joint-free
 **Interfaces:**
 - Produces: `struct ColorSplitDepths { double D, ws, cap_top, cap_bottom, layer_height; bool unlimited; }`,
   `ColorSplitDepths color_split_depths(const DynamicPrintConfig &effective, const std::vector<int> &filaments)`,
-  `std::vector<float> compute_vertex_depths(const ColorPatches &, const std::vector<Vec3f> &normals, double D)` (spec 3.4 clamp min(D, t/2)),
+  `std::vector<float> compute_vertex_depths(const ColorPatches &, const std::vector<Vec3f> &normals, double D)` (spec 3.4 clamp min(D, t/2 − δ), δ = 0.002 mm),
   `std::vector<Vec3f> color_split_normals(const indexed_triangle_set &)` (AngleWeighted).
 
 - [ ] **Step 1: Write the failing tests**
@@ -389,7 +389,7 @@ TEST_CASE("colorsplit: per-vertex depth is min(D, half thickness)", "[colorsplit
     std::vector<Vec3f> np = color_split_normals(pp.surface);
     std::vector<float> dp = compute_vertex_depths(pp, np, 1.5);
     for (size_t v = 0; v < pp.surface.vertices.size(); ++v)
-        if (pp.surface.vertices[v].z() > 1.0f) REQUIRE(dp[v] == Approx(0.6f).margin(1e-3f));
+        if (pp.surface.vertices[v].z() > 1.0f) REQUIRE(dp[v] == Approx(0.598f).margin(1e-3f));
 
     TriangleMesh block = make_cube(40., 40., 20.);
     ColorPatches pb = extract_color_patches(block.its, paint_data(block, all_with(CUBE_TOP, EnforcerBlockerType::Extruder2)));
@@ -426,7 +426,7 @@ ColorSplitDepths color_split_depths(const DynamicPrintConfig &effective, const s
 
 // Spec 3.2: angle-weighted vertex normals of the full surface F.
 std::vector<Vec3f> color_split_normals(const indexed_triangle_set &surface);
-// Spec 3.4: d(v) = min(D, t(v)/2), t(v) = thickness along -n(v). D may be +inf (unlimited).
+// Spec 3.4 (rev 2.2): d(v) = min(D, t(v)/2 - delta), delta = 0.002 mm, t(v) = thickness along -n(v). D may be +inf (unlimited).
 std::vector<float> compute_vertex_depths(const ColorPatches &patches, const std::vector<Vec3f> &normals, double D);
 ```
 
@@ -501,7 +501,7 @@ std::vector<float> compute_vertex_depths(const ColorPatches &p, const std::vecto
         double t = std::numeric_limits<double>::infinity();
         for (const AABBMesh::hit_result &hit : aabb.query_ray_hits(src, -n))
             if (hit.is_hit() && hit.distance() > 5. * eps) { t = hit.distance() + eps; break; }
-        d[v] = float(std::min(double(d[v]), t / 2.));
+        d[v] = float(std::min(double(d[v]), t / 2. - 0.002));   // delta keeps the bottom strictly short of the mid-surface
     }
     return d;
 }
@@ -567,7 +567,7 @@ TEST_CASE("colorsplit: painted sphere smaller than D gets a valid thin shell (fo
     REQUIRE(c.closed);
     REQUIRE(!c.self_intersects);
     REQUIRE(c.volume > 0.);
-    REQUIRE(c.volume < 4. / 3. * PI);          // hollow shell, less than the full ball
+    REQUIRE(c.volume < 4. / 3. * PI);          // hollow shell (bottom = delta-ball at the centre, or thicker after the guard), less than the full ball
 }
 
 TEST_CASE("colorsplit: thin plate painted on both sides gives two shells meeting mid-thickness", "[colorsplit]")
@@ -778,7 +778,7 @@ struct ShellBuilder {
             Vec3f nt = (b - a).cross(c - a);
             Vec3f a2 = a - depth[t[0]] * normals[t[0]], b2 = b - depth[t[1]] * normals[t[1]], c2 = c - depth[t[2]] * normals[t[2]];
             Vec3f nb = (c2 - a2).cross(b2 - a2);            // reversed winding -> should point along -nt
-            if (nb.dot(-nt) <= 0.f || nb.norm() < 1e-3f * nt.norm()) {
+            if (nb.dot(-nt) <= 0.f || nb.norm() < 1e-6f * nt.norm()) {   // Ruling 2: only truly collapsed bottoms
                 for (int k = 0; k < 3; ++k) depth[t[k]] = std::max(float(depths.layer_height), depth[t[k]] * 0.5f);
                 changed = true;
             }
@@ -958,7 +958,7 @@ TEST_CASE("colorsplit spike: S1 self-intersecting fixtures and S3 timing", "[col
     ColorSplitResult rb = split_volume_by_paint(bossed.its, paint, depths_for_test(1.5), ColorSplitParams{}, nullptr);
     REQUIRE(rb.pieces.size() == 1);
     WARN("S1 boss: piece volume " << volume_of(rb.pieces[0].second) << " (boss volume " << PI * 4.0 << ")");
-    REQUIRE(volume_of(rb.pieces[0].second) == Approx(PI * 1.0 * 1.0 * 4.0).epsilon(0.05));   // whole boss after island absorption
+    REQUIRE(volume_of(rb.pieces[0].second) == Approx(PI * 1.0 * 1.0 * 4.0).epsilon(0.05));   // whole boss: two half-shells meet at the axis (delta sliver), top slab covers the rest
 }
 ```
 
