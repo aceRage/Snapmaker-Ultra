@@ -224,6 +224,9 @@ public:
 #endif
 
     std::vector<PlaterPresetComboBox*>&   combos_filament();
+    // Ultra: the printer / process combos, so the phone API can select presets the way the sidebar does.
+    PlaterPresetComboBox*           combo_printer();
+    PlaterPresetComboBox*           combo_print();
     Search::OptionsSearcher&        get_searcher();
     std::string&                    get_search_line();
     void                            update_printer_thumbnail();

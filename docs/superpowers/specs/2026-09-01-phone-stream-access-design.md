@@ -50,9 +50,15 @@ Manifest at `GET /api`.
 | `GET /api/printers` | `DeviceManager` machines (my + local): online/connected, status, percent, time left, layers, bed/nozzle temps, task, selected |
 | `POST /api/slice?plate={i}\|all` | selects the plate and posts the same toolbar event as the Slice button; returns a job id; 409 while slicing |
 | `GET /api/jobs[/{id}]` | job state (running/done/error/cancelled, percent, text) fed by hooks in `Plater::priv::on_slicing_update` / `on_process_completed` |
+| `GET /api/presets` | printer / process choices exactly as the sidebar and Process tab list them (label rows skipped), filament choices, filament slots with colours, dirty flags |
+| `POST /api/presets/select?type=printer\|process\|filament&name=…[&index=…]` | selects through the sidebar combo (printer, filament slot) or `Tab::select_preset` (process); same name → no-op; 409 when the preset (or, for a printer switch, any preset) has unsaved changes on the PC, since that would raise a modal there |
+| `POST /api/presets/filament_color?index=…&color=%23RRGGBB` | `PlaterPresetComboBox::ApplyFilamentColor` on that slot |
+| `POST /api/presets/filament_add` | `Sidebar::add_filament()` |
 
-The phone page gains a Streams / Plates tab bar in remote mode: printer cards, plate cards with
-thumbnail, objects, estimates and a Slice button with live progress.
+The phone page has Streams / Prepare / Devices tabs in remote mode. Prepare mirrors the slicer:
+printer dropdown, filament rows (colour swatch + dropdown, "+ Add filament"), process dropdown,
+then plate cards (preview, name, estimate, Slice / Re-slice, progress bar). Devices lists the
+printers with status, progress and bed/nozzle temperatures.
 
 ## Not in this phase
 

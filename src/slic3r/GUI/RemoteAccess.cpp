@@ -7,6 +7,9 @@
 #include "GUI_App.hpp"
 #include "PartPlate.hpp"
 #include "Plater.hpp"
+#include "PresetComboBoxes.hpp"
+#include "Tab.hpp"
+#include "libslic3r/FilamentColorLibrary.hpp"
 #include "slic3r/Utils/Http.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCode/Thumbnails.hpp"
@@ -717,6 +720,173 @@ RemoteAccess::ApiResponse RemoteAccess::api_jobs(int id)
     return r;
 }
 
+// The sidebar's own combo boxes are the source of truth for "what can be picked" and selecting
+// through them runs the exact code path a click in the sidebar does (Plater::priv::on_select_preset).
+static bool is_label_item(PresetComboBox* combo, unsigned int i)
+{
+    const size_t marker = reinterpret_cast<size_t>(combo->GetClientData(i));
+    return marker >= PresetComboBox::LABEL_ITEM_MARKER && marker < PresetComboBox::LABEL_ITEM_MAX;
+}
+
+static std::string combo_item_value(PresetComboBox* combo, unsigned int i, Preset::Type type)
+{
+    const std::string display = combo->GetString(i).ToUTF8().data();
+    return wxGetApp().preset_bundle->get_preset_name_by_alias(type, Preset::remove_suffix_modified(display));
+}
+
+// The process preset has no sidebar combo in this fork; its list lives on the Process tab.
+static PresetComboBox* process_combo()
+{
+    Tab* tab = wxGetApp().get_tab(Preset::TYPE_PRINT);
+    return tab ? tab->get_combo_box() : nullptr;
+}
+
+static nlohmann::json combo_items(PresetComboBox* combo, Preset::Type type)
+{
+    nlohmann::json items = nlohmann::json::array();
+    if (!combo)
+        return items;
+    const int sel = combo->GetSelection();
+    for (unsigned int i = 0; i < combo->GetCount(); ++i) {
+        if (is_label_item(combo, i))
+            continue;
+        nlohmann::json it;
+        it["name"]     = combo->GetString(i).ToUTF8().data();
+        it["value"]    = combo_item_value(combo, i, type);
+        it["selected"] = ((int) i == sel);
+        items.push_back(it);
+    }
+    return items;
+}
+
+static bool select_in_combo(PlaterPresetComboBox* combo, Preset::Type type, const std::string& value)
+{
+    if (!combo)
+        return false;
+    for (unsigned int i = 0; i < combo->GetCount(); ++i) {
+        if (is_label_item(combo, i) || combo_item_value(combo, i, type) != value)
+            continue;
+        combo->SetSelection((int) i);
+        wxCommandEvent evt(wxEVT_COMBOBOX, combo->GetId());
+        evt.SetEventObject(combo);
+        evt.SetInt((int) i);
+        combo->GetEventHandler()->ProcessEvent(evt);
+        return true;
+    }
+    return false;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_presets()
+{
+    auto out = std::make_shared<nlohmann::json>();
+    bool ok  = run_on_main([out]() {
+        nlohmann::json& j      = *out;
+        Sidebar&        sb     = wxGetApp().sidebar();
+        PresetBundle*   bundle = wxGetApp().preset_bundle;
+        j["printer"]      = combo_items(sb.combo_printer(), Preset::TYPE_PRINTER);
+        j["process"]      = combo_items(process_combo(), Preset::TYPE_PRINT);
+        j["printer_name"] = bundle->printers.get_selected_preset_name();
+        j["process_name"] = bundle->prints.get_selected_preset_name();
+        auto& combos = sb.combos_filament();
+        j["filament_choices"] = combos.empty() ? nlohmann::json::array() : combo_items(combos.front(), Preset::TYPE_FILAMENT);
+        j["filaments"]        = nlohmann::json::array();
+        const ConfigOptionStrings* colors = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+        for (size_t i = 0; i < bundle->filament_presets.size(); ++i) {
+            nlohmann::json f;
+            f["index"] = i;
+            f["value"] = bundle->filament_presets[i];
+            f["color"] = (colors && i < colors->values.size()) ? colors->values[i] : "";
+            j["filaments"].push_back(f);
+        }
+        j["dirty"]["printer"]  = bundle->printers.current_is_dirty();
+        j["dirty"]["process"]  = bundle->prints.current_is_dirty();
+        j["dirty"]["filament"] = bundle->filaments.current_is_dirty();
+    });
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); }
+    else       r.body = out->dump();
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_select_preset(const std::string& type, const std::string& name, int index)
+{
+    auto result = std::make_shared<std::pair<int, std::string>>(500, "");
+    bool ok     = run_on_main([result, type, name, index]() {
+        Sidebar&      sb     = wxGetApp().sidebar();
+        PresetBundle* bundle = wxGetApp().preset_bundle;
+        if (wxGetApp().plater()->is_background_process_slicing()) { *result = { 409, "slicing in progress" }; return; }
+        PlaterPresetComboBox* combo = nullptr;
+        Preset::Type          t     = Preset::TYPE_INVALID;
+        bool                  dirty = false;
+        const bool any_dirty = bundle->printers.current_is_dirty() || bundle->prints.current_is_dirty() || bundle->filaments.current_is_dirty();
+        if (type == "printer") {
+            if (name == bundle->printers.get_selected_preset_name()) { *result = { 200, "" }; return; }
+            // A printer switch re-validates process and filaments: any unsaved change would raise the
+            // transfer/discard dialog on the PC and block the GUI thread.
+            if (any_dirty) { *result = { 409, "there are unsaved preset changes on the PC; save or discard them there before switching printers" }; return; }
+            combo = sb.combo_printer(); t = Preset::TYPE_PRINTER;
+        }
+        else if (type == "process" && name == bundle->prints.get_selected_preset_name()) { *result = { 200, "" }; return; }
+        else if (type == "process") {
+            // Same steps as Plater::priv::on_select_preset for TYPE_PRINT, minus the sidebar combo.
+            if (bundle->prints.current_is_dirty()) { *result = { 409, "the process preset has unsaved changes on the PC; save or discard them there first" }; return; }
+            if (!bundle->prints.find_preset(name)) { *result = { 404, "preset not in the list: " + name }; return; }
+            wxGetApp().get_tab(Preset::TYPE_PRINT)->select_preset(name);
+            wxGetApp().plater()->on_config_change(bundle->full_config());
+            wxGetApp().plater()->record_preferred_print_profile();
+            *result = { 200, "" };
+            return;
+        }
+        else if (type == "filament") {
+            auto& combos = sb.combos_filament();
+            if (index < 0 || index >= (int) combos.size()) { *result = { 404, "no such filament slot" }; return; }
+            if (index < (int) bundle->filament_presets.size() && bundle->filament_presets[index] == name) { *result = { 200, "" }; return; }
+            combo = combos[index]; t = Preset::TYPE_FILAMENT; dirty = bundle->filaments.current_is_dirty();
+        } else { *result = { 404, "type must be printer, process or filament" }; return; }
+        if (dirty) { *result = { 409, "the " + type + " preset has unsaved changes on the PC; save or discard them there first" }; return; }
+        *result = select_in_combo(combo, t, name) ? std::make_pair(200, std::string()) : std::make_pair(404, "preset not in the list: " + name);
+    });
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    if (result->first != 200) { r.status = result->first; r.body = json_error(result->second); return r; }
+    r.body = "{\"ok\":true}";
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_filament_color(int index, const std::string& color)
+{
+    ApiResponse r;
+    if (color.size() != 7 || color[0] != '#' || color.find_first_not_of("0123456789abcdefABCDEF", 1) != std::string::npos) {
+        r.status = 404; r.body = json_error("color must be #RRGGBB"); return r;
+    }
+    auto result = std::make_shared<int>(500);
+    bool ok     = run_on_main([result, index, color]() {
+        auto& combos = wxGetApp().sidebar().combos_filament();
+        if (index < 0 || index >= (int) combos.size()) { *result = 404; return; }
+        combos[index]->ApplyFilamentColor(FilamentColor::FromColors({ color }, FilamentColorMode::Segment));
+        *result = 200;
+    });
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    if (*result != 200) { r.status = *result; r.body = json_error("no such filament slot"); return r; }
+    r.body = "{\"ok\":true}";
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_filament_add()
+{
+    auto count = std::make_shared<size_t>(0);
+    bool ok    = run_on_main([count]() {
+        wxGetApp().sidebar().add_filament();
+        *count = wxGetApp().preset_bundle->filament_presets.size();
+    });
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    nlohmann::json j;
+    j["filaments"] = *count;
+    r.body = j.dump();
+    return r;
+}
+
 RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, const std::string& path, const std::string& query, const std::string& body)
 {
     ApiResponse r;
@@ -733,11 +903,27 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "POST"}, {"path", "/api/slice?plate={index}|all"}, {"description", "start slicing one plate (selects it) or all; returns a job id; 409 while slicing"} },
             { {"method", "GET"},  {"path", "/api/jobs"},                   {"description", "recent jobs"} },
             { {"method", "GET"},  {"path", "/api/jobs/{id}"},              {"description", "job state: running | done | error | cancelled, percent, text"} },
+            { {"method", "GET"},  {"path", "/api/presets"},                {"description", "printer / process choices as the sidebar shows them, filament choices and the current filament slots with colours"} },
+            { {"method", "POST"}, {"path", "/api/presets/select?type=printer|process|filament&name={value}[&index={slot}]"}, {"description", "select a preset the way the sidebar does; 409 when that preset has unsaved changes on the PC"} },
+            { {"method", "POST"}, {"path", "/api/presets/filament_color?index={slot}&color=%23RRGGBB"}, {"description", "set a filament slot colour"} },
+            { {"method", "POST"}, {"path", "/api/presets/filament_add"},   {"description", "add a filament slot"} },
             { {"method", "GET"},  {"path", "/state"},                      {"description", "camera list for the stream wall (see /r/<token>/)"} }
         });
         r.body = j.dump();
         return r;
     }
+    if (path == "/presets" && method == "GET")
+        return api_presets();
+    if (path == "/presets/select" && method == "POST") {
+        auto get = [&](const char* k) { std::string v = query_param(query, k); return v.empty() ? query_param(body, k) : v; };
+        return api_select_preset(get("type"), get("name"), num(get("index"), -1));
+    }
+    if (path == "/presets/filament_color" && method == "POST") {
+        auto get = [&](const char* k) { std::string v = query_param(query, k); return v.empty() ? query_param(body, k) : v; };
+        return api_filament_color(num(get("index"), -1), get("color"));
+    }
+    if (path == "/presets/filament_add" && method == "POST")
+        return api_filament_add();
     if (path == "/plates" && method == "GET")
         return api_plates();
     if (path.compare(0, 8, "/plates/") == 0 && method == "GET") {

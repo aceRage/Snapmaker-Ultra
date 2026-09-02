@@ -1173,7 +1173,7 @@ struct Sidebar::priv
     Plater *plater;
 
     wxPanel *scrolled;
-    PlaterPresetComboBox *combo_print;
+    PlaterPresetComboBox *combo_print = nullptr; // Ultra: never created in this fork (the Process tab owns the process combo); keep it null, not garbage
     std::vector<PlaterPresetComboBox*> combos_filament;
     int editing_filament = -1;
     wxBoxSizer *sizer_filaments;
@@ -8208,6 +8208,9 @@ std::vector<unsigned int> Sidebar::get_ui_ordered_filament_ids() const
 
     return ordered_filament_ids;
 }
+
+PlaterPresetComboBox* Sidebar::combo_printer() { return p->combo_printer; }
+PlaterPresetComboBox* Sidebar::combo_print() { return p->combo_print; }
 
 void Sidebar::add_filament() {
     if (p->combos_filament.size() >= MAXIMUM_EXTRUDER_NUMBER) return;

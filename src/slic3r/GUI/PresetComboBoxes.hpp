@@ -253,9 +253,11 @@ private:
     wxRect get_dropdown_rect() const;
 
     void SelectLegacyFilamentColor();
-    void ApplyFilamentColor(const FilamentColor& colorData);
     std::string CurrentFilamentPresetName() const;
     std::string CurrentFilamentId() const;
+public:
+    // Ultra: also used by the phone API (RemoteAccess) to set a slot colour the way the sidebar does.
+    void ApplyFilamentColor(const FilamentColor& colorData);
 };
 
 

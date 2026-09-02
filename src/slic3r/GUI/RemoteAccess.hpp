@@ -75,6 +75,10 @@ private:
     ApiResponse api_printers();
     ApiResponse api_slice(int plate, bool all);
     ApiResponse api_jobs(int id);
+    ApiResponse api_presets();
+    ApiResponse api_select_preset(const std::string& type, const std::string& name, int index);
+    ApiResponse api_filament_color(int index, const std::string& color);
+    ApiResponse api_filament_add();
 
     struct Job
     {

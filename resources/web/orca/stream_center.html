@@ -54,21 +54,36 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #tabs { display: none; gap: 4px; margin-right: 6px; }
 #tabs .tab { padding: 6px 12px; border-radius: 6px; background: #3a3a3a; color: #ccc; font-size: 13px; cursor: pointer; user-select: none; }
 #tabs .tab.active { background: #0a9e50; color: #fff; }
-#plates { display: none; position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; overflow-y: auto; padding: 10px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
-#plates .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; color: #ccc; font-size: 13px; }
-#plates .btn { padding: 7px 14px; border-radius: 6px; background: #0a9e50; color: #fff; font-size: 13px; cursor: pointer; user-select: none; }
-#plates .btn.dim { background: #555; }
-#plates .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
-#plates .card { background: #333; border-radius: 8px; overflow: hidden; color: #eee; font-size: 13px; }
-#plates .card img { display: block; width: 100%; aspect-ratio: 1 / 1; object-fit: contain; background: #222; }
-#plates .card .body { padding: 8px 10px 10px; }
-#plates .card .title { font-weight: 600; margin-bottom: 4px; }
-#plates .card .meta { color: #aaa; font-size: 12px; line-height: 1.5; }
-#plates .card .bar { height: 6px; background: #222; border-radius: 3px; margin: 8px 0; overflow: hidden; }
-#plates .card .bar div { height: 100%; background: #0a9e50; width: 0; transition: width .3s; }
-#plates .printer { background: #2f2f2f; border-left: 4px solid #555; border-radius: 6px; padding: 8px 12px; color: #ddd; font-size: 13px; }
-#plates .printer.online { border-left-color: #0a9e50; }
-#plates .printer .meta { color: #aaa; font-size: 12px; }
+.view { display: none; position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; overflow-y: auto; padding: 10px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); color: #ddd; font-size: 13px; }
+.view .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; color: #ccc; }
+.view .btn { padding: 7px 14px; border-radius: 6px; background: #0a9e50; color: #fff; font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }
+.view .btn.dim { background: #555; }
+.view .btn.small { padding: 5px 10px; font-size: 12px; background: #3a3a3a; border: 1px dashed #777; }
+.setup { background: #303030; border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+.setup .lbl { color: #9a9a9a; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: 8px 0 4px; }
+.setup .lbl:first-child { margin-top: 0; }
+.setup select { width: 100%; background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 8px 10px; font-size: 14px; }
+.setup .filrow { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.setup .filrow .num { width: 22px; height: 22px; border-radius: 4px; background: #444; color: #fff; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+.setup .filrow input[type=color] { width: 34px; height: 34px; border: 1px solid #555; border-radius: 6px; padding: 0; background: #222; flex: none; }
+.setup .filrow select { flex: 1; min-width: 0; }
+.setup.busy { opacity: .6; pointer-events: none; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.card { background: #333; border-radius: 8px; overflow: hidden; color: #eee; }
+.card img { display: block; width: 100%; aspect-ratio: 1 / 1; object-fit: contain; background: #222; }
+.card .body { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px 10px; }
+.card .title { font-weight: 600; }
+.card .meta { color: #aaa; font-size: 12px; line-height: 1.4; }
+.card .bar { height: 6px; background: #222; margin: 0 10px 10px; border-radius: 3px; overflow: hidden; }
+.card .bar div { height: 100%; background: #0a9e50; width: 0; transition: width .3s; }
+.printer { background: #2f2f2f; border-left: 4px solid #555; border-radius: 6px; padding: 10px 12px; color: #ddd; margin-bottom: 8px; }
+.printer.online { border-left-color: #0a9e50; }
+.printer .name { font-weight: 600; margin-bottom: 4px; }
+.printer .meta { color: #aaa; font-size: 12px; line-height: 1.5; }
+.printer .temps { display: flex; gap: 14px; margin-top: 6px; }
+.printer .temps div { background: #262626; border-radius: 6px; padding: 6px 10px; text-align: center; }
+.printer .temps .v { font-size: 16px; color: #fff; }
+.printer .temps .k { font-size: 11px; color: #888; }
 #modal .url { font-family: Consolas, monospace; font-size: 12px; color: #9ed; text-align: center; word-break: break-all; user-select: all; }
 @media (max-width: 640px) {
     #topbar { padding: 6px 8px; gap: 6px; }
@@ -79,7 +94,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 </head>
 <body>
 <div id="topbar">
-  <span id="tabs"><span class="tab active" data-view="streams">Streams</span><span class="tab" data-view="plates">Plates</span></span>
+  <span id="tabs"><span class="tab active" data-view="streams">Streams</span><span class="tab" data-view="prepare">Prepare</span><span class="tab" data-view="devices">Devices</span></span>
   <span id="chips"></span>
   <span class="chip" id="addchip">+ Add</span>
   <span class="chip" id="phonechip" title="Open this camera wall on your phone">&#128241; Phone</span>
@@ -90,7 +105,8 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
   </span>
 </div>
 <div id="grid"></div>
-<div id="plates"></div>
+<div id="prepare" class="view"></div>
+<div id="devices" class="view"></div>
 <div id="modal-bg"><div id="modal"></div></div>
 <script>
 (function() {
@@ -892,8 +908,8 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         render();
     });
 
-    // ---- Phone "Plates" view: plates, printers and slicing through the slicer's JSON API ----
-    var view = 'streams', platesTimer = null, jobTimer = null, activeJob = null, thumbStamp = Date.now();
+    // ---- Phone "Prepare" and "Devices" views, driven by the slicer's JSON API ----
+    var view = 'streams', viewTimer = null, jobTimer = null, activeJob = null, thumbStamp = Date.now(), lastPresetsJson = '';
     function api(path, opts) {
         return fetch(REMOTE + 'api' + path, opts || {}).then(function(r) {
             return r.json().then(function(j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; });
@@ -908,11 +924,13 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         view = v;
         document.querySelectorAll('#tabs .tab').forEach(function(t) { t.classList.toggle('active', t.dataset.view === v); });
         document.getElementById('grid').style.display = v === 'streams' ? '' : 'none';
-        document.getElementById('plates').style.display = v === 'plates' ? 'block' : 'none';
+        document.getElementById('prepare').style.display = v === 'prepare' ? 'block' : 'none';
+        document.getElementById('devices').style.display = v === 'devices' ? 'block' : 'none';
         document.getElementById('chips').style.display = v === 'streams' ? '' : 'none';
         document.getElementById('layoutbox').style.display = v === 'streams' ? '' : 'none';
-        if (v === 'plates') { refreshPlates(); if (!platesTimer) platesTimer = setInterval(refreshPlates, 10000); }
-        else if (platesTimer) { clearInterval(platesTimer); platesTimer = null; }
+        if (viewTimer) { clearInterval(viewTimer); viewTimer = null; }
+        if (v === 'prepare') { lastPresetsJson = ''; refreshPrepare(); viewTimer = setInterval(refreshPrepare, 10000); }
+        if (v === 'devices') { refreshDevices(); viewTimer = setInterval(refreshDevices, 5000); }
         try { localStorage.setItem('snorca_remote_view', v); } catch (e) {}
     }
     function el(tag, cls, text) {
@@ -921,17 +939,18 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         if (text !== undefined) e.textContent = text;
         return e;
     }
+    function fail(e) { document.getElementById('note').textContent = e.message || String(e); }
     function startSlice(plate) {
         api('/slice?plate=' + plate, { method: 'POST' }).then(function(j) {
             activeJob = j.job;
             pollJob();
-        }).catch(function(e) { document.getElementById('note').textContent = e.message; });
+        }).catch(fail);
     }
     function pollJob() {
         if (jobTimer) clearTimeout(jobTimer);
         if (activeJob === null) return;
         api('/jobs/' + activeJob).then(function(j) {
-            document.querySelectorAll('#plates .card').forEach(function(card) {
+            document.querySelectorAll('#prepare .card').forEach(function(card) {
                 var mine = j.plate === -1 || +card.dataset.index === j.plate;
                 var bar = card.querySelector('.bar');
                 if (bar) { bar.style.display = mine && j.state === 'running' ? '' : 'none'; bar.firstChild.style.width = j.percent + '%'; }
@@ -939,35 +958,87 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 if (st && mine && j.state === 'running') st.textContent = 'Slicing… ' + j.percent + '%' + (j.text ? ' — ' + j.text.replace(/^Slicing/, '').trim() : '');
             });
             if (j.state === 'running') jobTimer = setTimeout(pollJob, 1000);
-            else { activeJob = null; thumbStamp = Date.now(); refreshPlates(); if (j.state === 'error') document.getElementById('note').textContent = 'Slicing failed: ' + j.error; }
+            else { activeJob = null; thumbStamp = Date.now(); lastPresetsJson = ''; refreshPrepare(); if (j.state === 'error') fail(new Error('Slicing failed: ' + j.error)); }
         }).catch(function() { jobTimer = setTimeout(pollJob, 2000); });
     }
-    function refreshPlates() {
-        var root = document.getElementById('plates');
-        Promise.all([api('/plates'), api('/printers').catch(function() { return { printers: [] }; })]).then(function(res) {
-            var data = res[0], printers = res[1].printers || [];
+    // Any change made here goes through the slicer's own sidebar code path.
+    function postPreset(path, then) {
+        var setup = document.querySelector('#prepare .setup');
+        if (setup) setup.classList.add('busy');
+        api(path, { method: 'POST' }).then(function() { lastPresetsJson = ''; refreshPrepare(); if (then) then(); })
+            .catch(function(e) { fail(e); lastPresetsJson = ''; refreshPrepare(); });
+    }
+    function fillSelect(sel, items, current) {
+        sel.innerHTML = '';
+        var found = false;
+        (items || []).forEach(function(it) {
+            var o = el('option', '', it.name);
+            o.value = it.value;
+            if (it.value === current) { o.selected = true; found = true; }
+            sel.appendChild(o);
+        });
+        if (!found && current) {
+            var o2 = el('option', '', current);
+            o2.value = current; o2.selected = true;
+            sel.insertBefore(o2, sel.firstChild);
+        }
+    }
+    function buildSetup(pr) {
+        var setup = el('div', 'setup');
+        setup.appendChild(el('div', 'lbl', 'Printer'));
+        var sp = el('select');
+        fillSelect(sp, pr.printer, pr.printer_name);
+        sp.onchange = function() { postPreset('/presets/select?type=printer&name=' + encodeURIComponent(sp.value)); };
+        setup.appendChild(sp);
+        setup.appendChild(el('div', 'lbl', 'Filaments'));
+        (pr.filaments || []).forEach(function(f) {
+            var row = el('div', 'filrow');
+            row.appendChild(el('span', 'num', String(f.index + 1)));
+            var color = el('input');
+            color.type = 'color';
+            color.value = /^#[0-9a-fA-F]{6}$/.test(f.color) ? f.color : '#26a69a';
+            color.title = 'Filament colour';
+            color.onchange = function() { postPreset('/presets/filament_color?index=' + f.index + '&color=' + encodeURIComponent(color.value)); };
+            row.appendChild(color);
+            var sf = el('select');
+            fillSelect(sf, pr.filament_choices, f.value);
+            sf.onchange = function() { postPreset('/presets/select?type=filament&index=' + f.index + '&name=' + encodeURIComponent(sf.value)); };
+            row.appendChild(sf);
+            setup.appendChild(row);
+        });
+        var add = el('span', 'btn small', '+ Add filament');
+        add.onclick = function() { postPreset('/presets/filament_add'); };
+        setup.appendChild(add);
+        setup.appendChild(el('div', 'lbl', 'Process'));
+        var spr = el('select');
+        fillSelect(spr, pr.process, pr.process_name);
+        spr.onchange = function() { postPreset('/presets/select?type=process&name=' + encodeURIComponent(spr.value)); };
+        setup.appendChild(spr);
+        return setup;
+    }
+    function refreshPrepare() {
+        var root = document.getElementById('prepare');
+        Promise.all([api('/presets'), api('/plates')]).then(function(res) {
+            var pr = res[0], data = res[1];
+            var presetsJson = JSON.stringify(pr);
+            var editing = root.contains(document.activeElement) && /^(SELECT|INPUT)$/.test(document.activeElement.tagName);
             var scroll = root.scrollTop;
-            root.innerHTML = '';
+            var setup = root.querySelector('.setup');
+            if (!setup || (presetsJson !== lastPresetsJson && !editing)) {
+                var fresh = buildSetup(pr);
+                if (setup) root.replaceChild(fresh, setup); else root.insertBefore(fresh, root.firstChild);
+                lastPresetsJson = presetsJson;
+            }
+            var rest = root.querySelector('.rest');
+            if (rest) rest.remove();
+            rest = el('div', 'rest');
             var head = el('div', 'row');
-            head.appendChild(el('span', '', (data.project ? data.project.split(/[\\/]/).pop() : 'Untitled') + ' · ' + data.printer));
+            head.appendChild(el('span', '', (data.project ? data.project.split(/[\\/]/).pop() : 'Untitled') + ' · ' + (data.plates || []).length + ' plate' + ((data.plates || []).length === 1 ? '' : 's')));
+            head.appendChild(el('span', '', '')).style.flex = '1';
             var all = el('span', 'btn' + (data.slicing ? ' dim' : ''), 'Slice all');
             all.onclick = function() { if (!data.slicing) startSlice('all'); };
             head.appendChild(all);
-            root.appendChild(head);
-            if (printers.length) {
-                var prow = el('div', 'row');
-                printers.forEach(function(p) {
-                    var card = el('div', 'printer' + (p.online ? ' online' : ''));
-                    card.appendChild(el('div', '', p.name + (p.selected ? ' ★' : '')));
-                    var meta = (p.online ? (p.status || 'idle') : 'offline');
-                    if (p.printing) meta += ' · ' + p.percent + '% · ' + fmtTime(p.left_time_s) + ' left' + (p.total_layers ? ' · layer ' + p.layer + '/' + p.total_layers : '');
-                    if (p.online) meta += ' · bed ' + Math.round(p.bed_temp) + '°' + (p.nozzles && p.nozzles.length ? ' · nozzle ' + p.nozzles.map(function(n) { return Math.round(n.temp) + '°'; }).join('/') : '');
-                    if (p.task) meta += ' · ' + p.task;
-                    card.appendChild(el('div', 'meta', meta));
-                    prow.appendChild(card);
-                });
-                root.appendChild(prow);
-            }
+            rest.appendChild(head);
             var cards = el('div', 'cards');
             (data.plates || []).forEach(function(p) {
                 var card = el('div', 'card');
@@ -978,27 +1049,26 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 img.onerror = function() { img.style.display = 'none'; };
                 card.appendChild(img);
                 var body = el('div', 'body');
-                body.appendChild(el('div', 'title', (p.name ? p.name : 'Plate ' + (p.index + 1)) + (p.index === data.current_plate ? ' (current)' : '')));
-                var objs = p.objects || [];
-                body.appendChild(el('div', 'meta', objs.length ? objs.length + ' object' + (objs.length > 1 ? 's' : '') + ': ' + objs.slice(0, 4).join(', ') + (objs.length > 4 ? '…' : '') : 'Empty plate'));
-                var state = el('div', 'meta state', p.sliced ? ('Sliced · ' + fmtTime(p.time_s) + ' · ' + Math.round(p.filament_g || 0) + ' g' + (p.ready_for_print ? '' : ' · not printable')) : (p.printable ? 'Not sliced' : ''));
-                body.appendChild(state);
-                var bar = el('div', 'bar');
-                bar.appendChild(el('div'));
-                bar.style.display = 'none';
-                body.appendChild(bar);
+                var left = el('div');
+                left.appendChild(el('div', 'title', (p.name ? p.name : 'Plate ' + (p.index + 1)) + (p.index === data.current_plate ? ' ·' : '')));
+                left.appendChild(el('div', 'meta state', p.sliced ? (fmtTime(p.time_s) + ' · ' + Math.round(p.filament_g || 0) + ' g' + (p.ready_for_print ? '' : ' · not printable')) : (p.printable ? 'Not sliced' : 'Empty')));
+                body.appendChild(left);
                 if (p.printable && !p.locked) {
                     var b = el('span', 'btn' + (data.slicing ? ' dim' : ''), p.sliced ? 'Re-slice' : 'Slice');
                     b.onclick = function() { if (!data.slicing && activeJob === null) startSlice(p.index); };
                     body.appendChild(b);
                 }
                 card.appendChild(body);
+                var bar = el('div', 'bar');
+                bar.appendChild(el('div'));
+                bar.style.display = 'none';
+                card.appendChild(bar);
                 cards.appendChild(card);
             });
-            root.appendChild(cards);
+            rest.appendChild(cards);
+            root.appendChild(rest);
             root.scrollTop = scroll;
             if (data.slicing && activeJob === null) {
-                // a slice started on the PC: show the plate's own percentage
                 (data.plates || []).forEach(function(p) {
                     if (p.slicing_percent > 0 && !p.sliced) {
                         var c = cards.querySelector('.card[data-index="' + p.index + '"] .state');
@@ -1006,6 +1076,33 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                     }
                 });
             }
+        }).catch(function(e) { root.innerHTML = ''; root.appendChild(el('div', 'row', 'Cannot reach the slicer: ' + e.message)); });
+    }
+    function refreshDevices() {
+        var root = document.getElementById('devices');
+        api('/printers').then(function(res) {
+            var printers = res.printers || [];
+            root.innerHTML = '';
+            if (!printers.length) { root.appendChild(el('div', 'row', 'No printers known to the slicer yet')); return; }
+            printers.forEach(function(p) {
+                var card = el('div', 'printer' + (p.online ? ' online' : ''));
+                card.appendChild(el('div', 'name', p.name + (p.selected ? ' ★' : '') + (p.model ? '  ·  ' + p.model : '')));
+                var meta = p.online ? (p.status || 'idle') : 'offline';
+                if (p.printing) meta += ' · ' + p.percent + '% · ' + fmtTime(p.left_time_s) + ' left' + (p.total_layers ? ' · layer ' + p.layer + '/' + p.total_layers : '');
+                if (p.task) meta += ' · ' + p.task;
+                card.appendChild(el('div', 'meta', meta));
+                if (p.online) {
+                    var temps = el('div', 'temps');
+                    var bed = el('div'); bed.appendChild(el('div', 'v', Math.round(p.bed_temp) + '° / ' + Math.round(p.bed_target) + '°')); bed.appendChild(el('div', 'k', 'bed'));
+                    temps.appendChild(bed);
+                    (p.nozzles || []).forEach(function(n, i) {
+                        var d = el('div'); d.appendChild(el('div', 'v', Math.round(n.temp) + '° / ' + Math.round(n.target) + '°')); d.appendChild(el('div', 'k', (p.nozzles.length > 1 ? 'nozzle ' + (i + 1) : 'nozzle')));
+                        temps.appendChild(d);
+                    });
+                    card.appendChild(temps);
+                }
+                root.appendChild(card);
+            });
         }).catch(function(e) { root.innerHTML = ''; root.appendChild(el('div', 'row', 'Cannot reach the slicer: ' + e.message)); });
     }
     if (REMOTE) {
@@ -1023,7 +1120,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         setInterval(fetchRemoteState, 15000);
         var v = 'streams';
         try { v = localStorage.getItem('snorca_remote_view') || 'streams'; } catch (e) {}
-        if (v === 'plates') setView('plates');
+        if (v === 'prepare' || v === 'devices' || v === 'plates') setView(v === 'plates' ? 'prepare' : v);
     }
 })();
 </script>
