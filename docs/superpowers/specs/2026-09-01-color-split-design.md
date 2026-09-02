@@ -1,6 +1,6 @@
 # Colour Split — Design Spec
 
-Date: 2026-09-01 · Rev 2.13 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–10; §12 added at Task 11) · Status: implemented (v1) — GUI round pending
+Date: 2026-09-01 · Rev 2.14 (after adversarial review; §3.1a/§3.4/§3.4a/§3.6/§3.9/§7 refined during planning, Tasks 3–10; §12 added at Task 11; §3.1/§3.9/§12 amended by Ruling 28, the final fix wave) · Status: implemented (v1) — GUI round pending
 Research: `docs/colorsplitting_research.md` · Worktree: `C:\Dev\SnapmakerOrcaNext`, branch feat/color-split off
 Snapmaker-Ultra main dff2c65eab (the paint-depth merge). A copy of this file lives in that worktree at
 `docs/superpowers/specs/2026-09-01-color-split-design.md`; the worktree copy is the binding one once committed.
@@ -39,6 +39,15 @@ compactify per piece only. Adjacency = `its_face_neighbors(F)`; F must have zero
 States above the printer's filament count: physical overflow is skipped with a warning (those facets count as
 unpainted); mixed-filament virtual ids are kept and become the part's extruder, as the 2D path does
 (PrintApply.cpp:1885-1893) — the plan verifies the extruder clamp in `region_config_from_model_volume` accepts them.
+**Rev 2.14 (Ruling 28(2)), implemented:** the limit travels as `ColorSplitParams::max_state` (0 = no limit, for
+a caller with no printer in hand). `split_volume_by_paint` re-labels every facet of a state above it to state 0
+— the facets stay in F, they simply join the body — and pushes ONE warning per dropped state, "Filament _k_ is
+not available on this printer; its paint stays in the body colour.", ahead of the shell warnings; if that empties
+the state list the split raises the same `nothing_to_split` kind carrying those notes as its message. The GUI
+sets `max_state = fff_print().mixed_filament_manager().total_filaments(num_extruders)` with `num_extruders =
+filament_diameter.size()`, i.e. exactly Print::apply's `num_total_filaments` (PrintApply.cpp:1379, 1484), so the
+mixed VIRTUAL ids stay valid and only real overflow is dropped. Without this a part would carry `extruder = k`,
+which slice time clamps back to filament 1 while the object list shows a chip for a filament that does not exist.
 
 **3.1a Smooth-patch decomposition (rev 2.6, Ruling 18; replaces the refinement pre-pass of rev 2.4/2.5).**
 A single offset surface cannot represent two claims that overlap inside the part: on a painted boss the top
@@ -168,8 +177,17 @@ Validation before touching the model: every Manifold `Status() == NoError`; `Vol
 within 10⁻⁴·Volume(M) of Volume(M); empty pieces are dropped with a warning; an empty body is allowed (§4).
 
 **3.9 Coordinate space.** D, ws, h are world millimetres. Let T = instance × volume matrix. If T's scale is
-isotropic (scale s, any rotation, mirror allowed) the split runs in mesh space with D/s, ws/s, h/s — exact for
-every instance sharing that scale. Otherwise (rev 2.8, Ruling 23) the paint is still read in mesh space — `extract_color_patches` runs on the
+isotropic (scale s) **and T preserves Z** (rev 2.14, Ruling 28(1)) the split runs in mesh space with D/s, ws/s,
+h/s — exact for every instance sharing that transform. Z-preserving means mesh +z maps to world +z with no tilt:
+with L = T.linear(), |L(0,2)| < 10⁻⁶·s, |L(1,2)| < 10⁻⁶·s and L(2,2) > 0. A turn about z, an x or y mirror and
+any uniform scale all satisfy it and keep the cheap exact path; a rotation about x or y, or a z mirror, does not.
+Isotropy alone is **not** enough, because §3.5 and §3.6 are print-frame rules ("flat", "more horizontal than its
+neighbour", up-facing vs down-facing caps) that the shell stage reads off the z of the space it actually runs in
+— the flat test, the flat-core projection, the case A/B choice and the group mean-normal fallback all compare
+against that z. A cube turned 90° about x with its world top painted would otherwise be classified as a painted
+side face: case B at every corner, the wall stack held to what the printer sees as the side faces (painted colour
+on them for the top ≈ws) and the flat cap taken on the wrong faces; a z mirror would swap cap_top for cap_bottom.
+Otherwise — anisotropic (no single depth scale) or tilted — (rev 2.8, Ruling 23) the paint is still read in mesh space — `extract_color_patches` runs on the
 untransformed mesh — and only the extracted patch surface F is transformed by T of the first instance (with the
 left-handed fix; a per-triangle vertex swap leaves per-facet states intact, whereas transforming the raw mesh
 first would mirror the sub-facet paint of partially painted facets); the pieces are transformed back by T⁻¹
@@ -317,9 +335,10 @@ Implemented on `feat/color-split` in `C:\Dev\SnapmakerOrcaNext` (Tasks 1–11, 2
 below comes from the committed test suite, Release x64, Manifold 3.5.2 with `MANIFOLD_PAR=OFF`; the full
 record is `.superpowers/sdd/2026-09-01-color-split/spike-report.md`.
 
-**Tests.** `libslic3r_tests.exe "[colorsplit]"` 912 assertions in 56 cases (run twice, identical);
-`"[colorsplit_spike]"` 24 in 3; `"[paintdepth]"` 1568 in 94; `"[chameleon]"` 605 in 133; the whole binary
-52 583 assertions in 581 cases, 2 of which are the pre-existing cases that fail as expected.
+**Tests** (rev 2.14, after the Ruling 28 fix wave). `libslic3r_tests.exe "[colorsplit]"` 941 assertions in 59
+cases; `"[colorsplit_spike]"` 24 in 3; `"[paintdepth]"` 1568 in 94; `"[chameleon]"` 605 in 133; the whole binary
+52 612 assertions in 584 cases, 2 of which are the pre-existing cases that fail as expected. (At rev 2.13 the
+`[colorsplit]` figure was 912 in 56 and the binary 52 583 in 581.)
 
 **S1 — engine (§9): 2 mm boss on a block, painted whole.** The painted region is two smooth patches (§3.1a),
 so two shells: side tube 9.37426 mm³, top slab 4.43006 mm³. The piece after the partition is 9.37566 mm³ =
@@ -352,8 +371,18 @@ onto the side faces.
   cube face is case B and the tie edges between them inherit the hold, so the piece claims
   ws·(2D − ws) ≈ 1.61 mm² per layer more than the 2D Voronoi diagonal at stock settings — the whole of the
   S4a residual above, and ≤ one wall stack wide.
-- **Anisotropic multi-instance objects** (§3.9): the world path uses the FIRST instance's transform, so other
-  instances with a different anisotropic scale get an approximate depth.
+- **Partition cost is O(shells × mesh)** (§3.8): every shell is a separate Manifold `Split` against the whole
+  remainder, so the work grows with the number of smooth patches (§3.1a) times the size of the part. The S3
+  timing above is the smooth case — a sphere is a handful of patches. Painted TEXT is the bad case: hundreds
+  of tiny patches, hundreds of full-mesh Splits, and the split can take minutes. The planned improvement is a
+  per-filament `BatchBoolean` union of that filament's shells before a single Split per filament; it is not
+  built, and nothing below depends on it.
+- **Anisotropic or tilted multi-instance objects** (§3.9): the world path uses the FIRST instance's transform,
+  so another instance with a different scale gets an approximate depth and another instance with a different
+  ORIENTATION gets an approximate up-axis (its flat caps and §3.6 crease cases are the first instance's).
+- **The mesh-space path is only for Z-preserving isotropic transforms** (§3.9, rev 2.14, Ruling 28(1)): a turn
+  about z, an x/y mirror and a uniform scale keep it; a rotation about x or y and a z mirror take the world
+  path instead, since §3.5/§3.6 are print-frame rules read off the split space's own z.
 - **Strokes narrower than 2·ws** (§3.6 width guard, Ruling 22) fall back to the plain mitred bisector instead
   of the case-A inset; that is what keeps embossed text splittable at all, at the cost of 2D parity there.
 - §3.10's exclusions stand as written: no interlocking notch, no seam/support/fuzzy-skin paint transfer.
