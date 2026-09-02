@@ -35,6 +35,11 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
     .cell .label { font-size: 13px; padding: 3px 10px; }
 }
 .cell .label { position: absolute; left: 8px; top: 6px; z-index: 2; padding: 2px 8px; border-radius: 10px; background: rgba(0,0,0,0.55); color: #fff; font-size: 12px; cursor: grab; user-select: none; }
+.cell .expand { position: absolute; right: 8px; top: 6px; z-index: 2; min-width: 28px; height: 24px; line-height: 24px; text-align: center; border-radius: 10px; background: rgba(0,0,0,0.55); color: #fff; font-size: 14px; cursor: pointer; user-select: none; -webkit-touch-callout: none; }
+.cell.expanded { position: fixed; inset: 0; z-index: 60; border-radius: 0; background: #000; }
+.cell.expanded .label { top: calc(6px + env(safe-area-inset-top)); left: calc(8px + env(safe-area-inset-left)); }
+.cell.expanded .expand { top: calc(6px + env(safe-area-inset-top)); right: calc(8px + env(safe-area-inset-right)); }
+@media (pointer: coarse) { .cell .expand { min-width: 36px; height: 30px; line-height: 30px; font-size: 16px; } }
 .cell.empty { border: 1px dashed #555; background: #262626; }
 .cell.over { outline: 2px solid #5fd08a; outline-offset: -2px; }
 body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
@@ -834,6 +839,21 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         var cols = Math.min(MAX_DIM, Math.max(1, +p[0] || 1)), rows = Math.min(MAX_DIM, Math.max(1, +p[1] || 1));
         return { cols: cols, rows: rows, n: cols * rows };
     }
+    // One tile at a time can fill the screen; the iframe stays in place so the stream keeps playing.
+    function toggleExpand(cell) {
+        var on = !cell.classList.contains('expanded');
+        document.querySelectorAll('#grid .cell.expanded').forEach(function(c) {
+            c.classList.remove('expanded');
+            var b = c.querySelector('.expand'); if (b) { b.textContent = '\u2922'; b.title = 'Expand'; }
+        });
+        if (on) {
+            cell.classList.add('expanded');
+            var b2 = cell.querySelector('.expand'); if (b2) { b2.textContent = '\u2715'; b2.title = 'Close'; }
+        }
+    }
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') { var c = document.querySelector('#grid .cell.expanded'); if (c) toggleExpand(c); }
+    });
     function render() {
         var chips = document.getElementById('chips');
         chips.innerHTML = '';
@@ -904,8 +924,17 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         grid.style.gridTemplateColumns = 'repeat(' + lay.cols + ', 1fr)';
         // The layout sets the columns and how many rows fit on screen; every selected
         // stream is rendered and extra rows scroll.
-        var rowH = Math.max(60, Math.floor((grid.clientHeight - 8 - (lay.rows - 1) * 4) / lay.rows));
-        grid.style.gridAutoRows = rowH + 'px';
+        var rowH;
+        if (REMOTE) {
+            // Phone: tiles keep a 16:9 shape at the column width and scroll, instead of being
+            // stretched to fill the rows on screen (which letterboxes the stream). The layout's
+            // row count only decides when the "more below" note shows.
+            var tileW = (grid.clientWidth - 8 - (lay.cols - 1) * 4) / lay.cols;
+            rowH = Math.max(60, Math.floor(tileW * 9 / 16));
+        } else {
+            rowH = Math.max(60, Math.floor((grid.clientHeight - 8 - (lay.rows - 1) * 4) / lay.rows));
+        }
+        if (grid.clientWidth > 0) grid.style.gridAutoRows = rowH + 'px'; // hidden (another view): keep the last size
         var count = Math.ceil(Math.max(state.active.length, lay.n) / lay.cols) * lay.cols;
 
         var shown = state.active;
@@ -965,6 +994,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                         lab.addEventListener('dragend', endDrag);
                     })(id);
                     cell.appendChild(lab);
+                    var ex = document.createElement('span');
+                    ex.className = 'expand';
+                    ex.textContent = '\u2922';
+                    ex.title = 'Expand';
+                    (function(c) { ex.onclick = function(e) { e.stopPropagation(); toggleExpand(c); }; })(cell);
+                    cell.appendChild(ex);
                 }
                 cell.querySelector('.label').textContent = (h && h.alias) ? h.alias : (h ? (h.ip || 'Camera') : id);
             } else {
@@ -1168,6 +1203,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         document.getElementById('devices').style.display = v === 'devices' ? 'block' : 'none';
         document.getElementById('chips').style.display = v === 'streams' ? '' : 'none';
         document.getElementById('layoutbox').style.display = v === 'streams' ? '' : 'none';
+        if (v === 'streams') render(); // tile sizes come from the grid's on-screen size
         if (viewTimer) { clearInterval(viewTimer); viewTimer = null; }
         if (v === 'prepare') { lastPresetsJson = ''; refreshInstances(refreshPrepare); viewTimer = setInterval(function() { refreshInstances(refreshPrepare); }, 10000); }
         if (v === 'devices') { refreshInstances(refreshDevices); viewTimer = setInterval(function() { refreshInstances(refreshDevices); }, 5000); }
