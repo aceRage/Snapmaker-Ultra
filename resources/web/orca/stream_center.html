@@ -931,6 +931,8 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             // row count only decides when the "more below" note shows.
             var tileW = (grid.clientWidth - 8 - (lay.cols - 1) * 4) / lay.cols;
             rowH = Math.max(60, Math.floor(tileW * 9 / 16));
+            // ... but never taller than the screen (a one-column layout in landscape).
+            if (grid.clientHeight > 68) rowH = Math.min(rowH, grid.clientHeight - 8);
         } else {
             rowH = Math.max(60, Math.floor((grid.clientHeight - 8 - (lay.rows - 1) * 4) / lay.rows));
         }
