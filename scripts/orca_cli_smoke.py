@@ -29,12 +29,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
     ap.add_argument("--project", help="optional project 3mf to slice (all plates)")
+    ap.add_argument("--datadir", help="isolated data directory (default: the user's real one)")
     ap.add_argument("--printer", default="Snapmaker U1 (0.4 nozzle)")
     ap.add_argument("--process", default="0.20 Standard @Snapmaker U1 (0.4 nozzle)")
     ap.add_argument("--filament", default="Snapmaker PLA Matte @U1")
     ap.add_argument("--keep", action="store_true", help="keep the output directory")
     a = ap.parse_args()
-    cli = OrcaCli(a.exe)
+    cli = OrcaCli(a.exe, a.datadir)
     failures: list = []
     out = tempfile.mkdtemp(prefix="orca_cli_smoke_")
     try:
@@ -53,6 +54,16 @@ def main() -> int:
         check(any(e.get("plate_percent", 0) > 0 for e in events), f"progress events received ({len(events)})", failures)
         check(os.path.isfile(os.path.join(out, "stl", "result.json")), "result.json written", failures)
         check(os.path.isfile(os.path.join(out, "stl", "sliced.3mf")), "3mf exported after slicing (no thumbnails)", failures)
+
+        # A 3mf written by Bambu Studio / Orca that carries geometry only (no project_settings.config)
+        # used to be taken for a project file and crashed the CLI; it must slice like a model file.
+        cube = os.path.join(REPO, "resources", "handy_models", "Voron_Design_Cube_v7.3mf")
+        res3 = cli.slice([cube], printer=a.printer, process=a.process, filaments=[a.filament],
+                         outdir=os.path.join(out, "model3mf"), arrange=True, timeout=900)
+        check(res3.get("return_code") == 0 and res3.get("exit_code") == 0,
+              f"model-only 3mf slice by preset names (rc={res3.get('return_code')}, exit={res3.get('exit_code')}) {res3.get('error_string','')[:200]}", failures)
+        plates3 = res3.get("sliced_plates", [])
+        check(len(plates3) == 1 and plates3[0].get("time_s", 0) > 0, f"model-only 3mf: one plate with estimates ({len(plates3)})", failures)
 
         bad = cli.slice([stl], printer="No Such Printer 123", process=a.process, filaments=[a.filament],
                         outdir=os.path.join(out, "bad"), timeout=120)
