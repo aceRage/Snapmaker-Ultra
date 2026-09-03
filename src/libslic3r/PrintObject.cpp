@@ -1,5 +1,6 @@
 #include "Exception.hpp"
 #include "Print.hpp"
+#include "DeterminismDump.hpp"
 #include "BoundingBox.hpp"
 #include "ClipperUtils.hpp"
 #include "ElephantFootCompensation.hpp"
@@ -394,6 +395,8 @@ void PrintObject::make_perimeters()
     m_print->throw_if_canceled();
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - end";
 
+    det_dump_surfaces(*this, "2_make_perimeters_surfaces");
+    det_dump_extrusions(*this, "2_make_perimeters_extrusions");
     this->set_done(posPerimeters);
 }
 
@@ -533,6 +536,7 @@ void PrintObject::prepare_infill()
     } // for each layer
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
 
+    det_dump_surfaces(*this, "3_prepare_infill_surfaces");
     this->set_done(posPrepareInfill);
 }
 
@@ -561,6 +565,7 @@ void PrintObject::infill()
         /*  we could free memory now, but this would make this step not idempotent
         ### $_->fill_surfaces->clear for map @{$_->regions}, @{$object->layers};
         */
+        det_dump_extrusions(*this, "4_infill_extrusions");
         this->set_done(posInfill);
     }
 }
@@ -2250,7 +2255,12 @@ void PrintObject::bridge_over_infill()
 
     // SECTION to gather and filter surfaces for expanding, and then cluster them by layer
     {
-        tbb::concurrent_vector<CandidateSurface> candidate_surfaces;
+        // One bucket per layer rather than one shared concurrent_vector: each task writes only to
+        // the layers it owns, so the candidates of a layer come out in the same order however the
+        // work is split between threads. Draining a concurrent_vector instead handed the layers
+        // their candidates in thread-arrival order, and the expansion below is order-dependent -
+        // that is how the internal bridges of one project changed with the number of cores.
+        std::vector<std::vector<CandidateSurface>> candidate_surfaces(this->layer_count());
         tbb::parallel_for(tbb::blocked_range<size_t>(0, this->layers().size()), [po = static_cast<const PrintObject *>(this), &candidate_surfaces, has_lightning_infill](tbb::blocked_range<size_t> r) {
             PRINT_OBJECT_TIME_LIMIT_MILLIS(PRINT_OBJECT_TIME_LIMIT_DEFAULT);
             for (size_t lidx = r.begin(); lidx < r.end(); lidx++) {
@@ -2299,7 +2309,7 @@ void PrintObject::bridge_over_infill()
                         if (po->config().dont_filter_internal_bridges.value == ibfNofilter){
                             // expand the unsupported area by 4x spacing to trigger internal bridging
                             unsupported = expand(unsupported, 4 * spacing);
-                            candidate_surfaces.push_back(CandidateSurface(s, lidx, unsupported, region, 0));
+                            candidate_surfaces[lidx].push_back(CandidateSurface(s, lidx, unsupported, region, 0));
                         }else{
                             // The following flag marks those surfaces, which overlap with unuspported area, but at least part of them is supported.
                             // These regions can be filtered by area, because they for sure are touching solids on lower layers, and it does not make sense to bridge their tiny overhangs
@@ -2314,7 +2324,7 @@ void PrintObject::bridge_over_infill()
                                     }
                                 }
                                 worth_bridging = intersection(closing(worth_bridging, float(SCALED_EPSILON)), s->expolygon);
-                                candidate_surfaces.push_back(CandidateSurface(s, lidx, worth_bridging, region, 0));
+                                candidate_surfaces[lidx].push_back(CandidateSurface(s, lidx, worth_bridging, region, 0));
                                 
 #ifdef DEBUG_BRIDGE_OVER_INFILL
                                 debug_draw(std::to_string(lidx) + "_candidate_surface_" + std::to_string(area(s->expolygon)),
@@ -2334,9 +2344,9 @@ void PrintObject::bridge_over_infill()
             }
         });
 
-        for (const CandidateSurface &c : candidate_surfaces) {
-            surfaces_by_layer[c.layer_index].push_back(c);
-        }
+        for (size_t lidx = 0; lidx < candidate_surfaces.size(); ++lidx)
+            if (!candidate_surfaces[lidx].empty())
+                surfaces_by_layer[lidx] = std::move(candidate_surfaces[lidx]);
     }
 
     // LIGHTNING INFILL SECTION - If lightning infill is used somewhere, we check the areas that are going to be bridges, and those that rely on the 
@@ -2724,8 +2734,11 @@ void PrintObject::bridge_over_infill()
                                           polygon_sections[i].end());
                 std::sort(polygon_sections[i].begin(), polygon_sections[i].end(),
                           [](const Line &a, const Line &b) {
-                              if (a == b) return false; // Ensure irreflexivity
-                              return a.a.y() < b.b.y();
+                              // The sections of one vertical line are disjoint by construction, so
+                              // ordering them by their own endpoints gives the intended order - and
+                              // unlike the old `a.a.y() < b.b.y()` it is a strict weak ordering, so
+                              // std::sort is not left with undefined behaviour when two coincide.
+                              return a.a.y() != b.a.y() ? a.a.y() < b.a.y() : a.b.y() < b.b.y();
                           });
             }
 
