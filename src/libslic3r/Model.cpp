@@ -3220,9 +3220,6 @@ static bool paint_volume_from_vertex_colors(ModelVolume *volume, const unsigned 
             std::cout << "error";
         }
     };
-    auto calc_tri_area = [](const Vec3f &v0, const Vec3f &v1, const Vec3f &v2) {
-        return std::abs((v0 - v1).cross(v0 - v2).norm()) / 2;
-    };
     // `volume` is now a parameter.
     // the caller sets the volume's extruder before painting.
     auto face_count = volume->mesh().its.indices.size();
