@@ -1652,6 +1652,16 @@ int CLI::run(int argc, char **argv)
                 //LoadStrategy strategy = LoadStrategy::LoadModel | LoadStrategy::LoadConfig|LoadStrategy::AddDefaultInstances;
                 //if (load_aux) strategy = strategy | LoadStrategy::LoadAuxiliary;
                 model = Model::read_from_file(file, &config, &config_substitutions, strategy, &plate_data_src, &project_presets, &is_bbl_3mf, &file_version, nullptr, nullptr, nullptr, plate_to_slice);
+                // The importer flags any 3mf written by Bambu Studio / Orca / this fork as a project file,
+                // including geometry-only ones without Metadata/project_settings.config (the bundled handy
+                // models, for instance). Only a file that actually carried a config is a project: the GUI
+                // (Plater::load_files) makes the same distinction. Everything else is a plain model and
+                // keeps the presets given on the command line; the project branch below would otherwise
+                // dereference options that were never loaded.
+                if (is_bbl_3mf && !config.has("printer_settings_id")) {
+                    BOOST_LOG_TRIVIAL(warning) << boost::format("3mf %1% carries no project settings, loading it as a plain model") % file;
+                    is_bbl_3mf = false;
+                }
                 if (is_bbl_3mf)
                 {
                     if (!first_file)
@@ -1702,10 +1712,12 @@ int CLI::run(int argc, char **argv)
                             const Vec3d &instance_offset = model_instance->get_offset();
                             BOOST_LOG_TRIVIAL(info) << boost::format("instance %1% transform {%2%,%3%,%4%} at %5%:%6%")% model_object->name % instance_offset.x() % instance_offset.y() %instance_offset.z() % __FUNCTION__ % __LINE__<< std::endl;
                         }*/
-                    current_printer_name = config.option<ConfigOptionString>("printer_settings_id")->value;
-                    current_process_name = config.option<ConfigOptionString>("print_settings_id")->value;
+                    // A project config can be partial (hand-edited or from another slicer); read the ids
+                    // through create=true so a missing one is empty rather than a null dereference.
+                    current_printer_name = config.option<ConfigOptionString>("printer_settings_id", true)->value;
+                    current_process_name = config.option<ConfigOptionString>("print_settings_id", true)->value;
                     current_printer_model = config.option<ConfigOptionString>("printer_model", true)->value;
-                    current_filaments_name = config.option<ConfigOptionStrings>("filament_settings_id")->values;
+                    current_filaments_name = config.option<ConfigOptionStrings>("filament_settings_id", true)->values;
 
                     BOOST_LOG_TRIVIAL(info) << boost::format("current_printer_name %1%, current_process_name %2%")%current_printer_name %current_process_name;
                     ConfigOptionStrings* option_strings = config.option<ConfigOptionStrings>("inherits_group");
@@ -1758,7 +1770,8 @@ int CLI::run(int argc, char **argv)
                         old_printable_width = (int)(old_printable_area[2].x() - old_printable_area[0].x());
                         old_printable_depth = (int)(old_printable_area[2].y() - old_printable_area[0].y());
                     }
-                    old_printable_height = (int)(config.opt_float("printable_height"));
+                    if (config.option<ConfigOptionFloat>("printable_height"))
+                        old_printable_height = (int)(config.opt_float("printable_height"));
 
                     if (config.option<ConfigOptionFloat>("extruder_clearance_height_to_rod"))
                         old_height_to_rod = config.opt_float("extruder_clearance_height_to_rod");
