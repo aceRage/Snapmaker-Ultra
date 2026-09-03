@@ -355,6 +355,8 @@ static std::pair<int, std::string> connect_impl(const std::string& dev_id)
         return { 409, "that device has no address; pair it again on the PC" };
     if (dev->connected && *busy)
         return { 200, "" }; // already the connected host
+    // Where the certificate comes from decides whether the device record keeps one (below).
+    const bool record_had_certs = device_has_tls(*dev);
     apply_stored_credentials(*dev);
     if (!device_has_tls(*dev))
         return { 409, "there is no certificate for " + (dev->dev_name.empty() ? dev->ip : dev->dev_name) +
@@ -458,7 +460,7 @@ static std::pair<int, std::string> connect_impl(const std::string& dev_id)
     }
 
     // ---- 6. what the PC shows: the cards, the combo boxes, the Device tab ----
-    if (!on_main([dev, model, nozzles, device_name]() {
+    if (!on_main([dev, model, nozzles, device_name, record_had_certs]() {
             // One device at a time, like the Device page.
             auto devices = wxGetApp().app_config->get_devices();
             for (size_t i = 0; i < devices.size(); ++i) {
@@ -470,6 +472,11 @@ static std::pair<int, std::string> connect_impl(const std::string& dev_id)
             DeviceInfo info    = *dev;
             info.connected     = true;
             info.model_name    = model;
+            // A certificate that came from the store stays there: this record goes into the app
+            // config, which is not where the fork keeps one (SSWCP.cpp:6716-6718 blanks it). A
+            // record that carried its own keeps it.
+            if (!record_had_certs)
+                info.ca = info.cert = info.key = "";
             if (!device_name.empty())
                 info.dev_name = device_name;
             if (!nozzles.empty()) {
