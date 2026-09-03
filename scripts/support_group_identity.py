@@ -128,7 +128,13 @@ def compare_tolerance(compare_exe, a_path, b_path):
     Returns (ok, verdict dict). A non-zero exit that still produced JSON is a clean failure;
     anything else is reported as an error verdict.
     """
-    proc = subprocess.run([compare_exe, a_path, b_path],
+    # slice_compare_cli links libslic3r, which loads OpenCASCADE at run time. Its own directory
+    # holds the staged DLLs; the libslic3r test target stages the same set, so add both.
+    env = dict(os.environ)
+    dll_dirs = [os.path.dirname(compare_exe),
+                os.path.join(ROOT, "build", "tests", "libslic3r", "Release")]
+    env["PATH"] = os.pathsep.join(dll_dirs + [env.get("PATH", "")])
+    proc = subprocess.run([compare_exe, a_path, b_path], env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, encoding="utf-8", errors="replace")
     lines = (proc.stdout or "").strip().splitlines()

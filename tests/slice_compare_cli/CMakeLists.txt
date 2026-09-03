@@ -7,3 +7,16 @@ if (WIN32)
     target_link_libraries(slice_compare_cli bcrypt.lib)
 endif()
 set_property(TARGET slice_compare_cli PROPERTY FOLDER "tests")
+
+# The same DLL staging the other test targets do: this executable links libslic3r, which pulls
+# in OpenCASCADE (TKernel.dll and friends) at run time.
+if (WIN32)
+    if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
+        Snapmaker_Orca_copy_dlls(COPY_DLLS "Debug" "d" output_dlls_Debug)
+    elseif("${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDebInfo")
+        Snapmaker_Orca_copy_dlls(COPY_DLLS "RelWithDebInfo" "" output_dlls_Release)
+    else()
+        Snapmaker_Orca_copy_dlls(COPY_DLLS "Release" "" output_dlls_Release)
+    endif()
+endif()
+
