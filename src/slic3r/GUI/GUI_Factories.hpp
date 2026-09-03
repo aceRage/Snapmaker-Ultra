@@ -16,6 +16,7 @@ class wxMenuItem;
 namespace Slic3r {
 
 enum class ModelVolumeType : int;
+class ModelVolume;
 
 namespace GUI {
 
@@ -39,6 +40,15 @@ struct SettingsFactory
     static wxBitmap                             get_category_bitmap(const std::string& category_name, bool menu_bmp = true);
     static Bundle                               get_bundle(const DynamicPrintConfig* config, bool is_object_settings, bool is_layer_settings = false);
     static std::vector<std::string>             get_options(bool is_part);
+    // Ultra (support groups): the curated support keys a MODEL_PART volume may carry. The list
+    // itself lives in libslic3r (Slic3r::part_support_keys()) because PrintObject's group
+    // resolver and PrintApply's invalidation predicate read the same one; these are the GUI-side
+    // spellings used by the settings bundle, the part parameter panel and the group menu.
+    // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 3.5.
+    static const std::vector<std::string>&      part_support_keys();
+    static bool                                 is_part_support_key(const std::string& opt_key);
+    // The group label a MODEL_PART volume carries, "" when it carries none.
+    static std::string                          part_support_group(const ModelVolume* volume);
     //BBS: add api to get options for catogary
     static std::vector<SimpleSettingData> get_visible_options(const std::string& category, const bool is_part);
     static std::map<std::string, std::vector<SimpleSettingData>> get_all_visible_options(const bool is_part);
@@ -152,6 +162,7 @@ private:
     void        append_menu_item_merge_to_multipart_object(wxMenu *menu);
     void        append_menu_item_assemble_separately(wxMenu *menu);
     void        append_menu_items_visibility(wxMenu *menu);
+    void        append_menu_items_support_group(wxMenu *menu);
     void        append_menu_item_merge_to_single_object(wxMenu* menu);
     void        append_menu_item_merge_parts_to_single_part(wxMenu *menu);
     void        append_menu_item_merge_some_parts_to_single_part(wxMenu *menu);

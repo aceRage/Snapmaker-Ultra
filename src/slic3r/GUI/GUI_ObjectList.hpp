@@ -428,6 +428,8 @@ public:
     void repair_by_remesh();
     void toggle_visibility_state(const wxDataViewItem& item);
     void update_visibility_icons();
+    // Ultra (support groups): resync every part row's group badge with ModelVolume::config.
+    void update_support_group_badges();
     void simplify();
     void update_item_error_icon(const int obj_idx, int vol_idx) const ;
 

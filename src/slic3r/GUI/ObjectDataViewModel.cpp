@@ -318,6 +318,14 @@ void ObjectDataViewModelNode::msw_rescale()
     set_extruder_icon();
 }
 
+// Ultra (support groups): how the badge is spelled in the name column. One place, because
+// SetValue has to be able to take it back off the text the in-place rename editor was seeded
+// with - see the plan's 4 ("the badge is a suffix in the name column, not a new column").
+static wxString support_group_badge(const wxString& group)
+{
+    return group.IsEmpty() ? wxString() : wxString("  [") + group + "]";
+}
+
 bool ObjectDataViewModelNode::SetValue(const wxVariant& variant, unsigned col)
 {
     switch (col)
@@ -332,7 +340,14 @@ bool ObjectDataViewModelNode::SetValue(const wxVariant& variant, unsigned col)
         DataViewBitmapText data;
         data << variant;
         m_bmp = data.GetBitmap();
-        m_name = data.GetText();
+        // Ultra (support groups): GetValue renders the group as a "  [name]" suffix and
+        // BitmapTextRenderer::CreateEditorCtrl seeds the rename editor from that rendered text,
+        // so strip our own suffix back off before it can be baked into the part's name.
+        wxString text = data.GetText();
+        const wxString badge = support_group_badge(m_support_group);
+        if (!badge.IsEmpty() && text.EndsWith(badge))
+            text = text.Left(text.length() - badge.length());
+        m_name = text;
         return true; }
     case colFilament: {
         DataViewBitmapText data;
@@ -1781,7 +1796,9 @@ void ObjectDataViewModel::GetValue(wxVariant &variant, const wxDataViewItem &ite
 		variant << node->m_visibility_icon;
 		break;
 	case colName:
-        variant << DataViewBitmapText(node->m_name, node->m_bmp);
+        // Ultra (support groups): the part's group as a suffix badge. m_name itself is
+        // untouched, so rename, SetName and every other consumer are unaffected.
+        variant << DataViewBitmapText(node->m_name + support_group_badge(node->m_support_group), node->m_bmp);
 		break;
 	case colFilament:
 		variant << DataViewBitmapText(node->m_extruder, node->m_extruder_bmp);

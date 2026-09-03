@@ -21,6 +21,9 @@
 
 #include <boost/algorithm/string.hpp>
 #include "slic3r/GUI/Tab.hpp"
+#include "libslic3r/SupportSet.hpp"
+#include <algorithm>
+#include <iterator>
 #include "slic3r/Utils/FixModelByWin10.hpp"
 #include "ParamsPanel.hpp"
 #include "MixedFilamentBadge.hpp"
@@ -81,11 +84,22 @@ static wxString filament_menu_item_name(const int filament_id_1based, const int 
     return wxString::Format(_L("Mixed Filament %d"), display_filament_id_1based);
 }
 
-static bool is_improper_category(const std::string& category, const int filaments_cnt, const bool is_object_settings = true)
+// Ultra (support groups): the third clause used to test category == "Support material", a
+// string no option in this tree carries - every support key's category is "Support" - so the
+// clause was a dead no-op and the real gate on what a part may carry was
+// SettingsFactory::get_options(). It is now key-aware: a part may carry the curated
+// part-level support keys and nothing else from the "Support" category.
+//
+// A caller with no key in hand (create_freq_settings_popupmenu, which offers whole bundles)
+// therefore still blocks the entire category on a part, which is exactly what the plan's risk
+// R2.3 asks for. docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2.2.
+static bool is_improper_category(const std::string& category, const int filaments_cnt,
+                                 const bool is_object_settings = true,
+                                 const std::string& opt_key = std::string())
 {
     return  category.empty() ||
         (filaments_cnt == 1 && (category == "Extruders" || category == "Wipe options")) ||
-        (!is_object_settings && category == "Support material");
+        (!is_object_settings && category == "Support" && !SettingsFactory::is_part_support_key(opt_key));
 }
 
 
@@ -154,8 +168,47 @@ std::map<std::string, std::vector<SimpleSettingData>>  SettingsFactory::PART_CAT
     { L("Speed"), {{"outer_wall_speed", "",1},{"inner_wall_speed", "",2},{"sparse_infill_speed", "",3},{"top_surface_speed", "",4}, {"internal_solid_infill_speed", "",5},
                     {"enable_overhang_speed", "",6}, {"overhang_1_4_speed", "",7}, {"overhang_2_4_speed", "",8}, {"overhang_3_4_speed", "",9}, {"overhang_4_4_speed", "",10},
                     {"bridge_speed", "",11}, {"gap_infill_speed", "",12}, {"internal_bridge_speed", "", 13}
+                    }},
+    // Ultra (support groups): the curated part-level support keys, so a part's settings node
+    // renders them in the same table style as Quality/Strength/Speed. An OBJECT takes its
+    // Support rows from OBJECT_CATEGORY_SETTINGS instead - get_visible_options() strips these
+    // back out for objects, or the shared rows would appear twice.
+    // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2.2, 3.5.
+    { L("Support"), {{"support_style", "",1},{"support_threshold_angle", "",2},{"support_top_z_distance", "",3},
+                    {"support_interface_filament", "",4},
+                    {"support_interface_top_layers", "",5},{"support_interface_bottom_layers", "",6},
+                    {"support_interface_spacing", "",7},{"support_bottom_interface_spacing", "",8},
+                    {"support_interface_pattern", "",9},{"support_interface_loop_pattern", "",10},
+                    {"support_ironing", "",11},{"support_ironing_pattern", "",12},
+                    {"support_ironing_flow", "",13},{"support_ironing_spacing", "",14}
                     }}
 };
+
+const std::vector<std::string>& SettingsFactory::part_support_keys()
+{
+    // One source of truth with PrintObject::support_groups() and the PrintApply predicate, so
+    // the menu can never offer a key the resolver ignores.
+    return Slic3r::part_support_keys();
+}
+
+bool SettingsFactory::is_part_support_key(const std::string& opt_key)
+{
+    const std::vector<std::string>& keys = SettingsFactory::part_support_keys();
+    return std::find(keys.begin(), keys.end(), opt_key) != keys.end();
+}
+
+std::string SettingsFactory::part_support_group(const ModelVolume* volume)
+{
+    if (volume == nullptr || !volume->is_model_part())
+        return std::string();
+    const ConfigOption* opt = volume->config.option("support_group");
+    if (opt == nullptr)
+        return std::string();
+    // The raw value, not serialize(): the label is shown to the user and put in a menu, and
+    // ConfigOptionString::serialize() would C-escape it.
+    const ConfigOptionString* str = dynamic_cast<const ConfigOptionString*>(opt);
+    return str != nullptr ? str->value : opt->serialize();
+}
 
 std::vector<std::string> SettingsFactory::get_options(const bool is_part)
 {
@@ -172,6 +225,14 @@ std::vector<std::string> SettingsFactory::get_options(const bool is_part)
         PrintObjectConfig obj_config;
         std::vector<std::string> obj_options = obj_config.keys();
         options.insert(options.end(), obj_options.begin(), obj_options.end());
+    } else {
+        // Ultra (support groups): a part may also carry the curated part-level support keys.
+        // They are PrintObjectConfig keys, so apply_to_print_region_config still drops them on
+        // the way to a PrintRegionConfig - PrintObject::support_groups() reads them off the
+        // volume config directly instead.
+        // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2.2, 3.5.
+        const std::vector<std::string>& sup = SettingsFactory::part_support_keys();
+        options.insert(options.end(), sup.begin(), sup.end());
     }
     return options;
 }
@@ -212,6 +273,12 @@ std::vector<SimpleSettingData> SettingsFactory::get_visible_options(const std::s
     }
 
     if (!is_part) {
+        // Ultra (support groups): PART_CATEGORY_SETTINGS carries the curated support keys so a
+        // PART's settings table can show them. For an OBJECT the authoritative list is
+        // OBJECT_CATEGORY_SETTINGS, which already holds most of them - drop ours, or the object
+        // table would show the shared rows twice.
+        options.erase(std::remove_if(options.begin(), options.end(), [](const SimpleSettingData& s) {
+            return SettingsFactory::is_part_support_key(s.name); }), options.end());
         it = OBJECT_CATEGORY_SETTINGS.find(category);
         if (it != OBJECT_CATEGORY_SETTINGS.end())
             options.insert(options.end(), OBJECT_CATEGORY_SETTINGS[category].begin(), OBJECT_CATEGORY_SETTINGS[category].end());
@@ -231,6 +298,15 @@ std::map<std::string, std::vector<SimpleSettingData>> SettingsFactory::get_all_v
 
     option_maps = PART_CATEGORY_SETTINGS;
     if (!is_part) {
+        // Ultra (support groups): see get_visible_options(). Dropping the part-level support
+        // rows leaves the "Support" entry empty; erasing it too keeps the merge below on the
+        // exact path it took before this feature existed, object row order included.
+        for (auto it = option_maps.begin(); it != option_maps.end(); ) {
+            std::vector<SimpleSettingData>& opts = it->second;
+            opts.erase(std::remove_if(opts.begin(), opts.end(), [](const SimpleSettingData& s) {
+                return SettingsFactory::is_part_support_key(s.name); }), opts.end());
+            it = opts.empty() ? option_maps.erase(it) : std::next(it);
+        }
         for (it1 = OBJECT_CATEGORY_SETTINGS.begin(); it1 != OBJECT_CATEGORY_SETTINGS.end(); it1++)
         {
             std::string category = it1->first;
@@ -278,7 +354,7 @@ SettingsFactory::Bundle SettingsFactory::get_bundle(const DynamicPrintConfig* co
     for (auto& opt_key : opt_keys)
     {
         auto category = config->def()->get(opt_key)->category;
-        if (is_improper_category(category, filaments_cnt, is_object_settings))
+        if (is_improper_category(category, filaments_cnt, is_object_settings, opt_key))
             continue;
 
         std::vector< std::string > new_category;
@@ -382,7 +458,7 @@ static void get_full_settings_hierarchy(FullSettingsHierarchy& settings_menu, co
     {
         auto const opt = config.def()->get(option);
         auto category = opt->category;
-        if (is_improper_category(category, filaments_cnt, !is_part))
+        if (is_improper_category(category, filaments_cnt, !is_part, option))
             continue;
 
         const std::string& label = !opt->full_label.empty() ? opt->full_label : opt->label;
@@ -444,6 +520,13 @@ static wxMenu* create_settings_popupmenu(wxMenu* parent_menu, const bool is_obje
     return menu;
 }
 
+// NOTE (Ultra, support groups - the plan's risk R2.3): this whole path is dead - its only call
+// site is commented out below. If anyone re-enables it, it MUST filter the bundle through
+// SettingsFactory::get_options(is_part) first: add_category_to_settings_from_frequent()
+// (GUI_ObjectList.cpp) writes whatever it is handed onto the item's config with no legality
+// check, so a "Support" bundle offered on a part would put object-only support keys on a volume,
+// where nothing reads them. is_improper_category() below blocks the category here because this
+// caller has no option key to offer it, which is the safe answer for a part.
 static void create_freq_settings_popupmenu(wxMenu* menu, const bool is_object_settings, wxDataViewItem item)
 {
     // Add default settings bundles
@@ -1212,6 +1295,266 @@ void MenuFactory::append_menu_items_visibility(wxMenu* menu)
         []() { return true; }, m_parent);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Ultra (support groups): assign the selected parts to a named support group.
+//
+// A group's VALUES live on the parts themselves - the curated part-level support keys are
+// written onto ModelVolume::config - so a saved 3MF is self-contained and reopens anywhere,
+// including stock Orca, which drops the unknown support_group key silently. support_group is
+// only the label the badge and the Support-groups dialog read back:
+// PrintObject::support_groups() groups by RESOLVED config and never by name, so a part whose
+// values equal the object's collapses into the default group and K stays 1.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2.2, 3.4, 3.5.
+// ---------------------------------------------------------------------------------------------
+
+// The MODEL_PART volumes behind the current object-list selection, in list order, deduplicated.
+// Re-derived inside every menu handler rather than captured, so a menu built for one selection
+// can never write to a stale volume.
+static std::vector<ModelVolume*> selected_part_volumes()
+{
+    std::vector<ModelVolume*> volumes;
+    wxDataViewItemArray sels;
+    obj_list()->GetSelections(sels);
+    const auto& objects = plater()->model().objects;
+    for (const wxDataViewItem& item : sels) {
+        if (!(list_model()->GetItemType(item) & itVolume))
+            continue;
+        const int obj_idx = list_model()->GetObjectIdByItem(item);
+        const int vol_idx = list_model()->GetVolumeIdByItem(item);
+        if (obj_idx < 0 || obj_idx >= (int) objects.size())
+            continue;
+        if (vol_idx < 0 || vol_idx >= (int) objects[obj_idx]->volumes.size())
+            continue;
+        ModelVolume* volume = objects[obj_idx]->volumes[vol_idx];
+        // A modifier, a support enforcer/blocker or a negative volume never carries a group -
+        // PrintObject::support_groups() only ever looks at is_model_part() volumes.
+        if (volume->is_model_part() && std::find(volumes.begin(), volumes.end(), volume) == volumes.end())
+            volumes.push_back(volume);
+    }
+    return volumes;
+}
+
+// The distinct group labels an object's parts already use, in first-appearance order.
+static std::vector<std::string> object_support_group_names(const ModelObject* object)
+{
+    std::vector<std::string> names;
+    if (object == nullptr)
+        return names;
+    for (const ModelVolume* volume : object->volumes) {
+        const std::string name = SettingsFactory::part_support_group(volume);
+        if (!name.empty() && std::find(names.begin(), names.end(), name) == names.end())
+            names.push_back(name);
+    }
+    return names;
+}
+
+// "Group", "Group 2", "Group 3", ... - the first label this object does not use yet.
+static std::string unique_support_group_name(const ModelObject* object, const std::string& base)
+{
+    const std::vector<std::string> used = object_support_group_names(object);
+    auto taken = [&used](const std::string& n) {
+        return std::find(used.begin(), used.end(), n) != used.end();
+    };
+    if (!taken(base))
+        return base;
+    for (int i = 2; i < 1000; ++ i) {
+        const std::string candidate = base + " " + std::to_string(i);
+        if (!taken(candidate))
+            return candidate;
+    }
+    return base;
+}
+
+// The curated support values an existing group carries, read off its first member, so a part
+// joining the group ends up with the same RESOLVED config and therefore really is in that group.
+static DynamicPrintConfig support_group_values(const ModelObject* object, const std::string& group)
+{
+    DynamicPrintConfig values;
+    if (object == nullptr)
+        return values;
+    for (const ModelVolume* volume : object->volumes) {
+        if (SettingsFactory::part_support_group(volume) != group)
+            continue;
+        const DynamicPrintConfig& cfg = volume->config.get();
+        for (const std::string& key : SettingsFactory::part_support_keys())
+            if (const ConfigOption* opt = cfg.option(key); opt != nullptr)
+                values.set_key_value(key, opt->clone());
+        break;
+    }
+    return values;
+}
+
+// The object's own effective support values - the edited process preset with the object's
+// overrides on top. A brand new group starts from these, so it shows up in the part panel
+// immediately and still resolves into the default group until the user changes something.
+static DynamicPrintConfig object_support_values(const ModelObject* object)
+{
+    DynamicPrintConfig values;
+    if (wxGetApp().preset_bundle == nullptr)
+        return values;
+    DynamicPrintConfig full = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    if (object != nullptr)
+        full.apply(object->config.get(), true);
+    for (const std::string& key : SettingsFactory::part_support_keys())
+        if (const ConfigOption* opt = full.option(key); opt != nullptr)
+            values.set_key_value(key, opt->clone());
+    return values;
+}
+
+// A support set reduced to the part-level keys. The set carries its interface filament as a
+// TYPE; resolve_interface_filament() turns it into a slot here, which is what makes a set
+// portable between printers (the plan's 3.3).
+static DynamicPrintConfig support_set_values(const SupportSet& set, std::string* warning)
+{
+    DynamicPrintConfig filaments;
+    if (PresetBundle* bundle = wxGetApp().preset_bundle; bundle != nullptr) {
+        const DynamicPrintConfig full = bundle->full_config();
+        for (const char* key : { "filament_type", "filament_soluble" })
+            if (const ConfigOption* opt = full.option(key); opt != nullptr)
+                filaments.set_key_value(key, opt->clone());
+    }
+    DynamicPrintConfig applied;
+    support_set_apply_to(set, applied, filaments, warning);
+
+    DynamicPrintConfig values;
+    for (const std::string& key : SettingsFactory::part_support_keys())
+        if (const ConfigOption* opt = applied.option(key); opt != nullptr)
+            values.set_key_value(key, opt->clone());
+    return values;
+}
+
+// Write a group assignment onto every selected part, under ONE undo snapshot, so Ctrl+Z takes
+// the badge, the part panel and PrintObject::support_groups() back together
+// (ModelConfig::set_key_value bumps the timestamp the undo stack keys on - the plan's R2.4).
+static void assign_support_group(const std::vector<ModelVolume*>& volumes,
+                                 const std::string&               group_name,
+                                 const DynamicPrintConfig*        values,
+                                 const std::string&               snapshot)
+{
+    if (volumes.empty() || plater() == nullptr)
+        return;
+    plater()->take_snapshot(snapshot);
+
+    const std::vector<std::string>& keys = SettingsFactory::part_support_keys();
+    for (ModelVolume* volume : volumes) {
+        // Always start from a clean slate: a stale override left behind would keep the part in a
+        // group nobody asked for, because the resolver keys on values and not on the label.
+        volume->config.erase("support_group");
+        for (const std::string& key : keys)
+            volume->config.erase(key);
+        if (values == nullptr)
+            continue;
+        if (!group_name.empty())
+            volume->config.set_key_value("support_group", new ConfigOptionString(group_name));
+        for (const std::string& key : keys)
+            if (const ConfigOption* opt = values->option(key); opt != nullptr)
+                volume->config.set_key_value(key, opt->clone());
+    }
+
+    const auto& objects = plater()->model().objects;
+    std::vector<int> changed_objects;
+    for (ModelVolume* volume : volumes) {
+        // Adds or removes the settings node under the part and refreshes the part panel.
+        obj_list()->object_config_options_changed({ volume->get_object(), volume });
+        for (int i = 0; i < (int) objects.size(); ++ i)
+            if (objects[i] == volume->get_object()) {
+                if (std::find(changed_objects.begin(), changed_objects.end(), i) == changed_objects.end())
+                    changed_objects.push_back(i);
+                break;
+            }
+    }
+    obj_list()->update_support_group_badges();
+    // What actually triggers the re-slice; PrintApply's model_support_group_data_changed() then
+    // invalidates posSupportMaterial (or posSlice when the soluble rule flips).
+    for (int obj_idx : changed_objects)
+        obj_list()->changed_object(obj_idx);
+}
+
+void MenuFactory::append_menu_items_support_group(wxMenu* menu)
+{
+    const wxString title = _L("Support group");
+    // The submenu's contents depend on the selection and the part menu is long-lived, so it is
+    // rebuilt on every open - the idiom of append_menu_item_change_filament().
+    if (const int item_id = menu->FindItem(title); item_id != wxNOT_FOUND)
+        menu->Destroy(item_id);
+
+    const std::vector<ModelVolume*> volumes = selected_part_volumes();
+    if (volumes.empty())
+        return;
+    const ModelObject* object = volumes.front()->get_object();
+
+    wxMenu* sub = new wxMenu();
+
+    append_menu_item(sub, wxID_ANY, _L("None (object settings)"),
+        _L("Take these parts out of their support group: they follow the object's own support settings again"),
+        [](wxCommandEvent&) {
+            assign_support_group(selected_part_volumes(), std::string(), nullptr, "Support group cleared");
+        }, "", nullptr, []() { return true; }, m_parent);
+
+    const std::vector<std::string> names = object_support_group_names(object);
+    if (!names.empty())
+        sub->AppendSeparator();
+    for (const std::string& name : names)
+        append_menu_item(sub, wxID_ANY, from_u8(name),
+            format_wxstr(_L("Put the selected parts in the support group \"%1%\""), from_u8(name)),
+            [name](wxCommandEvent&) {
+                const std::vector<ModelVolume*> sel = selected_part_volumes();
+                if (sel.empty())
+                    return;
+                const DynamicPrintConfig values = support_group_values(sel.front()->get_object(), name);
+                assign_support_group(sel, name, &values, "Support group assigned");
+            }, "", nullptr, []() { return true; }, m_parent);
+
+    sub->AppendSeparator();
+
+    // Building the menu is an explicit user action, so a directory scan is allowed here - unlike
+    // inside a settings-change scope, which a phone request can reach.
+    SupportSetStore& store = SupportSetStore::instance();
+    store.reload();
+    if (!store.list().empty()) {
+        wxMenu* from_set = new wxMenu();
+        for (const SupportSet& set : store.list()) {
+            const std::string set_name = set.name;
+            append_menu_item(from_set, wxID_ANY, from_u8(set_name), "",
+                [set_name](wxCommandEvent&) {
+                    const std::vector<ModelVolume*> sel = selected_part_volumes();
+                    const SupportSet* set = SupportSetStore::instance().find(set_name);
+                    if (sel.empty() || set == nullptr)
+                        return;
+                    std::string warning;
+                    const DynamicPrintConfig values = support_set_values(*set, &warning);
+                    const std::string group = unique_support_group_name(sel.front()->get_object(), set_name);
+                    assign_support_group(sel, group, &values, "Support group assigned");
+                    // MessageDialog, never a raw wxDialog: its ShowModal override auto-answers on
+                    // a hub-managed instance rather than blocking a GUI nobody is watching.
+                    if (!warning.empty())
+                        MessageDialog(plater(), from_u8(warning), _L("Support group"),
+                                      wxICON_INFORMATION | wxOK).ShowModal();
+                }, "", nullptr, []() { return true; }, m_parent);
+        }
+        append_submenu(sub, from_set, wxID_ANY, _L("New group from support set"),
+            _L("Create a group named after the set and write its resolved values onto the selected parts"),
+            "", []() { return true; }, m_parent);
+    }
+
+    append_menu_item(sub, wxID_ANY, _L("New group"),
+        _L("Create a support group seeded with the object's current support settings"),
+        [](wxCommandEvent&) {
+            const std::vector<ModelVolume*> sel = selected_part_volumes();
+            if (sel.empty())
+                return;
+            const ModelObject* mo = sel.front()->get_object();
+            const DynamicPrintConfig values = object_support_values(mo);
+            // Not translated: the label is written into the 3MF and read back on any machine.
+            assign_support_group(sel, unique_support_group_name(mo, "Group"), &values,
+                                 "Support group assigned");
+        }, "", nullptr, []() { return true; }, m_parent);
+
+    append_submenu(menu, sub, wxID_ANY, title,
+        _L("Assign these parts to a named support group"), "",
+        []() { return true; }, m_parent);
+}
+
 // Ported from BambuStudio's "Sub merge": extract the selected parts into a new assembly.
 void MenuFactory::append_menu_item_assemble_separately(wxMenu* menu)
 {
@@ -1912,6 +2255,8 @@ wxMenu* MenuFactory::part_menu()
 {
     append_menu_items_convert_unit(&m_part_menu);
     append_menu_item_change_filament(&m_part_menu);
+    // Ultra (support groups): rebuilt per open, like Change Filament above it.
+    append_menu_items_support_group(&m_part_menu);
     append_menu_item_per_object_settings(&m_part_menu);
     return &m_part_menu;
 }
@@ -1996,6 +2341,8 @@ wxMenu* MenuFactory::multi_selection_menu()
         append_menu_item_merge_some_parts_to_single_part(menu);
         // Ultra: visibility for multi-part selections
         append_menu_items_visibility(menu);
+        // Ultra (support groups): one assignment for the whole multi-part selection
+        append_menu_items_support_group(menu);
         append_menu_item_fix_through_netfabb(menu);
         //append_menu_item_simplify(menu);
         append_menu_item_delete(menu);
