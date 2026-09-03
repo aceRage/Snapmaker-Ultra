@@ -11,6 +11,7 @@
 #include "PresetComboBoxes.hpp"
 #include "RemoteHub.hpp"
 #include "RemoteSend.hpp"
+#include "RemoteSnapmaker.hpp"
 #include "Selection.hpp"
 #include "Tab.hpp"
 #include "IMSlider.hpp"
@@ -1137,6 +1138,43 @@ RemoteAccess::ApiResponse RemoteAccess::api_send(int plate, const std::string& f
     return r;
 }
 
+// ------------------------------------------------------- Snapmaker connect ----
+
+// The paired Snapmaker printers ("My Devices" on the PC's Device page) and which one, if any, the
+// slicer is connected to. The port probe runs off the GUI thread: a printer that is off must not
+// hold up the answer.
+RemoteAccess::ApiResponse RemoteAccess::api_snapmaker_devices()
+{
+    auto out = std::make_shared<nlohmann::json>();
+    bool ok  = run_on_main([out]() { RemoteSnapmaker::list(*out); });
+    ApiResponse r;
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    RemoteSnapmaker::probe_online(*out);
+    r.body = out->dump();
+    return r;
+}
+
+// Connect / disconnect a paired Snapmaker the way a pick in the PC's Device page does. Blocks on
+// the MQTT connect (this is a request thread, not the GUI thread).
+RemoteAccess::ApiResponse RemoteAccess::api_snapmaker_connect(const std::string& id)
+{
+    ApiResponse r;
+    if (id.empty()) { r.status = 400; r.body = json_error("id is required (see /api/snapmaker/devices)"); return r; }
+    const std::pair<int, std::string> res = RemoteSnapmaker::connect(id);
+    if (res.first != 200) { r.status = res.first; r.body = json_error(res.second); return r; }
+    r.body = "{\"ok\":true}";
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_snapmaker_disconnect()
+{
+    ApiResponse r;
+    const std::pair<int, std::string> res = RemoteSnapmaker::disconnect();
+    if (res.first != 200) { r.status = res.first; r.body = json_error(res.second); return r; }
+    r.body = "{\"ok\":true}";
+    return r;
+}
+
 void RemoteAccess::update_job(int id, int percent, const std::string& text)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1223,6 +1261,15 @@ RemoteAccess::ApiResponse RemoteAccess::api_presets()
             f["color"] = (colors && i < colors->values.size()) ? colors->values[i] : "";
             j["filaments"].push_back(f);
         }
+        // The sidebar's nozzle notebook: the visible variants of this printer model, and the
+        // one in use (Sidebar::update_nozzle_settings reads printer_variant, not nozzle_diameter).
+        nlohmann::json nozzles;
+        nozzles["choices"] = nlohmann::json::array();
+        for (const std::string& d : bundle->printers.diameters_of_selected_printer())
+            nozzles["choices"].push_back(d);
+        const ConfigOptionString* variant = bundle->printers.get_edited_preset().config.option<ConfigOptionString>("printer_variant");
+        nozzles["current"] = variant ? variant->value : "";
+        j["nozzles"]       = nozzles;
         j["dirty"]["printer"]  = bundle->printers.current_is_dirty();
         j["dirty"]["process"]  = bundle->prints.current_is_dirty();
         j["dirty"]["filament"] = bundle->filaments.current_is_dirty();
@@ -1285,6 +1332,38 @@ RemoteAccess::ApiResponse RemoteAccess::api_select_preset(const std::string& typ
             reapply(Preset::TYPE_FILAMENT, filament_dirty);
             plater->on_config_change(bundle->full_config());
             wxGetApp().app_config->set("preferred_printer", bundle->printers.get_selected_preset_name());
+            // What the sidebar's own printer combo does after select_preset and the API did not:
+            // rebuild the nozzle notebook, and let the Device tab follow (a Snapmaker device page
+            // is only loaded again when asked - update_all_preset_comboboxes latches it).
+            sb.update_all_preset_comboboxes(true);
+            sb.update_nozzle_settings(true);
+            *result = { 200, "" };
+        } else if (type == "nozzle") {
+            // The sidebar's nozzle combo: the same printer preset with another variant. force so a
+            // phone selection never raises the transfer/discard dialog, then the two refreshes the
+            // desktop's own device-driven nozzle sync performs (Plater.cpp ~2252).
+            // get_similar_printer_preset falls back to *some* preset of the model when nothing
+            // matches, so the choice is checked against the list the combo offers first.
+            const std::vector<std::string> choices = bundle->printers.diameters_of_selected_printer();
+            if (std::find(choices.begin(), choices.end(), name) == choices.end()) {
+                *result = { 404, "this printer has no " + name + " nozzle (see /api/presets nozzles.choices)" };
+                return;
+            }
+            Preset* preset = bundle->get_similar_printer_preset({}, name);
+            if (!preset) { *result = { 404, "no printer preset with nozzle " + name }; return; }
+            preset->is_visible = true;
+            if (preset->name == bundle->printers.get_selected_preset_name()) { *result = { 200, "" }; return; }
+            const DynamicPrintConfig printer_dirty  = capture_dirty(bundle->printers);
+            const DynamicPrintConfig process_dirty  = capture_dirty(bundle->prints);
+            const DynamicPrintConfig filament_dirty = capture_dirty(bundle->filaments);
+            wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preset->name, false, "", true);
+            reapply(Preset::TYPE_PRINTER, printer_dirty);
+            reapply(Preset::TYPE_PRINT, process_dirty);
+            reapply(Preset::TYPE_FILAMENT, filament_dirty);
+            plater->on_config_change(bundle->full_config());
+            wxGetApp().app_config->set("preferred_printer", bundle->printers.get_selected_preset_name());
+            sb.update_all_preset_comboboxes(true);
+            sb.update_nozzle_settings(true);
             *result = { 200, "" };
         } else if (type == "process") {
             if (name == bundle->prints.get_selected_preset_name()) { *result = { 200, "" }; return; }
@@ -1316,7 +1395,7 @@ RemoteAccess::ApiResponse RemoteAccess::api_select_preset(const std::string& typ
             plater->on_config_change(bundle->full_config());
             *result = { 200, "" };
         } else {
-            *result = { 404, "type must be printer, process or filament" };
+            *result = { 404, "type must be printer, nozzle, process or filament" };
         }
     });
     ApiResponse r;
@@ -1789,8 +1868,11 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "POST"}, {"path", "/api/plates/{index}/send"},    {"description", "form printer={id}&mode=upload|print[&confirm=1][&force=1][&dry_run=1][&bed_leveling=0|1&flow_cali=0|1&timelapse=0|1&vibration_cali=0|1&use_ams=0|1][&name=]: send the sliced plate to a printer exactly like the desktop's Send / Print dialogs (upload = to the printer's storage, print = start it; print needs confirm=1); returns a job id; 409 unless the plate is sliced and no other send is running"} },
             { {"method", "GET"},  {"path", "/api/jobs"},                   {"description", "recent jobs"} },
             { {"method", "GET"},  {"path", "/api/jobs/{id}"},              {"description", "job state: kind slice|send, running | done | error | cancelled, percent, text; send jobs add printer, mode and result (what was sent, or the composed parameters of a dry run)"} },
-            { {"method", "GET"},  {"path", "/api/presets"},                {"description", "printer / process choices as the sidebar shows them, filament choices and the current filament slots with colours"} },
-            { {"method", "POST"}, {"path", "/api/presets/select?type=printer|process|filament&name={value}[&index={slot}]"}, {"description", "select a preset the way the sidebar does; 409 when that preset has unsaved changes on the PC"} },
+            { {"method", "GET"},  {"path", "/api/snapmaker/devices"},      {"description", "the Snapmaker printers paired on this PC (Device page \"My Devices\"): id, name, model, ip, nozzles, connected, online; plus which one is the connected host and whether the printer preset is a Snapmaker"} },
+            { {"method", "POST"}, {"path", "/api/snapmaker/connect?id={device}"}, {"description", "connect that paired Snapmaker the way picking it on the PC's Device page does (MQTT, no pairing / PIN); the PC's Device tab follows"} },
+            { {"method", "POST"}, {"path", "/api/snapmaker/disconnect"},     {"description", "disconnect the connected Snapmaker"} },
+            { {"method", "GET"},  {"path", "/api/presets"},                {"description", "printer / process choices as the sidebar shows them, the nozzle choices of the printer model, filament choices and the current filament slots with colours"} },
+            { {"method", "POST"}, {"path", "/api/presets/select?type=printer|nozzle|process|filament&name={value}[&index={slot}]"}, {"description", "select a preset the way the sidebar does (nozzle = the same printer with another nozzle variant); 409 when that preset has unsaved changes on the PC"} },
             { {"method", "POST"}, {"path", "/api/presets/filament_color?index={slot}&color=%23RRGGBB"}, {"description", "set a filament slot colour"} },
             { {"method", "POST"}, {"path", "/api/presets/filament_add"},   {"description", "add a filament slot"} },
             { {"method", "GET"},  {"path", "/api/settings/process"},       {"description", "the Process tab: pages > groups > lines > options with definition, current and saved values, dirty flags, app mode"} },
@@ -1869,6 +1951,15 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
         return api_object_transform(body.empty() ? query : body);
     if (path == "/printers" && method == "GET")
         return api_printers();
+    if (path == "/snapmaker/devices" && method == "GET")
+        return api_snapmaker_devices();
+    if (path == "/snapmaker/connect" && method == "POST") {
+        std::string id = query_param(query, "id");
+        if (id.empty()) id = query_param(body, "id");
+        return api_snapmaker_connect(id);
+    }
+    if (path == "/snapmaker/disconnect" && method == "POST")
+        return api_snapmaker_disconnect();
     if (path == "/slice" && method == "POST") {
         std::string plate = query_param(query, "plate");
         if (plate.empty()) plate = query_param(body, "plate");
