@@ -751,7 +751,7 @@ static int free_webrtc_port()
 // user as a note with the two things they can allow.
 struct FirewallState
 {
-    std::string state { "unknown" }; // allowed | partial | missing | unknown
+    std::string state { "unknown" }; // allowed | partial | missing | blocked | unknown
     std::string note;                // one sentence, shown on the hub page (and on the phone)
     std::string networks;            // profiles the PC's live networks are in ("Public, Private")
     long long   checked_at { 0 };
@@ -788,8 +788,8 @@ static FirewallState firewall_query(const std::string& exe, int port)
         "$r=@(Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |"
         " Where-Object { try { [IO.Path]::GetFullPath($_.Program) -ieq $f } catch { $false } } |"
         " Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' -and"
-        " $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' });"
-        "foreach ($x in $r) { 'RULE=' + $x.Profile };"
+        " $_.Direction -eq 'Inbound' });"
+        "foreach ($x in $r) { $(if ($x.Action -eq 'Block') { 'BLOCK=' } else { 'RULE=' }) + $x.Profile };"
         "foreach ($n in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) { 'NET=' + $n.NetworkCategory };"
         "'DONE'";
     std::string out;
@@ -800,27 +800,38 @@ static FirewallState firewall_query(const std::string& exe, int port)
                   "go2rtc.exe (inbound, UDP and TCP port " + std::to_string(port) + ").";
         return fw;
     }
-    std::vector<std::string> rules, nets;
+    std::vector<std::string> rules, blocks, nets;
     std::istringstream       is(out);
     std::string              line;
     while (std::getline(is, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
         if (line.compare(0, 5, "RULE=") == 0) rules.push_back(line.substr(5));
+        else if (line.compare(0, 6, "BLOCK=") == 0) blocks.push_back(line.substr(6));
         else if (line.compare(0, 4, "NET=") == 0) nets.push_back(line.substr(4) == "DomainAuthenticated" ? "Domain" : line.substr(4));
     }
     // Only the profiles the PC's live networks are in matter: a rule that covers Public does
     // nothing for a phone on a network Windows filed as Private.
-    std::vector<std::string> uncovered;
+    auto covers = [](const std::vector<std::string>& rs, const std::string& n) {
+        for (const std::string& r : rs)
+            if (r == "Any" || lower(r).find(lower(n)) != std::string::npos) return true;
+        return false;
+    };
+    std::vector<std::string> uncovered, denied;
     for (const std::string& n : nets) {
-        bool covered = false;
-        for (const std::string& r : rules)
-            if (r == "Any" || lower(r).find(lower(n)) != std::string::npos) { covered = true; break; }
-        if (!covered && std::find(uncovered.begin(), uncovered.end(), n) == uncovered.end()) uncovered.push_back(n);
+        if (covers(blocks, n) && std::find(denied.begin(), denied.end(), n) == denied.end()) denied.push_back(n);
+        else if (!covers(rules, n) && std::find(uncovered.begin(), uncovered.end(), n) == uncovered.end()) uncovered.push_back(n);
     }
     fw.networks = join_words(nets, ", ");
     const std::string allow = "In Windows Defender Firewall allow go2rtc.exe (inbound, UDP and TCP), or open port " +
                               std::to_string(port) + " for UDP and TCP.";
-    if (rules.empty()) {
+    if (!denied.empty()) {
+        // Windows writes one of these when the user dismisses its "allow access?" prompt, and a
+        // block rule wins over any allow rule, so this has to be reported ahead of them.
+        fw.state = "blocked";
+        fw.note  = "Windows Firewall has a rule that blocks go2rtc.exe on " + join_words(denied, " and ") +
+                   " networks (it is written when the firewall prompt is dismissed), so direct video cannot reach the phone; "
+                   "it falls back to relayed video through this hub. Delete that rule in Windows Defender Firewall > Inbound Rules. " + allow;
+    } else if (rules.empty()) {
         fw.state = "missing";
         fw.note  = "Windows Firewall has no inbound rule for go2rtc.exe, so direct video will not reach the phone; "
                    "it falls back to relayed video through this hub. " + allow;
