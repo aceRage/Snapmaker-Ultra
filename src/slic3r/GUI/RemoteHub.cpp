@@ -2046,9 +2046,11 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner, bool admin)
         const auto peer = client.remote_endpoint(ec).address();
         if (ec || !is_private_v4(peer)) return;
         client.set_option(tcp::no_delay(true));
-        if (!guard.ok()) { respond(client, 503, "text/plain; charset=utf-8", "the hub has too many connections open; try again"); return; }
         Request r;
         if (!read_request(client, r)) return;
+        // Over the cap: refuse only after the request head has been read, so closing the socket does
+        // not reset the connection with the request still unread (the 503 would then be lost).
+        if (!guard.ok()) { respond(client, 503, "text/plain; charset=utf-8", "the hub has too many connections open; try again"); return; }
 
         std::string token, secret, auth;
         int         go2rtc_port;
