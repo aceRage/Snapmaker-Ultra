@@ -1,0 +1,186 @@
+# Phone: sending a sliced plate to a printer (2026-09-03)
+
+**Goal.** From the phone page (and for agents through the same JSON API), send a plate that the
+slicer has sliced to a printer in both forms the desktop offers: *upload* (put the file on the
+printer or print host without starting it) and *upload and print* (start it, after an explicit
+confirmation). No dialog is shown on the PC; what reaches the printer is what the desktop's own
+dialogs would have sent.
+
+## 1. How the desktop sends today (anchors)
+
+Three paths, chosen by the printer preset (`Plater::priv::on_action_print_plate`,
+`src/slic3r/GUI/Plater.cpp` ~16162; `PresetBundle::use_bbl_network()`,
+`src/libslic3r/PresetBundle.cpp:553`):
+
+1. **Bambu printers** (a BBL-vendor preset without `bbl_use_printhost`): `SelectMachineDialog`
+   (`src/slic3r/GUI/SelectMachine.cpp`, send at `on_send_print` ~2018) for *print*, and
+   `SendToPrinterDialog` (`src/slic3r/GUI/SendToPrinter.cpp` ~740) for *upload to the printer's
+   storage*. Both first export the plate: `Plater::send_gcode(plate_idx)` (`Plater.cpp:22302`)
+   writes the **gcode 3mf** (`SaveStrategy::Silence | SkipModel | WithGcode | SkipAuxiliary`) to
+   `plate->get_tmp_gcode_path()` with a `.3mf` extension; a cloud (non LAN-only) printer also gets
+   `Plater::export_config_3mf(plate_idx)` (`Plater.cpp:22336`, `WithSliceInfo`). The paths come
+   back through `Plater::get_print_job_data`. Then a `PrintJob` (`Jobs/PrintJob.cpp`) or
+   `SendJob` (`Jobs/SendJob.cpp`) fills `BBL::PrintParams` (`src/slic3r/Utils/bambu_networking.hpp`)
+   and calls the network plugin through `NetworkAgent`:
+   - print, LAN printer: a tiny `start_send_gcode_to_sdcard` of `resources/check_access_code.txt`
+     as `verify_job` proves IP + access code (`PrintJob.cpp:205-221`), then `start_local_print`
+     (`PrintJob.cpp:564`), refused without an SD card;
+   - print, cloud printer: `start_local_print_with_record` with a fallback to `start_print`
+     (`PrintJob.cpp:532-561`), or `start_print` directly; `lan_mode_only` forces the local call;
+   - upload: `start_send_gcode_to_sdcard` (`SendJob.cpp:277/295`), refused without an SD card.
+   The dialog's inputs: dev_id/ip/access code/ftp folder/ssl flags/connection type from the
+   `MachineObject`; project name = the plate's export name (or the objects' names when untitled,
+   `SelectMachine.cpp:3168-3198`); checkboxes remembered in `AppConfig` section `print`
+   (`bed_leveling`, `flow_cali`, `timelapse`, on unless "0", `SelectMachine.cpp:3234`); vibration
+   calibration hard-coded `false`, layer inspection `true` (`SelectMachine.cpp:2183-2192`); AMS
+   mapping from `MachineObject::ams_filament_mapping` turned into three JSON strings
+   (`do_ams_mapping` / `get_ams_mapping_result`, `SelectMachine.cpp:1059-1205`), nozzle info for
+   two-nozzle printers (`build_nozzles_info`, `:1207`); the printer is made the selected one when
+   picked (`on_selection_changed`, `:2659-2666`), which connects to it.
+2. **Print hosts** (OctoPrint, Moonraker, Duet, …): `Plater::send_gcode_legacy`
+   (`Plater.cpp:22073`) → `PrintHostSendDialog` → `PrintHost::upload(PrintHostUpload{source_path,
+   upload_path, post_action None|StartPrint, …})` (`src/slic3r/Utils/PrintHost.hpp:61`) through
+   the `PrintHostJobQueue`. The file is the sliced G-code (post-processed by
+   `BackgroundSlicingProcess::prepare_upload`), or the gcode 3mf when a Bambu printer sits behind a
+   third-party host (`use_3mf`). The host class comes from the preset's `host_type`
+   (`PrintHost::get_print_host`, `PrintHost.cpp:41`); `print_host` must be set.
+3. **Snapmaker U1**: detected by `printer_model` containing "Snapmaker" and "U1"
+   (`Plater.cpp:22144`); the desktop opens the Flutter `WebPreprintDialog` with the plate's temp
+   G-code, and that page drives a `Moonraker_Mqtt` host the Device tab connected
+   (`wxGetApp().get_connect_host`, built in `SSWCP_MqttAgent_Instance::sw_mqtt_set_engine`,
+   `SSWCP.cpp:6433`): the file goes up as a Moonraker `/server/files/upload` POST
+   (`Moonraker::upload`, `MoonRaker.cpp:435`, `print=false|true`) and a print starts over MQTT
+   (`sw_MachinePrintStart` → `async_start_print_job` → `printer.print.start`,
+   `MoonRaker.cpp:1371`). Note `Moonraker::upload` with `StartPrint` blocks on that page
+   (`MoonRaker.cpp:440-468`), so a headless print must upload with `print=false` and start over MQTT.
+
+## 2. What was built
+
+`src/slic3r/GUI/RemoteSend.{hpp,cpp}` (new): `prepare()` on the GUI thread reproduces the dialog
+inputs above and exports the plate file; `run()` on a worker thread performs the transfer and
+reports progress; nothing is shown on the PC. `RemoteAccess` (the per-instance API) gained the
+route, the job plumbing and the printer capabilities; the hub allow-lists the route; the phone page
+gained a Send sheet.
+
+### The API contract (per instance, `/r/<token>/i/<pid>/api/...`)
+
+- `GET /api/printers` — every entry now carries `kind` (`bambu` | `printhost` | `connect`),
+  `can_upload`, `can_print`, and:
+  - Bambu: `lan_mode`, `access_code_set`, `sdcard`, `has_ams`, `ams_mapping`,
+    `model_matches` + `profile_model` (the sliced profile's model vs the printer's report, with the
+    P1P/P1S kit rule), `options` = the desktop's remembered defaults `{bed_leveling, flow_cali,
+    timelapse, vibration_cali: false, use_ams}`;
+  - `id: "host"` — the printer preset's print host when `print_host` is set and the preset does not
+    use the Bambu network: `name` (host class + address), `url`, `upload_name` (the export name);
+  - `id: "connect"` — the Snapmaker (Moonraker over MQTT) connected on the PC's Device tab.
+- `POST /api/plates/{index}/send` (form body): `printer={id}&mode=upload|print[&confirm=1]
+  [&force=1][&dry_run=1][&bed_leveling=0|1&flow_cali=0|1&timelapse=0|1&vibration_cali=0|1
+  &use_ams=0|1][&name=]`.
+  - 400: bad mode, `print` without `confirm=1`, no printer. 404: unknown printer / plate.
+  - 409: the plate is not sliced (or not printable), the slicer is slicing, another send is running,
+    the printer is offline / has no access code / is printing, the sliced profile's model differs
+    from the printer's (send `force=1` to proceed, as the desktop's "continue" would), or the
+    desktop's own preconditions (no SD card for a LAN send; a print host without `print_host`;
+    a plain Moonraker host asked to print, which only the PC's preprint page can do).
+  - 200: `{job, plate, kind, printer, mode, dry_run}`; one send at a time.
+  - Options default to the desktop's remembered checkboxes; `name` is the file name on a print host
+    (basename only; default the export name). `dry_run=1`, or `SNORCA_SEND_DRYRUN=1` in the
+    instance's environment, does everything up to the transfer and reports the composed parameters.
+- `GET /api/jobs/{id}` — `kind: "send"`, `state` running | done | error, `percent`, `text` (the
+  plugin's stage or the upload percentage), `error`, `printer`, `mode`, `result`:
+  - Bambu: `call` (the `NetworkAgent` function the desktop would use), `params` (every
+    `PrintParams` field but the access code, which is reported as `password_set`), `result_code`,
+    and for a print `printer_state` `printing` | `error` | `unknown` from watching the printer for
+    12 s after the command left, with `printer_error {code, message}` (HMS text) when it refused;
+  - print host: `host`, `url`, `source`, `upload_path`, `post_action`, `two_step`, `uploaded`,
+    `start_reply` (the MQTT answer to `printer.print.start` for the connected Snapmaker).
+
+### Decisions
+
+- **One code path for the real send and the dry run.** `RemoteSend` composes the parameters itself
+  (mirroring `PrintJob::process` / `SendJob::process` line by line) instead of running the
+  `PrintJob` / `SendJob` classes: those report through `ctl.show_error_info` and the plater's
+  error dialogs, and they cannot stop before the plugin call. The composed `PrintParams` is what a
+  dry run returns, so the gate asserts exactly what a real send would carry.
+- **Printer selection first, then a pause.** Picking a Bambu printer other than the selected one
+  connects to it (as the dialog does); its SD-card and busy state arrive with the first push. The
+  request thread waits for `is_connected()` + the SD state (≤ 15 s) before preparing, so a send to
+  a printer the PC was not connected to is not refused for a card it has.
+- **Upload+print on Moonraker hosts is two steps** (upload with `print=false`, then
+  `printer.print.start` over MQTT) because `Moonraker::upload` with `StartPrint` opens the PC's
+  preprint page. A plain HTTP Moonraker host (no MQTT) therefore refuses `mode=print`; the
+  connected Snapmaker (`Moonraker_Mqtt`) and OctoPrint-style hosts (`print=true` in the upload)
+  work in one go. The Snapmaker filament-mapping payload of the preprint page
+  (`server.files.start_local_print`) is not reproduced: the print starts with the mapping as sliced.
+- **Print-host file**: the plate's sliced G-code as the desktop's Snapmaker path uploads it (no
+  post-processing scripts, no output-name template beyond the export name); the gcode 3mf when the
+  preset is a Bambu one behind a third-party host, like `on_action_print_plate`.
+- **What is exposed**: bed levelling, flow calibration, timelapse, use AMS (Bambu); vibration
+  calibration is accepted but defaults to the desktop's fixed `false`; layer inspection stays `true`.
+- **The model mismatch is a refusal, not a warning**: the desktop lists it in a confirmation the
+  user reads; the phone gets a 409 with the two models and an "anyway" that adds `force=1`.
+- **Confirmation lives on the phone**: `mode=print` needs `confirm=1`; the page asks first.
+- **After a Bambu print command**, the job watches the printer's `print_error` / printing state
+  for 12 s and fails with the HMS text when the printer refuses. That is where an H2-series
+  printer's "command verification failed" (LAN-only mode with Developer Mode off) surfaces; the
+  phone adds the hint.
+
+### The phone page
+
+Prepare tab, plate cards: a **Send** button next to Slice / Re-slice once the plate is sliced and
+printable. It opens a full-screen sheet: the plate (time, filament, slicer), a printer picker
+(online first, remembered per phone), the printer's notes (LAN / cloud, missing access code, no SD
+card, busy, the model mismatch), the options (Bambu) or the file name (print host), then **Upload**
+and **Upload & print**; the latter asks once more ("Start printing … now?") before it starts.
+Progress and text come from the job every second; success and errors are shown, with the LAN-only
++ Developer Mode hint when a Bambu printer refuses a print. The sheet can be hidden while a
+transfer runs; the transfer continues on the PC.
+
+## 3. Safety rules
+
+- A print never starts without `confirm=1` from the phone, and the page asks the person first.
+- One send at a time per instance; the plate must be sliced and printable.
+- Nothing is shown on the PC; `RemoteSend` never opens a dialog and never touches Tailscale or
+  the hub's state.
+- Dry runs (`dry_run=1`, `SNORCA_SEND_DRYRUN=1`) stop before the plugin / HTTP call and are the
+  only thing the automated gate sends to a Bambu printer.
+- The access code never leaves the PC (`password_set` only).
+
+## 4. Verified (2026-09-03, gate `snorca_hubtest\test_phone_send.py`)
+
+Against an instance on the isolated `dd_phone` data dir with `mock_printhost.py` on
+127.0.0.1:18089 registered as the user preset "Snapmaker U1 (0.4 nozzle) - Mock host"
+(`host_type` octoprint):
+- manifest and hub allow-list carry `POST /api/plates/{index}/send`;
+- refusals: print without confirm (400), bad mode (400), unknown printer (404), unsliced plate
+  (409), missing plate (404), model mismatch without force (409 naming both models);
+- print host: dry run (nothing reaches the mock), upload (mock receives the file with
+  `print=false`), upload+print (`print=true`, same size); the phone page's own flow did the same
+  in a browser (Send → pick the host → Upload & print → Start print → "sent");
+- Bambu (four printers discovered on the LAN: X1C, H2S, H2D, H2C): upload dry run composes
+  `start_send_gcode_to_sdcard` with dev_id, `bblp`, the access code set, plate 1, the gcode 3mf on
+  disk and `<name>.gcode.3mf`; print dry run composes `start_local_print` for the LAN printer with
+  the flags as requested (`bed_leveling=0 flow_cali=1 timelapse=0`), layer inspect on, vibration
+  off, the plate's bed type and `<name>_plate_1` as preset name; no dry run reached the mock.
+
+## 5. For the user to verify on hardware (start with upload only)
+
+1. **Bambu, upload only**: Prepare → Send → pick the printer (LAN mode) → Upload. The file should
+   appear on the printer's SD card / storage under the project name; nothing starts.
+2. **Bambu, upload and print** on a printer that accepts third-party commands (X1C in LAN mode, or
+   an H2-series printer with LAN-only mode + Developer Mode on): the print should start; the sheet
+   should end with "Printing started." within ~12 s. With Developer Mode off on an H2-series
+   printer, expect the refusal with the hint instead of silence.
+3. **Snapmaker U1**: connect it on the PC's Device tab first (the picker then shows "Snapmaker …
+   · connected"); Upload, then Upload & print. The print starts with the filaments as sliced (no
+   mapping page).
+4. **A classic print host** (Moonraker/Klipper via HTTP): set `print_host` in the printer preset;
+   Upload works; Upload & print is refused for plain Moonraker (needs the PC's preprint page) and
+   works for OctoPrint-style hosts.
+
+## 6. Not done / follow-ups
+
+- Snapmaker filament mapping at print start (`server.files.start_local_print` payload).
+- Post-processing scripts and the output-name template for classic print hosts.
+- Cancelling a running send from the phone.
+- "Print all plates" and sending an unsliced plate (slice-then-send in one tap).
