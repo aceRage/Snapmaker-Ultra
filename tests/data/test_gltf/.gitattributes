@@ -1,0 +1,3 @@
+# Fixture payloads are binary: never let text=auto rewrite line endings inside them.
+*.glb binary
+*.bin binary

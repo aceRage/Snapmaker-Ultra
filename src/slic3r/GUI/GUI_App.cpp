@@ -660,11 +660,11 @@ static const FileWildcards file_wildcards_by_type[FT_SIZE] = {
 #ifdef __APPLE__
     /* FT_MODEL */
     {"Supported files"sv,
-     {".3mf"sv, ".stl"sv, ".oltp"sv, ".stp"sv, ".step"sv, ".svg"sv, ".amf"sv, ".obj"sv, ".usd"sv, ".usda"sv, ".usdc"sv, ".usdz"sv, ".abc"sv,
-      ".ply"sv}},
+     {".3mf"sv, ".stl"sv, ".oltp"sv, ".stp"sv, ".step"sv, ".svg"sv, ".amf"sv, ".obj"sv, ".glb"sv, ".gltf"sv, ".usd"sv, ".usda"sv, ".usdc"sv,
+      ".usdz"sv, ".abc"sv, ".ply"sv}},
 #else
     /* FT_MODEL */
-    {"Supported files"sv, {".3mf"sv, ".stl"sv, ".oltp"sv, ".stp"sv, ".step"sv, ".svg"sv, ".amf"sv, ".obj"sv}},
+    {"Supported files"sv, {".3mf"sv, ".stl"sv, ".oltp"sv, ".stp"sv, ".step"sv, ".svg"sv, ".amf"sv, ".obj"sv, ".glb"sv, ".gltf"sv}},
 #endif
     /* FT_ZIP */ {"ZIP files"sv, {".zip"sv}},
     /* FT_PROJECT */ {"Project files"sv, {".3mf"sv}},
@@ -4313,9 +4313,9 @@ void GUI_App::import_model(wxWindow *parent, wxArrayString& input_files) const
     input_files.Clear();
     wxFileDialog dialog(parent ? parent : GetTopWindow(),
 #ifdef __APPLE__
-        _L("Choose one or more files (3mf/step/stl/svg/obj/amf/usd*/abc/ply):"),
+        _L("Choose one or more files (3mf/step/stl/svg/obj/amf/glb/usd*/abc/ply):"),
 #else
-        _L("Choose one or more files (3mf/step/stl/svg/obj/amf):"),
+        _L("Choose one or more files (3mf/step/stl/svg/obj/amf/glb):"),
 #endif
         from_u8(app_config->get_last_dir()), "",
         file_wildcards(FT_MODEL), wxFD_OPEN | wxFD_MULTIPLE | wxFD_FILE_MUST_EXIST);

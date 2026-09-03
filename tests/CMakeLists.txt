@@ -33,4 +33,5 @@ add_subdirectory(slic3rutils)
 add_subdirectory(fff_print)
 # add_subdirectory(sla_print)
 add_subdirectory(cpp17 EXCLUDE_FROM_ALL)    # does not have to be built all the time
+add_subdirectory(fuzz_gltf EXCLUDE_FROM_ALL) # glTF reader fuzz driver, built on demand
 # add_subdirectory(example)

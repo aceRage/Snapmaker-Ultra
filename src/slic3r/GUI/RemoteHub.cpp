@@ -1059,8 +1059,9 @@ static bool spool_upload(tcp::socket& client, Request& r, std::string& out_path,
     if (clean.size() > 100) clean = clean.substr(clean.size() - 100);
     if (clean.empty()) { error = "X-File-Name header with the file name is required"; return false; }
     const std::string ext = lower(fs::path(clean).extension().string());
-    if (ext != ".3mf" && ext != ".stl" && ext != ".obj" && ext != ".step" && ext != ".stp") {
-        error = "only .3mf, .stl, .obj and .step files can be opened";
+    if (ext != ".3mf" && ext != ".stl" && ext != ".obj" && ext != ".step" && ext != ".stp" &&
+        ext != ".glb" && ext != ".gltf") {
+        error = "only .3mf, .stl, .obj, .step and .glb files can be opened";
         return false;
     }
     if (r.content_length == 0) { error = "empty upload (Content-Length required)"; return false; }
@@ -1955,7 +1956,7 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
         j["version"] = 2;
         j["routes"]  = json::array({
             { {"method", "GET"},  {"path", "/api/instances"},       {"description", "running slicer instances: id (pid), index, title, project path, slicing"} },
-            { {"method", "POST"}, {"path", "/api/instances/open"},  {"description", "body = a .3mf/.stl/.obj/.step file, header X-File-Name = its name; starts a new (hidden) slicer instance with it; ?visible=1 opens a window"} },
+            { {"method", "POST"}, {"path", "/api/instances/open"},  {"description", "body = a .3mf/.stl/.obj/.step/.glb file, header X-File-Name = its name; starts a new (hidden) slicer instance with it; ?visible=1 opens a window"} },
             { {"method", "POST"}, {"path", "/i/{id}/open?mode=load|import"}, {"description", "same upload, opened in instance {id}: load = save the current project, then open this project (default for .3mf); import = add the model to the current plate (default otherwise)"} },
             { {"method", "*"},    {"path", "/i/{id}/api/..."},      {"description", "the instance's own API (see GET /i/{id}/api)"} },
             { {"method", "GET"},  {"path", "/state"},               {"description", "camera list for the stream wall"} }

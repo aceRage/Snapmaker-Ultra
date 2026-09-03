@@ -11,6 +11,7 @@
 #include "TriangleSelector.hpp"
 
 #include "Format/AMF.hpp"
+#include "Format/GLTF.hpp"
 #include "Format/svg.hpp"
 // BBS
 #include "FaceDetector.hpp"
@@ -321,8 +322,13 @@ Model Model::read_from_file(const std::string&                                  
         delete_temp_file(temp_stl);
     }
 #endif
+    else if (boost::algorithm::iends_with(input_file, ".glb") || boost::algorithm::iends_with(input_file, ".gltf")) {
+        GltfInfo gltf_info;
+        result = load_gltf(input_file.c_str(), &model, gltf_info, message, nullptr, stlFn);
+        // Stage 2 hooks the objFn colour path in here (material colours -> filament slots).
+    }
     else
-        throw Slic3r::RuntimeError(_L("Unknown file format. Input file must have .stl, .obj, .amf(.xml) extension."));
+        throw Slic3r::RuntimeError(_L("Unknown file format. Input file must have .stl, .obj, .amf(.xml), .glb or .gltf extension."));
 
     if (is_cb_cancel) {
         Model empty_model;

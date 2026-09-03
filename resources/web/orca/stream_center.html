@@ -1151,14 +1151,14 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         }
         bar.appendChild(el('div', 'lbl', 'Open a file'));
         var row = el('div', 'filerow');
-        var pick = el('label', 'btn dim', chosenFile ? chosenFile.name : 'Choose 3MF / STL…');
+        var pick = el('label', 'btn dim', chosenFile ? chosenFile.name : 'Choose 3MF / STL / GLB…');
         var input = el('input');
         // No accept filter: phones grey out .3mf files when the extension is not one the OS
         // knows, so accept everything and check the name here (the hub checks it again).
         input.type = 'file'; input.style.display = 'none';
         input.onchange = function() {
             var f = input.files[0] || null;
-            if (f && !/\.(3mf|stl|obj|step|stp)$/i.test(f.name)) { chosenFile = null; uploadErr = true; uploadNote = 'Only .3mf, .stl, .obj and .step files can be opened (' + f.name + ')'; }
+            if (f && !/\.(3mf|stl|obj|step|stp|glb|gltf)$/i.test(f.name)) { chosenFile = null; uploadErr = true; uploadNote = 'Only .3mf, .stl, .obj, .step and .glb files can be opened (' + f.name + ')'; }
             else { chosenFile = f; uploadErr = false; uploadNote = ''; }
             renderInstBar();
         };

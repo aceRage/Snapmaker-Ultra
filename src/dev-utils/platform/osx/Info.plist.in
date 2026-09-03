@@ -76,6 +76,25 @@
     <dict>
       <key>CFBundleTypeExtensions</key>
       <array>
+        <string>glb</string>
+        <string>GLB</string>
+        <string>gltf</string>
+        <string>GLTF</string>
+      </array>
+      <key>CFBundleTypeIconFile</key>
+      <string>images/Snapmaker_Orca.icns</string>
+      <key>CFBundleTypeName</key>
+      <string>GLB</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LISsAppleDefaultForType</key>
+      <true/>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+    </dict>
+    <dict>
+      <key>CFBundleTypeExtensions</key>
+      <array>
         <string>amf</string>
         <string>AMF</string>
       </array>
