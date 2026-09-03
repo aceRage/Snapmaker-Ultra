@@ -23,6 +23,15 @@ using Catch::Matchers::WithinAbs;
 
 namespace {
 
+// test_data.cpp only ever defines mesh(TestMesh); its translate / scale overloads are declared
+// but have no definition, so move the mesh here instead.
+TriangleMesh cube_at(double dx, double dy, double dz)
+{
+    TriangleMesh m = Slic3r::Test::mesh(TestMesh::cube_20x20x20);
+    m.translate(float(dx), float(dy), float(dz));
+    return m;
+}
+
 // Two 20 mm cubes side by side as two MODEL_PART volumes of ONE object - the multi-part shape
 // support groups are about. `tweak` runs after the volumes exist and before print.apply(), which
 // is where a test sets per-volume config.
@@ -36,8 +45,8 @@ void make_two_part_print(Slic3r::Print                                        &p
 
     ModelObject *object = model.add_object();
     object->name = "two_part";
-    object->add_volume(Slic3r::Test::mesh(TestMesh::cube_20x20x20));
-    object->add_volume(Slic3r::Test::mesh(TestMesh::cube_20x20x20, Vec3d(25., 0., 0.)));
+    object->add_volume(cube_at(0., 0., 0.));
+    object->add_volume(cube_at(25., 0., 0.));
     object->add_instance();
     if (tweak)
         tweak(*object);
@@ -87,14 +96,16 @@ TEST_CASE("support_groups: one part overriding an interface key makes a second g
     // Group 0 is always the default group and comes first.
     CHECK(groups[0].name.empty());
     REQUIRE(groups[0].volumes.size() == 1);
-    CHECK(groups[0].volumes[0] == model.objects.front()->volumes[0]);
-    CHECK(groups[0].config.opt_int("support_interface_top_layers") == 2);
+    // print.apply() copies the model, so the resolver hands back volumes of the Print's own
+    // ModelObject, not of the source model.
+    CHECK(groups[0].volumes[0] == first_object(print).model_object()->volumes[0]);
+    CHECK(groups[0].config.support_interface_top_layers.value == 2);
 
     // The override group carries the right volume and the resolved value.
     CHECK(groups[1].name == "B");
     REQUIRE(groups[1].volumes.size() == 1);
-    CHECK(groups[1].volumes[0] == model.objects.front()->volumes[1]);
-    CHECK(groups[1].config.opt_int("support_interface_top_layers") == 5);
+    CHECK(groups[1].volumes[0] == first_object(print).model_object()->volumes[1]);
+    CHECK(groups[1].config.support_interface_top_layers.value == 5);
 }
 
 TEST_CASE("support_groups: an override equal to the object's value collapses into the default group",
@@ -184,9 +195,7 @@ TEST_CASE("support_groups: group data on a modifier or an enforcer is ignored", 
                         {{"enable_support", "1"}, {"support_interface_top_layers", "2"},
                          {"support_top_z_distance", "0.2"}},
                         [](ModelObject &object) {
-                            ModelVolume *modifier =
-                                object.add_volume(Slic3r::Test::mesh(TestMesh::cube_20x20x20,
-                                                                     Vec3d(0., 25., 0.)));
+                            ModelVolume *modifier = object.add_volume(cube_at(0., 25., 0.));
                             modifier->set_type(ModelVolumeType::PARAMETER_MODIFIER);
                             modifier->config.set_key_value("support_interface_top_layers",
                                                            new ConfigOptionInt(9));
@@ -195,9 +204,7 @@ TEST_CASE("support_groups: group data on a modifier or an enforcer is ignored", 
                             modifier->config.set_key_value("support_group",
                                                            new ConfigOptionString("ignore me"));
 
-                            ModelVolume *enforcer =
-                                object.add_volume(Slic3r::Test::mesh(TestMesh::cube_20x20x20,
-                                                                     Vec3d(0., -25., 0.)));
+                            ModelVolume *enforcer = object.add_volume(cube_at(0., -25., 0.));
                             enforcer->set_type(ModelVolumeType::SUPPORT_ENFORCER);
                             enforcer->config.set_key_value("support_group",
                                                            new ConfigOptionString("nor me"));

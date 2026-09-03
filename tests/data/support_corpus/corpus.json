@@ -29,15 +29,18 @@
     "",
     "Paths are relative to the repository root. 'args' are passed verbatim after the presets.",
     "",
-    "grouped_parts carries support_group data on one part. Nothing in Stage 2 consumes a group, so",
-    "it must slice exactly like normal_grid - that is the Stage 2 gate. twopart_bridge_soluble.3mf",
-    "is NOT a corpus case: it is the positive control that proves the metadata is really read (the",
-    "soluble rule of 3.6 makes it differ on purpose). Run it by hand when in doubt.",
     "",
     "tree_classic was REMOVED. Classic tree support is not self-reproducible: baseline-against-",
     "baseline on this very corpus gives 6.6% matching segments, 8 changed layers and 49 dirty",
     "layers, run after run. Organic tree, normal supports and rafts are all stable through the",
-    "tolerance gate; only the classic tree path is not. 5.1 says to drop such a case and say so."
+    "tolerance gate; only the classic tree path is not. 5.1 says to drop such a case and say so.",
+    "",
+    "There is deliberately NO case here carrying support_group data. Writing a loadable multi-part",
+    "fixture by hand did not work: a plain core-spec 3MF built from <component>s imports as one",
+    "ModelObject PER component, and per-part settings keyed on either the assembly object id or the",
+    "component object id were both ignored by the importer. Until a fixture is produced BY the",
+    "slicer itself, the group round trip is covered only by the unit tests, which build multi-volume",
+    "objects with add_volume. See the Stage 2 status section."
   ],
   "presets": {
     "printer": "Snapmaker U1 (0.4 nozzle)",
@@ -51,17 +54,6 @@
       "name": "normal_grid",
       "models": [
         "tests/data/support_corpus/twopart_bridge.3mf"
-      ],
-      "args": [
-        "--enable-support=1",
-        "--support-type=normal(auto)",
-        "--support-style=grid"
-      ]
-    },
-    {
-      "name": "grouped_parts",
-      "models": [
-        "tests/data/support_corpus/twopart_bridge_grouped.3mf"
       ],
       "args": [
         "--enable-support=1",
