@@ -97,6 +97,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 .setup .procrow select { flex: 1; min-width: 0; }
 .setup .procrow .btn { flex: none; }
 .setup .procrow .btn.mod { background: #b26a00; }
+.setup .procrow select.nozzle { flex: 0 0 auto; width: auto; }
+.setup .procrow .btn.eye { flex: none; display: inline-flex; align-items: center; padding: 6px 9px; }
+.setup .procrow .btn.eye svg { display: block; }
+.printer .acts { display: flex; gap: 8px; margin-top: 8px; }
+.view .smsec .lbl { color: #9a9a9a; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: 0 0 6px; }
 .setup .filerow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .setup .filerow label.btn { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .setup .note { color: #9ed; font-size: 12px; margin-top: 8px; }
@@ -1135,6 +1140,15 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             if (then) then();
         }).catch(function(e) { fail(e); if (then) then(); });
     }
+    // Open eye = this slicer's window is on the PC, struck-through = hidden there.
+    var EYE_ON = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"' +
+                 ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+                 '<path d="M1.6 12S5.3 5.8 12 5.8 22.4 12 22.4 12 18.7 18.2 12 18.2 1.6 12 1.6 12z"/>' +
+                 '<circle cx="12" cy="12" r="3.1"/></svg>';
+    var EYE_OFF = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"' +
+                  ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+                  '<path d="M1.6 12S5.3 5.8 12 5.8 22.4 12 22.4 12 18.7 18.2 12 18.2 1.6 12 1.6 12z"/>' +
+                  '<circle cx="12" cy="12" r="3.1"/><line x1="3.5" y1="20.5" x2="20.5" y2="3.5"/></svg>';
     // Top of the Prepare tab: which slicer, and a file to open (in it, or in a new one).
     function renderInstBar() {
         var root = document.getElementById('prepare');
@@ -1142,6 +1156,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         if (!bar) { bar = el('div', 'setup instbar'); root.insertBefore(bar, root.firstChild); }
         bar.innerHTML = '';
         bar.appendChild(el('div', 'lbl', 'Slicer'));
+        var srow = el('div', 'procrow');
         var sel = el('select');
         if (!instances.length) { var o0 = el('option', '', 'No slicer open'); o0.value = '0'; sel.appendChild(o0); sel.disabled = true; }
         instances.forEach(function(i) {
@@ -1151,20 +1166,24 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             sel.appendChild(o);
         });
         sel.onchange = function() { selectInstance(parseInt(sel.value) || 0); };
-        bar.appendChild(sel);
-        // The PC side of the selected slicer: phone-started slicers run without a window until asked.
+        srow.appendChild(sel);
+        // The PC side of the selected slicer: phone-started slicers run without a window until
+        // asked. The eye shows where it is; tapping it moves the window the other way.
         var cur = null;
         instances.forEach(function(i) { if (i.id === instSel) cur = i; });
         if (cur) {
-            var pc = el('span', 'btn small', cur.hidden ? 'Show on PC' : 'Hide on PC');
+            var pc = el('span', 'btn small eye');
+            pc.innerHTML = cur.hidden ? EYE_OFF : EYE_ON;
             pc.title = cur.hidden ? 'Open this slicer\'s window on the PC' : 'Take this slicer\'s window off the PC desktop; it keeps serving the phone';
+            pc.setAttribute('aria-label', pc.title);
             pc.onclick = function() {
-                pc.textContent = cur.hidden ? 'Showing…' : 'Hiding…';
+                pc.style.opacity = '.5';
                 fetch(instBase() + 'api/window?show=' + (cur.hidden ? '1' : '0'), { method: 'POST', body: 'via=phone', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
                     .then(function() { lastInstJson = ''; setTimeout(function() { refreshInstances(); }, 1500); }).catch(fail);
             };
-            bar.appendChild(pc);
+            srow.appendChild(pc);
         }
+        bar.appendChild(srow);
         // A slicer that hit something only a person at the PC can answer (its window is shown there).
         var att = instances.filter(function(i) { return i.needs_attention; });
         if (att.length) {
@@ -1319,10 +1338,22 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         file.appendChild(document.createTextNode(data && data.project ? data.project.split(/[\\/]/).pop() : 'Untitled'));
         setup.appendChild(file);
         setup.appendChild(el('div', 'lbl', 'Printer'));
+        var prow0 = el('div', 'procrow');
         var sp = el('select');
         fillSelect(sp, pr.printer, pr.printer_name);
         sp.onchange = function() { postPreset('/presets/select?type=printer&name=' + encodeURIComponent(sp.value)); };
-        setup.appendChild(sp);
+        prow0.appendChild(sp);
+        // The sidebar's nozzle combo: the same printer model with another nozzle variant. A
+        // printer with one variant has nothing to pick, so the dropdown stays away.
+        var nz = pr.nozzles || {};
+        if ((nz.choices || []).length > 1) {
+            var sn = el('select', 'nozzle');
+            fillSelect(sn, nz.choices.map(function(d) { return { name: d + ' mm', value: d }; }), nz.current);
+            sn.title = 'Nozzle diameter';
+            sn.onchange = function() { postPreset('/presets/select?type=nozzle&name=' + encodeURIComponent(sn.value)); };
+            prow0.appendChild(sn);
+        }
+        setup.appendChild(prow0);
         setup.appendChild(el('div', 'lbl', 'Filaments'));
         (pr.filaments || []).forEach(function(f) {
             var row = el('div', 'filrow');
@@ -2292,11 +2323,58 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             lastPresetsJson = '';
         });
     }
+    // The Snapmaker printers paired on the PC ("My Devices" on its Device page). Connecting one
+    // is what the PC's own page does when a device is picked there; the phone's Send then sees it.
+    var smBusy = '';
+    function refreshSnapmaker() {
+        var root = document.getElementById('devices');
+        api('/snapmaker/devices').then(function(d) {
+            var sec = root.querySelector('.smsec');
+            var devs = d.devices || [];
+            if (!devs.length && !d.is_snapmaker) { if (sec) sec.remove(); return; }
+            if (!sec) { sec = el('div', 'smsec'); root.insertBefore(sec, root.firstChild); }
+            sec.innerHTML = '';
+            sec.appendChild(el('div', 'lbl', 'Snapmaker'));
+            if (!devs.length) {
+                sec.appendChild(el('div', 'empty', 'No Snapmaker is paired on this PC. Pair one on the PC first (Device tab); the phone can then connect it.'));
+                return;
+            }
+            devs.forEach(function(p) {
+                var here = p.connected && p.is_host;
+                var card = el('div', 'printer' + (here ? ' online' : ''));
+                card.appendChild(el('div', 'name', (p.name || p.ip) + (p.model ? '  ·  ' + p.model : '')));
+                var meta = here ? 'connected' : (p.online ? 'reachable' : 'offline');
+                if (p.ip) meta += ' · ' + p.ip;
+                if ((p.nozzles || []).length) meta += ' · nozzle ' + p.nozzles.join(', ') + ' mm';
+                card.appendChild(el('div', 'meta', meta));
+                var acts = el('div', 'acts');
+                var busy = smBusy === p.id;
+                var b = el('span', 'btn small' + (busy || here ? ' dim' : ''),
+                           busy ? (here ? 'Disconnecting…' : 'Connecting…') : (here ? 'Disconnect' : 'Connect'));
+                b.title = here ? 'Disconnect this printer on the PC' : 'Connect this printer on the PC, as picking it there would';
+                b.onclick = function() {
+                    if (smBusy) return;
+                    smBusy = p.id;
+                    b.textContent = here ? 'Disconnecting…' : 'Connecting…';
+                    api(here ? '/snapmaker/disconnect' : '/snapmaker/connect?id=' + encodeURIComponent(p.id), { method: 'POST' })
+                        .then(function() { smBusy = ''; refreshSnapmaker(); })
+                        .catch(function(e) { smBusy = ''; fail(e); refreshSnapmaker(); });
+                };
+                acts.appendChild(b);
+                card.appendChild(acts);
+                sec.appendChild(card);
+            });
+        }).catch(function() {});
+    }
     function refreshDevices() {
         var root = document.getElementById('devices');
         if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); return; }
+        refreshSnapmaker();
         api('/printers').then(function(res) {
             var printers = res.printers || [];
+            var root2 = root.querySelector('.plist');
+            if (!root2) { root2 = el('div', 'plist'); root.appendChild(root2); }
+            root = root2;
             root.innerHTML = '';
             if (!printers.length) { root.appendChild(el('div', 'row', 'No printers known to the slicer yet')); return; }
             printers.forEach(function(p) {
@@ -2318,7 +2396,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 }
                 root.appendChild(card);
             });
-        }).catch(function(e) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'Cannot reach the slicer: ' + e.message)); });
+        }).catch(function(e) {
+            var list = root.querySelector('.plist');
+            if (!list) { list = el('div', 'plist'); root.appendChild(list); }
+            list.innerHTML = '';
+            list.appendChild(el('div', 'empty', 'Cannot reach the slicer: ' + e.message));
+        });
     }
     if (REMOTE) {
         document.getElementById('tabs').style.display = 'inline-flex';
