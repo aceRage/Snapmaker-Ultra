@@ -1631,3 +1631,133 @@ Every seed file also behaves correctly under the driver's contract check (`ok` w
 * **Paletted / greyscale / 16-bit PNG textures** (finding 2).
 * **KTX2 / Basis textures** — refused by name when required, dropped with a warning when used.
 * **The hidden-instance colour question** (finding 3), which is a product decision, not a bug.
+
+---
+
+## Stage 4 status
+
+Done, on branch `feat/glb-import-stage4` (from `feat/glb-import-stage3`), built and verified in the
+`C:\Dev\SnapmakerOrcaNext` worktree on 2026-09-03.
+
+Stage 2 and 3 gave the reader colours; Stage 3's finding 3 was that a hidden instance threw them
+away, because `ObjColorDialog` is a window nobody can answer. Most GLB files are coloured and most
+of them arrive from a phone, so this stage makes the headless case match colours itself.
+
+### What shipped
+
+| Piece | File | Note |
+|---|---|---|
+| the policy, pure and testable | `src/libslic3r/ObjColorMatch.{hpp,cpp}` (new) | clustering + slot mapping, no wxWidgets |
+| the wx half | `src/slic3r/GUI/ObjColorDialog.{hpp,cpp}` | `obj_color_auto_match_headless()`, beside the panel so the two cannot drift |
+| the switch | `src/slic3r/GUI/Plater.cpp` | both `ObjImportColorFn` lambdas (import ~12223 and reload-from-disk ~14678) |
+| the report | `src/slic3r/GUI/RemoteAccess.{hpp,cpp}` | `note_color_import` / `take_color_import`, and `colors` in the API response |
+| tests | `tests/libslic3r/test_obj_color_match.cpp` (new) | 218 assertions, tag `[objcolor]` |
+| fixture | `tests/data/test_gltf/many_materials.glb` | 24 materials, more than the 16 slots |
+
+**Interactive mode is untouched**: when `RemoteAccess::dialog_mode() == Mode::Interactive` the
+lambda constructs `ObjColorDialog` exactly as before. **The OBJ path gets the same headless rule**,
+because OBJ and glTF arrive through the same lambda — an `.obj` imported from the phone is now
+auto-matched too, where before it imported colourless.
+
+### The policy
+
+1. Cluster with the panel's own k-means (`QuantKMeans`, the call `ObjColorPanel::deal_algo` makes),
+   honouring `is_single_color` the way the panel's constructor does — one cluster, no k-means.
+2. Sort clusters by how many input colours they carry, so the busiest get first claim on a slot.
+3. For each cluster in that order:
+   * within **CIE76 ΔE 20** of a loaded filament → **reuse** that spool;
+   * else, if fewer than **16** slots exist → **add** one carrying the cluster's colour;
+   * else → **merge** into the nearest slot, where it does the least harm.
+4. Write one id per input colour and `first_extruder_id` from cluster 0 — the two lines
+   `ObjColorPanel::update_filament_ids` ends with, so the existing appliers (per-volume, per-vertex,
+   per-face) paint exactly as if somebody had clicked OK.
+
+### Decisions for the reviewer
+
+1. **Tolerance: CIE76 ΔE ≤ 20, and it is measured, not guessed.** Two oranges (`#FF8800` vs
+   `#FF9900`) are 9.7 apart; a pure red against the dark red spool actually loaded (`#D50000`) is
+   15.9 — that spool should print it; genuinely different hues are far above (green vs yellow 92.7,
+   blue vs red 167). 20 sits in the gap. The constant is `OBJ_COLOR_MATCH_TOLERANCE`, one place to
+   turn if it proves wrong.
+2. **The panel's own colour distance is not in CIE units.** `deal_approximate_match_btn` calls
+   `RGB2Lab(c.Red(), c.Green(), c.Blue())` — 0–255 into a curve whose thresholds assume 0–1 — so its
+   ΔE numbers are inflated and arbitrary. That is pre-existing, harmless for its purpose ("which is
+   nearest"), and **left alone**; but a tolerance needs real units, so `obj_color_distance()` in
+   libslic3r is the correctly scaled implementation of the same formula. Two implementations of
+   CIE76 now exist; unifying them means touching the interactive path, which was out of scope here.
+3. **Merge rule: nearest kept slot, busiest clusters keep their own.** The alternative — merging the
+   *nearest pair* of clusters repeatedly — gives slightly better colour fidelity but can starve a
+   cluster that covers half the model. Prioritising by usage means the colours you see most get
+   their own filament.
+4. **Added slots inherit the current filament preset** and differ only in colour: the code path is
+   `Sidebar::add_custom_filament()`, the same call the dialog's "add filament" button ends up
+   making, so a headless import produces exactly the slots an interactive one would. They are not
+   named; they are numbered like any other slot.
+5. **The reader trusts what exists, not what it planned.** `add_custom_filament` has ceilings of its
+   own and can decline, so after adding, the filament list is re-read and any id past the end is
+   clamped to 1. Painting with a slot that was never created would be worse than not painting.
+
+### Gate output
+
+**Automated** — `libslic3r_tests.exe "[objcolor]"`:
+
+```
+All tests passed (218 assertions in 2 test cases)
+```
+
+The existing gates, unchanged: `"[gltf],[golden]"` → **466 assertions in 12 test cases, all pass**.
+Full suite:
+
+```
+test cases:   596 |   594 passed | 2 failed as expected
+assertions: 53281 | 53279 passed | 2 failed as expected
+```
+
+The unit tests cover reuse within tolerance, adding when there is room, merging when all 16 are
+taken, the 16 cap under 40 distinct colours, single-colour input, one filament loaded versus
+sixteen, empty input, and the distance function against the measurements that chose the tolerance.
+The policy tests inject a trivially predictable metric so they are about the decisions, not about
+colour science.
+
+**Live**, hidden instance on the isolated `dd_next` data dir, imports through the phone route,
+starting from the five filaments it already had (`#FF8800 #FFFFFF #000000 #D50000 #FEC600`):
+
+| Import | `colors` reported | Filaments after | Result |
+|---|---|---|---|
+| `three_materials.glb` | input 3, clusters 3, **reused 1, added 2** | 7 | red reused the loaded `#D50000`; green and blue added. The plate shows three parts in three colours |
+| `textured_two_regions.glb` | input 12, clusters 2, **reused 2, added 0** | 7 | both cluster colours were already loaded by the previous import; faces painted |
+| `BoxVertexColors.glb` | input 8, clusters 8, **reused 5, added 3** | 10 | per-vertex painting visible on the plate |
+| `many_materials.glb` | input 24, clusters 15, **reused 3, added 6, merged 6** | **16** | the cap held and the overflow merged |
+
+Every one completed in **≤ 1 second**, no dialog was answered (`"Obj file Import color"` appears
+zero times in the log), `needs_attention` stayed **false**, and the attention log carries one
+`"auto"` entry per import, e.g.
+`colour import auto-matched 15 colour(s): 3 reused, 6 added, 6 merged`.
+
+### Findings
+
+1. **`QuantKMeans` never returns more than 15 clusters** — `apply()` defaults `max_cluster` to 15,
+   so a 24-material file gives 15 clusters, not 24. The 16-slot cap is therefore reached through
+   *existing + added*, which is exactly what `many_materials.glb` demonstrates (5 existing + 6 added
+   = 11 … then 6 clusters merge because the ramp reused 3). Worth knowing before anyone tries to
+   raise the slot limit: the clustering ceiling would bind first.
+2. **A hidden instance answers the metres prompt with yes.** `BoxVertexColors.glb` is a 1-unit cube,
+   so `looks_like_saved_in_meters()` fires and the modal hook accepts, scaling it ×1000. Pre-existing
+   hidden-mode behaviour, unrelated to colour, but it explains why that cube dwarfs the others on the
+   plate and is worth a line in the release note.
+3. **The plate thumbnail does render per-part filament colours and MMU painting**, which is what
+   makes the live check above conclusive — and retroactively confirms that the Stage 2 and Stage 3
+   hidden imports really were unpainted rather than merely looking that way.
+
+### Manual checklist
+
+* [ ] **Interactive is unchanged**: import a 3-material GLB with the window open — the dialog still
+      appears, with three swatches, and OK still assigns the three filaments.
+* [ ] Import an OBJ with `mtl` colours interactively — dialog as before.
+* [ ] From the phone, import a coloured GLB into a hidden instance — it lands painted, with no
+      dialog and no attention flag, and the response carries `colors`.
+* [ ] From the phone, import an OBJ with vertex colours — same treatment.
+* [ ] Import a GLB whose colours already match loaded spools — `added` is 0 and no new filaments
+      appear.
+* [ ] Import a GLB with more than 16 colours — the filament list stops at 16.
+* [ ] Check the added filaments use the current filament preset and only differ in colour.
