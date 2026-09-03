@@ -5,6 +5,7 @@
 #include "GUI_App.hpp"
 #include "MainFrame.hpp"
 #include "DownloadManager.hpp"
+#include "RemoteSnapmaker.hpp" // Ultra: the phone's own connect reuses this connect's credentials
 #include "Timelapse/TimelapseDownloadPopup.hpp"
 #include "nlohmann/json.hpp"
 #include "slic3r/GUI/Tab.hpp"
@@ -6573,6 +6574,13 @@ void SSWCP_MqttAgent_Instance::sw_mqtt_set_engine()
 
                     std::string link_mode       = m_param_data.count("link_mode") ? m_param_data["link_mode"] : "lan";
                     connect_params["link_mode"] = link_mode;
+
+                    // Ultra: the certificate this connect uses lives in the Device page and nowhere
+                    // else, so a phone / agent connect has nothing to log in with. When the person
+                    // asked for it (app / snapmaker_remember_keys), keep a copy for this printer.
+                    RemoteSnapmaker::remember_credentials(connect_params.count("sn") ? connect_params["sn"].get<std::string>()
+                                                                                     : std::string(),
+                                                          connect_params);
 
                     std::string id     = m_param_data.count("id") ? m_param_data["id"].get<std::string>() : "";
                     std::string userid = m_param_data.count("userid") ? m_param_data["userid"].get<std::string>() : "";
