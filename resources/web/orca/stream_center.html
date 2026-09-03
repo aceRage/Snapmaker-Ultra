@@ -332,7 +332,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         box.style.display = document.getElementById('layoutbox').style.display === 'none' ? 'none' : 'inline-flex'; // follows the layout picker
         sel.value = videoPref;
         var show = !!videoNote && videoPref !== 'mse';
-        warn.style.display = show ? '' : 'none';
+        warn.style.display = show ? 'inline' : 'none'; // the stylesheet hides it, so name a value
         warn.title = videoNote;
     }
     // Phone mode: pull the list from the PC now and every 15 s.

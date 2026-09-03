@@ -706,7 +706,11 @@ static int free_loopback_port()
     } catch (...) { return 0; }
 }
 
-static std::string go2rtc_exe_path() { return resources_dir() + "/tools/go2rtc/go2rtc.exe"; }
+// Native separators: this path is shown to the user to paste into the firewall dialog.
+static std::string go2rtc_exe_path()
+{
+    return fs::path(resources_dir() + "/tools/go2rtc/go2rtc.exe").make_preferred().string();
+}
 
 // ---- WebRTC (Phase 2): go2rtc's media port ------------------------------------------------
 // Everything else the hub runs is loopback-only, but WebRTC media goes straight from go2rtc to
