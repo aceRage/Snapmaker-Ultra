@@ -1613,6 +1613,12 @@ wxWindow* PreferencesDialog::create_ultra_page()
     auto title_phone = create_item_title(_L("Phone access"), page, _L("Phone access"));
     auto item_start_hidden = create_item_checkbox(_L("Start hidden (serve the phone without a window)"), page,
         _L("Slicers you start by hand run without a window and serve the phone in the background. Bring a window back from the hub's tray icon (Slicer windows > Show), the hub page, or the phone's \"Show on PC\". Slicers started from the phone are always hidden, and a hidden slicer shows itself when it needs a person at the PC."), 50, "start_hidden");
+    // Ultra (phone Snapmaker connect): a Snapmaker printer only answers a client holding the certificate it
+    // issued at pairing, which the Device tab keeps in the web page alone. With this on, a connect made on
+    // this PC leaves a copy under <datadir>/hub/snapmaker_keys.json so the phone can connect the printer
+    // later. Off by default: it is a private key at rest.
+    auto item_sm_keys = create_item_checkbox(_L("Remember Snapmaker printer certificates so the phone can connect them"), page,
+        _L("After you connect a Snapmaker printer on the Device tab, keep its pairing certificate on this PC (under the data folder's hub\snapmaker_keys.json) so the phone's Devices tab can connect that printer without you at the PC. The certificate never leaves this PC. Off by default because it is a private key stored on disk."), 50, "snapmaker_remember_keys");
 
     sizer_page->Add(title_project, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_autosave, 0, wxTOP, FromDIP(3));
@@ -1636,6 +1642,7 @@ wxWindow* PreferencesDialog::create_ultra_page()
     sizer_page->Add(item_spoolman_deduct, 0, wxTOP, FromDIP(3));
     sizer_page->Add(title_phone, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_start_hidden, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_sm_keys, 0, wxTOP, FromDIP(3));
 
     page->SetSizer(sizer_page);
     page->Layout();

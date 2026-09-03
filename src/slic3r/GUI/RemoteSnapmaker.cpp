@@ -65,7 +65,8 @@ static std::string keys_path() { return (fs::path(RemoteHub::hub_dir()) / "snapm
 
 static bool remember_keys_on()
 {
-    return wxGetApp().app_config && wxGetApp().app_config->get("app", "snapmaker_remember_keys") == "1";
+    // "1" from a hand edit or "true" from the Preferences checkbox (Phone access) both count.
+    return wxGetApp().app_config && wxGetApp().app_config->get_bool("snapmaker_remember_keys");
 }
 
 static std::mutex s_keys_mutex;
@@ -361,9 +362,9 @@ static std::pair<int, std::string> connect_impl(const std::string& dev_id)
     if (!device_has_tls(*dev))
         return { 409, "there is no certificate for " + (dev->dev_name.empty() ? dev->ip : dev->dev_name) +
                           " on this PC: the printer answers only the client it issued one to, and the slicer keeps it "
-                          "in the Device page alone. Connect this printer once on the PC with "
-                          "\"snapmaker_remember_keys\" set to 1 in the app settings, and the phone can connect it "
-                          "from then on." };
+                          "in the Device page alone. Turn on \"Remember Snapmaker printer certificates\" under "
+                          "Preferences > Phone access, connect this printer once on the PC, and the phone can "
+                          "connect it from then on." };
 
     // ---- 2. the host, built exactly as sw_mqtt_set_engine builds it ----
     const int         port = device_port(*dev);
