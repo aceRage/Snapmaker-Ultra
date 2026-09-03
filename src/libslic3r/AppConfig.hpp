@@ -227,6 +227,8 @@ public:
 	void                set_vendors(const AppConfig &from);
 	void 				set_vendors(const VendorMap &vendors) { m_vendors = vendors; m_dirty = true; }
 	void 				set_vendors(VendorMap &&vendors) { m_vendors = std::move(vendors); m_dirty = true; }
+	// Ultra: union the installed printer models saved by other instances into ours before saving.
+	void merge_models_from_disk(const std::string &path);
 	const VendorMap&    vendors() const { return m_vendors; }
 
 	// Orca printer settings
