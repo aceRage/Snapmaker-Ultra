@@ -1,0 +1,772 @@
+#include "RemoteSend.hpp"
+
+#include "BitmapCache.hpp"
+#include "DeviceManager.hpp"
+#include "GUI_App.hpp"
+#include "HMS.hpp"
+#include "PartPlate.hpp"
+#include "Plater.hpp"
+#include "SelectMachine.hpp" // CloudTaskNozzleId
+#include "Jobs/PrintJob.hpp" // PrintPrepareData
+#include "libslic3r/Model.hpp"
+#include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/ProjectTask.hpp" // FilamentInfo
+#include "libslic3r/Utils.hpp"
+#include "slic3r/Utils/Http.hpp"
+#include "slic3r/Utils/MoonRaker.hpp"
+#include "slic3r/Utils/NetworkAgent.hpp"
+
+#include <boost/filesystem.hpp>
+#include <boost/log/trivial.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <future>
+#include <mutex>
+#include <thread>
+
+#include <wx/utils.h>
+
+namespace Slic3r {
+namespace GUI {
+namespace RemoteSend {
+
+namespace fs = boost::filesystem;
+using nlohmann::json;
+
+// ---------------------------------------------------------------- helpers ----
+
+// From the worker thread: run fn on the GUI thread and wait for it (bounded).
+static bool on_main(std::function<void()> fn, int timeout_ms = 10000)
+{
+    auto done = std::make_shared<std::promise<void>>();
+    auto fut  = done->get_future();
+    wxGetApp().CallAfter([done, fn]() {
+        try { fn(); } catch (...) {}
+        done->set_value();
+    });
+    return fut.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready;
+}
+
+static bool env_flag(const char* name)
+{
+    wxString v;
+    return wxGetEnv(name, &v) && v == "1";
+}
+
+// The send dialog remembers its checkboxes in AppConfig section "print": unset or "1" means on.
+static bool remembered(const char* key)
+{
+    AppConfig* cfg = wxGetApp().app_config;
+    return !(cfg && cfg->get("print", key) == "0");
+}
+
+static bool flag(int requested, bool def) { return requested < 0 ? def : requested != 0; }
+
+// PrintJob::truncate_string: at most `max_bytes` of UTF-8 without cutting a character in half.
+static std::string truncate_utf8(std::string s, size_t max_bytes)
+{
+    if (s.size() <= max_bytes) return s;
+    size_t n = max_bytes;
+    while (n > 0 && ((unsigned char) s[n] & 0xC0) == 0x80) --n;
+    s.resize(n);
+    return s;
+}
+
+static std::string drop_characters(std::string s, const char* bad)
+{
+    std::string out;
+    for (char c : s)
+        if (!std::strchr(bad, c)) out += c;
+    return out;
+}
+
+static MachineObject* find_machine(DeviceManager* dm, const std::string& id)
+{
+    std::map<std::string, MachineObject*> all = dm->get_my_machine_list();
+    for (const auto& kv : dm->get_local_machine_list()) all.insert(kv);
+    for (const auto& kv : all)
+        if (kv.second && kv.second->dev_id == id) return kv.second;
+    return nullptr;
+}
+
+// SelectMachineDialog::is_same_printer_model without the dialog.
+static bool same_printer_model(MachineObject* obj, std::string* profile_model)
+{
+    PresetBundle*     bundle = wxGetApp().preset_bundle;
+    const std::string source = bundle->printers.get_edited_preset().get_printer_type(bundle);
+    const std::string target = obj->printer_type;
+    if (profile_model) *profile_model = source;
+    const bool p1p_with_kit = target == "C11" && obj->is_support_upgrade_kit && obj->installed_upgrade_kit;
+    if (source != target)
+        return (source == "C12" && target == "C11") || (source == "C11" && target == "C12") || (p1p_with_kit && source == "C12");
+    return !p1p_with_kit;
+}
+
+// The name the desktop shows in its send dialog (SelectMachineDialog::set_default): the export
+// name of the plate, or the plate's object names when the project is untitled.
+static std::string print_name_for(Plater* plater, PartPlate* plate)
+{
+    wxString filename = plater->get_export_gcode_filename("", true);
+    if (filename.empty()) filename = "Untitled";
+    std::string name = fs::path(filename.ToUTF8().data()).filename().string();
+    if (name.find("Untitled") != std::string::npos) {
+        const ModelObjectPtrs objects = plate->get_objects_on_this_plate();
+        if (!objects.empty()) {
+            name = objects[0]->name;
+            for (size_t i = 1; i < objects.size(); ++i) name += " + " + objects[i]->name;
+            if (name.size() > 100) name = name.substr(0, 97) + "...";
+        }
+    }
+    return drop_characters(name, "<>[]:/\\|?*\"");
+}
+
+// SelectMachineDialog::reset_and_sync_ams_list + set_default_normal: the plate's filaments as the
+// AMS mapping wants them (type, brand, id, colour per used extruder).
+static std::vector<FilamentInfo> plate_filaments(PartPlate* plate)
+{
+    PresetBundle*            bundle = wxGetApp().preset_bundle;
+    std::vector<std::string> types, brands, ids;
+    for (const std::string& name : bundle->filament_presets) {
+        Preset*     preset = bundle->filaments.find_preset(name, false);
+        std::string display, type, id, brand;
+        if (preset) {
+            type = preset->config.get_filament_type(display);
+            id   = preset->filament_id;
+            if (auto* v = dynamic_cast<const ConfigOptionStrings*>(preset->config.option("filament_vendor")); v && !v->values.empty())
+                brand = v->values[0];
+        }
+        types.push_back(type);
+        ids.push_back(id);
+        brands.push_back(brand);
+    }
+    std::vector<FilamentInfo> out;
+    for (int e : plate->get_used_extruders()) {
+        const int extruder = e - 1;
+        if (extruder < 0 || extruder >= (int) types.size()) continue;
+        const std::string colour = bundle->project_config.opt_string("filament_colour", (unsigned int) extruder);
+        unsigned char     rgb[4] = { 0, 0, 0, 255 };
+        BitmapCache::parse_color4(colour, rgb);
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "#%02X%02X%02X%02X", rgb[0], rgb[1], rgb[2], rgb[3]);
+        FilamentInfo info;
+        info.id          = extruder;
+        info.type        = types[extruder];
+        info.brand       = brands[extruder];
+        info.filament_id = ids[extruder];
+        info.color       = buf;
+        info.used_m = info.used_g = 0.f;
+        info.tray_id     = -1;
+        info.distance    = 0.f;
+        out.push_back(info);
+    }
+    return out;
+}
+
+// SelectMachineDialog::do_ams_mapping + get_ams_mapping_result: the three JSON strings PrintJob
+// forwards (v0 tray list, v1 ams/slot list, per-filament info). Empty when nothing maps.
+static void ams_mapping(MachineObject* obj, const std::vector<FilamentInfo>& filaments, std::string& v0, std::string& v1, std::string& info)
+{
+    std::vector<FilamentInfo> result;
+    const int                 rc = obj->ams_filament_mapping(filaments, result);
+    if (rc != 0 && rc != 1 && !obj->is_valid_mapping_result(result))
+        for (FilamentInfo& r : result) { r.tray_id = -1; r.distance = 99999; }
+    if (result.empty()) return;
+    size_t invalid = 0;
+    for (const FilamentInfo& r : result)
+        if (r.tray_id == -1) ++invalid;
+    if (invalid == result.size()) return;
+
+    PresetBundle* bundle = wxGetApp().preset_bundle;
+    json          j0 = json::array(), j1 = json::array(), ji = json::array();
+    for (size_t i = 0; i < bundle->filament_presets.size(); ++i) {
+        int  tray_id = -1;
+        json item1;
+        item1["ams_id"]  = 0xff;
+        item1["slot_id"] = 0xff;
+        json item;
+        item["ams"]          = tray_id;
+        item["targetColor"]  = "";
+        item["filamentId"]   = "";
+        item["filamentType"] = "";
+        for (size_t k = 0; k < result.size(); ++k) {
+            if (result[k].id != (int) i) continue;
+            tray_id              = result[k].tray_id;
+            item["ams"]          = tray_id;
+            item["filamentType"] = k < filaments.size() ? filaments[k].type : result[k].type;
+            if (const Preset* p = bundle->filaments.find_preset(bundle->filament_presets[i])) item["filamentId"] = p->filament_id;
+            item["sourceColor"] = k < filaments.size() ? filaments[k].color : result[k].color;
+            item["targetColor"] = result[k].color;
+            try {
+                if (result[k].ams_id.empty() || result[k].slot_id.empty()) { item1["ams_id"] = 255; item1["slot_id"] = 255; }
+                else { item1["ams_id"] = std::stoi(result[k].ams_id); item1["slot_id"] = std::stoi(result[k].slot_id); }
+            } catch (...) {}
+        }
+        j0.push_back(tray_id);
+        j1.push_back(item1);
+        ji.push_back(item);
+    }
+    v0   = j0.dump();
+    v1   = j1.dump();
+    info = ji.dump();
+}
+
+// SelectMachineDialog::build_nozzles_info: only the two-nozzle printers carry this.
+static std::string nozzles_info()
+{
+    json        arr  = json::array();
+    const auto* diam = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (!diam || diam->size() != 2) return arr.dump();
+    for (size_t i = 0; i < 2; ++i) {
+        json n;
+        n["id"]       = (int) (i == 0 ? CloudTaskNozzleId::NOZZLE_LEFT : CloudTaskNozzleId::NOZZLE_RIGHT);
+        n["type"]     = nullptr;
+        n["flowSize"] = "standard_flow";
+        n["diameter"] = diam->get_at(i);
+        arr.push_back(n);
+    }
+    return arr.dump();
+}
+
+static json params_json(const BBL::PrintParams& p)
+{
+    json j;
+    j["dev_id"]           = p.dev_id;
+    j["dev_ip"]           = p.dev_ip;
+    j["project_name"]     = p.project_name;
+    j["preset_name"]      = p.preset_name;
+    j["filename"]         = p.filename;
+    j["config_filename"]  = p.config_filename;
+    j["plate_index"]      = p.plate_index;
+    j["ftp_folder"]       = p.ftp_folder;
+    j["ams_mapping"]      = p.ams_mapping;
+    j["ams_mapping2"]     = p.ams_mapping2;
+    j["ams_mapping_info"] = p.ams_mapping_info;
+    j["nozzles_info"]     = p.nozzles_info;
+    j["connection_type"]  = p.connection_type;
+    j["print_type"]       = p.print_type;
+    j["use_ssl_for_ftp"]  = p.use_ssl_for_ftp;
+    j["use_ssl_for_mqtt"] = p.use_ssl_for_mqtt;
+    j["username"]         = p.username;
+    j["password_set"]     = !p.password.empty(); // the access code itself never leaves the PC
+    j["task_bed_leveling"]     = p.task_bed_leveling;
+    j["task_flow_cali"]        = p.task_flow_cali;
+    j["task_vibration_cali"]   = p.task_vibration_cali;
+    j["task_layer_inspect"]    = p.task_layer_inspect;
+    j["task_record_timelapse"] = p.task_record_timelapse;
+    j["task_use_ams"]          = p.task_use_ams;
+    j["task_bed_type"]         = p.task_bed_type;
+    return j;
+}
+
+// PrintJob / SendJob: the stage the plugin reports -> the percentage the desktop shows.
+static int stage_percent(int stage, int code, bool upload_only)
+{
+    static const int print_pts[7] = { 20, 30, 70, 75, 97, 100, 100 };
+    static const int send_pts[7]  = { 20, 30, 99, 99, 99, 100, 100 };
+    const int*       pts          = upload_only ? send_pts : print_pts;
+    if (stage < 0) return -1;
+    const int s   = std::min(stage, 6);
+    int       pct = pts[s];
+    if ((stage == BBL::PrintingStageUpload || stage == BBL::PrintingStageRecord) && code > 0 && code <= 100 && s < 6)
+        pct = (pts[s + 1] - pts[s]) * code / 100 + pts[s];
+    return pct;
+}
+
+static const char* stage_name(int stage)
+{
+    switch (stage) {
+    case BBL::PrintingStageCreate:      return "preparing";
+    case BBL::PrintingStageUpload:      return "uploading";
+    case BBL::PrintingStageWaiting:     return "waiting for the printer";
+    case BBL::PrintingStageSending:     return "sending the print command";
+    case BBL::PrintingStageRecord:      return "sending the print configuration";
+    case BBL::PrintingStageWaitPrinter: return "waiting for the printer";
+    case BBL::PrintingStageFinished:    return "sent";
+    default:                            return "working";
+    }
+}
+
+// PrintJob::process: the desktop's words for the plugin's result codes.
+static std::string result_text(int result)
+{
+    switch (result) {
+    case BAMBU_NETWORK_ERR_PRINT_WR_FILE_NOT_EXIST:
+    case BAMBU_NETWORK_ERR_PRINT_SP_FILE_NOT_EXIST:            return "Print file not found. Please slice again.";
+    case BAMBU_NETWORK_ERR_PRINT_SP_FILE_OVER_SIZE:
+    case BAMBU_NETWORK_ERR_PRINT_WR_FILE_OVER_SIZE:            return "The print file exceeds the maximum allowable size (1GB).";
+    case BAMBU_NETWORK_ERR_PRINT_WR_CHECK_MD5_FAILED:
+    case BAMBU_NETWORK_ERR_PRINT_SP_CHECK_MD5_FAILED:          return "Cloud service connection failed. Please try again.";
+    case BAMBU_NETWORK_ERR_PRINT_WR_GET_NOTIFICATION_TIMEOUT:
+    case BAMBU_NETWORK_ERR_PRINT_SP_GET_NOTIFICATION_TIMEOUT:  return "Upload task timed out. Please check the network status and try again.";
+    case BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED:
+    case BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED:         return "Failed to upload file to ftp. Please try again.";
+    case BAMBU_NETWORK_ERR_CANCELED:                           return "Task canceled.";
+    default:                                                   return "Failed to send the print job (code " + std::to_string(result) + ")";
+    }
+}
+
+// ---------------------------------------------------------------- prepare ----
+
+static std::pair<int, std::string> prepare_bambu(const Request& req, PartPlate* plate, std::shared_ptr<Prepared> p, std::shared_ptr<Prepared>& out)
+{
+    Plater*        plater = wxGetApp().plater();
+    DeviceManager* dm     = wxGetApp().getDeviceManager();
+    if (!dm) return { 503, "no device manager" };
+    if (!wxGetApp().getAgent()) return { 503, "the network plugin is not loaded" };
+    MachineObject* obj = find_machine(dm, req.printer);
+    if (!obj) return { 404, "no such printer: " + req.printer };
+    if (!obj->is_online()) return { 409, obj->dev_name + " is offline" };
+    if (obj->is_lan_mode_printer() && !obj->has_access_right()) return { 409, obj->dev_name + " needs its access code entered on the PC first" };
+    if (obj->is_in_printing()) return { 409, obj->dev_name + " is busy printing" };
+    std::string profile_model;
+    if (!same_printer_model(obj, &profile_model) && !req.force)
+        return { 409, "the plate was sliced for printer model " + profile_model + " but " + obj->dev_name + " reports " + obj->printer_type +
+                          "; send with force=1 to ignore" };
+
+    // preselect() made this the selected (connected) printer; a late caller still gets that here.
+    if (!dm->get_selected_machine() || dm->get_selected_machine()->dev_id != obj->dev_id)
+        dm->set_selected_machine(obj->dev_id, true);
+
+    // The files the plugin uploads: the gcode 3mf, plus the configuration 3mf for cloud printers.
+    if (plater->send_gcode(req.plate, nullptr) < 0) return { 500, "Abnormal print file data. Please slice again" };
+    if (!obj->is_lan_mode_printer() && plater->export_config_3mf(req.plate) < 0) return { 500, "exporting the configuration 3mf failed" };
+    PrintPrepareData jd;
+    plater->get_print_job_data(&jd);
+
+    p->kind               = "bambu";
+    p->printer_name       = obj->dev_name;
+    p->print_error_before = obj->print_error;
+    BBL::PrintParams& ps  = p->params;
+    ps.dev_id     = obj->dev_id;
+    ps.dev_ip     = obj->dev_ip;
+    ps.ftp_folder = obj->get_ftp_folder();
+    ps.username   = "bblp";
+    ps.password   = obj->get_access_code();
+#if !BBL_RELEASE_TO_PUBLIC
+    ps.use_ssl_for_ftp  = wxGetApp().app_config->get("enable_ssl_for_ftp") == "true";
+    ps.use_ssl_for_mqtt = wxGetApp().app_config->get("enable_ssl_for_mqtt") == "true";
+#else
+    ps.use_ssl_for_ftp  = obj->local_use_ssl_for_ftp;
+    ps.use_ssl_for_mqtt = obj->local_use_ssl_for_mqtt;
+#endif
+    ps.connection_type = obj->connection_type();
+    ps.filename        = jd._3mf_path.string();
+    ps.config_filename = jd._3mf_config_path.string();
+    ps.plate_index     = req.plate + 1;
+    const bool        has_sdcard = obj->get_sdcard_state() == MachineObject::SdcardState::HAS_SDCARD_NORMAL;
+    const std::string name       = print_name_for(plater, plate);
+
+    if (req.mode == "print") {
+        // SelectMachineDialog::on_send_print + PrintJob::process
+        ps.print_type            = "from_normal";
+        ps.project_name          = truncate_utf8(name, 100);
+        ps.preset_name           = name + "_plate_" + std::to_string(req.plate + 1);
+        ps.task_bed_type         = bed_type_to_gcode_string(plate->get_bed_type(true));
+        ps.task_bed_leveling     = flag(req.bed_leveling, remembered("bed_leveling"));
+        ps.task_flow_cali        = flag(req.flow_cali, remembered("flow_cali"));
+        ps.task_vibration_cali   = flag(req.vibration_cali, false); // the desktop passes false here
+        ps.task_record_timelapse = flag(req.timelapse, remembered("timelapse"));
+        ps.task_layer_inspect    = true;
+        ps.task_use_ams          = obj->has_ams() && flag(req.use_ams, true);
+        ps.nozzles_info          = nozzles_info();
+        if (obj->is_support_ams_mapping() && ps.task_use_ams) {
+            ams_mapping(obj, plate_filaments(plate), ps.ams_mapping, ps.ams_mapping2, ps.ams_mapping_info);
+        } else if (!ps.task_use_ams) {
+            const std::vector<FilamentInfo> fils = plate_filaments(plate);
+            if (!fils.empty()) {
+                json a = json::array(), it;
+                it["sourceColor"]  = fils[0].color.size() >= 9 ? fils[0].color.substr(1, 8) : fils[0].color;
+                it["filamentType"] = fils[0].type;
+                a.push_back(it);
+                ps.ams_mapping_info = a.dump();
+            }
+        }
+        if (ps.connection_type == "lan") {
+            if (!has_sdcard) return { 409, "An SD card needs to be inserted before printing via LAN." };
+            p->call               = "start_local_print";
+            p->verify_access_code = true;
+        } else {
+            const bool lan_only  = wxGetApp().app_config->get("lan_mode_only") == "1";
+            const bool can_local = !ps.password.empty() && !ps.dev_ip.empty() && has_sdcard;
+            if (lan_only) {
+                if (!can_local) return { 409, "LAN-only mode is on but the printer has no IP address, access code or SD card" };
+                p->call = "start_local_print_with_record";
+            } else if (!obj->is_support_cloud_print_only && can_local) {
+                p->call                  = "start_local_print_with_record";
+                p->lan_fallback_to_cloud = true;
+            } else {
+                p->call = "start_print";
+            }
+        }
+    } else {
+        // SendToPrinterDialog::on_ok_btn + SendJob::process: upload to the printer's storage only
+        ps.project_name = name + ".gcode.3mf";
+        ps.preset_name  = wxGetApp().preset_bundle->prints.get_selected_preset_name();
+        ps.task_use_ams = true;
+        if (ps.connection_type == "lan") {
+            if (!has_sdcard) return { 409, "An SD card needs to be inserted before sending to printer." };
+        } else if (ps.password.empty() || ps.dev_ip.empty() || !has_sdcard) {
+            return { 409, "uploading needs the printer's IP address, its access code and an SD card" };
+        }
+        p->call = "start_send_gcode_to_sdcard";
+    }
+    out = p;
+    return { 200, "" };
+}
+
+static std::pair<int, std::string> prepare_host(const Request& req, PartPlate* plate, std::shared_ptr<Prepared> p, std::shared_ptr<Prepared>& out)
+{
+    Plater*             plater = wxGetApp().plater();
+    PresetBundle*       bundle = wxGetApp().preset_bundle;
+    DynamicPrintConfig& cfg    = bundle->printers.get_edited_preset().config;
+    std::shared_ptr<PrintHost> host;
+    if (req.printer == "connect") {
+        wxGetApp().get_connect_host(host);
+        if (!host) return { 409, "no Snapmaker printer is connected on the PC's Device tab" };
+        p->kind         = "connect";
+        p->printer_name = "Snapmaker " + host->get_host();
+    } else {
+        if (bundle->use_bbl_network()) return { 409, "the current printer preset sends through the Bambu network; pick that printer by its id" };
+        const std::string url = cfg.opt_string("print_host");
+        if (url.empty()) return { 409, "the printer preset has no print host address" };
+        host.reset(PrintHost::get_print_host(&cfg, false));
+        if (!host) return { 500, "unsupported host type" };
+        p->kind         = "printhost";
+        p->printer_name = std::string(host->get_name()) + " " + url;
+    }
+    const bool want_print = req.mode == "print";
+    if (want_print && !host->get_post_upload_actions().has(PrintHostPostUploadAction::StartPrint))
+        return { 409, std::string(host->get_name()) + " cannot start a print after the upload" };
+    // Moonraker::upload with StartPrint stops at the PC's preprint page (WebPreprintDialog). Upload
+    // first, then start the file over the MQTT channel like the page's own Print button does.
+    if (want_print && dynamic_cast<Moonraker*>(host.get()) != nullptr) {
+        if (dynamic_cast<Moonraker_Mqtt*>(host.get()) == nullptr) return { 409, "this Moonraker host can only start prints from the PC's preprint page" };
+        p->two_step = true;
+    }
+    // The file: the plate's sliced G-code (what the Snapmaker path uploads), or the gcode 3mf when a
+    // Bambu printer sits behind a print host (Plater::priv::on_action_print_plate, use_3mf).
+    const bool use_3mf = bundle->is_bbl_vendor();
+    fs::path   source;
+    if (use_3mf) {
+        if (plater->send_gcode(req.plate, nullptr) < 0) return { 500, "Abnormal print file data. Please slice again" };
+        PrintPrepareData jd;
+        plater->get_print_job_data(&jd);
+        source = jd._3mf_path;
+    } else {
+        source = fs::path(plate->get_tmp_gcode_path());
+        boost::system::error_code ec;
+        if (!fs::is_regular_file(source, ec)) return { 409, "this plate has no G-code file; slice it again" };
+    }
+    const char* ext  = use_3mf ? ".gcode.3mf" : ".gcode";
+    std::string name = req.name;
+    if (name.empty()) name = plater->get_export_gcode_filename(ext, true).ToUTF8().data();
+    name = fs::path(name).filename().string(); // never a directory from the phone
+    if (name.empty() || name == "." || name == "..") name = "plate_" + std::to_string(req.plate + 1) + ext;
+    p->host                = host;
+    p->upload.use_3mf      = use_3mf;
+    p->upload.source_path  = source;
+    p->upload.upload_path  = fs::path(name);
+    p->upload.post_action  = (want_print && !p->two_step) ? PrintHostPostUploadAction::StartPrint : PrintHostPostUploadAction::None;
+    out                    = p;
+    return { 200, "" };
+}
+
+std::pair<int, std::string> preselect(const Request& req, bool& wait)
+{
+    wait = false;
+    if (req.printer.empty()) return { 400, "printer is required" };
+    if (req.printer == "host" || req.printer == "connect") return { 200, "" };
+    DeviceManager* dm = wxGetApp().getDeviceManager();
+    if (!dm) return { 503, "no device manager" };
+    MachineObject* obj = find_machine(dm, req.printer);
+    if (!obj) return { 404, "no such printer: " + req.printer };
+    if (!obj->is_online()) return { 409, obj->dev_name + " is offline" };
+    if (obj->is_lan_mode_printer() && !obj->has_access_right()) return { 409, obj->dev_name + " needs its access code entered on the PC first" };
+    // SelectMachineDialog::on_selection_changed: the picked printer becomes the selected one, which
+    // connects to it; its SD card / printing state arrives with the first push afterwards.
+    MachineObject* selected = dm->get_selected_machine();
+    if (!selected || selected->dev_id != obj->dev_id) {
+        dm->set_selected_machine(obj->dev_id, true);
+        wait = true;
+    } else if (!obj->is_connected()) {
+        wait = true;
+    }
+    return { 200, "" };
+}
+
+bool printer_ready(const std::string& printer)
+{
+    DeviceManager* dm = wxGetApp().getDeviceManager();
+    if (!dm) return true;
+    MachineObject* obj = find_machine(dm, printer);
+    if (!obj) return true;
+    return obj->is_connected() && obj->get_sdcard_state() != MachineObject::SdcardState::NO_SDCARD;
+}
+
+std::pair<int, std::string> prepare(const Request& req, std::shared_ptr<Prepared>& out)
+{
+    Plater* plater = wxGetApp().plater();
+    if (!plater) return { 503, "no plater" };
+    if (req.mode != "upload" && req.mode != "print") return { 400, "mode must be upload or print" };
+    if (req.mode == "print" && !req.confirm) return { 400, "starting a print needs confirm=1" };
+    if (req.printer.empty()) return { 400, "printer is required" };
+    PartPlateList& plates = plater->get_partplate_list();
+    if (req.plate < 0 || req.plate >= plates.get_plate_count()) return { 404, "no such plate" };
+    if (plater->is_background_process_slicing()) return { 409, "the slicer is slicing" };
+    PartPlate* plate = plates.get_plate(req.plate);
+    if (!plate->is_slice_result_valid() || plate->get_slice_result() == nullptr || !plate->is_slice_result_ready_for_print())
+        return { 409, "this plate is not sliced, or its result is not printable" };
+    // The export helpers and the file name work on the current plate, exactly as the dialogs do.
+    if (plates.get_curr_plate_index() != req.plate) plater->select_plate(req.plate, false);
+
+    auto p        = std::make_shared<Prepared>();
+    p->mode       = req.mode;
+    p->plate      = req.plate;
+    p->dry_run    = req.dry_run || env_flag("SNORCA_SEND_DRYRUN");
+    p->printer_id = req.printer;
+    if (req.printer == "host" || req.printer == "connect") return prepare_host(req, plate, p, out);
+    return prepare_bambu(req, plate, p, out);
+}
+
+// -------------------------------------------------------------------- run ----
+
+static void run_bambu(std::shared_ptr<Prepared> p, Sink& sink)
+{
+    NetworkAgent* agent = wxGetApp().getAgent();
+    json          result;
+    result["kind"]    = "bambu";
+    result["mode"]    = p->mode;
+    result["printer"] = { { "id", p->printer_id }, { "name", p->printer_name } };
+    result["call"]    = p->call;
+    result["params"]  = params_json(p->params);
+    if (!agent) { sink.done(false, "the network plugin is not loaded", result); return; }
+    if (p->dry_run) {
+        result["dry_run"] = true;
+        sink.progress(99, "dry run: nothing was sent");
+        sink.done(true, "", result);
+        return;
+    }
+
+    const bool  upload_only = p->mode == "upload";
+    std::mutex  m;
+    std::string last_error;
+    auto update_fn = [&](int stage, int code, std::string info) {
+        std::lock_guard<std::mutex> lock(m);
+        if (stage < 0 || code < 0 || code > 100 || stage == BBL::PrintingStageERROR) {
+            last_error = info.empty() ? "error code " + std::to_string(code) : info;
+            return;
+        }
+        sink.progress(stage_percent(stage, code, upload_only), info.empty() ? stage_name(stage) : info);
+    };
+    auto cancel_fn = []() { return false; };
+    auto wait_fn   = [](int, std::string) { return true; };
+
+    if (p->verify_access_code) {
+        // PrintJob::process: a tiny upload proves the IP address and access code before the real file goes out.
+        BBL::PrintParams v = p->params;
+        v.project_name     = "verify_job";
+        v.filename         = (fs::path(resources_dir()) / "check_access_code.txt").string();
+        sink.progress(5, "checking the access code");
+        if (agent->start_send_gcode_to_sdcard(v, nullptr, nullptr, nullptr) != 0) {
+            sink.done(false, p->printer_name + " rejected the access code (or its IP address changed); fix it on the PC's Device tab", result);
+            return;
+        }
+    }
+    sink.progress(10, p->params.connection_type == "lan" ? "Sending print job over LAN" : "Sending print job through cloud service");
+    int rc = -1;
+    if (p->call == "start_send_gcode_to_sdcard") {
+        rc = agent->start_send_gcode_to_sdcard(p->params, update_fn, cancel_fn, nullptr);
+    } else if (p->call == "start_local_print") {
+        rc = agent->start_local_print(p->params, update_fn, cancel_fn);
+    } else if (p->call == "start_local_print_with_record") {
+        rc = agent->start_local_print_with_record(p->params, update_fn, cancel_fn, wait_fn);
+        if (rc < 0 && p->lan_fallback_to_cloud) {
+            result["fallback"] = "cloud";
+            sink.progress(10, "Sending print job through cloud service");
+            rc = agent->start_print(p->params, update_fn, cancel_fn, wait_fn);
+        }
+    } else if (p->call == "start_print") {
+        rc = agent->start_print(p->params, update_fn, cancel_fn, wait_fn);
+    }
+    result["result_code"] = rc;
+    if (rc < 0) {
+        std::lock_guard<std::mutex> lock(m);
+        sink.done(false, result_text(rc) + (last_error.empty() ? "" : ": " + last_error), result);
+        return;
+    }
+    if (upload_only) { sink.done(true, "", result); return; }
+
+    // The command left the PC; the printer may still refuse it (an H2-series printer that is not in
+    // LAN-only mode with Developer Mode answers "command verification failed" on its own screen).
+    // Watch what it reports for a few seconds so the phone learns about it.
+    sink.progress(98, "waiting for the printer to start");
+    struct Watch { std::mutex m; std::string state { "unknown" }, err_text; int err { 0 }; };
+    auto w = std::make_shared<Watch>(); // shared: a timed-out GUI call may still run after this loop
+    for (int i = 0; i < 12; ++i) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        on_main([w, p]() {
+            DeviceManager* dm = wxGetApp().getDeviceManager();
+            if (!dm) return;
+            MachineObject* obj = find_machine(dm, p->printer_id);
+            if (!obj) return;
+            std::lock_guard<std::mutex> lock(w->m);
+            if (w->state != "unknown") return;
+            if (obj->print_error != 0 && obj->print_error != p->print_error_before) {
+                w->err   = obj->print_error;
+                w->state = "error";
+                wxString msg;
+                if (HMSQuery* q = wxGetApp().get_hms_query(); q && q->query_print_error_msg(w->err, msg)) w->err_text = msg.ToUTF8().data();
+            } else if (obj->is_in_printing()) {
+                w->state = "printing";
+            }
+        }, 3000);
+        std::lock_guard<std::mutex> lock(w->m);
+        if (w->state != "unknown") break;
+    }
+    std::lock_guard<std::mutex> lock(w->m);
+    result["printer_state"] = w->state;
+    if (w->state == "error") {
+        char code[16];
+        std::snprintf(code, sizeof code, "%08X", (unsigned) w->err);
+        result["printer_error"] = { { "code", code }, { "message", w->err_text } };
+        sink.done(false, "the printer refused the print (error " + std::string(code) + (w->err_text.empty() ? "" : ": " + w->err_text) + ")", result);
+        return;
+    }
+    sink.done(true, "", result);
+}
+
+static void run_host(std::shared_ptr<Prepared> p, Sink& sink)
+{
+    json result;
+    result["kind"]        = p->kind;
+    result["mode"]        = p->mode;
+    result["printer"]     = { { "id", p->printer_id }, { "name", p->printer_name } };
+    result["host"]        = p->host->get_name();
+    result["url"]         = p->host->get_host();
+    result["source"]      = p->upload.source_path.string();
+    result["upload_path"] = p->upload.upload_path.string();
+    result["post_action"] = p->upload.post_action == PrintHostPostUploadAction::StartPrint ? "start_print" : "none";
+    result["two_step"]    = p->two_step;
+    if (p->dry_run) {
+        result["dry_run"] = true;
+        sink.progress(99, "dry run: nothing was sent");
+        sink.done(true, "", result);
+        return;
+    }
+    std::string error;
+    sink.progress(1, "uploading " + p->upload.upload_path.string());
+    const bool ok = p->host->upload(
+        p->upload,
+        [&](Http::Progress prog, bool& cancel) {
+            cancel = false;
+            if (prog.ultotal > 0) {
+                const size_t pct = prog.ulnow * 100 / prog.ultotal;
+                sink.progress((int) std::min<size_t>(95, pct * 95 / 100), "uploading " + std::to_string(pct) + "%");
+            }
+        },
+        [&](wxString e) { error = e.ToUTF8().data(); },
+        [&](wxString tag, wxString status) { if (tag == "resolve") result["resolved"] = std::string(status.ToUTF8().data()); });
+    if (!ok) { sink.done(false, error.empty() ? "upload failed" : error, result); return; }
+    result["uploaded"] = true;
+    if (!p->two_step) { sink.done(true, "", result); return; }
+
+    sink.progress(97, "starting the print");
+    auto reply = std::make_shared<std::promise<json>>();
+    auto once  = std::make_shared<std::atomic<bool>>(false);
+    auto fut   = reply->get_future();
+    p->host->async_start_print_job(p->upload.upload_path.string(), [reply, once](const json& r) {
+        if (!once->exchange(true)) reply->set_value(r);
+    });
+    if (fut.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+        sink.done(false, "the printer did not answer the print start within 30 s (the file is uploaded)", result);
+        return;
+    }
+    const json r          = fut.get();
+    result["start_reply"] = r;
+    if (r.is_null() || (r.is_object() && r.contains("error"))) {
+        sink.done(false, "the printer did not start the print: " + (r.is_null() ? std::string("no reply") : r["error"].dump()), result);
+        return;
+    }
+    sink.done(true, "", result);
+}
+
+void run(std::shared_ptr<Prepared> p, Sink sink)
+{
+    try {
+        if (p->kind == "bambu") run_bambu(p, sink);
+        else                    run_host(p, sink);
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error) << "RemoteSend: " << e.what();
+        sink.done(false, std::string("send failed: ") + e.what(), json::object());
+    } catch (...) {
+        sink.done(false, "send failed", json::object());
+    }
+}
+
+// ----------------------------------------------------------- /api/printers ----
+
+void describe_bambu(MachineObject* m, json& p)
+{
+    p["kind"]            = "bambu";
+    p["lan_mode"]        = m->is_lan_mode_printer();
+    p["access_code_set"] = m->has_access_right();
+    p["has_ams"]         = m->has_ams();
+    p["ams_mapping"]     = m->is_support_ams_mapping();
+    p["sdcard"]          = m->get_sdcard_state() == MachineObject::SdcardState::HAS_SDCARD_NORMAL;
+    std::string profile_model;
+    p["model_matches"]   = same_printer_model(m, &profile_model);
+    p["profile_model"]   = profile_model;
+    p["can_upload"]      = true;
+    p["can_print"]       = true;
+    p["options"]         = { { "bed_leveling", remembered("bed_leveling") }, { "flow_cali", remembered("flow_cali") },
+                             { "timelapse", remembered("timelapse") },       { "vibration_cali", false },
+                             { "use_ams", m->has_ams() } };
+}
+
+void list_hosts(json& printers)
+{
+    Plater*             plater = wxGetApp().plater();
+    PresetBundle*       bundle = wxGetApp().preset_bundle;
+    DynamicPrintConfig& cfg    = bundle->printers.get_edited_preset().config;
+    const bool          use_3mf = bundle->is_bbl_vendor();
+    const std::string   upload_name = plater ? std::string(plater->get_export_gcode_filename(use_3mf ? ".gcode.3mf" : ".gcode", true).ToUTF8().data()) : std::string();
+    const std::string   url         = cfg.opt_string("print_host");
+    if (!url.empty() && !bundle->use_bbl_network()) {
+        std::unique_ptr<PrintHost> host(PrintHost::get_print_host(&cfg, false));
+        json p;
+        p["id"]          = "host";
+        p["kind"]        = "printhost";
+        p["name"]        = (host ? std::string(host->get_name()) : std::string("print host")) + " " + url;
+        p["model"]       = cfg.opt_string("printer_model");
+        p["url"]         = url;
+        p["online"]      = true; // a print host has no live status here; the upload itself tells
+        p["can_upload"]  = host != nullptr;
+        p["can_print"]   = host && host->get_post_upload_actions().has(PrintHostPostUploadAction::StartPrint) &&
+                           (dynamic_cast<Moonraker*>(host.get()) == nullptr || dynamic_cast<Moonraker_Mqtt*>(host.get()) != nullptr);
+        p["upload_name"] = upload_name;
+        printers.push_back(p);
+    }
+    std::shared_ptr<PrintHost> connected;
+    wxGetApp().get_connect_host(connected);
+    if (connected) {
+        json p;
+        p["id"]          = "connect";
+        p["kind"]        = "connect";
+        p["name"]        = "Snapmaker " + connected->get_host();
+        p["model"]       = cfg.opt_string("printer_model");
+        p["url"]         = connected->get_host();
+        p["online"]      = connected->check_sn_arrived();
+        p["can_upload"]  = true;
+        p["can_print"]   = dynamic_cast<Moonraker_Mqtt*>(connected.get()) != nullptr;
+        p["upload_name"] = upload_name;
+        printers.push_back(p);
+    }
+}
+
+} // namespace RemoteSend
+} // namespace GUI
+} // namespace Slic3r

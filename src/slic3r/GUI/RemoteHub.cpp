@@ -1923,6 +1923,7 @@ static bool instance_api_allowed(const std::string& method, const std::string& s
         const size_t       slash = rest.find('/');
         if (slash == std::string::npos || !is_index(rest.substr(0, slash))) return false;
         const std::string what = rest.substr(slash);
+        if (what == "/send") return post; // send the sliced plate to a printer (RemoteSend)
         return get && (what == "/thumbnail.png" || what == "/layout" || what == "/preview" ||
                        what == "/preview.png" || what == "/preview/status");
     }

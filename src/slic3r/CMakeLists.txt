@@ -400,6 +400,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/BambuCamRelay.hpp
     GUI/RemoteAccess.cpp
     GUI/RemoteAccess.hpp
+    GUI/RemoteSend.cpp
+    GUI/RemoteSend.hpp
     GUI/RemoteHub.cpp
     GUI/RemoteHub.hpp
     GUI/PrintHostDialogs.cpp
