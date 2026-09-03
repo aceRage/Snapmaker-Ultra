@@ -1483,3 +1483,151 @@ route:
 * The `import_warning` channel exists for any future "loaded, but you should know" message.
 * `box_draco.glb` is genuinely Draco-compressed, so Stage 3b inverts an assertion rather than needing
   a new fixture.
+
+---
+
+## Stage 3 status
+
+Done, on branch `feat/glb-import-stage3` (from `feat/glb-import-stage2`), built and verified in the
+`C:\Dev\SnapmakerOrcaNext` worktree on 2026-09-03.
+
+**Shipped: 3a (quantization), 3c (meshopt), 3d (textures). 3b (Draco) deliberately not taken** —
+this section's own recommendation is to vendor Draco only once real user files turn up compressed,
+because it is the one piece that would force every developer and CI runner to rebuild `deps/`. The
+named refusal from 3.8 stands, and `box_draco.glb` is a genuinely compressed asset waiting for it.
+
+### What shipped
+
+| Plan item | File | Note |
+|---|---|---|
+| tidy | `src/libslic3r/Model.cpp` | the dead `calc_tri_area` lambda that rode along with the Stage 2 transplant |
+| 3a | `tests/data/test_gltf/box_quantized.glb`, `test_gltf.cpp` | **no reader change needed** — see deviation 1 |
+| 3c | `deps_src/meshoptimizer/` (new), `deps_src/CMakeLists.txt`, `src/libslic3r/CMakeLists.txt`, `Format/GLTF.cpp` | decoder-only meshoptimizer v1.2 as a static library in `deps_src/`, the qoi shape |
+| 3c | `tests/data/test_gltf/box_meshopt.glb` | all three meshopt modes plus the octahedral filter, quantized as well |
+| 3d | `Format/GLTF.{hpp,cpp}` | `GltfInfo::face_colors`, centroid-UV sampling, PNG/JPEG decode, image sourcing |
+| 3d | `src/libslic3r/Model.{hpp,cpp}` | `paint_volume_from_face_colors()` extracted, `import_multi_volume_face_color_deal` added, the dispatch branch |
+| 3d | `tests/data/test_gltf/textured_two_regions.glb`, `textured_undecodable.glb` | the two-cluster fixture and the still-dropped case |
+
+`KHR_texture_basisu` is refused by name when **required** (covered by `unknown_extension.glb`) and
+falls back to the dropped-texture warning when merely **used** (covered by
+`textured_undecodable.glb`).
+
+### Deviations from the plan
+
+1. **3a needed no code at all.** The reader has allowed `KHR_mesh_quantization` since Stage 1, and
+   `cgltf_accessor_unpack_floats` plus `cgltf_node_transform_world` already did the right thing.
+   The work was the fixture and the assertion, which is what the plan wanted from it anyway
+   ("silently importing at the wrong scale is the one outcome worse than an error"). The tolerance
+   is 0.02 mm, which is what 16-bit positions over a 30 mm span allow.
+2. **3d samples *before* welding, not after.** The plan says to build face colours after step 4 of
+   the hygiene chain "by re-walking the surviving faces". That cannot work: `its_merge_vertices`
+   merges vertices that differ only in UV — which is every seam an exporter makes — so after it the
+   UVs no longer line up with the vertices. The array is therefore built at triangle-emission time
+   and carried through the chain, with a paired degenerate-removal that drops the same entries from
+   both. The plan's underlying concern (that the array must not desync from the faces) is met; only
+   the order is inverted.
+3. **Image decoding uses the in-tree `png::decode_colored_png` and libjpeg, not OpenCV.** OpenCV is
+   linked to libslic3r and `cv::imdecode` would have been three lines, but this path is reachable
+   from the phone upload endpoint and OpenCV's imgcodecs is a much larger decode surface than the
+   two libraries the plan actually named. Both are capped on encoded bytes (64 MB) and decoded
+   pixels (64 Mpx).
+4. **`had_textures` no longer drives the warning on its own.** It still means "this model had a base
+   colour texture"; the warning now fires only when `face_colors` came back empty, i.e. the texture
+   was really lost. That is 3d's "the dropped-texture notification stops firing", made precise.
+5. **A Stage 2 test changed meaning and was updated.** `textured_two_materials.glb` used to assert
+   "no dialog, texture reported dropped"; with 3d its texture is sampled, so it now asserts "the
+   dialog sees one colour per triangle and nothing is dropped". `textured_undecodable.glb` was added
+   so the dropped-texture path keeps its coverage rather than losing it.
+6. **A primitive that could not be sampled contributes its flat material colour** rather than
+   disqualifying the whole file. `face_colors` must cover every triangle of the object or
+   `import_multi_volume_face_color_deal` rejects it, so a mixed file (one textured primitive, one
+   plain) still works — `textured_two_materials.glb` is exactly that case.
+
+### Gate output
+
+**Automated** — `libslic3r_tests.exe "[gltf]"`:
+
+```
+All tests passed (451 assertions in 10 test cases)
+```
+
+Full suite:
+
+```
+test cases:   594 |   592 passed | 2 failed as expected
+assertions: 53063 | 53061 passed | 2 failed as expected
+```
+
+Both OBJ `[golden]` scenarios still pass, which is what makes "the OBJ path is unchanged" a claim
+rather than a hope — and the face-colour refactor was independently shown to be a **pure move**
+(11 of 11 body lines identical against `git show HEAD`), the same check Stage 2 used for the vertex
+path.
+
+Per plan item:
+
+* **3a** `box_quantized.glb` → `Vec3d(10, 30, 20)`, one object, one volume.
+* **3c** `box_meshopt.glb` → same box, 12 triangles, `open_edges == 0`. The fixture uses TRIANGLES
+  for indices, ATTRIBUTES for positions and octahedral-filtered normals, and is quantized too, so
+  one file covers the whole decoder plus both extensions interacting.
+* **3d** `textured_two_regions.glb` → 12 face colours, exactly 6 red and 6 blue (two clusters, as
+  the plan asks); with a stub dialog mapping red→2 and blue→3 the volume ends up painted with
+  exactly 6 triangles carrying `"8"` and 6 carrying `"0C"` — the right faces, checked through
+  `FacetsAnnotation::get_triangle_as_string`. A per-face array of the wrong length is refused and
+  paints nothing. The dropped-texture warning is empty for this file and non-empty for
+  `textured_undecodable.glb`.
+
+**Fuzz** — the corpus is now 28 files including three textured ones, so the mutation run also
+exercises the PNG and JPEG decoders:
+
+```
+seeds  : 28
+rounds=2273 cases=90920 findings=0
+```
+
+Every seed file also behaves correctly under the driver's contract check (`ok` with matching
+`info.parts`, or `no` with a specific message) — including the new
+`box_meshopt.glb`, `box_quantized.glb`, `textured_two_regions.glb` and `textured_undecodable.glb`.
+
+**Manual, on the isolated `dd_next` data dir**, hidden instance via the phone route:
+`POST /r/<token>/i/<pid>/open?mode=import` with `textured_two_regions.glb` → **HTTP 200 in
+1 second, no hang**, one object of the right size on the plate. See finding 3 for what it does
+*not* do.
+
+### Findings
+
+1. **`cgltf_validate` dereferences `sparse->indices_buffer_view->buffer` without a null check**, and
+   a meshopt-compressed buffer view has no outer buffer at all — the buffer lives in the extension.
+   Enabling meshopt made that combination reachable, so the reader now refuses a sparse accessor
+   whose index or value view has no buffer, before validate runs. Exotic, but it was a crash.
+2. **The in-tree `png::decode_colored_png` only handles 8-bit RGB and RGBA.** A paletted or
+   greyscale PNG — common for small, flat textures, which is exactly the kind this feature is most
+   useful for — is refused and falls back to the dropped-texture warning. Teaching it
+   `png_set_palette_to_rgb` / `png_set_expand_gray_1_2_4_to_8` / `png_set_strip_16` would be a
+   handful of lines in `PNGReadWrite.cpp`, but that file is shared with the SLA and thumbnail paths,
+   so it is left for a separate change rather than widened here.
+3. **A hidden instance still imports a textured GLB *unpainted*.** This is Stage 2 finding 3 again:
+   the modal hook answers `ObjColorDialog` with `wxID_OK` straight out of `ShowModal()`, the OK
+   *click handler* never runs, `update_filament_ids()` never fills `filament_ids`, and the dispatch's
+   length check correctly declines to paint from an empty answer. The import completes in a second
+   and the geometry is right — but the faces are not painted, and the `ObjColorDialog → wxID_CANCEL`
+   rule being added on `fix/side-fixes` will make that outcome *deliberate* rather than accidental,
+   not different. Painting on a headless import would need the hook to run the dialog's accept path
+   (or the Plater to auto-match when there is nobody to ask), which is a separate decision.
+   Painted faces **are** proven end to end through `Model::read_from_file` in the suite — the whole
+   path the app uses, minus the GUI dialog itself.
+4. **Sampling at the centroid gives one colour per triangle**, so a detailed texture on a low-poly
+   mesh is quantised hard — a 12-triangle box gets 12 colours no matter how intricate its texture.
+   That is inherent to the approach this plan chose (and to what the filament count can express),
+   but it is worth saying out loud in the release note: texture import approximates, it does not
+   reproduce.
+5. **meshoptimizer's decoder is four files and ~240 KB of source**, and it built clean under MSVC
+   with no warnings at this repo's level. The `deps_src/` placement means no dependency rebuild for
+   anyone, which is the property Stage 1's decision 4 bought and 3b would have spent.
+
+### What is left
+
+* **3b (Draco)** — the named refusal stands. `box_draco.glb` is genuinely compressed, so when Draco
+  is wanted the Stage 1 assertion is inverted against the same file rather than needing a new one.
+* **Paletted / greyscale / 16-bit PNG textures** (finding 2).
+* **KTX2 / Basis textures** — refused by name when required, dropped with a warning when used.
+* **The hidden-instance colour question** (finding 3), which is a product decision, not a bug.
