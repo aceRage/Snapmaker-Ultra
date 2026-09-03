@@ -193,6 +193,21 @@ included - are byte-identical across three passes **on all cores**, object-id to
 Before this branch the same gate failed six of ten on the object-id line alone, and `no_support`,
 `normal_grid` and `raft` failed on the Arachne bead as well.
 
+The same gate pinned to one CPU passes **all ten**:
+
+```
+$ python det_gate.py --passes 3 --one-cpu
+mode   : one CPU, 3 passes, 10 case(s)
+... tree_classic         ok      49950 lines, 3 passes, 16s ...
+RESULT: byte-identical across 3 passes on all 10 case(s)
+```
+
+One thing the gate cannot see, because every pass runs the same way: `tree_organic` gives 52808
+lines on all cores and 52816 on one CPU. It is reproducible *for a given number of cores* but not
+*across* them, so the same project sliced on a machine with a different core count still gives
+different G-code. `tree_classic` is the same, more loudly. Every other case gives the same byte
+count in both modes.
+
 Spot measurements behind the individual fixes:
 
 | Case | Before | After |
@@ -200,6 +215,23 @@ Spot measurements behind the individual fixes:
 | `no_support`, one CPU | 2 distinct outputs in 20 runs (4678 / 4641 lines) | 40 runs identical |
 | `tree_classic`, one CPU | differed on every pass | 12 runs identical |
 | `tree_classic`, all cores | ~1200 lines apart | 6+ distinct outputs in 8 runs; see §4.1 |
+
+### 4.0 Unit tests
+
+The build tree was reconfigured with `-DBUILD_TESTS=ON` (it was off) and the suite built and run:
+
+```
+$ build/tests/libslic3r/Release/libslic3r_tests.exe
+test cases:   584 |   582 passed | 2 failed as expected
+assertions: 52612 | 52610 passed | 2 failed as expected
+```
+
+`tests/fff_print` was built and run too, and fails - but it fails for a reason that predates this
+branch and has nothing to do with it: the suite still uses PrusaSlicer's config key names, so
+`Slic3r::Test::init_print()` throws `Unknown option exception: first_layer_extrusion_width` (this
+fork calls it `initial_layer_line_width`). Every fff_print failure hangs off that fixture,
+including the SIGSEGV in `test_skirt_brim.cpp`, and the `[Flow]` case that fails cannot be reached
+by anything changed here.
 
 ### 4.1 The one case that is still not reproducible: `tree_classic` on more than one core
 
@@ -227,6 +259,10 @@ be deterministic and is a two-line change, but it removes the only parallelism `
 
 - **Classic tree support on more than one core** - §4.1. The one corpus case that is not
   byte-identical and the only one that still needs a CPU pin.
+- **Organic tree support (`TreeSupport3D`) depends on the core count.** It is byte-identical over
+  three passes on all cores and over three passes on one CPU, but the two answers differ (52808
+  against 52816 lines). Not chased here; it is the same family of question as §4.1 and would need
+  the same kind of look at that generator's parallel sections.
 - **Lightning infill's SVG-debug filename helper** still calls `srand(time(NULL))`
   (`Fill/Lightning/Generator.cpp`), reseeding that thread's C-runtime generator from the wall
   clock. The generator's own `rand()` in the tree traversal is fixed (§3.8); the `srand` is left
