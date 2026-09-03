@@ -481,6 +481,20 @@ std::string RemoteAccess::take_error()
     return e;
 }
 
+void RemoteAccess::note_color_import(const ColorImport& c)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_last_color_import = c;
+}
+
+RemoteAccess::ColorImport RemoteAccess::take_color_import()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    ColorImport c;
+    std::swap(c, m_last_color_import);
+    return c;
+}
+
 // ---------------------------------------------------------------- JSON API ----
 
 void RemoteAccess::note_slice_progress(int plate, int percent, const std::string& text)
@@ -1611,6 +1625,10 @@ RemoteAccess::ApiResponse RemoteAccess::api_project_open(const std::string& path
             const std::vector<size_t>      res = plater->load_files(files, LoadStrategy::LoadModel);
             if (res.empty()) { *result = { 500, "nothing was imported" }; return; }
             (*out)["objects"] = res.size();
+            const ColorImport ci = RemoteAccess::get().take_color_import();
+            if (ci.valid)
+                (*out)["colors"] = { {"input", ci.input}, {"clusters", ci.clusters},
+                                     {"reused", ci.reused}, {"added", ci.added}, {"merged", ci.merged} };
         }
         wxGetApp().mainframe->select_tab(MainFrame::tp3DEditor);
         (*out)["project"] = plater->get_project_filename(".3mf").ToUTF8().data();

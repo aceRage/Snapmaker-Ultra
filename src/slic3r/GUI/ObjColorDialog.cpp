@@ -16,6 +16,7 @@
 #include "Widgets/ComboBox.hpp"
 #include <wx/sizer.h>
 
+#include "libslic3r/ObjColorMatch.hpp"
 #include "libslic3r/ObjColorUtils.hpp"
 
 using namespace Slic3r;
@@ -436,6 +437,56 @@ void ObjColorPanel::update_filament_ids()
         m_filament_ids.emplace_back(resolve_filament_id(m_cluster_map_filaments[label]));
     }
     m_first_extruder_id = resolve_filament_id(m_cluster_map_filaments[0]);
+}
+
+bool obj_color_auto_match_headless(std::vector<Slic3r::RGBA> &      input_colors,
+                                   bool                            is_single_color,
+                                   const std::vector<std::string> &extruder_colours,
+                                   std::vector<unsigned char> &    filament_ids,
+                                   unsigned char &                 first_extruder_id,
+                                   ObjColorAutoMatchInfo &         info)
+{
+    info = ObjColorAutoMatchInfo();
+    filament_ids.clear();
+    if (input_colors.empty() || extruder_colours.empty())
+        return false;
+
+    std::vector<wxColour> loaded;
+    loaded.reserve(extruder_colours.size());
+    for (const std::string &c : extruder_colours)
+        loaded.emplace_back(wxColour(c));
+
+    // The panel's constructor substitutes the first filament for an undefined input colour; do the
+    // same here so both paths see the same input.
+    for (size_t i = 0; i < input_colors.size(); i++)
+        if (color_is_equal(input_colors[i], UNDEFINE_COLOR))
+            input_colors[i] = convert_to_rgba(loaded[0]);
+
+    std::vector<Slic3r::RGBA> existing;
+    existing.reserve(loaded.size());
+    for (const wxColour &c : loaded)
+        existing.emplace_back(convert_to_rgba(c));
+
+    Slic3r::ObjColorMatchResult result;
+    if (!Slic3r::obj_color_auto_match(input_colors, is_single_color, existing, result, g_max_color))
+        return false;
+
+    // Create the slots the match asked for, the same call the dialog's "add filament" button ends
+    // up making, so a new slot inherits the current filament preset and only its colour differs.
+    for (const Slic3r::RGBA &c : result.added_colors)
+        wxGetApp().sidebar().add_custom_filament(convert_to_wxColour(c));
+
+    filament_ids      = result.filament_ids;
+    first_extruder_id = result.first_extruder_id;
+    info.input        = result.input;
+    info.clusters     = result.clusters;
+    info.reused       = result.reused;
+    info.added        = result.added;
+    info.merged       = result.merged;
+    BOOST_LOG_TRIVIAL(info) << "colour import auto-matched: " << info.input << " colour(s) -> "
+                            << info.clusters << " cluster(s), " << info.reused << " reused, "
+                            << info.added << " added, " << info.merged << " merged";
+    return true;
 }
 
 wxBoxSizer *ObjColorPanel::create_approximate_match_btn_sizer(wxWindow *parent)

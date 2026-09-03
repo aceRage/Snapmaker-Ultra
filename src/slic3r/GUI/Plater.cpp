@@ -12226,6 +12226,31 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         !boost::iends_with(path.string(), ".glb") &&
                         !boost::iends_with(path.string(), ".gltf")) { return; }
                     const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+                    // Nobody is at the PC - a phone-started import, or a hidden instance. Opening
+                    // ObjColorDialog here would block on a window no one can answer, so match the
+                    // colours ourselves and carry on. Same rule for OBJ as for glTF: both arrive
+                    // through this lambda.
+                    if (RemoteAccess::dialog_mode() != RemoteAccess::Mode::Interactive) {
+                        ObjColorAutoMatchInfo info;
+                        if (!obj_color_auto_match_headless(input_colors, is_single_color, extruder_colours,
+                                                           filament_ids, first_extruder_id, info)) {
+                            filament_ids.clear();
+                            return;
+                        }
+                        RemoteAccess::ColorImport c;
+                        c.input = info.input; c.clusters = info.clusters;
+                        c.reused = info.reused; c.added = info.added; c.merged = info.merged;
+                        c.valid = true;
+                        RemoteAccess::get().note_color_import(c);
+                        // Recorded, not raised: this is the intended behaviour, not something that
+                        // needs a person.
+                        RemoteAccess::get().note_attention(
+                            "colour import auto-matched " + std::to_string(info.clusters) + " colour(s): " +
+                            std::to_string(info.reused) + " reused, " + std::to_string(info.added) + " added" +
+                            (info.merged ? ", " + std::to_string(info.merged) + " merged" : ""),
+                            "auto");
+                        return;
+                    }
                     ObjColorDialog                 color_dlg(nullptr, input_colors, is_single_color, extruder_colours, filament_ids, first_extruder_id);
                     if (color_dlg.ShowModal() != wxID_OK) { 
                         filament_ids.clear();
@@ -14687,6 +14712,31 @@ void Plater::priv::reload_from_disk()
                 !boost::iends_with(path, ".glb") &&
                 !boost::iends_with(path, ".gltf")) { return; }
             const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+            // Nobody is at the PC - a phone-started import, or a hidden instance. Opening
+            // ObjColorDialog here would block on a window no one can answer, so match the
+            // colours ourselves and carry on. Same rule for OBJ as for glTF: both arrive
+            // through this lambda.
+            if (RemoteAccess::dialog_mode() != RemoteAccess::Mode::Interactive) {
+                ObjColorAutoMatchInfo info;
+                if (!obj_color_auto_match_headless(input_colors, is_single_color, extruder_colours,
+                                                   filament_ids, first_extruder_id, info)) {
+                    filament_ids.clear();
+                    return;
+                }
+                RemoteAccess::ColorImport c;
+                c.input = info.input; c.clusters = info.clusters;
+                c.reused = info.reused; c.added = info.added; c.merged = info.merged;
+                c.valid = true;
+                RemoteAccess::get().note_color_import(c);
+                // Recorded, not raised: this is the intended behaviour, not something that
+                // needs a person.
+                RemoteAccess::get().note_attention(
+                    "colour import auto-matched " + std::to_string(info.clusters) + " colour(s): " +
+                    std::to_string(info.reused) + " reused, " + std::to_string(info.added) + " added" +
+                    (info.merged ? ", " + std::to_string(info.merged) + " merged" : ""),
+                    "auto");
+                return;
+            }
             ObjColorDialog                 color_dlg(nullptr, input_colors, is_single_color, extruder_colours, filament_ids, first_extruder_id);
             if (color_dlg.ShowModal() != wxID_OK) { filament_ids.clear(); }
         };

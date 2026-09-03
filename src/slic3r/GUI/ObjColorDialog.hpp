@@ -98,6 +98,23 @@ private:
     std::vector<unsigned char> &m_filament_ids;
 };
 
+// What the headless match did, for the API response and the log.
+struct ObjColorAutoMatchInfo
+{
+    size_t input{0}, clusters{0}, reused{0}, added{0}, merged{0};
+};
+
+// Colour import with nobody at the PC: cluster and assign filament slots without a dialog, adding
+// slots for colours nothing loaded is close to. Lives here, beside the panel, so the interactive
+// and headless paths cannot drift apart. Fills `filament_ids` and `first_extruder_id` exactly as
+// ObjColorPanel::update_filament_ids would have after an OK.
+bool obj_color_auto_match_headless(std::vector<Slic3r::RGBA> &      input_colors,
+                                   bool                            is_single_color,
+                                   const std::vector<std::string> &extruder_colours,
+                                   std::vector<unsigned char> &    filament_ids,
+                                   unsigned char &                 first_extruder_id,
+                                   ObjColorAutoMatchInfo &         info);
+
 class ObjColorDialog : public Slic3r::GUI::DPIDialog
 {
 public:
