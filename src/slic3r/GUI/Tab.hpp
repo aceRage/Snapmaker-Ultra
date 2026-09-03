@@ -46,6 +46,7 @@ class TabCtrl;
 // Ultra (support sets): the Support-set picker on the Process tab's Support page. The fork's
 // themed combo lives in the global namespace, like TabCtrl above.
 class ComboBox;
+class Button;
 
 namespace Slic3r {
 
@@ -470,10 +471,10 @@ private:
 	// Tab::load_config(), so the preset shows as modified exactly like a hand edit.
 	// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md, Stage 1.
 	ComboBox*		m_support_set_combo   = nullptr;
-	ScalableButton*	m_support_set_apply   = nullptr;
-	ScalableButton*	m_support_set_save    = nullptr;
-	ScalableButton*	m_support_set_rename  = nullptr;
-	ScalableButton*	m_support_set_delete  = nullptr;
+	Button*			m_support_set_apply   = nullptr;
+	Button*			m_support_set_save    = nullptr;
+	Button*			m_support_set_rename  = nullptr;
+	Button*			m_support_set_delete  = nullptr;
 	wxStaticText*	m_support_set_note     = nullptr;
 	// Set names in combo order; index 0 of the combo is the "- none -" entry and has no name.
 	std::vector<std::string> m_support_set_names;

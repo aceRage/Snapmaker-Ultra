@@ -59,6 +59,7 @@
 // Ultra (support sets): the Support-set row on the Support page.
 #include "libslic3r/SupportSet.hpp"
 #include "Widgets/ComboBox.hpp"
+#include "Widgets/Button.hpp"
 #include <wx/textdlg.h>
 #include <wx/wrapsizer.h>
 #ifdef WIN32
@@ -2981,17 +2982,19 @@ wxSizer* TabPrint::support_set_create_widget(wxWindow* parent)
     });
     vsizer->Add(m_support_set_combo, 0, wxEXPAND);
 
-    auto add_button = [this, parent, em, hsizer](ScalableButton** btn, const wxString& label,
+    // The fork's themed buttons, styled like the sidebar's "Flushing volumes" (Confirm for the
+    // one that changes the settings, Regular for the housekeeping ones).
+    auto add_button = [this, parent, em, hsizer](Button** btn, const wxString& label, ButtonStyle style,
                                                  void (TabPrint::*handler)()) {
-        *btn = new ScalableButton(parent, wxID_ANY, "", label, wxDefaultSize, wxDefaultPosition, wxBU_EXACTFIT);
-        (*btn)->SetFont(wxGetApp().normal_font());
+        *btn = new Button(parent, label);
+        (*btn)->SetStyle(style, ButtonType::Compact);
         (*btn)->Bind(wxEVT_BUTTON, [this, handler](wxCommandEvent&) { (this->*handler)(); });
         hsizer->Add(*btn, 0, wxRIGHT | wxTOP, em / 2);
     };
-    add_button(&m_support_set_apply,  _L("Apply"),             &TabPrint::on_support_set_apply);
-    add_button(&m_support_set_save,   _L("Save current as..."),&TabPrint::on_support_set_save_as);
-    add_button(&m_support_set_rename, _L("Rename"),            &TabPrint::on_support_set_rename);
-    add_button(&m_support_set_delete, _L("Delete"),            &TabPrint::on_support_set_delete);
+    add_button(&m_support_set_apply,  _L("Apply"),      ButtonStyle::Confirm, &TabPrint::on_support_set_apply);
+    add_button(&m_support_set_save,   _L("Save As..."), ButtonStyle::Regular, &TabPrint::on_support_set_save_as);
+    add_button(&m_support_set_rename, _L("Rename"),     ButtonStyle::Regular, &TabPrint::on_support_set_rename);
+    add_button(&m_support_set_delete, _L("Delete"),     ButtonStyle::Regular, &TabPrint::on_support_set_delete);
 
     m_support_set_note = new wxStaticText(parent, wxID_ANY, wxEmptyString);
     m_support_set_note->SetFont(wxGetApp().normal_font());
