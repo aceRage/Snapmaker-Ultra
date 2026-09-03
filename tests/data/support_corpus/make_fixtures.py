@@ -60,8 +60,12 @@ def mesh_xml(vertices, triangles, indent="     "):
     return "\n".join(out)
 
 
-def write_3mf(path, parts, assembly_id=100):
-    """parts: list of (name, vertices, triangles). One assembly object holds them all."""
+def write_3mf(path, parts, assembly_id=100, part_config=None):
+    """parts: list of (name, vertices, triangles). One assembly object holds them all.
+
+    part_config: optional {part index -> {key: value}} written into
+    Metadata/model_settings.config, the same place bbs_3mf stores per-volume settings.
+    """
     objs = []
     for i, (name, v, t) in enumerate(parts, start=1):
         objs.append('  <object id="%d" name="%s" type="model">\n%s\n  </object>'
@@ -77,11 +81,27 @@ def write_3mf(path, parts, assembly_id=100):
         ' <build>\n  <item objectid="%d"/>\n </build>\n'
         '</model>\n' % assembly_id)
 
+    files = [("[Content_Types].xml", CONTENT_TYPES),
+             ("_rels/.rels", RELS),
+             ("3D/3dmodel.model", model)]
+
+    if part_config:
+        # <part id> is the object id of the component's own <object>, i.e. 1-based part index.
+        rows = []
+        for idx, cfg in sorted(part_config.items()):
+            rows.append('  <part id="%d" subtype="ModelPart">' % (idx + 1))
+            rows.append('   <metadata key="name" value="%s"/>' % parts[idx][0])
+            for key in sorted(cfg):
+                rows.append('   <metadata key="%s" value="%s"/>' % (key, cfg[key]))
+            rows.append("  </part>")
+        files.append(("Metadata/model_settings.config",
+                      '<?xml version="1.0" encoding="UTF-8"?>\n<config>\n'
+                      ' <object id="%d">\n%s\n </object>\n</config>\n'
+                      % (assembly_id, "\n".join(rows))))
+
     # Fixed timestamps so regenerating gives a byte-identical archive.
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, data in (("[Content_Types].xml", CONTENT_TYPES),
-                           ("_rels/.rels", RELS),
-                           ("3D/3dmodel.model", model)):
+        for name, data in files:
             info = zipfile.ZipInfo(name, date_time=(2026, 9, 3, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o600 << 16
@@ -102,6 +122,27 @@ def main():
               [("pillar", pillar_v, pillar_t),
                ("partA", deck_a_v, deck_a_t),
                ("partB", deck_b_v, deck_b_t)])
+
+    # The same bridge with support-group data on part B. Nothing in Stage 2 consumes a group,
+    # so this must slice exactly like twopart_bridge.3mf - that is the whole Stage 2 gate. The
+    # values deliberately avoid support_top_z_distance: a zero gap trips the soluble rule of 3.6,
+    # which DOES change the object config and therefore the output, by design.
+    write_3mf(os.path.join(HERE, "twopart_bridge_grouped.3mf"),
+              [("pillar", pillar_v, pillar_t),
+               ("partA", deck_a_v, deck_a_t),
+               ("partB", deck_b_v, deck_b_t)],
+              part_config={2: {"support_group": "B",
+                               "support_interface_top_layers": "5",
+                               "support_interface_spacing": "0"}})
+
+    # Positive control: the same file with a soluble part. The soluble rule makes the whole object
+    # soluble, so this one MUST differ between a build that knows support groups and one that does
+    # not - which is how we know the metadata above is really being read rather than ignored.
+    write_3mf(os.path.join(HERE, "twopart_bridge_soluble.3mf"),
+              [("pillar", pillar_v, pillar_t),
+               ("partA", deck_a_v, deck_a_t),
+               ("partB", deck_b_v, deck_b_t)],
+              part_config={2: {"support_group": "B", "support_top_z_distance": "0"}})
 
     # A stubby leg under one end of a long ledge: a single overhang region, two volumes, and the
     # simplest thing that still exercises contact / base / interface generation.
