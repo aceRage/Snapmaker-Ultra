@@ -6,8 +6,19 @@ docs/superpowers/plans/2026-09-02-support-sets-and-groups.md §3.7.
 TWO GATES, and the default is the tolerance one:
 
   --gate tolerance  (default) run each pair of G-code files through the fork's own Slice
-                    Compare engine and require its criteria: zero changed config rows, every
-                    layer identical, and 100 % of segments matching on every matched layer.
+                    Compare engine and require: zero changed config rows, zero changed layers,
+                    zero layers present on only one side, and at least --segment-tolerance per
+                    cent of segments matching (default 99.0).
+
+                    The plan asked for 100 % of segments. The BASELINE CANNOT MEET THAT AGAINST
+                    ITSELF: running this script with one executable on both sides still shows a
+                    handful of segments (10-18 out of several thousand, on 4-7 layers of a 41-66
+                    layer print) appearing or vanishing in roughly one case per run. The
+                    structural criteria - config rows, changed layers, added or removed layers -
+                    ARE stable at zero, so they are required exactly, and the segment count is
+                    thresholded instead. A support-group regression would move layers or a large
+                    fraction of segments, not 0.4 % of them; classic tree support, which really
+                    does move (see below), lands at 6 %.
                     The engine is reached through tests/slice_compare_cli, a test-only
                     executable calling SliceCompare::load_snapshot_from_file and the diff_*
                     functions directly - nothing was added to the shipped application.
@@ -149,6 +160,23 @@ def compare_tolerance(compare_exe, a_path, b_path):
     return bool(verdict.get("ok")), verdict
 
 
+def tolerance_ok(verdict, segment_tolerance):
+    """Apply the gate's criteria to a slice_compare_cli verdict.
+
+    The tool itself only measures - it reports `ok` under the strict 100 % reading. The decision
+    lives here so the threshold is visible and adjustable in one place.
+    """
+    if "error" in verdict:
+        return False
+    lay = verdict.get("layers", {})
+    seg = verdict.get("segments", {})
+    return (verdict.get("config_rows", 1) == 0 and
+            lay.get("changed", 1) == 0 and
+            lay.get("a_only", 1) == 0 and
+            lay.get("b_only", 1) == 0 and
+            float(seg.get("percent", 0.0)) >= segment_tolerance)
+
+
 def describe(verdict):
     """One-line summary of a tolerance verdict."""
     if "error" in verdict:
@@ -204,6 +232,9 @@ def main(argv=None):
     ap.add_argument("--gate", choices=("tolerance", "bytes"), default="tolerance",
                     help="tolerance (default): the Slice Compare criteria; bytes: the original "
                          "byte comparison, which this tree cannot pass - see the docstring")
+    ap.add_argument("--segment-tolerance", type=float, default=99.0,
+                    help="minimum per cent of matching segments (default 99.0); see the "
+                         "module docstring for why this is not 100")
     ap.add_argument("--compare-exe", default=DEFAULT_COMPARE_EXE,
                     help="path to slice_compare_cli (built by the slice_compare_cli target)")
     ap.add_argument("--single-core", action="store_true",
@@ -232,7 +263,9 @@ def main(argv=None):
     same_exe = os.path.normcase(os.path.abspath(a.baseline)) == os.path.normcase(os.path.abspath(a.candidate))
     print("baseline : %s" % a.baseline)
     print("candidate: %s%s" % (a.candidate, "   (same file - §5.1 reproducibility run)" if same_exe else ""))
-    print("gate     : %s%s" % (a.gate, "   (pinned to one CPU)" if a.single_core else ""))
+    print("gate     : %s%s%s" % (a.gate,
+          "" if a.gate == "bytes" else "   (segments >= %.2f%%)" % a.segment_tolerance,
+          "   (pinned to one CPU)" if a.single_core else ""))
     print("corpus   : %d case(s)\n" % len(cases))
 
     os.makedirs(a.out, exist_ok=True)
@@ -273,9 +306,9 @@ def main(argv=None):
                               % (x[:160], y[:160]))
                     break
             else:
-                ok, verdict = compare_tolerance(a.compare_exe, bf, cf)
+                _strict, verdict = compare_tolerance(a.compare_exe, bf, cf)
                 total += int(verdict.get("segments", {}).get("both", 0) or 0)
-                if not ok:
+                if not tolerance_ok(verdict, a.segment_tolerance):
                     bad = (os.path.basename(bf), describe(verdict))
                     detail = "          " + json.dumps(verdict)[:600]
                     break

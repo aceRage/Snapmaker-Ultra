@@ -32,7 +32,12 @@
     "grouped_parts carries support_group data on one part. Nothing in Stage 2 consumes a group, so",
     "it must slice exactly like normal_grid - that is the Stage 2 gate. twopart_bridge_soluble.3mf",
     "is NOT a corpus case: it is the positive control that proves the metadata is really read (the",
-    "soluble rule of 3.6 makes it differ on purpose). Run it by hand when in doubt."
+    "soluble rule of 3.6 makes it differ on purpose). Run it by hand when in doubt.",
+    "",
+    "tree_classic was REMOVED. Classic tree support is not self-reproducible: baseline-against-",
+    "baseline on this very corpus gives 6.6% matching segments, 8 changed layers and 49 dirty",
+    "layers, run after run. Organic tree, normal supports and rafts are all stable through the",
+    "tolerance gate; only the classic tree path is not. 5.1 says to drop such a case and say so."
   ],
   "presets": {
     "printer": "Snapmaker U1 (0.4 nozzle)",
@@ -129,17 +134,6 @@
         "--enable-support=1",
         "--support-type=tree(auto)",
         "--support-style=organic"
-      ]
-    },
-    {
-      "name": "tree_classic",
-      "models": [
-        "tests/data/support_corpus/twopart_bridge.3mf"
-      ],
-      "args": [
-        "--enable-support=1",
-        "--support-type=tree(auto)",
-        "--support-style=tree_slim"
       ]
     },
     {
