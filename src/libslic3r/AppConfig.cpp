@@ -893,6 +893,11 @@ void AppConfig::save()
         }
     }
 
+    // Ultra: several slicer instances share this file (the hub keeps them alive for the phone), and
+    // whichever saves last used to win: a printer added in one window vanished when another window
+    // saved its stale copy. Installed printer models are additive, so union the on-disk list in.
+    merge_models_from_disk(path);
+
     // Write vendor sections
     for (const auto& vendor : m_vendors) {
         size_t size_sum = 0;
