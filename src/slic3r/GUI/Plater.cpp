@@ -3852,7 +3852,11 @@ void Sidebar::update_all_preset_comboboxes(bool reload_printer_view)
     if (is_flashforge)
         p_mainframe->show_flashforge_device();
     else
-        p_mainframe->show_device(preset_bundle.use_bbl_device_tab() && !use_new_connection);
+        // Ultra: a Bambu printer preset gets the Bambu device page whether or not a Snapmaker
+        // machine is connected through the new connection flow (use_new_connect is that
+        // connection's state, set on connect and cleared on disconnect; it used to pin the
+        // Device tab to the Snapmaker page after a print had been sent to a U1).
+        p_mainframe->show_device(preset_bundle.use_bbl_device_tab());
     p_mainframe->m_tabpanel->SetSelection(p_mainframe->m_tabpanel->GetSelection());
 }
 
