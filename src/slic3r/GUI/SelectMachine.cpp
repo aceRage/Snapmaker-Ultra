@@ -1497,6 +1497,10 @@ void SelectMachineDialog::show_status(PrintDialogStatus status, std::vector<wxSt
             if (obj_ == nullptr) return;
             auto sourcet_print_name = obj_->get_printer_type_display_str();
             sourcet_print_name.Replace(wxT("Bambu Lab "), wxEmptyString);
+            // Ultra: a printer this build has no definition for (resources/printers/<code>.json) names
+            // its reported model code instead of a bare "Unknown", so it can be reported and added.
+            if (sourcet_print_name.IsEmpty() || sourcet_print_name == _L("Unknown"))
+                sourcet_print_name = wxString::Format(_L("model code %s, no printer definition in this build"), from_u8(obj_->printer_type));
 
             //target print
             std::string target_model_id;
@@ -1512,6 +1516,13 @@ void SelectMachineDialog::show_status(PrintDialogStatus status, std::vector<wxSt
 
             auto target_print_name = wxString(obj_->get_preset_printer_model_name(target_model_id));
             target_print_name.Replace(wxT("Bambu Lab "), wxEmptyString);
+            if (target_print_name.IsEmpty()) {
+                // The profile side: name the profile's printer model (or the plate's model id) rather than "()".
+                std::string model = target_model_id;
+                if (m_print_type == PrintFromType::FROM_NORMAL)
+                    model = wxGetApp().preset_bundle->printers.get_edited_preset().config.opt_string("printer_model");
+                target_print_name = wxString::Format(_L("%s, no printer definition in this build"), from_u8(model));
+            }
             msg_text = wxString::Format(_L("The selected printer (%s) is incompatible with the chosen printer profile in the slicer (%s)."), sourcet_print_name, target_print_name);
             
             update_print_status_msg(msg_text, true, true);
