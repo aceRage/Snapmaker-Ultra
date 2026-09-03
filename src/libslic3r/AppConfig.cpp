@@ -795,6 +795,32 @@ std::string AppConfig::load()
     return "";
 }
 
+void AppConfig::merge_models_from_disk(const std::string& path)
+{
+    try {
+        boost::nowide::ifstream ifs(path);
+        if (!ifs.good()) return;
+        std::stringstream ss;
+        ss << ifs.rdbuf();
+        const std::string whole = ss.str();
+        const size_t      last  = whole.find_last_of('}');
+        if (last == std::string::npos) return;
+        const json j = json::parse(whole.substr(0, last + 1));
+        if (!j.contains(MODELS_STR) || !j[MODELS_STR].is_array()) return;
+        for (const auto& j_model : j[MODELS_STR]) {
+            const std::string vendor_name = j_model.value("vendor", "");
+            const std::string model_name  = j_model.value("model", "");
+            if (vendor_name.empty() || model_name.empty()) continue;
+            std::vector<std::string> variants;
+            if (!j_model.contains("nozzle_diameter") || !unescape_strings_cstyle(j_model["nozzle_diameter"].get<std::string>(), variants)) continue;
+            auto& variants_here = m_vendors[vendor_name][model_name];
+            for (const auto& v : variants) variants_here.insert(v);
+        }
+    } catch (...) {
+        // an unreadable or corrupt file: write what this instance knows, as before
+    }
+}
+
 void AppConfig::save()
 {
     if (! is_main_thread_active())
