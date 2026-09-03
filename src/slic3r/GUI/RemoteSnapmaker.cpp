@@ -206,9 +206,12 @@ static bool is_snapmaker_preset()
     return model && boost::icontains(model->value, "Snapmaker");
 }
 
-// One device, without anything secret (no certificates, no password).
-static json device_json(const DeviceInfo& d)
+// One device, without anything secret (no certificates, no password). What the store holds for it
+// is folded in first, so the port and `can_connect` describe the connection the phone would get.
+static json device_json(const DeviceInfo& in)
 {
+    DeviceInfo d = in;
+    apply_stored_credentials(d);
     json j;
     j["id"]           = d.dev_id;
     j["name"]         = d.dev_name;
@@ -326,7 +329,7 @@ static void announce_connected()
     }
 }
 
-std::pair<int, std::string> connect(const std::string& dev_id)
+static std::pair<int, std::string> connect_impl(const std::string& dev_id)
 {
     // ---- 1. the stored device ----
     auto found = std::make_shared<bool>(false);
@@ -397,10 +400,14 @@ std::pair<int, std::string> connect(const std::string& dev_id)
     // request, so a connect without the certificate was refused above.
     const std::string url    = "mqtts://" + addr;
     const std::string client = client_id_for(*dev);
+    // From here on the host is the app's connected host, so every way out has to take it back:
+    // a half-connected host would show up as a printer to send to.
+    auto forget_host = []() { on_main([]() { wxGetApp().set_connect_host(nullptr); }); };
     std::shared_ptr<MqttClient> engine;
     try {
         engine.reset(new MqttClient(url, client, dev->ca, dev->cert, dev->key, dev->user, dev->password, false));
     } catch (const std::exception& e) {
+        forget_host();
         return { 500, std::string("could not create the MQTT client: ") + e.what() };
     }
     engine->SetConnectionFailureCallback([engine]() {
@@ -408,8 +415,10 @@ std::pair<int, std::string> connect(const std::string& dev_id)
         engine->Disconnect(msg);
     });
     std::string msg;
-    if (!engine->Connect(msg)) // blocks, 20 s at most
+    if (!engine->Connect(msg)) { // blocks, 20 s at most
+        forget_host();
         return { 502, "could not reach " + addr + ": " + (msg.empty() ? std::string("no answer") : msg) };
+    }
 
     // ---- 4. hand it to the host and subscribe, as sw_mqtt_set_engine + sw_mqtt_subscribe do ----
     mqtt->m_ca        = dev->ca;
@@ -428,6 +437,7 @@ std::pair<int, std::string> connect(const std::string& dev_id)
     if (!mqtt->set_engine(engine, engine_msg)) {
         std::string ig;
         engine->Disconnect(ig);
+        forget_host();
         return { 502, "the printer accepted the connection but the slicer could not use it: " + engine_msg };
     }
     std::string sub_msg = "success";
@@ -443,7 +453,7 @@ std::pair<int, std::string> connect(const std::string& dev_id)
     if (!answered || model.empty()) {
         std::string ig;
         engine->Disconnect(ig);
-        on_main([]() { wxGetApp().set_connect_host(nullptr); });
+        forget_host();
         return { 504, "connected to " + addr + " but the printer did not answer; is it awake?" };
     }
 
@@ -474,9 +484,26 @@ std::pair<int, std::string> connect(const std::string& dev_id)
     return { 200, "" };
 }
 
+// The MQTT library throws on material it cannot use (a certificate the printer no longer accepts,
+// a truncated key), and an escaping exception would take the request's thread down with no answer
+// and the half-built host still in place.
+std::pair<int, std::string> connect(const std::string& dev_id)
+{
+    try {
+        return connect_impl(dev_id);
+    } catch (const std::exception& e) {
+        on_main([]() { wxGetApp().set_connect_host(nullptr); });
+        BOOST_LOG_TRIVIAL(error) << "[RemoteSnapmaker] connect failed: " << e.what();
+        return { 502, std::string("the connection failed: ") + e.what() };
+    } catch (...) {
+        on_main([]() { wxGetApp().set_connect_host(nullptr); });
+        return { 502, "the connection failed" };
+    }
+}
+
 // ------------------------------------------------------------ disconnect ----
 
-std::pair<int, std::string> disconnect()
+static std::pair<int, std::string> disconnect_impl()
 {
     auto have = std::make_shared<bool>(false);
     if (!on_main([have]() {
@@ -501,6 +528,20 @@ std::pair<int, std::string> disconnect()
         }, 30000))
         return { 503, "the slicer is busy" };
     return { 200, "" };
+}
+
+std::pair<int, std::string> disconnect()
+{
+    try {
+        return disconnect_impl();
+    } catch (const std::exception& e) {
+        on_main([]() { wxGetApp().set_connect_host(nullptr); });
+        BOOST_LOG_TRIVIAL(error) << "[RemoteSnapmaker] disconnect failed: " << e.what();
+        return { 500, std::string("the disconnect failed: ") + e.what() };
+    } catch (...) {
+        on_main([]() { wxGetApp().set_connect_host(nullptr); });
+        return { 500, "the disconnect failed" };
+    }
 }
 
 } // namespace RemoteSnapmaker

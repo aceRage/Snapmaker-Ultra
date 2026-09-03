@@ -2049,6 +2049,7 @@ void RemoteAccess::serve(void* socket_ptr)
         ApiResponse ar = handle_api(method, path.substr(4), query, body);
         const char* status = ar.status == 200 ? "200 OK" : ar.status == 400 ? "400 Bad Request" : ar.status == 404 ? "404 Not Found"
                            : ar.status == 409 ? "409 Conflict" : ar.status == 413 ? "413 Payload Too Large"
+                           : ar.status == 502 ? "502 Bad Gateway" : ar.status == 504 ? "504 Gateway Timeout"
                            : ar.status == 503 ? "503 Service Unavailable" : "500 Internal Server Error";
         respond(client, status, ar.type, ar.body, ar.headers);
     } catch (const std::exception& e) {
