@@ -476,6 +476,16 @@ bool obj_color_auto_match_headless(std::vector<Slic3r::RGBA> &      input_colors
     for (const Slic3r::RGBA &c : result.added_colors)
         wxGetApp().sidebar().add_custom_filament(convert_to_wxColour(c));
 
+    // Sidebar::add_custom_filament can decline (it has its own ceilings), so trust what actually
+    // exists rather than what we planned - painting with a slot that is not there would be worse
+    // than not painting at all.
+    const size_t slots = wxGetApp().plater()->get_extruder_colors_from_plater_config().size();
+    for (unsigned char &id : result.filament_ids)
+        if ((size_t) id > slots)
+            id = 1;
+    if ((size_t) result.first_extruder_id > slots)
+        result.first_extruder_id = 1;
+
     filament_ids      = result.filament_ids;
     first_extruder_id = result.first_extruder_id;
     info.input        = result.input;

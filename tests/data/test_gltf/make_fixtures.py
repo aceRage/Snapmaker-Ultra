@@ -307,6 +307,47 @@ def make_three_materials():
     write_glb("three_materials.glb", gltf, bytes(blob.data))
 
 
+def make_many_materials(count=24):
+    """One mesh, `count` primitives, `count` distinct materials spread around the colour wheel.
+
+    More colours than the 16 filament slots CONST_FILAMENTS allows, so the headless colour import
+    has to hit its cap and merge the remainder into their nearest kept slot.
+    """
+    import colorsys
+
+    blob = Blob()
+    accessors, primitives, materials = [], [], []
+    for i in range(count):
+        x = (i % 8) * 12
+        y = (i // 8) * 12
+        pos, nrm, idx = box_mesh(x, y, 0, x + 10, y + 10, 10)
+        v_p, v_n, v_i = blob.add_floats(pos), blob.add_floats(nrm), blob.add_ushorts(idx)
+        lo, hi = bounds(pos)
+        base = len(accessors)
+        accessors += [
+            {"bufferView": v_p, "componentType": FLOAT, "count": len(pos) // 3, "type": "VEC3",
+             "min": lo, "max": hi},
+            {"bufferView": v_n, "componentType": FLOAT, "count": len(nrm) // 3, "type": "VEC3"},
+            {"bufferView": v_i, "componentType": UNSIGNED_SHORT, "count": len(idx), "type": "SCALAR"},
+        ]
+        primitives.append({"attributes": {"POSITION": base, "NORMAL": base + 1},
+                           "indices": base + 2, "material": i, "mode": MODE_TRIANGLES})
+        r, g, b = colorsys.hsv_to_rgb(i / float(count), 0.9, 0.9)
+        materials.append({"name": "c%02d" % i,
+                          "pbrMetallicRoughness": {"baseColorFactor": [r, g, b, 1.0]}})
+    gltf = {
+        "asset": {"version": "2.0", "generator": "Snapmaker Orca test fixture"},
+        "scene": 0,
+        "scenes": [{"nodes": [0], "name": "swatches"}],
+        "nodes": [{"mesh": 0, "name": "swatches"}],
+        "meshes": [{"name": "swatches", "primitives": primitives}],
+        "materials": materials,
+        "accessors": accessors,
+        "bufferViews": blob.views,
+    }
+    write_glb("many_materials.glb", gltf, bytes(blob.data))
+
+
 def make_nested_trs():
     """parent: translate (5,0,0) then rotate +90 deg about Y; child: translate (1,0,0), scale 2;
     mesh: a 1 x 2 x 4 box centred on the child origin.
@@ -675,6 +716,7 @@ def main():
     make_box_meters()
     make_two_parts_two_materials()
     make_three_materials()
+    make_many_materials()
     make_nested_trs()
     make_strip_and_fan()
     make_textured_two_materials()
