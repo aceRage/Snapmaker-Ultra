@@ -1840,7 +1840,7 @@ Preset* CalibrationPresetPage::get_printer_preset(MachineObject* obj, float nozz
         std::string model_id = printer_it->get_current_printer_type(preset_bundle);
 
         std::string printer_type = obj->printer_type;
-        if (obj->is_support_upgrade_kit && obj->installed_upgrade_kit) { printer_type = "C12"; }
+        if (obj->printer_type == "C11" && obj->is_support_upgrade_kit && obj->installed_upgrade_kit) { printer_type = "C12"; } // the P1P upgrade kit makes it a P1S
         if (model_id.compare(printer_type) == 0
             && printer_nozzle_vals
             && abs(printer_nozzle_vals->get_at(0) - nozzle_value) < 1e-3) {

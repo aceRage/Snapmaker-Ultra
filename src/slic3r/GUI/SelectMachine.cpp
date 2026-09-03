@@ -1707,21 +1707,24 @@ bool SelectMachineDialog::is_same_printer_model()
     if(preset_bundle == nullptr) return result;
     const auto source_model = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
     const auto target_model = obj_->printer_type;
+    // The P1P upgrade kit turns a P1P (C11) into a P1S (C12): only that machine's report flags mean
+    // "kit installed". Newer printers (H2 series) set the same bits for other things, so the kit
+    // rule is scoped to the P1P instead of declaring every such printer a different model.
+    const bool p1p_with_kit = target_model == "C11" && obj_->is_support_upgrade_kit && obj_->installed_upgrade_kit;
     // Orca: ignore P1P -> P1S
     if (source_model != target_model) {
         if ((source_model == "C12" && target_model == "C11") || (source_model == "C11" && target_model == "C12") ||
-            ((obj_->is_support_upgrade_kit && obj_->installed_upgrade_kit) && (source_model == "C12"))) {
+            (p1p_with_kit && source_model == "C12")) {
             return true;
         }
 
-        BOOST_LOG_TRIVIAL(info) << "printer_model: source = " << source_model;
-        BOOST_LOG_TRIVIAL(info) << "printer_model: target = " << target_model;
+        BOOST_LOG_TRIVIAL(warning) << "printer_model mismatch: profile = " << source_model << ", printer = " << target_model
+                                   << ", kit flags = " << obj_->is_support_upgrade_kit << "/" << obj_->installed_upgrade_kit;
         return false;
     }
 
-    if (obj_->is_support_upgrade_kit && obj_->installed_upgrade_kit) {
-        BOOST_LOG_TRIVIAL(info) << "printer_model: source = " << source_model;
-        BOOST_LOG_TRIVIAL(info) << "printer_model: target = " << obj_->printer_type << " (plus)";
+    if (p1p_with_kit) {
+        BOOST_LOG_TRIVIAL(warning) << "printer_model mismatch: profile = " << source_model << ", printer = " << obj_->printer_type << " (P1P with the P1S kit)";
         return false;
     }
     return true;
