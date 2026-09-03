@@ -43,6 +43,10 @@
 #pragma warning(pop)
 #endif
 
+// EXT_meshopt_compression: cgltf recognises the extension and hands us the compressed span plus
+// the decoded layout, but does not decode. Only meshoptimizer's decoder is vendored.
+#include <meshoptimizer/meshoptimizer.h>
+
 namespace Slic3r {
 
 namespace {
@@ -248,15 +252,81 @@ bool accessor_data_fits(const cgltf_accessor &acc)
     if (acc.buffer_view == nullptr)
         return acc.is_sparse != 0;      // a sparse accessor may have an all-zero base
     const cgltf_buffer_view &bv = *acc.buffer_view;
-    if (bv.buffer == nullptr || bv.buffer->data == nullptr)
-        return false;
-    if (bv.offset > bv.buffer->size || bv.size > bv.buffer->size - bv.offset)
-        return false;
+    if (bv.data == nullptr) {
+        // Plain view: the bytes live in the buffer, at bv.offset.
+        if (bv.buffer == nullptr || bv.buffer->data == nullptr)
+            return false;
+        if (bv.offset > bv.buffer->size || bv.size > bv.buffer->size - bv.offset)
+            return false;
+    }
+    // A decoded view (meshopt) owns exactly bv.size bytes; either way the accessor must fit those.
     const cgltf_size stride = acc.stride != 0 ? acc.stride : 1;
     if (acc.count > (cgltf_size) -1 / stride)
         return false;
     const cgltf_size span = (acc.count - 1) * stride + stride;
     return acc.offset <= bv.size && span <= bv.size - acc.offset;
+}
+
+// Decode every EXT_meshopt_compression buffer view in place. cgltf_buffer_view::data is the hook
+// cgltf documents for exactly this ("overrides buffer->data if present, filled by extensions"),
+// and cgltf_free releases it with the same allocator we take it from - so nothing here leaks.
+bool decode_meshopt_buffer_views(cgltf_data *data, std::string &message)
+{
+    uint64_t decoded_total = 0;
+    for (cgltf_size i = 0; i < data->buffer_views_count; ++i) {
+        cgltf_buffer_view &bv = data->buffer_views[i];
+        if (!bv.has_meshopt_compression || bv.data != nullptr)
+            continue;
+        const cgltf_meshopt_compression &mc = bv.meshopt_compression;
+        // Everything below is a number read out of the file, so none of it is trusted.
+        if (mc.buffer == nullptr || mc.buffer->data == nullptr || mc.offset > mc.buffer->size ||
+            mc.size > mc.buffer->size - mc.offset || mc.count == 0 || mc.stride == 0 ||
+            mc.stride > 256 || bv.size != mc.stride * mc.count) {
+            message = err_damaged();
+            return false;
+        }
+        decoded_total += (uint64_t) bv.size;
+        if ((uint64_t) bv.size > MAX_GLTF_FILE || decoded_total > MAX_GLTF_FILE) {
+            message = format(_L("This glTF file expands to more than %1% MB of mesh data, which "
+                                "Snapmaker Orca will not load."),
+                             (unsigned long long) (MAX_GLTF_FILE / (1024 * 1024)));
+            return false;
+        }
+
+        void *out = data->memory.alloc_func(data->memory.user_data, bv.size);
+        if (out == nullptr) {
+            message = _L("There is not enough memory to read this glTF file.");
+            return false;
+        }
+        const unsigned char *src = (const unsigned char *) mc.buffer->data + mc.offset;
+        int                  rc  = -1;
+        switch (mc.mode) {
+        case cgltf_meshopt_compression_mode_attributes:
+            rc = meshopt_decodeVertexBuffer(out, mc.count, mc.stride, src, mc.size);
+            break;
+        case cgltf_meshopt_compression_mode_triangles:
+            rc = meshopt_decodeIndexBuffer(out, mc.count, mc.stride, src, mc.size);
+            break;
+        case cgltf_meshopt_compression_mode_indices:
+            rc = meshopt_decodeIndexSequence(out, mc.count, mc.stride, src, mc.size);
+            break;
+        default:
+            break;
+        }
+        if (rc != 0) {
+            data->memory.free_func(data->memory.user_data, out);
+            message = err_damaged();
+            return false;
+        }
+        switch (mc.filter) {
+        case cgltf_meshopt_compression_filter_octahedral:  meshopt_decodeFilterOct(out, mc.count, mc.stride);  break;
+        case cgltf_meshopt_compression_filter_quaternion:  meshopt_decodeFilterQuat(out, mc.count, mc.stride); break;
+        case cgltf_meshopt_compression_filter_exponential: meshopt_decodeFilterExp(out, mc.count, mc.stride);  break;
+        default: break;
+        }
+        bv.data = out;   // cgltf_free() releases this
+    }
+    return true;
 }
 
 const cgltf_accessor *find_attribute(const cgltf_primitive &prim, cgltf_attribute_type type, int index)
@@ -491,7 +561,7 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
     //    and must never cause a refusal.
     {
         std::vector<std::string> unsupported;
-        bool draco = false, meshopt = false;
+        bool draco = false;
         for (cgltf_size i = 0; i < data->extensions_required_count; ++i) {
             const char *ext = data->extensions_required[i];
             if (ext == nullptr)
@@ -499,20 +569,15 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
             const std::string name(ext);
             if (name == "KHR_mesh_quantization")
                 continue;   // cgltf_accessor_unpack_floats de-quantizes for us
+            if (name == "EXT_meshopt_compression")
+                continue;   // decoded below, by the vendored meshoptimizer decoder
             if (name == "KHR_draco_mesh_compression")
                 draco = true;
-            else if (name == "EXT_meshopt_compression")
-                meshopt = true;
             unsupported.push_back(name);
         }
         info.unsupported_extensions = unsupported;
         if (draco) {
             message = err_draco();
-            return false;
-        }
-        if (meshopt) {
-            message = _L("This file uses the glTF extension \"EXT_meshopt_compression\", which Snapmaker Orca "
-                         "does not support. Re-export it without meshopt compression.");
             return false;
         }
         if (!unsupported.empty()) {
@@ -564,7 +629,25 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
         }
     }
 
-    // 4. cgltf_validate. Its data_too_short family is exactly the "an accessor points outside its
+    // 4. EXT_meshopt_compression, before anything reads an accessor.
+    if (!decode_meshopt_buffer_views(data, message))
+        return false;
+
+    // cgltf_validate dereferences sparse->indices_buffer_view->buffer without a null check, and a
+    // meshopt-compressed view has no outer buffer at all (it lives in the extension). That
+    // combination is exotic, but it is a crash, so refuse it rather than risk it.
+    for (cgltf_size i = 0; i < data->accessors_count; ++i) {
+        const cgltf_accessor &acc = data->accessors[i];
+        if (!acc.is_sparse)
+            continue;
+        if (acc.sparse.indices_buffer_view == nullptr || acc.sparse.indices_buffer_view->buffer == nullptr ||
+            acc.sparse.values_buffer_view == nullptr || acc.sparse.values_buffer_view->buffer == nullptr) {
+            message = err_damaged();
+            return false;
+        }
+    }
+
+    // 5. cgltf_validate. Its data_too_short family is exactly the "an accessor points outside its
     //    buffer" check - including the sparse-index bound, which cgltf's own unpack does NOT
     //    re-check before writing - so that family is a refusal. The invalid_gltf family is
     //    cosmetic (real files trip it) and is only logged.
@@ -579,7 +662,7 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
                                        << "; importing anyway";
     }
 
-    // 5. Pick the scene and enumerate the (node, primitive) pairs it draws.
+    // 6. Pick the scene and enumerate the (node, primitive) pairs it draws.
     const cgltf_scene *scene = data->scene != nullptr ? data->scene
                                                       : (data->scenes_count > 0 ? &data->scenes[0] : nullptr);
     std::vector<DrawItem>          items;
@@ -597,7 +680,7 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
         return false;
     }
 
-    // 6. Build the meshes. Nothing touches `model` until every primitive has succeeded, so a
+    // 7. Build the meshes. Nothing touches `model` until every primitive has succeeded, so a
     //    failure leaves the caller's Model exactly as it was.
     const Matrix4d up = up_axis_correction();
 
@@ -792,7 +875,7 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
     if (info.dropped_primitives > 0)
         BOOST_LOG_TRIVIAL(info) << "load_gltf: dropped " << info.dropped_primitives << " point/line primitive(s)";
 
-    // 7. Build the one ModelObject.
+    // 8. Build the one ModelObject.
     std::string object_name;
     if (object_name_in != nullptr && *object_name_in != 0)
         object_name = object_name_in;

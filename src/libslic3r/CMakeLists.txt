@@ -606,6 +606,7 @@ target_link_libraries(libslic3r
         libslic3r_cgal
         manifold::manifold
         mcut
+        meshoptimizer
         noise::noise
         PNG::PNG
         qhull

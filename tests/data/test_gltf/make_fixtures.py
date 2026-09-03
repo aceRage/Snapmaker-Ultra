@@ -507,6 +507,16 @@ def make_box_quantized():
     _external_tool("quantize", "box_quantized.glb")
 
 
+def make_box_meshopt():
+    """box_10_20_30.glb through EXT_meshopt_compression.
+
+    gltf-transform emits all three meshopt modes for this file - TRIANGLES for the indices,
+    ATTRIBUTES for positions and (with the OCTAHEDRAL filter) normals - and quantizes on the way,
+    so one fixture covers the whole decoder path plus its interaction with KHR_mesh_quantization.
+    """
+    _external_tool("meshopt", "box_meshopt.glb")
+
+
 def make_box_draco():
     """box_10_20_30.glb run through Draco compression.
 
@@ -561,6 +571,7 @@ def main():
     make_points_only()
     make_sparse_triangle()
     make_box_quantized()
+    make_box_meshopt()
     make_box_draco()
     make_unknown_extension()
     make_escaping_buffer()

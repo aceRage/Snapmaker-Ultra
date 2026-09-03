@@ -122,6 +122,26 @@ SCENARIO("Reading a glTF/GLB file: geometry", "[gltf]")
         }
     }
 
+    GIVEN("the same box through EXT_meshopt_compression")
+    {
+        Slic3r::Model model;
+        GltfInfo      info;
+        std::string   message;
+        THEN("the vendored meshoptimizer decoder reproduces the same box")
+        {
+            // The fixture exercises all three meshopt modes (TRIANGLES indices, ATTRIBUTES for
+            // positions and octahedral-filtered normals) and is quantized as well, so this also
+            // covers the two extensions interacting.
+            REQUIRE(load_ok("box_meshopt.glb", model, info, message));
+            REQUIRE(model.objects.size() == 1);
+            REQUIRE(model.objects.front()->volumes.size() == 1);
+            const TriangleMesh &mesh = model.objects.front()->volumes.front()->mesh();
+            REQUIRE(is_approx(mesh.size(), Vec3d(10, 30, 20), 0.02));
+            REQUIRE(mesh.its.indices.size() == 12);
+            REQUIRE(mesh.stats().open_edges == 0);
+        }
+    }
+
     GIVEN("two nodes sharing one mesh (Khronos SimpleMeshes)")
     {
         Slic3r::Model model;
