@@ -43,6 +43,10 @@
 #include "Widgets/CheckBox.hpp" // ORCA
 
 class TabCtrl;
+// Ultra (support sets): the Support-set picker on the Process tab's Support page. The fork's
+// themed combo lives in the global namespace, like TabCtrl above.
+class ComboBox;
+class Button;
 
 namespace Slic3r {
 
@@ -461,6 +465,36 @@ public:
 private:
 	ogStaticText*	m_recommended_thin_wall_thickness_description_line = nullptr;
 	ogStaticText*	m_top_bottom_shell_thickness_explanation = nullptr;
+
+	// Ultra (support sets): the "Support set" row at the top of the Support page. A support set
+	// is not a preset - Apply copies its values into the edited process settings through
+	// Tab::load_config(), so the preset shows as modified exactly like a hand edit.
+	// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md, Stage 1.
+	ComboBox*		m_support_set_combo   = nullptr;
+	Button*			m_support_set_apply   = nullptr;
+	Button*			m_support_set_save    = nullptr;
+	Button*			m_support_set_rename  = nullptr;
+	Button*			m_support_set_delete  = nullptr;
+	wxStaticText*	m_support_set_note     = nullptr;
+	// Set names in combo order; index 0 of the combo is the "- none -" entry and has no name.
+	std::vector<std::string> m_support_set_names;
+	// True while the Support page is the active one, so the folder is rescanned on the way in
+	// rather than on every update().
+	bool			m_support_set_page_was_active = false;
+
+	wxSizer*	support_set_create_widget(wxWindow* parent);
+	void		support_set_reload_list(const std::string& select_name = std::string());
+	void		support_set_update_buttons();
+	std::string	support_set_selected_name() const;
+	void		support_set_set_note(const wxString& text, bool is_warning);
+	// filament_type / filament_soluble of the loaded filaments, for the interface-filament
+	// resolution. Empty when there is no preset bundle yet.
+	DynamicPrintConfig support_set_filament_config() const;
+
+	void		on_support_set_apply();
+	void		on_support_set_save_as();
+	void		on_support_set_rename();
+	void		on_support_set_delete();
 };
 
 class TabPrintModel : public TabPrint

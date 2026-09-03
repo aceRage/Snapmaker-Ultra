@@ -25,6 +25,7 @@ add_executable(${_TEST_NAME}_tests
 	test_mutable_priority_queue.cpp
 	test_slice_compare.cpp
 	test_stl.cpp
+	test_support_set.cpp
 	test_meshboolean.cpp
 	# test_marchingsquares.cpp
 	test_timeutils.cpp

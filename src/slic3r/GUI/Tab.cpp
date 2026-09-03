@@ -56,6 +56,12 @@
 
 #include "BedShapeDialog.hpp"
 // #include "BonjourDialog.hpp"
+// Ultra (support sets): the Support-set row on the Support page.
+#include "libslic3r/SupportSet.hpp"
+#include "Widgets/ComboBox.hpp"
+#include "Widgets/Button.hpp"
+#include <wx/textdlg.h>
+#include <wx/wrapsizer.h>
 #ifdef WIN32
 	#include <commctrl.h>
 #endif // WIN32
@@ -2506,6 +2512,22 @@ void TabPrint::build()
         optgroup->append_single_option_line("extrusion_rate_smoothing_external_perimeter_only", "speed_settings_advanced");
 
     page = add_options_page(L("Support"), "custom-gcode_support"); // ORCA: icon only visible on placeholders
+        // Ultra (support sets): a reusable, named snippet of the Support-category settings, saved
+        // under <datadir>/user/<preset_folder>/support_set/. Applying one copies its values into
+        // the edited process settings, which then show as modified exactly like a hand edit - a
+        // set is deliberately not a preset. Only the process tab gets the row; the object/part
+        // tabs derive from TabPrint and would inherit it (their build() prunes option-less lines,
+        // but be explicit rather than rely on that).
+        // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md, Stage 1 §1.2.
+        if (m_type == Preset::TYPE_PRINT) {
+            optgroup = page->new_optgroup(L("Support set"), L"param_support");
+            Line support_set_line = Line{ "", "" };
+            support_set_line.full_width = 1;
+            // line.widget (not an extra widget): the description-line path spans the group from its
+            // left edge, where extra widgets are indented by the label column and clip on the right.
+            support_set_line.widget = [this](wxWindow* parent) { return support_set_create_widget(parent); };
+            optgroup->append_line(support_set_line);
+        }
         optgroup = page->new_optgroup(L("Support"), L"param_support");
     optgroup->append_single_option_line("enable_support", "support_settings_support");
         optgroup->append_single_option_line("support_type", "support_settings_support#type");
@@ -2743,6 +2765,252 @@ void TabPrint::reload_config()
     Tab::reload_config();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Ultra (support sets): the "Support set" row at the top of the Support page.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md, Stage 1 §1.2.
+// ---------------------------------------------------------------------------------------------
+
+std::string TabPrint::support_set_selected_name() const
+{
+    if (m_support_set_combo == nullptr)
+        return std::string();
+    const int sel = m_support_set_combo->GetSelection();
+    if (sel <= 0 || size_t(sel) >= m_support_set_names.size())
+        return std::string();
+    return m_support_set_names[size_t(sel)];
+}
+
+DynamicPrintConfig TabPrint::support_set_filament_config() const
+{
+    // resolve_interface_filament() reads exactly two vectors; hand it those rather than a whole
+    // config, so the pure helper's inputs stay obvious.
+    DynamicPrintConfig cfg;
+    PresetBundle* bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return cfg;
+    const DynamicPrintConfig full = bundle->full_config();
+    for (const char* key : { "filament_type", "filament_soluble" })
+        if (const ConfigOption* opt = full.option(key); opt != nullptr)
+            cfg.set_key_value(key, opt->clone());
+    return cfg;
+}
+
+void TabPrint::support_set_set_note(const wxString& text, bool is_warning)
+{
+    if (m_support_set_note == nullptr)
+        return;
+    m_support_set_note->SetLabel(text);
+    m_support_set_note->SetForegroundColour(is_warning ? wxColour("#ED6B21")
+                                                       : wxSystemSettings::GetColour(wxSYS_COLOUR_GRAYTEXT));
+    m_support_set_note->Show(!text.IsEmpty());
+    if (m_support_set_note->GetParent() != nullptr)
+        m_support_set_note->GetParent()->Layout();
+}
+
+void TabPrint::support_set_update_buttons()
+{
+    const std::string name = support_set_selected_name();
+    const SupportSet* set  = name.empty() ? nullptr : SupportSetStore::instance().find(name);
+    if (m_support_set_apply  != nullptr) m_support_set_apply->Enable(set != nullptr);
+    // A set read from the shared "default" folder can be applied but not edited from here.
+    const bool editable = set != nullptr && !set->read_only;
+    if (m_support_set_rename != nullptr) m_support_set_rename->Enable(editable);
+    if (m_support_set_delete != nullptr) m_support_set_delete->Enable(editable);
+}
+
+void TabPrint::support_set_reload_list(const std::string& select_name)
+{
+    if (m_support_set_combo == nullptr)
+        return;
+    // The store lives in libslic3r and cannot reach the running AppConfig, so hand it the
+    // per-account preset folder the same way PresetBundle::load_user_presets picks it.
+    SupportSetStore::set_preset_folder(wxGetApp().app_config != nullptr ? wxGetApp().app_config->get("preset_folder")
+                                                                       : std::string());
+    SupportSetStore& store = SupportSetStore::instance();
+    store.reload();
+
+    m_support_set_names.clear();
+    m_support_set_combo->Clear();
+    m_support_set_combo->Append(_L("- none -"));
+    m_support_set_names.emplace_back();
+    int select = 0;
+    for (const SupportSet& set : store.list()) {
+        wxString label = from_u8(set.name);
+        if (set.read_only)
+            label += " " + _L("(shared)");
+        m_support_set_combo->Append(label);
+        m_support_set_names.emplace_back(set.name);
+        if (set.name == select_name)
+            select = int(m_support_set_names.size()) - 1;
+    }
+    m_support_set_combo->SetSelection(select);
+    support_set_update_buttons();
+}
+
+void TabPrint::on_support_set_apply()
+{
+    const std::string name = support_set_selected_name();
+    const SupportSet* set  = name.empty() ? nullptr : SupportSetStore::instance().find(name);
+    if (set == nullptr)
+        return;
+
+    DynamicPrintConfig delta;
+    std::string        warning;
+    support_set_apply_to(*set, delta, support_set_filament_config(), &warning);
+
+    // Tab::load_config() diffs first and only marks the tab dirty when something changed, so work
+    // out beforehand whether this is a no-op: applying a set that already matches is correct but
+    // looks broken without a word (plan R1.2). One load_config call, so ConfigManipulation's
+    // toggles settle once (plan R1.3).
+    const bool changed = !m_config->diff(delta).empty();
+    this->load_config(delta);
+
+    wxString note;
+    if (!warning.empty())
+        note = from_u8(warning);
+    else if (changed)
+        note = format_wxstr(_L("Applied \"%1%\". The process preset now shows as modified."), from_u8(set->name));
+    else
+        note = format_wxstr(_L("\"%1%\" is already applied; nothing changed."), from_u8(set->name));
+    support_set_set_note(note, !warning.empty());
+}
+
+void TabPrint::on_support_set_save_as()
+{
+    wxTextEntryDialog dlg(this, _L("Name for this support set:"), _L("Save support set"),
+                          from_u8(support_set_selected_name()));
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+    wxString entered = dlg.GetValue();
+    entered.Trim(true).Trim(false);
+    const std::string name = into_u8(entered);
+    if (name.empty())
+        return;
+
+    SupportSetStore& store = SupportSetStore::instance();
+    if (const SupportSet* existing = store.find(name); existing != nullptr) {
+        if (existing->read_only) {
+            MessageDialog(this, format_wxstr(_L("\"%1%\" is shared with every account on this computer. "
+                                                "Saving will create your own copy, which hides the shared one."),
+                                             from_u8(name)),
+                          _L("Save support set"), wxICON_INFORMATION | wxOK).ShowModal();
+        } else {
+            MessageDialog confirm(this, format_wxstr(_L("A support set named \"%1%\" already exists. Replace it?"),
+                                                     from_u8(name)),
+                                  _L("Save support set"), wxICON_WARNING | wxYES_NO);
+            if (confirm.ShowModal() != wxID_YES)
+                return;
+        }
+    }
+
+    // The process config alone has no filament_type / filament_soluble, and the reverse map needs
+    // them to turn the current support_interface_filament slot back into a portable type.
+    DynamicPrintConfig cfg = *m_config;
+    cfg.apply(support_set_filament_config());
+    SupportSet set = support_set_from_config(cfg, name);
+
+    std::string err;
+    if (!store.save(set, &err)) {
+        MessageDialog(this, from_u8(err), _L("Save support set"), wxICON_ERROR | wxOK).ShowModal();
+        return;
+    }
+    support_set_reload_list(name);
+    support_set_set_note(format_wxstr(_L("Saved \"%1%\"."), from_u8(name)), false);
+}
+
+void TabPrint::on_support_set_rename()
+{
+    const std::string name = support_set_selected_name();
+    if (name.empty())
+        return;
+    wxTextEntryDialog dlg(this, _L("New name for this support set:"), _L("Rename support set"), from_u8(name));
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+    wxString entered = dlg.GetValue();
+    entered.Trim(true).Trim(false);
+    const std::string to = into_u8(entered);
+    if (to.empty() || to == name)
+        return;
+
+    std::string err;
+    if (!SupportSetStore::instance().rename(name, to, &err)) {
+        MessageDialog(this, from_u8(err), _L("Rename support set"), wxICON_ERROR | wxOK).ShowModal();
+        return;
+    }
+    support_set_reload_list(to);
+    support_set_set_note(format_wxstr(_L("Renamed to \"%1%\"."), from_u8(to)), false);
+}
+
+void TabPrint::on_support_set_delete()
+{
+    const std::string name = support_set_selected_name();
+    if (name.empty())
+        return;
+    MessageDialog confirm(this, format_wxstr(_L("Delete the support set \"%1%\"? "
+                                                "Settings already applied to a project are not affected."),
+                                             from_u8(name)),
+                          _L("Delete support set"), wxICON_WARNING | wxYES_NO);
+    if (confirm.ShowModal() != wxID_YES)
+        return;
+
+    std::string err;
+    if (!SupportSetStore::instance().remove(name, &err)) {
+        MessageDialog(this, from_u8(err), _L("Delete support set"), wxICON_ERROR | wxOK).ShowModal();
+        return;
+    }
+    support_set_reload_list();
+    support_set_set_note(format_wxstr(_L("Deleted \"%1%\"."), from_u8(name)), false);
+}
+
+wxSizer* TabPrint::support_set_create_widget(wxWindow* parent)
+{
+    const int em = em_unit(parent);
+
+    // The combo takes the whole row; the buttons wrap underneath, since the process panel is
+    // narrow and four buttons beside a combo do not fit on one line.
+    auto* vsizer = new wxBoxSizer(wxVERTICAL);
+    auto* hsizer = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+
+    m_support_set_combo = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                       wxSize(20 * em, -1), 0, nullptr, wxCB_READONLY);
+    m_support_set_combo->SetToolTip(_L("A saved set of support settings. Applying one copies its values into "
+                                       "the current process settings, which then show as modified."));
+    m_support_set_combo->Bind(wxEVT_COMBOBOX, [this](wxCommandEvent& evt) {
+        evt.Skip();
+        support_set_update_buttons();
+        support_set_set_note(wxEmptyString, false);
+    });
+    vsizer->Add(m_support_set_combo, 0, wxEXPAND);
+
+    // The fork's themed buttons, styled like the sidebar's "Flushing volumes" (Confirm for the
+    // one that changes the settings, Regular for the housekeeping ones).
+    auto add_button = [this, parent, em, hsizer](Button** btn, const wxString& label, ButtonStyle style,
+                                                 void (TabPrint::*handler)()) {
+        *btn = new Button(parent, label);
+        (*btn)->SetStyle(style, ButtonType::Compact);
+        (*btn)->Bind(wxEVT_BUTTON, [this, handler](wxCommandEvent&) { (this->*handler)(); });
+        hsizer->Add(*btn, 0, wxRIGHT | wxTOP, em / 2);
+    };
+    add_button(&m_support_set_apply,  _L("Apply"),      ButtonStyle::Confirm, &TabPrint::on_support_set_apply);
+    add_button(&m_support_set_save,   _L("Save As..."), ButtonStyle::Regular, &TabPrint::on_support_set_save_as);
+    add_button(&m_support_set_rename, _L("Rename"),     ButtonStyle::Regular, &TabPrint::on_support_set_rename);
+    add_button(&m_support_set_delete, _L("Delete"),     ButtonStyle::Regular, &TabPrint::on_support_set_delete);
+
+    m_support_set_note = new wxStaticText(parent, wxID_ANY, wxEmptyString);
+    m_support_set_note->SetFont(wxGetApp().normal_font());
+    m_support_set_note->Hide();
+
+    vsizer->Add(hsizer, 0, wxEXPAND);
+    vsizer->Add(m_support_set_note, 0, wxEXPAND | wxTOP, em / 2);
+
+    // One directory scan when the page is built. Refreshing again happens on page activation and
+    // after every save/rename/delete - never from update(), which runs inside settings-change
+    // scopes (a phone API request among them) where blocking file I/O does not belong.
+    support_set_reload_list();
+    m_support_set_page_was_active = true;
+    return vsizer;
+}
+
 void TabPrint::update_description_lines()
 {
     Tab::update_description_lines();
@@ -2759,6 +3027,12 @@ void TabPrint::update_description_lines()
             from_u8(PresetHints::top_bottom_shell_thickness_explanation(*m_preset_bundle)));
     }
 
+    // Ultra (support sets): rescan the folder when the Support page *becomes* the active one, so
+    // a set saved elsewhere shows up, without scanning on every update().
+    const bool on_support_page = m_active_page && m_active_page->title() == "Support";
+    if (on_support_page && !m_support_set_page_was_active && m_support_set_combo != nullptr)
+        support_set_reload_list(support_set_selected_name());
+    m_support_set_page_was_active = on_support_page;
 }
 
 void TabPrint::toggle_options()
@@ -2897,6 +3171,16 @@ void TabPrint::clear_pages()
 
     m_recommended_thin_wall_thickness_description_line = nullptr;
     m_top_bottom_shell_thickness_explanation = nullptr;
+
+    // Ultra (support sets): the page owns these windows, so drop the pointers with it.
+    m_support_set_combo  = nullptr;
+    m_support_set_apply  = nullptr;
+    m_support_set_save   = nullptr;
+    m_support_set_rename = nullptr;
+    m_support_set_delete = nullptr;
+    m_support_set_note   = nullptr;
+    m_support_set_names.clear();
+    m_support_set_page_was_active = false;
 }
 
 
