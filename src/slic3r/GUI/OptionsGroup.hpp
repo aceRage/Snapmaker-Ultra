@@ -67,8 +67,12 @@ public:
     //BBS: export the extra colume widget
     wxWindow*	extra_widget_win {nullptr};
     //BBS: add api to get the first option's key
-    std::string& get_first_option_key() {
-        return m_options[0].opt_id;
+    // A line made only of widgets (a description, a button row) has no option: hand back an
+    // empty key instead of reading past the end, which crashed the first time such a line sat
+    // alone in its group (Tab::decorate -> Page::get_line on page activation).
+    const std::string& get_first_option_key() const {
+        static const std::string none;
+        return m_options.empty() ? none : m_options[0].opt_id;
     }
 
     void append_option(const Option& option) {

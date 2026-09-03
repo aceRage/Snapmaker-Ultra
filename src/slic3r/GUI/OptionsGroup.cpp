@@ -231,7 +231,7 @@ Line* OptionsGroup::get_line(const std::string& opt_key)
 {
     for (auto& l : m_lines)
     {
-        if(l.is_separator())
+        if(l.is_separator() || l.get_options().empty())
             continue;
         if (l.get_first_option_key() == opt_key)
             return &l;
