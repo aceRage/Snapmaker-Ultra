@@ -36,6 +36,7 @@
 #  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <mstcpip.h>
 #  include <iphlpapi.h>
 #  include <netioapi.h>
 #  include <windows.h>
@@ -74,6 +75,24 @@ static const char* const GO2RTC_WS   = "/api/ws";
 static const size_t      MAX_API_BODY       = 64 * 1024;
 static const uint64_t    MAX_UPLOAD         = 2ull * 1024 * 1024 * 1024;
 static const int         IDLE_EXIT_SECONDS  = 60;
+// Request hygiene. The head cap is generous for a browser (cookies + a long referer) and small
+// enough that a dribbling client cannot grow the buffer. The connection caps leave room for a
+// phone with six live camera WebSockets plus its polling, several times over; the admin listener
+// only ever talks to this PC's slicer instances and its own page.
+static const size_t      MAX_HEAD           = 16 * 1024;
+static const int         HEAD_TIMEOUT_S     = 10;   // to read the request head
+static const int         BODY_TIMEOUT_S     = 30;   // between reads of a body we buffer
+static const int         UPLOAD_TIMEOUT_S   = 120;  // between reads of an upload (phones stall)
+static const int         WRITE_TIMEOUT_S    = 30;   // a peer that stops reading a plain response
+static const int         TUNNEL_WRITE_S     = 120;  // ... and one that stops reading a video stream
+static const int         MAX_CONNECTIONS    = 128;  // main listener
+static const int         MAX_ADMIN_CONNECTIONS = 64;
+// Uploads (<datadir>/hub/uploads) are scratch: the hub keeps them under a total quota and drops
+// the oldest, but never one younger than an hour (it may still be opening in a slicer).
+static const uint64_t    UPLOAD_QUOTA       = 1ull * 1024 * 1024 * 1024;
+static const long long   UPLOAD_MIN_AGE_S   = 3600;
+// A slicer instance is a full wxWidgets + OpenGL process; a phone must not be able to fork the PC.
+static const int         MAX_INSTANCES      = 6;
 
 // ------------------------------------------------------------------ paths ----
 
@@ -188,14 +207,31 @@ static bool valid_token(const std::string& t)
     return t.size() >= 10 && t.size() <= 32 && t.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789") == std::string::npos;
 }
 
+// Compare a secret without an early exit, so a wrong value takes the same time whatever prefix
+// it got right. The lengths are compared normally (they are not the secret) and an empty value
+// never matches - an unset token or secret must not authenticate anybody.
+static bool ct_equal(const std::string& a, const std::string& b)
+{
+    if (a.empty() || b.empty() || a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) diff |= (unsigned char) (a[i] ^ b[i]);
+    return diff == 0;
+}
+
+// The phone link's token, straight from the OS CSPRNG (std::random_device; a seeded mt19937 has
+// only as much entropy as its seed). Rejection sampling keeps the 32 symbols equally likely.
 static std::string random_token()
 {
     static const char alphabet[] = "abcdefghijkmnpqrstuvwxyz23456789"; // no 0/o/1/l look-alikes
+    const unsigned    n     = (unsigned) sizeof(alphabet) - 1;
+    const unsigned    limit = 256u - (256u % n); // 256 % 32 == 0 today; correct if the alphabet changes
     std::random_device rd;
-    std::mt19937_64    gen(((uint64_t) rd() << 32) ^ rd());
-    std::uniform_int_distribution<int> d(0, (int) sizeof(alphabet) - 2);
-    std::string t;
-    for (int i = 0; i < 14; ++i) t += alphabet[d(gen)];
+    std::string        t;
+    while (t.size() < 14) {
+        const unsigned v = rd() & 0xffu;
+        if (v >= limit) continue;
+        t += alphabet[v % n];
+    }
     return t;
 }
 
@@ -236,6 +272,7 @@ static const char* status_text(int status)
     case 403: return "403 Forbidden";            case 415: return "415 Unsupported Media Type";
     case 404: return "404 Not Found";            case 409: return "409 Conflict";
     case 413: return "413 Payload Too Large";    case 502: return "502 Bad Gateway";
+    case 429: return "429 Too Many Requests";
     case 503: return "503 Service Unavailable";  default:  return "500 Internal Server Error";
     }
 }
@@ -446,6 +483,60 @@ static long spawn_process(const std::vector<std::string>& args, const std::vecto
 
 // ------------------------------------------------------------ HTTP bits ----
 
+// Every connection is served on its own detached thread, so a peer that stops talking must not
+// be able to hold one for ever. These are blocking sockets: a receive timeout is what makes a
+// stalled read fail instead of parking the thread, and 0 puts it back to "wait as long as it
+// takes" for the long-lived tunnels (WebSocket, MJPEG, the U1 relay).
+static void set_socket_timeout(tcp::socket& s, int option, int seconds)
+{
+    if (!s.is_open()) return;
+#ifdef _WIN32
+    DWORD ms = (DWORD) seconds * 1000;
+    ::setsockopt(s.native_handle(), SOL_SOCKET, option, (const char*) &ms, sizeof(ms));
+#else
+    struct timeval tv { seconds, 0 };
+    ::setsockopt(s.native_handle(), SOL_SOCKET, option, &tv, sizeof(tv));
+#endif
+}
+static void set_read_timeout(tcp::socket& s, int seconds) { set_socket_timeout(s, SO_RCVTIMEO, seconds); }
+// A peer that stops reading fills our send buffer; without this the write parks the thread.
+static void set_write_timeout(tcp::socket& s, int seconds) { set_socket_timeout(s, SO_SNDTIMEO, seconds); }
+
+// A tunnel has no timeout (a camera can be quiet for a while), so keep-alive probes are what
+// tell us the phone went away - without them a lost Wi-Fi connection holds two threads until
+// the OS default of two hours.
+static void set_keepalive(tcp::socket& s, int idle_seconds)
+{
+    if (!s.is_open()) return;
+    boost::system::error_code ig;
+    s.set_option(asio::socket_base::keep_alive(true), ig);
+#ifdef _WIN32
+    struct tcp_keepalive ka = { 1, (ULONG) idle_seconds * 1000, 5000 };
+    DWORD                out = 0;
+    ::WSAIoctl(s.native_handle(), SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &out, nullptr, nullptr);
+#else
+    (void) idle_seconds;
+#endif
+}
+
+// How many connections each listener is serving right now; the cap answers 503 beyond it so a
+// flood cannot exhaust threads or handles.
+struct ConnCount
+{
+    std::atomic<int> n { 0 };
+};
+
+class ConnGuard
+{
+public:
+    ConnGuard(ConnCount& c, int limit) : m_c(c) { m_ok = ++m_c.n <= limit; }
+    ~ConnGuard() { --m_c.n; }
+    bool ok() const { return m_ok; }
+private:
+    ConnCount& m_c;
+    bool       m_ok { false };
+};
+
 struct Request
 {
     std::string method, target, path, query, head, pending, cookies, file_name;
@@ -456,7 +547,12 @@ struct Request
 
 static bool read_request(tcp::socket& client, Request& r)
 {
-    asio::streambuf req;
+    // Bounded and deadlined: a client that dribbles bytes without ever finishing the head hits
+    // either the buffer limit (read_until then fails) or the receive timeout, and the connection
+    // is dropped instead of growing without limit.
+    set_read_timeout(client, HEAD_TIMEOUT_S);
+    set_write_timeout(client, WRITE_TIMEOUT_S);
+    asio::streambuf req(MAX_HEAD);
     boost::system::error_code ec;
     asio::read_until(client, req, "\r\n\r\n", ec);
     if (ec) return false;
@@ -505,10 +601,15 @@ static void write_all(tcp::socket& s, const std::string& data)
 static void respond(tcp::socket& s, int status, const std::string& type, const std::string& body, const std::string& extra_headers = "")
 {
     std::ostringstream o;
+    // nosniff so a body the hub relays (an uploaded name, a printer's answer) can never be
+    // re-interpreted as script; no-referrer because the phone's token is in the path and the page
+    // loads printer pages in iframes.
     o << "HTTP/1.1 " << status_text(status) << "\r\n"
       << "Content-Type: " << type << "\r\n"
       << "Content-Length: " << body.size() << "\r\n"
       << "Cache-Control: no-store\r\n"
+      << "X-Content-Type-Options: nosniff\r\n"
+      << "Referrer-Policy: no-referrer\r\n"
       << extra_headers
       << "Connection: close\r\n\r\n"
       << body;
@@ -812,6 +913,12 @@ static void relay_h264(tcp::socket& client, const std::string& url)
     asio::connect(up, endpoints, ec);
     if (ec) { respond(client, 502, "text/plain", "camera did not answer"); return; }
     up.set_option(tcp::no_delay(true));
+    // Long-lived from here: no read deadline on the consumer (go2rtc), but a camera that stops
+    // sending must not hold this thread, and keep-alive probes end it if go2rtc disappears.
+    set_read_timeout(up, 30);
+    set_read_timeout(client, 0);
+    set_write_timeout(client, TUNNEL_WRITE_S);
+    set_keepalive(client, 30);
     write_all(up, "GET " + path + " HTTP/1.1\r\nHost: " + hostport + "\r\nConnection: close\r\n\r\n");
     std::string buf;
     char        tmp[16384];
@@ -827,7 +934,8 @@ static void relay_h264(tcp::socket& client, const std::string& url)
         return;
     }
     const bool chunked = head.find("transfer-encoding: chunked") != std::string::npos;
-    write_all(client, "HTTP/1.1 200 OK\r\nContent-Type: video/h264\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+    write_all(client, "HTTP/1.1 200 OK\r\nContent-Type: video/h264\r\nCache-Control: no-store\r\n"
+                      "X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n");
 
     bool        started = false;
     std::string pend; // unforwarded bytes while waiting for the first SPS
@@ -897,6 +1005,12 @@ static void tunnel(tcp::socket& client, int port, const std::string& head, const
     tcp::socket      up(ioc);
     up.connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), (unsigned short) port));
     up.set_option(tcp::no_delay(true));
+    // A tunnel is long-lived (a camera WebSocket, an MJPEG stream): drop the head deadline, and
+    // let TCP keep-alive - not a timeout - be what notices a phone that walked out of range.
+    set_read_timeout(client, 0);
+    set_write_timeout(client, TUNNEL_WRITE_S);
+    set_keepalive(client, 30);
+    set_keepalive(up, 30);
     write_all(up, head);
     if (!pending.empty()) write_all(up, pending);
     std::thread t([&]() { pump(client, up); });
@@ -909,6 +1023,7 @@ static bool read_small_body(tcp::socket& client, Request& r, std::string& body, 
 {
     if (r.content_length > limit) return false;
     body = r.pending;
+    set_read_timeout(client, BODY_TIMEOUT_S); // a body that stops arriving must not hold the thread
     boost::system::error_code ec;
     while (body.size() < r.content_length) {
         char   buf[8192];
@@ -952,23 +1067,81 @@ static bool spool_upload(tcp::socket& client, Request& r, std::string& out_path,
     if (r.content_length > MAX_UPLOAD) { error = "file too large"; return false; }
     ensure_dirs();
     // One folder per upload so the file keeps its own name (it becomes the object / project name).
-    const fs::path folder = fs::path(uploads_dir()) / timestamp_compact();
+    // The stamp is only one-second precise, so a random suffix keeps two uploads in the same
+    // second from sharing a folder (the second used to overwrite the first).
+    const fs::path folder = fs::path(uploads_dir()) / (timestamp_compact() + "_" + random_hex(4));
     boost::system::error_code ec;
     fs::create_directories(folder, ec);
     out_path = (folder / clean).string();
     boost::nowide::ofstream f(out_path, std::ios::binary | std::ios::trunc);
     if (!f) { error = "cannot write to " + uploads_dir(); return false; }
+    set_read_timeout(client, UPLOAD_TIMEOUT_S); // a stalled upload frees its thread and its file
     size_t received = std::min(r.pending.size(), r.content_length);
     f.write(r.pending.data(), (std::streamsize) received);
     char buf[65536];
     while (received < r.content_length) {
         size_t n = client.read_some(asio::buffer(buf, std::min(sizeof(buf), r.content_length - received)), ec);
-        if (ec) { error = "upload interrupted"; f.close(); fs::remove(out_path, ec); return false; }
+        if (ec) {
+            error = "upload interrupted";
+            f.close();
+            boost::system::error_code ig;
+            fs::remove_all(folder, ig); // no half-file and no empty folder left behind
+            out_path.clear();
+            return false;
+        }
         f.write(buf, (std::streamsize) n);
         received += n;
     }
     f.close();
     return true;
+}
+
+// Uploads are scratch space: keep <datadir>/hub/uploads under UPLOAD_QUOTA by deleting whole
+// upload folders, oldest first, but never one younger than an hour - a slicer may still be
+// opening it. Runs at hub start and after every upload. <datadir>/hub/saves holds the user's own
+// projects and is never touched here.
+static void gc_uploads()
+{
+    struct Entry { fs::path dir; long long age_key; uint64_t bytes; };
+    std::vector<Entry>        entries;
+    uint64_t                  total = 0;
+    boost::system::error_code ec;
+    if (!fs::is_directory(uploads_dir(), ec)) return;
+    for (fs::directory_iterator it(uploads_dir(), ec), end; !ec && it != end; it.increment(ec)) {
+        boost::system::error_code ig;
+        if (!fs::is_directory(it->path(), ig)) continue;
+        Entry e;
+        e.dir      = it->path();
+        e.bytes    = 0;
+        e.age_key  = (long long) fs::last_write_time(it->path(), ig);
+        for (fs::recursive_directory_iterator f(it->path(), ig), fend; !ig && f != fend; f.increment(ig)) {
+            boost::system::error_code i2;
+            if (fs::is_regular_file(f->path(), i2)) {
+                e.bytes += (uint64_t) fs::file_size(f->path(), i2);
+                const long long t = (long long) fs::last_write_time(f->path(), i2);
+                if (t > e.age_key) e.age_key = t; // a folder is as young as its newest file
+            }
+        }
+        total += e.bytes;
+        entries.push_back(e);
+    }
+    if (total <= UPLOAD_QUOTA) return;
+    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.age_key < b.age_key; });
+    const long long now = now_unix();
+    uint64_t        freed = 0;
+    for (const Entry& e : entries) {
+        if (total - freed <= UPLOAD_QUOTA) break;
+        if (now - e.age_key < UPLOAD_MIN_AGE_S) continue; // still in use, or about to be
+        boost::system::error_code ig;
+        fs::remove_all(e.dir, ig);
+        if (!ig) freed += e.bytes;
+    }
+    if (freed > 0)
+        BOOST_LOG_TRIVIAL(info) << "RemoteHub: uploads over quota (" << total / (1024 * 1024) << " MiB), freed "
+                                << freed / (1024 * 1024) << " MiB";
+    else
+        BOOST_LOG_TRIVIAL(warning) << "RemoteHub: uploads over quota (" << total / (1024 * 1024)
+                                   << " MiB) but every upload is younger than an hour";
 }
 
 // --------------------------------------------------------------- server ----
@@ -1000,6 +1173,7 @@ public:
     {
         bool        phone { false };
         int         port { 0 };
+        int         admin_port { 0 };
         std::string token, url;
         int         instances { 0 };
         int         hidden { 0 };
@@ -1013,14 +1187,16 @@ public:
     bool     instance_window(long pid, bool show);
     bool     instance_quit(long pid, bool discard);
     std::vector<Instance> instances(bool probe);
+    int      instances_in_flight(); // live instances plus spawns that have not registered yet
 
 private:
     json  info_json();
     json  instances_json();
     void  write_hub_json();
     bool  bind(bool lan);
-    void  accept_loop(std::shared_ptr<tcp::acceptor> acceptor);
-    void  serve(std::unique_ptr<tcp::socket> sock);
+    bool  bind_admin();
+    void  accept_loop(std::shared_ptr<tcp::acceptor> acceptor, bool admin);
+    void  serve(std::unique_ptr<tcp::socket> sock, bool admin);
     void  handle_hub(tcp::socket& client, Request& r);
     void  handle_phone(tcp::socket& client, Request& r, const std::string& rest);
     void  start_go2rtc();
@@ -1044,6 +1220,14 @@ private:
     int                            m_port { 0 };
     asio::io_context               m_ioc;
     std::shared_ptr<tcp::acceptor> m_acceptor;
+    // The control plane has its own acceptor on an ephemeral loopback port, recorded in hub.json
+    // as admin_port. Nothing else binds it, so no tunnel (Tailscale Serve, zrok, anything a user
+    // starts by hand) can ever front /hub/* or the U1 relay, whatever the peer address says.
+    std::shared_ptr<tcp::acceptor> m_admin_acceptor;
+    int                            m_admin_port { 0 };
+    // Spawns that have not dropped their <pid>.json yet, so a burst of phone uploads cannot get
+    // past the instance cap while the first process is still starting.
+    std::vector<std::pair<long, long long>> m_recent_spawns;
     std::string                    m_state; // full Stream-tab state JSON (with credentials)
     std::string                    m_secret;      // per run; in hub.json and the hub page, required as X-Hub-Secret on /hub/*
     std::string                    m_go2rtc_user, m_go2rtc_pass, m_go2rtc_auth; // go2rtc credentials, this process only
@@ -1065,6 +1249,7 @@ json HubServer::info_json()
     j["alive"]       = true;
     j["pid"]         = current_pid();
     j["port"]        = m_port;
+    j["admin_port"]  = m_admin_port;
     j["phone"]       = m_phone;
     j["token"]       = m_token;
     j["go2rtc_port"] = m_go2rtc_port;
@@ -1088,6 +1273,7 @@ void HubServer::write_hub_json()
         std::lock_guard<std::mutex> lock(m_mutex);
         j["pid"]         = current_pid();
         j["port"]        = m_port;
+        j["admin_port"]  = m_admin_port; // loopback-only control plane; this is what /hub/* answers on
         j["phone"]       = m_phone;
         j["token"]       = m_token;
         j["secret"]      = m_secret;
@@ -1136,12 +1322,35 @@ bool HubServer::bind(bool lan)
         m_port     = port;
     }
     if (old) { boost::system::error_code ig; old->close(ig); } // its accept loop exits
-    std::thread([this, acceptor]() { accept_loop(acceptor); }).detach();
+    std::thread([this, acceptor]() { accept_loop(acceptor, false); }).detach();
     BOOST_LOG_TRIVIAL(info) << "RemoteHub: listening on " << (lan ? "0.0.0.0" : "127.0.0.1") << ":" << port;
     return true;
 }
 
-void HubServer::accept_loop(std::shared_ptr<tcp::acceptor> acceptor)
+// The control plane: 127.0.0.1 on whatever ephemeral port the OS hands out, written to hub.json
+// so the slicer instances, the tray and the hub page can find it. It is never rebound, so the
+// /relay/h264 URLs registered in go2rtc stay valid when phone access flips the main listener.
+bool HubServer::bind_admin()
+{
+    auto acceptor = std::make_shared<tcp::acceptor>(m_ioc);
+    boost::system::error_code ec;
+    acceptor->open(tcp::v4(), ec);
+    if (ec) return false;
+    acceptor->bind(tcp::endpoint(asio::ip::address_v4::loopback(), 0), ec);
+    if (ec) { BOOST_LOG_TRIVIAL(error) << "RemoteHub: no loopback port for the control plane: " << ec.message(); return false; }
+    acceptor->listen(32, ec);
+    if (ec) return false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_admin_acceptor = acceptor;
+        m_admin_port     = (int) acceptor->local_endpoint().port();
+    }
+    std::thread([this, acceptor]() { accept_loop(acceptor, true); }).detach();
+    BOOST_LOG_TRIVIAL(info) << "RemoteHub: control plane on 127.0.0.1:" << m_admin_port;
+    return true;
+}
+
+void HubServer::accept_loop(std::shared_ptr<tcp::acceptor> acceptor, bool admin)
 {
     for (;;) {
         auto sock = std::make_unique<tcp::socket>(m_ioc);
@@ -1149,7 +1358,7 @@ void HubServer::accept_loop(std::shared_ptr<tcp::acceptor> acceptor)
         acceptor->accept(*sock, ec);
         if (ec) break; // closed by a rebind or at shutdown
         tcp::socket* raw = sock.release();
-        std::thread([this, raw]() { serve(std::unique_ptr<tcp::socket>(raw)); }).detach();
+        std::thread([this, raw, admin]() { serve(std::unique_ptr<tcp::socket>(raw), admin); }).detach();
     }
 }
 
@@ -1214,7 +1423,7 @@ void HubServer::register_streams()
         state  = m_state;
         base   = go2rtc_base_locked();
         secret = m_secret;
-        port   = m_port;
+        port   = m_admin_port; // /relay/h264 lives on the control plane, never on the tunnelled listener
     }
     if (base.empty() || state.empty()) return;
     try {
@@ -1393,6 +1602,26 @@ std::vector<Instance> HubServer::instances(bool probe)
     return out;
 }
 
+// How many slicer processes we are on the hook for: the ones that registered plus the ones that
+// were just spawned and have not written their <pid>.json yet (that takes a few seconds, which is
+// long enough for a phone to ask for a dozen more).
+int HubServer::instances_in_flight()
+{
+    const std::vector<Instance> live = instances(false);
+    const long long             now  = now_unix();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_recent_spawns.erase(std::remove_if(m_recent_spawns.begin(), m_recent_spawns.end(),
+                                         [&](const std::pair<long, long long>& s) {
+                                             if (now - s.second > 120) return true;  // gave up waiting
+                                             if (!pid_alive(s.first)) return true;   // died or never started
+                                             for (const Instance& i : live)
+                                                 if (i.pid == s.first) return true;  // registered: counted below
+                                             return false;
+                                         }),
+                          m_recent_spawns.end());
+    return (int) live.size() + (int) m_recent_spawns.size();
+}
+
 json HubServer::instances_json()
 {
     json j;
@@ -1420,9 +1649,10 @@ HubServer::Snapshot HubServer::snapshot()
     Snapshot s;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        s.phone = m_phone;
-        s.port  = m_port;
-        s.token = m_token;
+        s.phone      = m_phone;
+        s.port       = m_port;
+        s.admin_port = m_admin_port;
+        s.token      = m_token;
     }
     if (s.phone) {
         const std::vector<std::string> ips = lan_ips();
@@ -1550,6 +1780,10 @@ long HubServer::spawn_slicer(const std::string& file, bool hidden)
     std::vector<std::pair<std::string, std::string>> env { { "SNORCA_NEW_INSTANCE", "1" } };
     env.emplace_back("SNORCA_HIDDEN", hidden ? "1" : "0"); // explicit either way
     const long pid = spawn_process(args, env, false, nullptr);
+    if (pid > 0) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_recent_spawns.emplace_back(pid, now_unix()); // counts against the cap until it registers
+    }
     BOOST_LOG_TRIVIAL(info) << "RemoteHub: new " << (hidden ? "hidden" : "visible") << " instance pid " << pid
                             << (file.empty() ? std::string() : " for " + file);
     return pid;
@@ -1616,6 +1850,12 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
     } else if (r.path == "/hub/instances" && r.method == "GET") {
         respond_json(client, 200, instances_json().dump());
     } else if (r.path == "/hub/new" && r.method == "POST") {
+        const int open = instances_in_flight();
+        if (open >= MAX_INSTANCES) {
+            respond_json(client, 429, json_error("too many slicer windows are open (" + std::to_string(open) + " of " +
+                                                 std::to_string(MAX_INSTANCES) + "); close one first"));
+            return;
+        }
         const long pid = spawn_slicer("", query_param(r.query, "hidden") == "1");
         json j;
         j["ok"]  = pid > 0;
@@ -1662,6 +1902,50 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
     }
 }
 
+// The phone reaches a slicer instance's API through /r/<token>/i/<pid>/api/..., and used to reach
+// *all* of it: whatever route the instance grew next was exposed the day it was written. This is
+// the explicit list instead, one entry per route of the manifest in RemoteAccess::handle_api, so a
+// new instance route is opt-in. /api/debug/* is deliberately not here - it is the PC's own back
+// door and is not in the manifest either. test_hardening.py compares the two and fails on drift.
+static bool instance_api_allowed(const std::string& method, const std::string& sub)
+{
+    const bool get = method == "GET", post = method == "POST";
+    if (!get && !post) return false;
+    auto is_index = [](const std::string& s) {
+        return !s.empty() && s.size() <= 9 && s.find_first_not_of("0123456789") == std::string::npos;
+    };
+    // /api/plates/<index>/<what> and /api/jobs/<id>
+    if (sub.compare(0, 12, "/api/plates/") == 0) {
+        const std::string  rest  = sub.substr(12);
+        const size_t       slash = rest.find('/');
+        if (slash == std::string::npos || !is_index(rest.substr(0, slash))) return false;
+        const std::string what = rest.substr(slash);
+        return get && (what == "/thumbnail.png" || what == "/layout" || what == "/preview" ||
+                       what == "/preview.png" || what == "/preview/status");
+    }
+    if (sub.compare(0, 10, "/api/jobs/") == 0) return get && is_index(sub.substr(10));
+
+    if (sub == "/api" || sub == "/api/")             return get;
+    if (sub == "/api/info")                          return get;
+    if (sub == "/api/window")                        return get || post;
+    if (sub == "/api/quit")                          return post;
+    if (sub == "/api/attention/clear")               return post;
+    if (sub == "/api/project/open")                  return post;
+    if (sub == "/api/plates")                        return get;
+    if (sub == "/api/objects/transform")             return post;
+    if (sub == "/api/printers")                      return get;
+    if (sub == "/api/slice")                         return post;
+    if (sub == "/api/jobs")                          return get;
+    if (sub == "/api/presets")                       return get;
+    if (sub == "/api/presets/select")                return post;
+    if (sub == "/api/presets/filament_color")        return post;
+    if (sub == "/api/presets/filament_add")          return post;
+    if (sub == "/api/settings/process")              return get || post;
+    if (sub == "/api/settings/process/revert")       return post;
+    if (sub == "/api/settings/process/save")         return post;
+    return false;
+}
+
 void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string& rest)
 {
     // ---- hub-level API (instances, uploads) ----
@@ -1684,8 +1968,16 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
         return;
     }
     if (rest == "/api/instances/open" && r.method == "POST") {
+        // Refuse before reading the upload: there is no point spooling a gigabyte we will not open.
+        const int open = instances_in_flight();
+        if (open >= MAX_INSTANCES) {
+            respond_json(client, 429, json_error("too many slicer windows are open (" + std::to_string(open) + " of " +
+                                                 std::to_string(MAX_INSTANCES) + "); close one on the PC, or open this file in one of them"));
+            return;
+        }
         std::string path, error;
         if (!spool_upload(client, r, path, error)) { respond_json(client, 400, json_error(error)); return; }
+        gc_uploads();
         const long pid = spawn_slicer(path, query_param(r.query, "visible") != "1");
         json j;
         j["ok"]      = pid > 0;
@@ -1707,6 +1999,7 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
         if (sub == "/open" && r.method == "POST") {
             std::string path, error;
             if (!spool_upload(client, r, path, error)) { respond_json(client, 400, json_error(error)); return; }
+            gc_uploads();
             std::string mode = query_param(r.query, "mode");
             if (mode.empty()) mode = lower(fs::path(path).extension().string()) == ".3mf" ? "load" : "import";
             int         status = 502;
@@ -1722,6 +2015,7 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
             return;
         }
         if (sub.compare(0, 4, "/api") == 0 && (sub.size() == 4 || sub[4] == '/')) {
+            if (!instance_api_allowed(r.method, sub)) { respond_json(client, 404, json_error("route not proxied; see /api")); return; }
             if (r.content_length > MAX_API_BODY) { respond_json(client, 413, json_error("body too large")); return; }
             // Replay the request against the instance with the prefix stripped; the instance
             // answers with Connection: close, so the splice ends by itself.
@@ -1740,14 +2034,19 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
     respond_json(client, 404, json_error("no such route; see /api"));
 }
 
-void HubServer::serve(std::unique_ptr<tcp::socket> owner)
+void HubServer::serve(std::unique_ptr<tcp::socket> owner, bool admin)
 {
-    tcp::socket& client = *owner;
+    // Each listener has its own budget: a flood on the phone listener must not stop the PC's own
+    // page and slicer instances from reaching the control plane.
+    static ConnCount s_main, s_admin;
+    ConnGuard        guard(admin ? s_admin : s_main, admin ? MAX_ADMIN_CONNECTIONS : MAX_CONNECTIONS);
+    tcp::socket&     client = *owner;
     try {
         boost::system::error_code ec;
         const auto peer = client.remote_endpoint(ec).address();
         if (ec || !is_private_v4(peer)) return;
         client.set_option(tcp::no_delay(true));
+        if (!guard.ok()) { respond(client, 503, "text/plain; charset=utf-8", "the hub has too many connections open; try again"); return; }
         Request r;
         if (!read_request(client, r)) return;
 
@@ -1763,6 +2062,11 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner)
             phone       = m_phone;
         }
 
+        // The control plane answers only on the admin listener, and the admin listener answers
+        // only the control plane. Anything a tunnel can front is on the other socket.
+        const bool control_route = r.path.compare(0, 5, "/hub/") == 0 || r.path == "/relay/h264";
+        if (admin != control_route) { respond(client, 404, "text/plain", "not found"); return; }
+
         // Through Tailscale Serve (a loopback peer carrying Tailscale-User-Login, which Serve sets
         // and strips from clients) only allow-listed tailnet logins get anything at all.
         const bool via_serve = peer.is_loopback() && !r.ts_login.empty();
@@ -1776,8 +2080,8 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner)
         // The stream player lives at the root so its relative "api/ws" resolves here. Gate: the
         // phone's rt cookie, or - loopback only - the hub secret as `lt`, which is how the PC's own
         // Stream tab embeds it. The two scripts are public (verbatim go2rtc files).
-        const bool player_ok = (!token.empty() && cookie_value(r.cookies, "rt") == token) ||
-                               (peer.is_loopback() && !secret.empty() && query_param(r.query, "lt") == secret);
+        const bool player_ok = ct_equal(cookie_value(r.cookies, "rt"), token) ||
+                               (peer.is_loopback() && ct_equal(query_param(r.query, "lt"), secret));
         if (r.path == PLAYER_PAGE) {
             if (!player_ok) { respond(client, 404, "text/plain", "not found"); return; }
             respond(client, 200, "text/html; charset=utf-8", read_file(resources_dir() + "/web/orca/player.html"));
@@ -1794,35 +2098,45 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner)
         }
         // go2rtc pulls a printer's raw H.264 through here (loopback + hub secret; see relay_h264).
         if (r.path == "/relay/h264") {
-            if (!(peer.is_loopback() && !secret.empty() && query_param(r.query, "lt") == secret)) { respond(client, 404, "text/plain", "not found"); return; }
+            if (!(peer.is_loopback() && ct_equal(query_param(r.query, "lt"), secret))) { respond(client, 404, "text/plain", "not found"); return; }
             const std::string url = relay_h264_url(query_param(r.query, "id"));
             if (url.empty()) { respond(client, 404, "text/plain", "unknown camera"); return; }
             relay_h264(client, url);
             return;
         }
-        // Control routes for the slicer instances and the hub page on this PC: loopback peer,
+        // Control routes for the slicer instances and the hub page on this PC. They only exist on
+        // the loopback-only admin listener (checked above), and on top of that: loopback peer,
         // loopback Host (no DNS rebinding), never cross-site, and the per-run secret as a custom
         // header - a cross-origin page cannot send one without a preflight we never answer. The
         // page and its script are the only unauthenticated GETs; the page carries the secret.
         if (r.path.compare(0, 5, "/hub/") == 0) {
             if (!peer.is_loopback() || !loopback_host(r.host) || r.sec_fetch_site == "cross-site") { respond(client, 404, "text/plain", "not found"); return; }
             const bool page = r.method == "GET" && (r.path == "/hub/" || r.path == "/hub/index.html" || r.path == "/hub/qrcode.js");
-            if (!page && (secret.empty() || r.secret != secret)) { respond_json(client, 403, json_error("missing or wrong X-Hub-Secret")); return; }
+            if (!page && !ct_equal(r.secret, secret)) { respond_json(client, 403, json_error("missing or wrong X-Hub-Secret")); return; }
             handle_hub(client, r);
             return;
         }
+        // /r/<token>/... - the token pulled out of the path first, so it can be compared in
+        // constant time instead of as a path prefix.
         const std::string prefix = "/r/" + token;
-        if (token.empty() || r.path.compare(0, prefix.size(), prefix) != 0 ||
-            (r.path.size() > prefix.size() && r.path[prefix.size()] != '/') ||
-            (!phone && !peer.is_loopback())) {
+        std::string       rest;
+        bool              token_ok = false;
+        if (r.path.compare(0, 3, "/r/") == 0) {
+            const size_t slash = r.path.find('/', 3);
+            token_ok = ct_equal(r.path.substr(3, slash == std::string::npos ? std::string::npos : slash - 3), token);
+            if (slash != std::string::npos) rest = r.path.substr(slash);
+        }
+        if (!token_ok || (!phone && !peer.is_loopback())) {
             respond(client, 404, "text/plain", "not found");
             return;
         }
-        const std::string rest = r.path.substr(prefix.size());
         if (rest.empty()) { respond(client, 302, "text/plain", "", "Location: " + prefix + "/\r\n"); return; }
         if (rest == "/" || rest == "/index.html") {
+            // A top-level page: never in anybody's frame. (The player at /stream.html deliberately
+            // carries no X-Frame-Options - this page frames it, and so does the PC's Stream tab
+            // from a different origin, which even SAMEORIGIN would block.)
             respond(client, 200, "text/html; charset=utf-8", read_file(resources_dir() + "/web/orca/stream_center.html"),
-                    "Set-Cookie: rt=" + token + "; Path=/; SameSite=Lax" + cookie_flags + "\r\n");
+                    "X-Frame-Options: DENY\r\nSet-Cookie: rt=" + token + "; Path=/; SameSite=Lax" + cookie_flags + "\r\n");
         } else if (rest == "/state") {
             // Through Tailscale Serve the phone learns who it is signed in as (shown in its top bar).
             std::string st = state_for_phone();
@@ -1887,8 +2201,11 @@ bool HubServer::start()
     m_secret = random_hex(16);
     m_state  = read_file(streams_json_path());
 
+    gc_uploads(); // whatever last time left behind, before anything new lands
     start_go2rtc();
     BambuCamRelay::get().port();
+    // The control plane first: register_streams() points go2rtc at /relay/h264 on the admin port.
+    if (!bind_admin()) return false;
     if (!bind(m_phone)) return false;
     write_hub_json();
     register_streams();
@@ -1933,6 +2250,7 @@ void HubServer::shutdown()
         fs::remove(hub_json_path(), ig);
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_acceptor) m_acceptor->close(ig);
+        if (m_admin_acceptor) m_admin_acceptor->close(ig);
     }
 #ifndef _WIN32
     if (m_go2rtc_pid > 0) ::kill((pid_t) m_go2rtc_pid, SIGTERM);
@@ -2028,7 +2346,8 @@ public:
 private:
     void open_page()
     {
-        wxLaunchDefaultBrowser(wxString::Format("http://127.0.0.1:%d/hub/", m_server.snapshot().port));
+        // The hub page lives on the control plane, not on the listener a tunnel can front.
+        wxLaunchDefaultBrowser(wxString::Format("http://127.0.0.1:%d/hub/", m_server.snapshot().admin_port));
     }
 
     HubServer&            m_server;
@@ -2168,15 +2487,21 @@ static Info parse_info(const std::string& body)
     return i;
 }
 
-struct HubFile { int port { 0 }; std::string secret; };
+// admin_port is where /hub/* answers (the loopback-only control plane); port is the listener the
+// phone and any tunnel use. Everything below talks to the control plane.
+struct HubFile { int port { 0 }; int admin_port { 0 }; std::string secret; };
 static HubFile hub_file()
 {
     HubFile h;
     try {
         json j = json::parse(read_file(hub_json_path()));
         if (!pid_alive(j.value("pid", 0L))) return h;
-        h.port   = j.value("port", 0);
-        h.secret = j.value("secret", "");
+        h.port       = j.value("port", 0);
+        h.admin_port = j.value("admin_port", 0);
+        h.secret     = j.value("secret", "");
+        // A hub from before the split served /hub/* on its one listener; talking to it there is
+        // what lets ensure_running() shut it down and put this build's hub in its place.
+        if (h.admin_port == 0) h.admin_port = h.port;
     } catch (...) {}
     return h;
 }
@@ -2184,9 +2509,9 @@ static HubFile hub_file()
 static Info hub_call(const std::string& method, const std::string& path, const std::string& body, long timeout)
 {
     const HubFile hf = hub_file();
-    if (hf.port == 0) return Info();
+    if (hf.admin_port == 0) return Info();
     Info        out;
-    std::string url = "http://127.0.0.1:" + std::to_string(hf.port) + path;
+    std::string url = "http://127.0.0.1:" + std::to_string(hf.admin_port) + path;
     Http        http = method == "POST" ? Http::post(url) : Http::get(url);
     if (method == "POST") http.set_post_body(body).header("Content-Type", body.empty() ? "text/plain" : "application/json");
     http.header("X-Hub-Secret", hf.secret);
@@ -2201,10 +2526,10 @@ Info query() { return hub_call("GET", "/hub/info", "", 3); }
 std::pair<int, std::string> onvif_discover()
 {
     const HubFile hf = hub_file();
-    if (hf.port == 0) return { 503, "the hub is not running" };
+    if (hf.admin_port == 0) return { 503, "the hub is not running" };
     int         status = 0;
     std::string body;
-    Http::get("http://127.0.0.1:" + std::to_string(hf.port) + "/hub/onvif")
+    Http::get("http://127.0.0.1:" + std::to_string(hf.admin_port) + "/hub/onvif")
         .header("X-Hub-Secret", hf.secret)
         .timeout_connect(1).timeout_max(20)
         .on_complete([&](std::string b, unsigned s) { status = (int) s; body = b; })
@@ -2227,9 +2552,9 @@ bool post_state(const std::string& state_json)
         s_last_state = state_json;
     }
     const HubFile hf = hub_file();
-    if (hf.port == 0) return false;
+    if (hf.admin_port == 0) return false;
     bool ok = false;
-    Http::post("http://127.0.0.1:" + std::to_string(hf.port) + "/hub/state")
+    Http::post("http://127.0.0.1:" + std::to_string(hf.admin_port) + "/hub/state")
         .timeout_connect(1).timeout_max(5)
         .header("Content-Type", "application/json")
         .header("X-Hub-Secret", hf.secret)
