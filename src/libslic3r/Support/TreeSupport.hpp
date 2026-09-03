@@ -115,7 +115,12 @@ struct SupportNode
      * \brief The position of this node on the layer.
      */
     Point          position;
-    Point          movement; // movement towards neighbor center or outline
+    // Both of these are only ever assigned for a node that has a parent (or, for skin_direction,
+    // for a sharp-tail contact node), yet they are read for every node - movement when the branch
+    // is drawn, skin_direction when a sharp tail decides which way to lean. Eigen leaves a Point
+    // uninitialised, so a contact node used to carry whatever the heap held, and classic tree
+    // support came out different from one slice of a project to the next.
+    Point          movement{0, 0}; // movement towards neighbor center or outline
     mutable double radius          = 0.0;
     mutable double max_move_dist   = 0.0;
     TreeNodeType   type            = eCircle;
@@ -132,7 +137,7 @@ struct SupportNode
      * This determines in which direction we should reduce the width of the
      * branch.
      */
-    Point skin_direction;
+    Point skin_direction{0, 0};
 
     /*!
      * \brief The number of support roof layers below this one.

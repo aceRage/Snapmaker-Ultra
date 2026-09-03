@@ -2017,7 +2017,18 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     if (print_regions_reshuffled) {
         // Update Print::m_print_regions from objects.
-        struct cmp { bool operator() (const PrintRegion *l, const PrintRegion *r) const { return l->config_hash() == r->config_hash() && l->config() == r->config(); } };
+        // A std::set comparator has to be a strict weak ordering. The old predicate returned
+        // "l equals r", which leaves the red-black tree free to do anything at all. Order by the
+        // config hash instead - the hash is the config's identity here, so regions that hash the
+        // same are the equivalent ones. (Nothing is ever inserted into this set today, so the
+        // lookup below always misses and every region keeps its own id; see the design note.)
+        struct cmp {
+            bool operator() (const PrintRegion *l, const PrintRegion *r) const {
+                if (l->config_hash() != r->config_hash())
+                    return l->config_hash() < r->config_hash();
+                return false;
+            }
+        };
         std::set<const PrintRegion*, cmp> region_set;
         m_print_regions.clear();
         PrintObjectRegions *print_object_regions = nullptr;

@@ -253,6 +253,7 @@ public:
     bool is_BBL_Printer();
 
     // SoftFever
+    static void assign_object_and_instance_ids(Print& print);
     std::string set_object_info(Print* print);
 
     // append full config to the given string

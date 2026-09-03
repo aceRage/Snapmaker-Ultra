@@ -43,54 +43,63 @@ auto MinimumSpanningTree::prim(std::vector<Point> vertices) const -> AdjacencyGr
     result.reserve(vertices.size());
     std::vector<Point> vertices_list(vertices.begin(), vertices.end());
 
-    std::unordered_map<const Point*, coordf_t> smallest_distance;    //The shortest distance to the current tree.
-    std::unordered_map<const Point*, const Point*> smallest_distance_to; //Which point the shortest distance goes towards.
-    smallest_distance.reserve(vertices_list.size());
-    smallest_distance_to.reserve(vertices_list.size());
-    for (size_t vertex_index = 1; vertex_index < vertices_list.size(); vertex_index++)
+    // The candidate set used to be two std::unordered_maps keyed by `const Point*`, and the vertex
+    // to add next was picked with std::min_element over one of them. An unordered_map keyed by a
+    // pointer iterates in the hash order of heap addresses, so every tie in the distance - and
+    // ties are the normal case for support points sitting on a grid - was broken by where the
+    // vertices happened to be allocated. That is why classic tree support put its branches in
+    // different places from one slice of a project to the next, on the same binary and the same
+    // input. Keep the candidates in index order instead: a tie now goes to the lowest index, which
+    // is a property of the input alone.
+    const size_t          n = vertices_list.size();
+    std::vector<coordf_t> smallest_distance(n, 0.);    //The shortest distance to the current tree.
+    std::vector<size_t>   smallest_distance_to(n, 0);  //Which vertex the shortest distance goes towards.
+    std::vector<char>     is_candidate(n, 0);          //Whether the vertex is still outside the tree.
+    for (size_t vertex_index = 1; vertex_index < n; vertex_index++)
     {
-        const auto& vert = vertices_list[vertex_index];
-        smallest_distance[&vert] = vsize2_with_unscale(vert - vertices_list[0]);
-        smallest_distance_to[&vert] = &vertices_list[0];
+        smallest_distance[vertex_index]    = vsize2_with_unscale(vertices_list[vertex_index] - vertices_list[0]);
+        smallest_distance_to[vertex_index] = 0;
+        is_candidate[vertex_index]         = 1;
     }
 
-    while (result.size() < vertices_list.size()) //All of the vertices need to be in the tree at the end.
+    while (result.size() < n) //All of the vertices need to be in the tree at the end.
     {
         //Choose the closest vertex to connect to that is not yet in the tree.
         //This search is O(V) right now, which can be made down to O(log(V)). This reduces the overall time complexity from O(V*V) to O(V*log(E)).
         //However that requires an implementation of a heap that supports the decreaseKey operation, which is not in the std library.
         //TODO: Implement this?
-        using MapValue = std::pair<const Point*, coordf_t>;
-        const auto closest = std::min_element(smallest_distance.begin(), smallest_distance.end(),
-                                              [](const MapValue& a, const MapValue& b) {
-                                                  return a.second < b.second;
-                                              });
+        size_t closest_index = size_t(-1);
+        for (size_t i = 0; i < n; i++)
+            if (is_candidate[i] && (closest_index == size_t(-1) || smallest_distance[i] < smallest_distance[closest_index]))
+                closest_index = i;
+        if (closest_index == size_t(-1))
+            break; //Duplicate vertices can leave the tree smaller than the input; do not spin.
 
         //Add this point to the graph and remove it from the candidates.
-        const Point* closest_point = closest->first;
-        const Point other_end = *smallest_distance_to[closest_point];
-        if (result.find(*closest_point) == result.end())
+        const Point closest_point = vertices_list[closest_index];
+        const Point other_end     = vertices_list[smallest_distance_to[closest_index]];
+        if (result.find(closest_point) == result.end())
         {
-            result[*closest_point] = std::vector<Edge>();
+            result[closest_point] = std::vector<Edge>();
         }
-        result[*closest_point].push_back({*closest_point, other_end});
+        result[closest_point].push_back({closest_point, other_end});
         if (result.find(other_end) == result.end())
         {
             result[other_end] = std::vector<Edge>();
         }
-        result[other_end].push_back({other_end, *closest_point});
-        smallest_distance.erase(closest_point); //Remove it so we don't check for these points again.
-        smallest_distance_to.erase(closest_point);
+        result[other_end].push_back({other_end, closest_point});
+        is_candidate[closest_index] = 0; //Remove it so we don't check for this point again.
 
         //Update the distances of all points that are not in the graph.
-        for (std::pair<const Point*, coordf_t> point_and_distance : smallest_distance)
+        for (size_t i = 0; i < n; i++)
         {
-            const coordf_t new_distance = vsize2_with_unscale(*closest_point - *point_and_distance.first);
-            const coordf_t old_distance = point_and_distance.second;
-            if (new_distance < old_distance) //New point is closer.
+            if (!is_candidate[i])
+                continue;
+            const coordf_t new_distance = vsize2_with_unscale(closest_point - vertices_list[i]);
+            if (new_distance < smallest_distance[i]) //New point is closer.
             {
-                smallest_distance[point_and_distance.first] = new_distance;
-                smallest_distance_to[point_and_distance.first] = closest_point;
+                smallest_distance[i]    = new_distance;
+                smallest_distance_to[i] = closest_index;
             }
         }
     }

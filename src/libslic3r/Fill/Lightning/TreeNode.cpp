@@ -362,7 +362,14 @@ void Node::convertToPolylines(size_t long_line_idx, Polylines &output) const
         output[long_line_idx].points.push_back(m_p);
         return;
     }
-    size_t first_child_idx = rand() % m_children.size();
+    // rand() made the order of a lightning tree's polylines depend on how many times the C
+    // runtime's per-thread generator had already been used, so the same project sliced twice - or
+    // sliced on a different number of cores - produced different lightning infill. Pick the
+    // starting child from the node's own position instead: it still spreads the starts around the
+    // tree, but it is a function of the geometry alone.
+    const uint64_t node_mix = uint64_t(int64_t(m_p.x())) * 73856093ull ^
+                              uint64_t(int64_t(m_p.y())) * 19349663ull;
+    size_t first_child_idx = size_t(node_mix % uint64_t(m_children.size()));
     m_children[first_child_idx]->convertToPolylines(long_line_idx, output);
     output[long_line_idx].points.push_back(m_p);
 

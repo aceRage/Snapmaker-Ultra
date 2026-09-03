@@ -3224,8 +3224,12 @@ void TreeSupport::generate_contact_points()
         }
     }
 
-    int      nonempty_layers = 0;
-    tbb::concurrent_vector<Slic3r::Vec3f> all_nodes;
+    // One bucket per layer rather than one shared concurrent_vector. The node positions are
+    // summed into floats below to fit a line through them, and float addition is not associative,
+    // so the orientation the whole tree support is built around used to depend on the order the
+    // worker threads happened to append in. nonempty_layers was incremented from every worker on
+    // a plain int as well, which is a data race on top of that; count it afterwards instead.
+    std::vector<std::vector<Slic3r::Vec3f>> nodes_by_layer(m_object->layers().size());
     tbb::parallel_for(tbb::blocked_range<size_t>(1, m_object->layers().size()), [&](const tbb::blocked_range<size_t>& range) {
         for (size_t layer_nr = range.begin(); layer_nr < range.end(); layer_nr++) {
             if (m_object->print()->canceled())
@@ -3344,8 +3348,7 @@ void TreeSupport::generate_contact_points()
                 if (node)
                     node->skin_direction = pt_and_normal.second;
             }
-            if (!curr_nodes.empty()) nonempty_layers++;
-            for (auto node : curr_nodes) { all_nodes.emplace_back(node->position(0), node->position(1), scale_(node->print_z)); }
+            for (auto node : curr_nodes) { nodes_by_layer[layer_nr].emplace_back(node->position(0), node->position(1), scale_(node->print_z)); }
 #ifdef SUPPORT_TREE_DEBUG_TO_SVG
             if (!curr_nodes.empty())
             draw_contours_and_nodes_to_svg(debug_out_path("init_contact_points_%.2f.svg", bottom_z), layer->loverhangs,layer->lslices_extrudable, m_ts_data->m_layer_outlines_below[layer_nr],
@@ -3355,6 +3358,14 @@ void TreeSupport::generate_contact_points()
     ); // end tbb::parallel_for
 
 
+
+    std::vector<Slic3r::Vec3f> all_nodes;
+    int      nonempty_layers = 0;
+    for (const std::vector<Slic3r::Vec3f> &layer_nodes : nodes_by_layer) {
+        if (!layer_nodes.empty())
+            ++nonempty_layers;
+        all_nodes.insert(all_nodes.end(), layer_nodes.begin(), layer_nodes.end());
+    }
 
     int nNodes = all_nodes.size();
     avg_node_per_layer = nodes_angle = 0;
