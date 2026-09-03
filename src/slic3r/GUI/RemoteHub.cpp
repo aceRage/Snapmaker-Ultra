@@ -1775,7 +1775,10 @@ bool HubServer::login_allowed(const std::string& login)
 
 long HubServer::spawn_slicer(const std::string& file, bool hidden)
 {
-    std::vector<std::string> args = { current_exe() };
+    // The child must live on this hub's data dir: without --datadir it starts on the default one,
+    // registers with (or starts) the hub over there, and this hub never lists it. Only a hub on a
+    // custom --datadir (tests, a second profile) ever noticed, since the two coincide otherwise.
+    std::vector<std::string> args = { current_exe(), "--datadir", data_dir() };
     if (!file.empty()) args.push_back(file);
     std::vector<std::pair<std::string, std::string>> env { { "SNORCA_NEW_INSTANCE", "1" } };
     env.emplace_back("SNORCA_HIDDEN", hidden ? "1" : "0"); // explicit either way
