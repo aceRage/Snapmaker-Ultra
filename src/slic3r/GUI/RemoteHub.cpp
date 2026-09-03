@@ -83,6 +83,7 @@ std::string uploads_dir()   { return (fs::path(hub_dir()) / "uploads").string();
 std::string saves_dir()     { return (fs::path(hub_dir()) / "saves").string(); }
 static std::string hub_json_path()     { return (fs::path(hub_dir()) / "hub.json").string(); }
 static std::string streams_json_path() { return (fs::path(hub_dir()) / "streams.json").string(); }
+static std::string settings_json_path() { return (fs::path(hub_dir()) / "settings.json").string(); } // survives a hub quit (hub.json does not)
 
 static void ensure_dirs()
 {
@@ -1096,6 +1097,10 @@ void HubServer::write_hub_json()
         j["allowed_logins"] = m_allowed_logins;
     }
     write_file(hub_json_path(), j.dump(2));
+    json st;
+    st["remote_on"]      = j["remote_on"];
+    st["allowed_logins"] = j["allowed_logins"];
+    write_file(settings_json_path(), st.dump(2));
 }
 
 bool HubServer::bind(bool lan)
@@ -1106,6 +1111,10 @@ bool HubServer::bind(bool lan)
     if (ec) return false;
 #ifndef _WIN32
     acceptor->set_option(tcp::acceptor::reuse_address(true), ec); // on Windows this would let two hubs share the port
+#else
+    // Otherwise a second hub (another data dir) could bind 127.0.0.1:<port> underneath our
+    // 0.0.0.0:<port> and silently take the loopback traffic.
+    acceptor->set_option(asio::detail::socket_option::boolean<SOL_SOCKET, SO_EXCLUSIVEADDRUSE>(true), ec);
 #endif
     int port = HUB_PORT;
     for (; port < HUB_PORT + 20; ++port) {
@@ -1865,6 +1874,12 @@ bool HubServer::start()
         json j = json::parse(read_file(hub_json_path()));
         if (!valid_token(m_token)) m_token = j.value("token", "");
         m_phone = m_phone || j.value("phone", false);
+    } catch (...) {}
+    // Remote access settings live in their own file: hub.json is removed on a clean quit (it
+    // is how instances find a live hub), which used to lose remote_on and the allow-list and
+    // left Tailscale Serve answering 403 until remote access was switched on again.
+    try {
+        json j      = json::parse(read_file(settings_json_path()));
         m_remote_on = j.value("remote_on", false);
         for (const auto& l : j.value("allowed_logins", json::array())) m_allowed_logins.push_back(lower(l.get<std::string>()));
     } catch (...) {}
