@@ -109,8 +109,11 @@ SCENARIO("Reading a glTF/GLB file: geometry", "[gltf]")
             const ModelVolume *a = model.objects.front()->volumes[0];
             const ModelVolume *b = model.objects.front()->volumes[1];
             REQUIRE(a->name != b->name);                       // "part" and "part_2"
-            REQUIRE(a->get_offset().x() == Approx(0.0).margin(1e-5));
-            REQUIRE(b->get_offset().x() == Approx(1.0).margin(1e-5));
+            // add_volume centres each mesh on its own bbox, so the offset is that centre - the
+            // triangle spans 0..1 in X, and the second node's translation moves it by exactly 1.
+            REQUIRE(a->get_offset().x() == Approx(0.5).margin(1e-5));
+            REQUIRE(b->get_offset().x() == Approx(1.5).margin(1e-5));
+            REQUIRE(b->get_offset().x() - a->get_offset().x() == Approx(1.0).margin(1e-5));
             REQUIRE(a->mesh().its.indices.size() == 1);
             REQUIRE(b->mesh().its.indices.size() == 1);
         }
