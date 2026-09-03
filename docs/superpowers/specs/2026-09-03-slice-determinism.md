@@ -301,3 +301,13 @@ be deterministic and is a two-line change, but it removes the only parallelism `
 - `det_bisect.py` - slice until two different outputs appear, then report the first `ORCA_DET_DUMP`
   stage whose file differs between them.
 - `make_twoobj.py` - regenerates `tests/data/support_corpus/two_objects.3mf`.
+
+## 7. Follow-up (decided 2026-09-03)
+
+Merged into the integration branch as is. The remaining multi-core case, classic tree support's
+`TreeSupport::drop_nodes()` merging nodes from two `tbb::parallel_for_each` passes in arrival order
+(section 4.1), is deliberately left for a later change of its own: the proposed fix - a parallel
+read-only phase followed by a short sequential apply phase in `nodes_vec` order - changes which node
+wins a merge and therefore tree geometry and timing, so it wants its own tests and a measurement of
+the effect on real tree-supported prints before it lands. Until then classic tree support is
+reproducible on one core only; organic tree support stays self-consistent per core count.
