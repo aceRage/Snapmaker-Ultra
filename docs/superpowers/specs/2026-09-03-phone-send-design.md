@@ -287,6 +287,30 @@ Against an instance on the isolated `dd_phone` data dir with `mock_printhost.py`
   the flags as requested (`bed_leveling=0 flow_cali=1 timelapse=0`), layer inspect on, vibration
   off, the plate's bed type and `<name>_plate_1` as preset name; no dry run reached the mock.
 
+### 5.1 The Snapmaker connect (gate `snorca_hubtest\test_phone_snapmaker.py`)
+
+Against an instance on the isolated `dd_sm` data dir (three U1s seeded from what the printers
+themselves report, `seed_sm_device.py`), all green:
+- the three routes are in the manifest and in the hub's allow-list, and nothing near them is
+  proxied (`GET …/connect`, `POST …/devices`, `…/nope`);
+- `GET /api/snapmaker/devices` lists the three printers with model, address, nozzles and `online`,
+  and carries no certificate, key or password;
+- refusals: unknown device (404), no id (400), and a device with no certificate (409 saying to
+  connect it once on the PC);
+- with a stand-in certificate in the store the device reports `can_connect` and its stored port,
+  and a connect that the printer cannot accept ends as a clean 502 with no host left behind;
+- nozzles: `choices` and `current` are listed, a switch moves `printer_variant`, the printer preset
+  and the plate's printer name, switching back restores it, and a diameter the model does not have
+  is refused (404);
+- the page: the Snapmaker section, the eye icon (with the old wording as its tooltip) and the
+  nozzle dropdown are all served. In a browser at 375×812 the Devices tab showed the three
+  printers with Connect, the eye toggled the PC window off and on (the icon and tooltip following),
+  and picking 0.6 mm moved the printer preset to "Snapmaker U1 (0.6 nozzle)".
+
+`test_phone_send.py` (31 checks) and the phase-0a security gate pass unchanged on the same build.
+What the gate cannot do is connect to a printer: the certificate for one only exists after a PC
+connect with `snapmaker_remember_keys` on (§3.3).
+
 ## 6. For the user to verify on hardware (start with upload only)
 
 1. **Bambu, upload only**: Prepare → Send → pick the printer (LAN mode) → Upload. The file should
@@ -295,10 +319,16 @@ Against an instance on the isolated `dd_phone` data dir with `mock_printhost.py`
    an H2-series printer with LAN-only mode + Developer Mode on): the print should start; the sheet
    should end with "Printing started." within ~12 s. With Developer Mode off on an H2-series
    printer, expect the refusal with the hint instead of silence.
-3. **Snapmaker U1**: connect it on the PC's Device tab first (the picker then shows "Snapmaker …
-   · connected"); Upload, then Upload & print. The print starts with the filaments as sliced (no
-   mapping page).
-4. **A classic print host** (Moonraker/Klipper via HTTP): set `print_host` in the printer preset;
+3. **Snapmaker U1, connecting from the phone**: set `snapmaker_remember_keys` to `1` in the app
+   settings, then connect the U1 once on the PC's Device tab as usual — that connect leaves its
+   certificate behind. Restart the slicer (the Device tab says "Unconnected" again), open the
+   phone's **Devices** tab: the printer is listed under *Snapmaker* as *reachable*; tap **Connect**.
+   Within a few seconds it should read *connected*, the PC's Device tab should show the same
+   printer connected, and the phone's Send picker should offer "Snapmaker …". **Disconnect** takes
+   it back down.
+4. **Snapmaker U1, sending**: with it connected (from the phone or the PC), Upload, then
+   Upload & print. The print starts with the filaments as sliced (no mapping page).
+5. **A classic print host** (Moonraker/Klipper via HTTP): set `print_host` in the printer preset;
    Upload works; Upload & print is refused for plain Moonraker (needs the PC's preprint page) and
    works for OctoPrint-style hosts.
 
