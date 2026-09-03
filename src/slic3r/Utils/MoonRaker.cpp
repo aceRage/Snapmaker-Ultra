@@ -996,6 +996,29 @@ bool Moonraker_Mqtt::set_engine(const std::shared_ptr<MqttClient>& engine, std::
     return true;
 }
 
+bool Moonraker_Mqtt::subscribe_device_topics(std::string& msg)
+{
+    if (!m_mqtt_client_tls) {
+        msg = "no engine";
+        return false;
+    }
+    m_sn_mtx.lock();
+    const std::string sn = m_sn;
+    m_sn_mtx.unlock();
+    if (sn.empty()) {
+        msg = "SN is empty, cannot subscribe to topics";
+        return false;
+    }
+    std::string no_sub_msg = "success", res_sub_msg = "success";
+    const bool  notification_subscribed = m_mqtt_client_tls->Subscribe(sn + m_notification_topic, 1, no_sub_msg);
+    const bool  response_subscribed     = m_mqtt_client_tls->Subscribe(sn + m_response_topic, 1, res_sub_msg);
+    msg = notification_subscribed && response_subscribed ? "success" : (no_sub_msg + "; " + res_sub_msg);
+    BOOST_LOG_TRIVIAL(info) << "[Moonraker_Mqtt] donated-engine subscription - notification: "
+                            << (notification_subscribed ? "success" : "failed")
+                            << ", response: " << (response_subscribed ? "success" : "failed");
+    return notification_subscribed && response_subscribed;
+}
+
 // Ask for TLS info
 bool Moonraker_Mqtt::ask_for_tls_info(const nlohmann::json& cn_params)
 {

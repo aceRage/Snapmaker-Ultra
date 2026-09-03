@@ -361,6 +361,11 @@ public:
     // set engine
     bool set_engine(const std::shared_ptr<MqttClient>& engine, std::string& msg);
 
+    // Subscribe this printer's response and notification topics on the engine in use. connect()
+    // does it itself; a caller that handed over an already-connected engine (set_engine) has to
+    // ask, or no reply to a request would ever come back.
+    bool subscribe_device_topics(std::string& msg);
+
     // Callback structure for MQTT requests
     struct RequestCallback {
         std::function<void(const nlohmann::json&)> success_cb;  // Success callback
