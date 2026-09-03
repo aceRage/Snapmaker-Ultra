@@ -17,6 +17,7 @@ namespace Slic3r {
 
 enum class ModelVolumeType : int;
 class ModelVolume;
+class ModelObject;
 
 namespace GUI {
 
@@ -53,6 +54,25 @@ struct SettingsFactory
     static std::vector<SimpleSettingData> get_visible_options(const std::string& category, const bool is_part);
     static std::map<std::string, std::vector<SimpleSettingData>> get_all_visible_options(const bool is_part);
 };
+
+// Ultra (support groups): the reads and the one write everything that touches a group goes
+// through - the Object-List submenu here and SupportGroupsDialog. A group's values live on its
+// parts (the curated part-level support keys on ModelVolume::config); support_group is the label.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2.2, 2.5, 3.4.
+std::vector<ModelVolume*> selected_part_volumes();
+std::vector<std::string>  object_support_group_names(const ModelObject* object);
+std::string               unique_support_group_name(const ModelObject* object, const std::string& base);
+// The object's own effective support values: the edited process preset plus the object's overrides.
+DynamicPrintConfig        object_support_values(const ModelObject* object);
+// The overrides an existing group carries, read off its first member.
+DynamicPrintConfig        support_group_values(const ModelObject* object, const std::string& group);
+// A saved support set resolved against the loaded filaments and reduced to the part-level keys.
+DynamicPrintConfig        support_set_values_by_name(const std::string& set_name, std::string* warning);
+// Write a group assignment onto every volume, under one undo snapshot. values == nullptr clears.
+void                      assign_support_group(const std::vector<ModelVolume*>& volumes,
+                                               const std::string&               group_name,
+                                               const DynamicPrintConfig*        values,
+                                               const std::string&               snapshot);
 
 class MenuFactory
 {

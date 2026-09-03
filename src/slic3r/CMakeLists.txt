@@ -320,6 +320,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Mouse3DController.hpp
     GUI/MsgDialog.cpp
     GUI/MsgDialog.hpp
+    GUI/SupportGroupsDialog.cpp
+    GUI/SupportGroupsDialog.hpp
     GUI/MultiMachine.cpp
     GUI/MultiMachine.hpp
     GUI/MultiMachineManagerPage.cpp

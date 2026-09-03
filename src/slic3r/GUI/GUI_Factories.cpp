@@ -22,6 +22,7 @@
 #include <boost/algorithm/string.hpp>
 #include "slic3r/GUI/Tab.hpp"
 #include "libslic3r/SupportSet.hpp"
+#include "SupportGroupsDialog.hpp"
 #include <algorithm>
 #include <iterator>
 #include "slic3r/Utils/FixModelByWin10.hpp"
@@ -1310,7 +1311,7 @@ void MenuFactory::append_menu_items_visibility(wxMenu* menu)
 // The MODEL_PART volumes behind the current object-list selection, in list order, deduplicated.
 // Re-derived inside every menu handler rather than captured, so a menu built for one selection
 // can never write to a stale volume.
-static std::vector<ModelVolume*> selected_part_volumes()
+std::vector<ModelVolume*> selected_part_volumes()
 {
     std::vector<ModelVolume*> volumes;
     wxDataViewItemArray sels;
@@ -1335,7 +1336,7 @@ static std::vector<ModelVolume*> selected_part_volumes()
 }
 
 // The distinct group labels an object's parts already use, in first-appearance order.
-static std::vector<std::string> object_support_group_names(const ModelObject* object)
+std::vector<std::string> object_support_group_names(const ModelObject* object)
 {
     std::vector<std::string> names;
     if (object == nullptr)
@@ -1349,7 +1350,7 @@ static std::vector<std::string> object_support_group_names(const ModelObject* ob
 }
 
 // "Group", "Group 2", "Group 3", ... - the first label this object does not use yet.
-static std::string unique_support_group_name(const ModelObject* object, const std::string& base)
+std::string unique_support_group_name(const ModelObject* object, const std::string& base)
 {
     const std::vector<std::string> used = object_support_group_names(object);
     auto taken = [&used](const std::string& n) {
@@ -1367,7 +1368,7 @@ static std::string unique_support_group_name(const ModelObject* object, const st
 
 // The curated support values an existing group carries, read off its first member, so a part
 // joining the group ends up with the same RESOLVED config and therefore really is in that group.
-static DynamicPrintConfig support_group_values(const ModelObject* object, const std::string& group)
+DynamicPrintConfig support_group_values(const ModelObject* object, const std::string& group)
 {
     DynamicPrintConfig values;
     if (object == nullptr)
@@ -1387,7 +1388,7 @@ static DynamicPrintConfig support_group_values(const ModelObject* object, const 
 // The object's own effective support values - the edited process preset with the object's
 // overrides on top. A brand new group starts from these, so it shows up in the part panel
 // immediately and still resolves into the default group until the user changes something.
-static DynamicPrintConfig object_support_values(const ModelObject* object)
+DynamicPrintConfig object_support_values(const ModelObject* object)
 {
     DynamicPrintConfig values;
     if (wxGetApp().preset_bundle == nullptr)
@@ -1423,13 +1424,28 @@ static DynamicPrintConfig support_set_values(const SupportSet& set, std::string*
     return values;
 }
 
+// By name, for callers that only have the group label: a group "references" the support set of
+// the same name - that IS the whole reference. There is no second config key holding a set id;
+// the plan's 3.1 allows exactly one new key, so the label carries the association and a group
+// whose set was renamed or deleted simply stops showing one.
+DynamicPrintConfig support_set_values_by_name(const std::string& set_name, std::string* warning)
+{
+    SupportSetStore& store = SupportSetStore::instance();
+    const SupportSet* set = store.find(set_name);
+    if (set == nullptr) {
+        store.reload();
+        set = store.find(set_name);
+    }
+    return set != nullptr ? support_set_values(*set, warning) : DynamicPrintConfig();
+}
+
 // Write a group assignment onto every selected part, under ONE undo snapshot, so Ctrl+Z takes
 // the badge, the part panel and PrintObject::support_groups() back together
 // (ModelConfig::set_key_value bumps the timestamp the undo stack keys on - the plan's R2.4).
-static void assign_support_group(const std::vector<ModelVolume*>& volumes,
-                                 const std::string&               group_name,
-                                 const DynamicPrintConfig*        values,
-                                 const std::string&               snapshot)
+void assign_support_group(const std::vector<ModelVolume*>& volumes,
+                          const std::string&               group_name,
+                          const DynamicPrintConfig*        values,
+                          const std::string&               snapshot)
 {
     if (volumes.empty() || plater() == nullptr)
         return;
@@ -1464,6 +1480,7 @@ static void assign_support_group(const std::vector<ModelVolume*>& volumes,
             }
     }
     obj_list()->update_support_group_badges();
+    support_groups_dialog_refresh();
     // What actually triggers the re-slice; PrintApply's model_support_group_data_changed() then
     // invalidates posSupportMaterial (or posSlice when the soluble rule flips).
     for (int obj_idx : changed_objects)
@@ -1548,6 +1565,15 @@ void MenuFactory::append_menu_items_support_group(wxMenu* menu)
             // Not translated: the label is written into the 3MF and read back on any machine.
             assign_support_group(sel, unique_support_group_name(mo, "Group"), &values,
                                  "Support group assigned");
+        }, "", nullptr, []() { return true; }, m_parent);
+
+    sub->AppendSeparator();
+    append_menu_item(sub, wxID_ANY, _L("Support groups..."),
+        _L("Open the Support groups window for this object"),
+        [](wxCommandEvent&) {
+            const std::vector<ModelVolume*> sel = selected_part_volumes();
+            if (!sel.empty())
+                open_support_groups_dialog(plater(), sel.front()->get_object());
         }, "", nullptr, []() { return true; }, m_parent);
 
     append_submenu(menu, sub, wxID_ANY, title,
@@ -1795,6 +1821,16 @@ void MenuFactory::create_extra_object_menu()
     append_menu_item_clone(&m_object_menu);
     // Ultra: per-object visibility (Normal / Ghost / Hidden)
     append_menu_items_visibility(&m_object_menu);
+    // Ultra (support groups): the per-object Support groups window. Non-modal, so it stays open
+    // while the user picks the parts a new group is made from.
+    append_menu_item(&m_object_menu, wxID_ANY, _L("Support groups..."),
+        _L("Name and edit this object's support groups"),
+        [](wxCommandEvent&) {
+            const int obj_idx = obj_list()->get_selected_obj_idx();
+            if (obj_idx >= 0)
+                open_support_groups_dialog(plater(), obj_list()->object(obj_idx));
+        }, "", &m_object_menu,
+        []() { return obj_list()->get_selected_obj_idx() >= 0; }, m_parent);
     // Object Repair
     append_menu_item_fix_through_netfabb(&m_object_menu);
     // Object Simplify

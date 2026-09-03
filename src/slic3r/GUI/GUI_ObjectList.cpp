@@ -2,6 +2,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "GUI_ObjectList.hpp"
 #include "GUI_Factories.hpp"
+#include "SupportGroupsDialog.hpp"
 //#include "GUI_ObjectLayers.hpp"
 #include "GUI_App.hpp"
 #include "I18N.hpp"
@@ -785,6 +786,11 @@ void ObjectList::object_config_options_changed(const ObjectVolumeID& ov_id)
 {
     if (ov_id.object == nullptr)
         return;
+
+    // Ultra (support groups): the single funnel every per-object/per-part config change goes
+    // through - the part parameter panel included - so the Support groups window learns about an
+    // edit made outside it without polling. No-op when the window is closed.
+    support_groups_dialog_refresh();
 
     ModelObjectPtrs& objects = wxGetApp().model().objects;
     ModelObject* mo = ov_id.object;
