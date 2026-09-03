@@ -13,6 +13,14 @@ resolver reasons over.
 
 Regenerating is deterministic - byte-identical output for the same source - so the committed
 fixtures can be checked against a fresh run.
+
+twopart_groups.3mf is NOT written here, and cannot be. A support group lives in a volume's
+ModelConfig, and a 3MF keeps that in Metadata/model_settings.config keyed on the ids the exporter
+assigned - which this script has no way to know. make_group_fixture.py builds it instead, by
+asking the slicer for a project (--export-3mf on twopart_bridge.3mf, which imports as ONE object
+with three MODEL_PART volumes), injecting the group metadata into that project, and re-exporting
+it to prove the application reads the group back.
+
 """
 import os
 import sys

@@ -118,6 +118,22 @@
       ]
     },
     {
+      "name": "group_parts",
+      "comment": "A project whose parts carry support_group and part-level support keys, and which the SLICER ITSELF produced - see make_group_fixture.py. Stage 2's generator ignores those keys, so this case must come out exactly like the baseline, a build that does not even know support_group and drops it on load. That is the whole off-mode claim, measured. It deliberately carries no support_top_z_distance: that one ACTS in Stage 2 through the soluble rule, and a case carrying it would rightly differ.",
+      "models": [
+        "tests/data/support_corpus/twopart_groups.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=normal(auto)",
+        "--support-style=grid"
+      ],
+      "filaments": [
+        "Generic PLA",
+        "Generic PLA"
+      ]
+    },
+    {
       "name": "tree_organic",
       "models": [
         "tests/data/support_corpus/twopart_bridge.3mf"
