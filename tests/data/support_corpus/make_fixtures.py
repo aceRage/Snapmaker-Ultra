@@ -90,16 +90,21 @@ def write_3mf(path, parts, assembly_id=100):
 
 
 def main():
-    # Two side-by-side slabs floating 4 mm above the bed on nothing at all, so the support
-    # generator has to build a column under each. That is the fixture the plan's Stage 3 gate
-    # measures per part ("interface length above part B grows, above part A does not").
-    a_v, a_t = box(-16, -8, 4, 14, 16, 3)
-    b_v, b_t = box(2, -8, 4, 14, 16, 3)
+    # A single pillar carrying a two-piece deck. Everything is one connected solid resting on the
+    # bed, so each layer has ONE island - two disconnected islands made the print order (and with
+    # it whole blocks of G-code) vary between two runs of the same binary. The deck overhangs the
+    # pillar on both sides by different amounts, which both breaks ties and gives each half its own
+    # support region: the A/B shape the plan's Stage 3 gate measures.
+    pillar_v, pillar_t = box(-4, -8, 0, 8, 16, 10)
+    deck_a_v, deck_a_t = box(-20, -8, 10, 20, 16, 2)
+    deck_b_v, deck_b_t = box(0, -8, 10, 14, 16, 2)
     write_3mf(os.path.join(HERE, "twopart_bridge.3mf"),
-              [("partA", a_v, a_t), ("partB", b_v, b_t)])
+              [("pillar", pillar_v, pillar_t),
+               ("partA", deck_a_v, deck_a_t),
+               ("partB", deck_b_v, deck_b_t)])
 
-    # One part with a long unsupported overhang plus a stubby pillar under one end: normal
-    # supports have to bridge, and there is a real contact/base split to keep identical.
+    # A stubby leg under one end of a long ledge: a single overhang region, two volumes, and the
+    # simplest thing that still exercises contact / base / interface generation.
     p_v, p_t = box(-15, -6, 0, 6, 12, 6)
     o_v, o_t = box(-15, -6, 6, 30, 12, 2)
     write_3mf(os.path.join(HERE, "overhang_ledge.3mf"),
