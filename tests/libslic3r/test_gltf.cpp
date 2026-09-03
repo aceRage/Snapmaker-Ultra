@@ -496,6 +496,46 @@ SCENARIO("glTF material colours become per-part filaments", "[gltf]")
         }
     }
 
+    GIVEN("a three-material GLB and a dialog that answers 2, 3 and 4")
+    {
+        ColorDialogStub stub;
+        stub.answer = {2, 3, 4};
+        stub.first  = 2;
+        Slic3r::Model model = read_gltf_with_colors("three_materials.glb", stub);
+        THEN("the dialog is opened once and the three parts take the three filaments")
+        {
+            REQUIRE(stub.called);
+            REQUIRE(stub.seen.size() == 3);
+            const ModelObject *obj = model.objects.front();
+            REQUIRE(obj->volumes.size() == 3);
+            REQUIRE(obj->volumes[0]->config.extruder() == 2);
+            REQUIRE(obj->volumes[1]->config.extruder() == 3);
+            REQUIRE(obj->volumes[2]->config.extruder() == 4);
+            for (const ModelVolume *v : obj->volumes)
+                REQUIRE(v->is_mm_painted() == false);
+        }
+    }
+
+    GIVEN("a three-material GLB and a dialog the user cancelled")
+    {
+        // What a hidden instance sees: the modal hook answers the dialog without showing it, and
+        // Plater clears filament_ids on anything but OK. The import must still succeed, in colour
+        // or not - it must never fail or hang.
+        ColorDialogStub stub;   // answer left empty, i.e. cancelled
+        stub.first = 1;
+        Slic3r::Model model = read_gltf_with_colors("three_materials.glb", stub);
+        THEN("the geometry still imports, simply without colour")
+        {
+            REQUIRE(stub.called);
+            REQUIRE(model.objects.size() == 1);
+            REQUIRE(model.objects.front()->volumes.size() == 3);
+            for (const ModelVolume *v : model.objects.front()->volumes) {
+                REQUIRE(v->is_mm_painted() == false);
+                REQUIRE(v->config.has("extruder") == false);
+            }
+        }
+    }
+
     GIVEN("a single-material GLB")
     {
         ColorDialogStub stub;

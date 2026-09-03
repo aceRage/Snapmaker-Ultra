@@ -248,6 +248,44 @@ def make_two_parts_two_materials():
     write_glb("two_parts_two_materials.glb", gltf, bytes(blob.data))
 
 
+def make_three_materials():
+    """One mesh, three primitives, three materials - red, green, blue.
+
+    Used for the colour dialog: three swatches, three parts, three filaments. Also the fixture for
+    the hidden-instance check, where the modal hook has to answer the dialog rather than let a
+    phone-initiated import block forever on a window nobody can see.
+    """
+    boxes = [box_mesh(x, 0, 0, x + 10, 10, 10) for x in (0, 12, 24)]
+    colors = [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]]
+    names = ["red", "green", "blue"]
+    blob = Blob()
+    accessors, primitives = [], []
+    for i, (pos, nrm, idx) in enumerate(boxes):
+        v_p, v_n, v_i = blob.add_floats(pos), blob.add_floats(nrm), blob.add_ushorts(idx)
+        lo, hi = bounds(pos)
+        base = len(accessors)
+        accessors += [
+            {"bufferView": v_p, "componentType": FLOAT, "count": len(pos) // 3, "type": "VEC3",
+             "min": lo, "max": hi},
+            {"bufferView": v_n, "componentType": FLOAT, "count": len(nrm) // 3, "type": "VEC3"},
+            {"bufferView": v_i, "componentType": UNSIGNED_SHORT, "count": len(idx), "type": "SCALAR"},
+        ]
+        primitives.append({"attributes": {"POSITION": base, "NORMAL": base + 1},
+                           "indices": base + 2, "material": i, "mode": MODE_TRIANGLES})
+    gltf = {
+        "asset": {"version": "2.0", "generator": "Snapmaker Orca test fixture"},
+        "scene": 0,
+        "scenes": [{"nodes": [0], "name": "traffic light"}],
+        "nodes": [{"mesh": 0, "name": "lamps"}],
+        "meshes": [{"name": "lamps", "primitives": primitives}],
+        "materials": [{"name": n, "pbrMetallicRoughness": {"baseColorFactor": c}}
+                      for n, c in zip(names, colors)],
+        "accessors": accessors,
+        "bufferViews": blob.views,
+    }
+    write_glb("three_materials.glb", gltf, bytes(blob.data))
+
+
 def make_nested_trs():
     """parent: translate (5,0,0) then rotate +90 deg about Y; child: translate (1,0,0), scale 2;
     mesh: a 1 x 2 x 4 box centred on the child origin.
@@ -497,6 +535,7 @@ def main():
     make_box_stl_twin()
     make_box_meters()
     make_two_parts_two_materials()
+    make_three_materials()
     make_nested_trs()
     make_strip_and_fan()
     make_textured_two_materials()
