@@ -1344,3 +1344,142 @@ through its loopback API rather than the GUI:
 0.2158605 → 0.5). The `Model.cpp` glTF branch has a comment marking where the `objFn` colour path
 hooks in. Nothing in Stage 1 writes `mmu_segmentation_facets`, and a test asserts
 `is_mm_painted() == false` after a `COLOR_0` import, so Stage 2's first change is visible.
+
+---
+
+## Stage 2 status
+
+Done, on branch `feat/glb-import-stage2` (from `feat/glb-import-stage1`), built and verified in the
+`C:\Dev\SnapmakerOrcaNext` worktree on 2026-09-03. All of Stage 2 shipped.
+
+### What shipped
+
+| Plan item | File | Note |
+|---|---|---|
+| 2.1 | `src/libslic3r/Format/GLTF.cpp` | **already done in Stage 1** — `material_colors` (deduplicated, sRGB), `parts[i].material_index`, `vertex_colors`, `is_single_material`, `had_textures`. Re-verified, no change needed |
+| 2.2 | `src/libslic3r/Model.{hpp,cpp}` | `paint_volume_from_vertex_colors()` extracted; `import_volume_color_deal` and `import_multi_volume_vertex_color_deal` added |
+| 2.3 | `src/libslic3r/Model.cpp` | the `objFn` hook in the glTF branch, with the `> 1` material guard and the `had_textures` skip |
+| 2.4 | `src/slic3r/GUI/Plater.cpp` | both `.obj` guards widened to `.obj\|.glb\|.gltf`, kept as a positive extension list |
+| 2.5 | `src/libslic3r/Model.{hpp,cpp}`, `Plater.cpp` | the dropped-texture warning, via a new optional out-parameter (see deviation 1) |
+| tests | `tests/libslic3r/test_gltf.cpp` | 5 new scenarios, 415 `[gltf]` assertions; 2 tagged `[golden]` |
+| fixtures | `tests/data/test_gltf/` | `three_materials.glb`, `textured_two_materials.glb` |
+
+`ObjColorDialog` and `ObjImportColorFn` were reused verbatim — no new callback type, no change to the
+dialog. `obj_import_face_color_deal` was not touched at all.
+
+### Deviations from the plan
+
+1. **`Model::read_from_file` gained an optional trailing `std::string *import_warning = nullptr`.**
+   Change 2.5 says to carry the dropped-texture sentence "through the `message` warning from 3.8"
+   and push it from the Plater — but `read_from_file` reads `message` **only on failure**
+   (`Model.cpp`, the `if (!result)` tail), so on a successful load the sentence had nowhere to go.
+   A defaulted trailing parameter leaves every existing call site untouched and gives the Plater a
+   real channel. The glTF branch moves the sentence out of `message` and clears it, so `message`
+   only ever holds an actual error from that point on.
+2. **A failed colour step now gets its own message.** The plan's snippet assigns
+   `result = Model::import_volume_color_deal(...)`, mirroring OBJ — but a `false` there with an
+   empty `message` would surface as the generic "Loading of a model file failed.", which Stage 1
+   went to some trouble to avoid. The branch adds *"The colours in this glTF file could not be
+   applied to the model."* for that case.
+3. **Experiment 5.3 became a permanent test, not a scratch build.** `QuantKMeans` lives in
+   `src/libslic3r/ObjColorUtils.hpp` and `libslic3r_tests` already links OpenCV, so the experiment
+   is now two scenarios in the suite. Findings below.
+4. **The dead `calc_tri_area` lambda moved across with the rest of the body.** It is provably
+   unreferenced (one declaration, no uses), but leaving it in keeps the transplant a pure move,
+   which is the whole point of doing 2.2 this way. Worth deleting in a separate tidy-up.
+5. **Two extra scenarios beyond the plan's four**: a three-material GLB through the full dialog
+   path, and the same file with a *cancelled* dialog — which is what a hidden instance actually
+   sees (finding 3).
+
+### Gate output
+
+**Automated** — `build/tests/libslic3r/Release/libslic3r_tests.exe "[gltf]"`:
+
+```
+All tests passed (415 assertions in 9 test cases)
+```
+
+Full suite, guarding the "must not change" list:
+
+```
+test cases:   593 |   591 passed | 2 failed as expected
+assertions: 53027 | 53025 passed | 2 failed as expected
+```
+
+The plan's four gate items, plus what was added:
+
+1. `two_parts_two_materials.glb` + a stub returning `{2, 3}` with `first_extruder_id = 2` → volume 0
+   `config.extruder() == 2`, volume 1 `== 3`, and **neither volume `is_mm_painted()`**. The stub also
+   asserts the dialog saw exactly **2** colours — one per material, not one per triangle.
+2. `BoxVertexColors.glb` + a per-vertex stub → `is_mm_painted()` true, the dialog saw exactly one
+   colour per surviving vertex, and the volume's extruder is the first id.
+3. A vertex-colour array one entry short → `import_multi_volume_vertex_color_deal` returns false and
+   **neither** volume is painted; the correct length paints both.
+4. **Golden regression.** Two `[golden]` scenarios pin the exact 3MF/AMF serialisation
+   (`FacetsAnnotation::get_triangle_as_string`) that `obj_import_vertex_color_deal` and
+   `obj_import_face_color_deal` produce for a cube. The vertex fixture's ids
+   (`{2,2,2,3,3,4,2,3}`) make the twelve faces cover all three branches of the moved code —
+   `_3_SAME_COLOR`, `_3_DIFF_COLOR` and `_2_SAME_1_DIFF_COLOR`, the last two including the
+   split-triangle encodings. Note what backs the *"unchanged"* claim: a scripted comparison against
+   `git show HEAD:src/libslic3r/Model.cpp` showed **105 of 105 body lines identical** apart from
+   three intended rebinds, so the move is provably pure; the golden strings guard from here on.
+5. Single-material GLB → the dialog is never opened.
+6. Textured two-material GLB → the dialog is never opened *and* a warning is returned. This file has
+   two materials on purpose, so without the `had_textures` guard it would open the dialog — the test
+   really tests the guard.
+7. A part with no material at all (`strip_and_fan.glb`) → no dialog.
+8. Three-material GLB → three parts on filaments 2, 3 and 4, none painted.
+9. Three-material GLB with a cancelled dialog → geometry still imports, no colour, no failure.
+
+**Manual, on the isolated `dd_next` data dir** (never the user's real one), through the hub's phone
+route:
+
+* A **hidden** instance, 3-material GLB via `POST /r/<token>/i/<pid>/open?mode=import`:
+  **`{"objects":1}`, HTTP 200, in 1 second** — no hang. The plate then holds one object named
+  `traffic light` (the glTF scene name) of size `[34, 10, 10]`, which is the three 10 mm boxes at
+  x 0/12/24 after the axis swap. `needs_attention` stayed false, and the log shows
+  `hidden-mode dialog answered ok: wxDialog "Obj file Import color"`.
+* The textured GLB into the same hidden instance: imported, and **no second dialog** was answered —
+  the `had_textures` guard held in the real app, not just in the test.
+
+### Findings
+
+1. **`read_from_file` cannot report a warning on success.** See deviation 1. The new
+   `import_warning` out-parameter is the general fix; STL and OBJ could use it too.
+2. **`QuantKMeans` is safe for 1–30 colours** (experiment 5.3, now a test). With automatic cluster
+   selection it returns one label per colour and between 1 and n clusters; with an explicit count it
+   never asks OpenCV for more clusters than it has samples, because
+   `more_than_request()` fails and `compute_num_colors()` clamps to the distinct-colour count. And
+   `deal_default_strategy()` **cannot** divide by zero: it early-returns on an empty filament list,
+   and `deal_approximate_match_btn()` guards both `m_result_icon_list.size() == 0` and
+   `map_count < 1` before indexing. There is no division in that path at all.
+3. **On a hidden instance the modal hook answers `ObjColorDialog` with OK, not cancel — and OK
+   silently means cancel.** The plan predicted cancel. What actually happens is more interesting:
+   `default_answer()` finds a real `wxID_OK` child button and the phone path runs in `Request` mode,
+   so the hook returns `wxID_OK`. But the hook returns it *from `ShowModal()` without dispatching any
+   button event*, and `ObjColorDialog` only calls `update_filament_ids()` inside its OK **click
+   handler** — so the caller's `filament_ids` is never written and stays empty. The Plater's
+   `if (ShowModal() != wxID_OK) filament_ids.clear();` then does nothing, because it *was* OK.
+   The outcome is exactly what the plan wanted (imports without colour, never hangs), but by a
+   different route, and the guard that makes it safe is the
+   `material_filament_ids.size() == material_colors.size()` check in the dispatch — that check is
+   load-bearing, not decorative. **Any future dialog whose OK handler does the real work has the
+   same trap**, and a `ClassRule` entry for `ObjColorDialog` answering `wxID_CANCEL` would make the
+   intent explicit rather than accidental. Left alone here because the behaviour is correct and the
+   hidden-mode rules are another plan's territory.
+4. **A single-material glTF opens no dialog**, which is stricter than OBJ (which always asks). This
+   is the answer to research §5.4.3 and it is deliberate: with one material there is nothing to
+   choose, and the normal filament picker still works.
+
+### What Stage 3 inherits
+
+* `paint_volume_from_vertex_colors()` is the shared per-volume painter; Stage 3d's
+  `import_multi_volume_face_color_deal` should be built the same way — refactor the loop body of
+  `Model::obj_import_face_color_deal` into a file-static and leave the OBJ entry point untouched.
+  That function is still **completely unmodified** by Stage 2, and its golden test is already in
+  place to prove the next refactor is also pure.
+* `GltfInfo::had_textures` is set and now reaches the user; when Stage 3d starts sampling textures it
+  should stop setting the flag (or the notification will contradict the result).
+* The `import_warning` channel exists for any future "loaded, but you should know" message.
+* `box_draco.glb` is genuinely Draco-compressed, so Stage 3b inverts an assertion rather than needing
+  a new fixture.
