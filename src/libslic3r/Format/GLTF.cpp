@@ -19,12 +19,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
 #include <boost/log/trivial.hpp>
 #include <boost/nowide/fstream.hpp>
+
+#include "../PNGReadWrite.hpp"
+
+#include <csetjmp>
+#include <jpeglib.h>
 
 // Translation
 #include "I18N.hpp"
@@ -60,6 +66,8 @@ constexpr size_t   MAX_GLTF_TRIANGLES = 20u * 1000 * 1000;     // across the who
 constexpr size_t   MAX_GLTF_VERTICES  = 3 * MAX_GLTF_TRIANGLES;
 constexpr size_t   MAX_GLTF_VOLUMES   = 2000;
 constexpr size_t   MAX_NODE_DEPTH     = 256;                   // guards a pathological node tree
+constexpr size_t   MAX_TEXTURE_BYTES  = 64u * 1024 * 1024;     // one encoded baseColorTexture
+constexpr size_t   MAX_TEXTURE_PIXELS = 64u * 1024 * 1024;     // and its decoded size
 
 // Two messages used from several places. Kept as functions so the literal stays inside _L() for
 // the translation extractor.
@@ -107,6 +115,15 @@ float linear_to_srgb(float c)
     if (c >= 1.f)
         return 1.f;
     return (c <= 0.0031308f) ? (c * 12.92f) : (1.055f * std::pow(c, 1.f / 2.4f) - 0.055f);
+}
+
+float srgb_to_linear(float c)
+{
+    if (!(c > 0.f))
+        return 0.f;
+    if (c >= 1.f)
+        return 1.f;
+    return (c <= 0.04045f) ? (c / 12.92f) : std::pow((c + 0.055f) / 1.055f, 2.4f);
 }
 
 std::string unique_part_name(const std::string &base, std::set<std::string> &taken)
@@ -243,6 +260,191 @@ void nowide_file_release(const cgltf_memory_options *memory_options, const cgltf
 
 // --- accessors --------------------------------------------------------------------------
 
+// --- baseColorTexture sampling (Stage 3d) ------------------------------------------------
+
+// A decoded RGB/RGBA image, sampled at a triangle's centroid UV.
+struct TextureImage
+{
+    size_t                     width{0}, height{0}, channels{0};
+    std::vector<unsigned char> pixels;   // row major, `channels` bytes per pixel
+
+    bool ok() const
+    {
+        return width > 0 && height > 0 && channels >= 3 &&
+               pixels.size() >= width * height * channels;
+    }
+
+    // glTF's default sampler wrap is REPEAT, and its UV origin is the image's top-left corner,
+    // so v maps straight onto the row index with no flip.
+    RGBA sample(float u, float v) const
+    {
+        auto wrap = [](float t, size_t n) -> size_t {
+            if (!std::isfinite(t))
+                return 0;
+            const float f = t - std::floor(t);
+            const size_t i = (size_t) (f * (float) n);
+            return i >= n ? n - 1 : i;
+        };
+        const unsigned char *p = pixels.data() + (wrap(v, height) * width + wrap(u, width)) * channels;
+        return RGBA{p[0] / 255.f, p[1] / 255.f, p[2] / 255.f, channels >= 4 ? p[3] / 255.f : 1.f};
+    }
+};
+
+bool decode_png_image(const unsigned char *bytes, size_t n, TextureImage &out)
+{
+    const png::ReadBuf buf{bytes, n};
+    if (!png::is_png(buf))
+        return false;
+    png::ImageColorscale img;
+    if (!png::decode_colored_png(buf, img))
+        return false;   // the in-tree decoder only does 8-bit RGB / RGBA
+    if (img.cols == 0 || img.rows == 0 || img.bytes_per_pixel < 3)
+        return false;
+    if (img.cols > MAX_TEXTURE_PIXELS / img.rows)
+        return false;
+    // Reject anything whose row stride is not exactly cols * bytes_per_pixel (a 16-bit PNG, say):
+    // the decoder reports 3 or 4 bytes per pixel regardless, and indexing would be wrong.
+    if (img.buf.size() != img.rows * img.cols * (size_t) img.bytes_per_pixel)
+        return false;
+    out.width    = img.cols;
+    out.height   = img.rows;
+    out.channels = (size_t) img.bytes_per_pixel;
+    out.pixels   = std::move(img.buf);
+    return out.ok();
+}
+
+// libjpeg reports fatal errors by longjmp-ing out; keep everything that owns memory outside the
+// setjmp scope so nothing is skipped over.
+struct JpegError
+{
+    jpeg_error_mgr pub;
+    std::jmp_buf   jump;
+};
+
+void jpeg_error_longjmp(j_common_ptr info) { std::longjmp(((JpegError *) info->err)->jump, 1); }
+
+bool decode_jpeg_image(const unsigned char *bytes, size_t n, TextureImage &out)
+{
+    if (n < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8)
+        return false;   // not a JPEG SOI
+    jpeg_decompress_struct cinfo;
+    JpegError              err;
+    cinfo.err       = jpeg_std_error(&err.pub);
+    err.pub.error_exit = &jpeg_error_longjmp;
+    bool ok = false;
+    if (setjmp(err.jump) == 0) {
+        jpeg_create_decompress(&cinfo);
+        jpeg_mem_src(&cinfo, bytes, (unsigned long) n);
+        if (jpeg_read_header(&cinfo, TRUE) == JPEG_HEADER_OK) {
+            cinfo.out_color_space = JCS_RGB;
+            if (jpeg_start_decompress(&cinfo) && cinfo.output_components == 3 &&
+                cinfo.output_width > 0 && cinfo.output_height > 0 &&
+                (size_t) cinfo.output_width <= MAX_TEXTURE_PIXELS / (size_t) cinfo.output_height) {
+                out.width    = cinfo.output_width;
+                out.height   = cinfo.output_height;
+                out.channels = 3;
+                out.pixels.assign(out.width * out.height * 3, 0);
+                while (cinfo.output_scanline < cinfo.output_height) {
+                    JSAMPROW row = out.pixels.data() + (size_t) cinfo.output_scanline * out.width * 3;
+                    if (jpeg_read_scanlines(&cinfo, &row, 1) != 1)
+                        break;
+                }
+                ok = cinfo.output_scanline >= cinfo.output_height;
+                jpeg_finish_decompress(&cinfo);
+            }
+        }
+    }
+    jpeg_destroy_decompress(&cinfo);
+    return ok && out.ok();
+}
+
+// The encoded bytes of a glTF image: an embedded buffer view, a data: URI, or a sidecar file
+// under the .gltf's own directory (the same containment rule the buffers get).
+bool image_bytes(const cgltf_options &options, const cgltf_image &image, const char *gltf_path,
+                 std::vector<unsigned char> &out)
+{
+    out.clear();
+    if (image.buffer_view != nullptr) {
+        const cgltf_buffer_view *bv = image.buffer_view;
+        const uint8_t           *p  = cgltf_buffer_view_data(bv);
+        if (p == nullptr || bv->size == 0 || bv->size > MAX_TEXTURE_BYTES)
+            return false;
+        out.assign(p, p + bv->size);
+        return true;
+    }
+    if (image.uri == nullptr)
+        return false;
+    const std::string uri(image.uri);
+    if (uri.compare(0, 5, "data:") == 0) {
+        const size_t comma = uri.find(',');
+        if (comma == std::string::npos || comma < 7 || uri.compare(comma - 7, 7, ";base64") != 0)
+            return false;
+        const char  *b64  = uri.c_str() + comma + 1;
+        const size_t b64n = uri.size() - comma - 1;
+        if (b64n < 4 || b64n / 4 * 3 > MAX_TEXTURE_BYTES)
+            return false;
+        size_t size = b64n / 4 * 3;
+        if (uri[uri.size() - 1] == '=') --size;
+        if (uri[uri.size() - 2] == '=') --size;
+        void *raw = nullptr;
+        if (cgltf_load_buffer_base64(&options, size, b64, &raw) != cgltf_result_success || raw == nullptr)
+            return false;
+        out.assign((unsigned char *) raw, (unsigned char *) raw + size);
+        options.memory.free_func != nullptr ? options.memory.free_func(options.memory.user_data, raw)
+                                            : std::free(raw);
+        return true;
+    }
+    if (uri.find("://") != std::string::npos || !uri_is_safe_relative(uri))
+        return false;
+    // Resolve strictly under the .gltf's own directory, exactly as cgltf does for buffers.
+    std::string base(gltf_path == nullptr ? "" : gltf_path);
+    const size_t slash = base.find_last_of("/\\");
+    base = slash == std::string::npos ? std::string() : base.substr(0, slash + 1);
+    boost::nowide::ifstream in(( base + percent_decode(uri)).c_str(), std::ios::in | std::ios::binary);
+    if (!in)
+        return false;
+    in.seekg(0, std::ios::end);
+    const std::streamoff len = in.tellg();
+    if (len <= 0 || (size_t) len > MAX_TEXTURE_BYTES)
+        return false;
+    in.seekg(0, std::ios::beg);
+    out.resize((size_t) len);
+    in.read((char *) out.data(), len);
+    return in.gcount() == len;
+}
+
+// The material's base colour texture, decoded once per image and cached.
+const TextureImage *base_color_texture(const cgltf_options &options, const cgltf_material *material,
+                                       const char *gltf_path, int &uv_set,
+                                       std::map<const cgltf_image *, std::shared_ptr<TextureImage>> &cache)
+{
+    uv_set = 0;
+    if (material == nullptr || !material->has_pbr_metallic_roughness)
+        return nullptr;
+    const cgltf_texture_view &view = material->pbr_metallic_roughness.base_color_texture;
+    if (view.texture == nullptr || view.texture->image == nullptr)
+        return nullptr;
+    uv_set = (int) view.texcoord;
+    const cgltf_image *image = view.texture->image;
+    auto               found = cache.find(image);
+    if (found != cache.end())
+        return found->second ? found->second.get() : nullptr;
+
+    std::shared_ptr<TextureImage> decoded;
+    std::vector<unsigned char>    bytes;
+    if (image_bytes(options, *image, gltf_path, bytes)) {
+        auto img = std::make_shared<TextureImage>();
+        if (decode_png_image(bytes.data(), bytes.size(), *img) ||
+            decode_jpeg_image(bytes.data(), bytes.size(), *img))
+            decoded = img;
+        else
+            BOOST_LOG_TRIVIAL(warning) << "load_gltf: a baseColorTexture is in an image format this "
+                                          "importer cannot decode; its colours were dropped";
+    }
+    cache.emplace(image, decoded);
+    return decoded ? decoded.get() : nullptr;
+}
+
 // Belt and braces on top of cgltf_validate: an accessor must really be backed by bytes that are
 // inside its buffer before we size an allocation from its element count.
 bool accessor_data_fits(const cgltf_accessor &acc)
@@ -365,13 +567,44 @@ struct PrimitiveGeometry
 {
     indexed_triangle_set its;
     std::vector<RGBA>    vertex_colors;   // one per its.vertices entry, empty when no COLOR_0
+    std::vector<Vec2f>   uvs;             // one per its.vertices entry, only read when a texture wants them
     bool                 has_color0{false};
 };
+
+// glTF: base colour = baseColorFactor (linear) x baseColorTexture (sRGB). Decode the texel to
+// linear, multiply, re-encode - the colour dialog compares against sRGB filament swatches.
+RGBA modulate_srgb(const RGBA &texel, const cgltf_float *factor)
+{
+    if (factor == nullptr)
+        return texel;
+    RGBA out = texel;
+    for (int c = 0; c < 3; ++c)
+        out[c] = linear_to_srgb(srgb_to_linear(texel[c]) * (float) factor[c]);
+    out[3] = texel[3] * (float) factor[3];
+    return out;
+}
+
+// its_remove_degenerate_faces erases faces, so a parallel per-face array has to lose exactly the
+// same entries. Same predicate as TriangleMesh.cpp's, applied to both arrays at once.
+void remove_degenerate_faces_paired(indexed_triangle_set &its, std::vector<RGBA> &face_colors)
+{
+    size_t w = 0;
+    for (size_t r = 0; r < its.indices.size(); ++r) {
+        const stl_triangle_vertex_indices &f = its.indices[r];
+        if (f(0) == f(1) || f(0) == f(2) || f(1) == f(2))
+            continue;
+        its.indices[w] = its.indices[r];
+        face_colors[w] = face_colors[r];
+        ++w;
+    }
+    its.indices.resize(w);
+    face_colors.resize(w);
+}
 
 // Read `prim` and append it to `geo`, transformed by `world`. Returns false only for a damaged
 // file; an empty result (all faces degenerate, say) is a success with no triangles.
 bool build_primitive(const cgltf_primitive &prim, const Matrix4d &world, PrimitiveGeometry &geo,
-                     size_t &out_of_range_indices, std::string &message)
+                     int uv_set, size_t &out_of_range_indices, std::string &message)
 {
     const cgltf_accessor *pos = find_attribute(prim, cgltf_attribute_type_position, 0);
     if (pos == nullptr || cgltf_num_components(pos->type) != 3 || !accessor_data_fits(*pos)) {
@@ -422,6 +655,20 @@ bool build_primitive(const cgltf_primitive &prim, const Matrix4d &world, Primiti
             geo.has_color0 = true;
         else
             geo.vertex_colors.clear();
+    }
+
+    // TEXCOORD_<n> for the material's baseColorTexture, read only when there is one to sample.
+    if (uv_set >= 0) {
+        const cgltf_accessor *uv = find_attribute(prim, cgltf_attribute_type_texcoord, uv_set);
+        if (uv != nullptr && uv->count == pos->count && cgltf_num_components(uv->type) == 2 &&
+            accessor_data_fits(*uv)) {
+            std::vector<float> raw(vertex_count * 2, 0.f);
+            if (cgltf_accessor_unpack_floats(uv, raw.data(), raw.size()) == raw.size()) {
+                geo.uvs.resize(vertex_count);
+                for (size_t i = 0; i < vertex_count; ++i)
+                    geo.uvs[i] = Vec2f(raw[i * 2], raw[i * 2 + 1]);
+            }
+        }
     }
 
     // Indices. cgltf_accessor_unpack_indices handles u8 / u16 / u32; without an index accessor
@@ -691,12 +938,15 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
         Matrix4d          world;
         int               material_index{-1};
         std::vector<RGBA> vertex_colors;
+        std::vector<RGBA> face_colors;    // one per triangle, when a texture was sampled
         bool              has_color0{false};
     };
     std::vector<BuiltPart> parts;
     std::set<std::string>  taken_names;
 
     std::map<const cgltf_material *, int> material_index_of;
+    std::map<const cgltf_image *, std::shared_ptr<TextureImage>> texture_cache;
+    bool   any_texture_sampled   = false;
     size_t triangles_total       = 0;
     size_t triangle_primitives   = 0;
     size_t out_of_range_indices  = 0;
@@ -742,9 +992,28 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
                 node_world(r, c) = (double) wm[c * 4 + r];
         const Matrix4d world = up * node_world;
 
+        // The base colour texture, decoded once per image and reused across primitives.
+        int                 uv_set = -1;
+        const TextureImage *tex    = base_color_texture(options, prim.material, path, uv_set, texture_cache);
+
         PrimitiveGeometry geo;
-        if (!build_primitive(prim, world, geo, out_of_range_indices, message))
+        if (!build_primitive(prim, world, geo, tex != nullptr ? uv_set : -1, out_of_range_indices, message))
             return false;
+
+        // Sample at each triangle's centroid UV, while the UVs still line up with the vertices -
+        // welding merges vertices that differ only in UV, so this cannot wait until after it.
+        std::vector<RGBA> face_colors;
+        if (tex != nullptr && geo.uvs.size() == geo.its.vertices.size() && !geo.its.indices.empty()) {
+            const cgltf_float *factor = prim.material->has_pbr_metallic_roughness
+                                            ? prim.material->pbr_metallic_roughness.base_color_factor
+                                            : nullptr;
+            face_colors.reserve(geo.its.indices.size());
+            for (const stl_triangle_vertex_indices &f : geo.its.indices) {
+                const Vec2f uv = (geo.uvs[f(0)] + geo.uvs[f(1)] + geo.uvs[f(2)]) / 3.f;
+                face_colors.push_back(modulate_srgb(tex->sample(uv.x(), uv.y()), factor));
+            }
+            any_texture_sampled = true;
+        }
 
         // --- mesh hygiene, in the order the plan fixes ---
         // 1) built above; 2) a mirrored node chain inverts winding; 3) weld (glTF exporters split
@@ -762,7 +1031,10 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
                                                       geo.its.vertices[i].z()},
                                  geo.vertex_colors[i]);
         its_merge_vertices(geo.its);
-        its_remove_degenerate_faces(geo.its);
+        if (face_colors.empty())
+            its_remove_degenerate_faces(geo.its);
+        else
+            remove_degenerate_faces_paired(geo.its, face_colors);
 
         if (geo.its.indices.empty()) {
             ++empty_after_hygiene;
@@ -845,7 +1117,8 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
                 info.had_textures = true;
         }
 
-        part.world = world;
+        part.face_colors = std::move(face_colors);
+        part.world       = world;
         // Note: TriangleMesh(indexed_triangle_set&&) only fills stats, it does not run admesh
         // repair - repair is reachable only through TriangleMesh::from_stl and is STL-only today.
         // glTF follows the OBJ precedent: the object list's manifold warning stays the remedy.
@@ -912,6 +1185,20 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
 
         if (every_part_has_color0)
             info.vertex_colors.insert(info.vertex_colors.end(), part.vertex_colors.begin(), part.vertex_colors.end());
+        if (any_texture_sampled) {
+            // Every triangle of the object needs an entry. A primitive we could not sample - no
+            // texture, or an image format we cannot decode - contributes its flat material colour.
+            const size_t tris = volume->mesh().its.indices.size();
+            if (part.face_colors.size() == tris) {
+                info.face_colors.insert(info.face_colors.end(), part.face_colors.begin(), part.face_colors.end());
+            } else {
+                const RGBA flat = (part.material_index >= 0 &&
+                                   part.material_index < (int) info.material_colors.size())
+                                      ? info.material_colors[part.material_index]
+                                      : RGBA{1.f, 1.f, 1.f, 1.f};
+                info.face_colors.insert(info.face_colors.end(), tris, flat);
+            }
+        }
     }
     if (!every_part_has_color0)
         info.vertex_colors.clear();
@@ -922,7 +1209,8 @@ bool load_gltf(const char *path, Model *model, GltfInfo &info, std::string &mess
         object->config.set_key_value("extruder", new ConfigOptionInt(0));
     object->invalidate_bounding_box();
 
-    if (info.had_textures)
+    // Only complain about a texture we could not use. When it was sampled, face_colors carries it.
+    if (info.had_textures && info.face_colors.empty())
         message = _L("This model's colours come from a texture, which was not imported.");
 
     BOOST_LOG_TRIVIAL(info) << "load_gltf: " << path << " -> 1 object, " << info.parts.size() << " part(s), "

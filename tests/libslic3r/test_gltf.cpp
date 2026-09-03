@@ -589,18 +589,50 @@ SCENARIO("glTF material colours become per-part filaments", "[gltf]")
 
     GIVEN("a two-material GLB whose first material paints from a texture")
     {
+        // Stage 3d changed what this file does: the texture is now sampled, so the dialog is asked
+        // about per-face colours rather than skipped, and nothing is dropped. The textured
+        // primitive contributes sampled texels; the untextured one contributes its flat material
+        // colour, so the array still covers every triangle of the object.
+        Slic3r::Model probe;
+        GltfInfo      probe_info;
+        std::string   probe_message;
+        REQUIRE(load_ok("textured_two_materials.glb", probe, probe_info, probe_message));
+        size_t tris = 0;
+        for (const ModelVolume *v : probe.objects.front()->volumes)
+            tris += v->mesh().its.indices.size();
+        REQUIRE(probe_info.had_textures);
+        REQUIRE(probe_info.face_colors.size() == tris);
+        REQUIRE(probe_message.empty());
+
         ColorDialogStub stub;
-        stub.answer = {2, 3};
+        stub.first     = 2;
+        stub.per_color = [](size_t i) { return (unsigned char) (2 + (i % 2)); };
         std::string   warning;
         Slic3r::Model model = read_gltf_with_colors("textured_two_materials.glb", stub, &warning);
-        THEN("no dialog is opened, and the dropped texture is reported instead")
+        THEN("the dialog sees one colour per triangle and nothing is reported as dropped")
         {
-            // Without the had_textures guard this file WOULD open the dialog - it has two
-            // materials - so this really tests the guard.
+            REQUIRE(stub.called);
+            REQUIRE(stub.seen.size() == tris);
+            REQUIRE(warning.empty());
+            REQUIRE(model.objects.front()->volumes.size() == 2);
+            REQUIRE(model.objects.front()->volumes[0]->is_mm_painted());
+        }
+    }
+
+    GIVEN("a GLB whose texture is a KTX2 image nothing here can decode")
+    {
+        ColorDialogStub stub;
+        stub.answer = {2};
+        std::string   warning;
+        Slic3r::Model model = read_gltf_with_colors("textured_undecodable.glb", stub, &warning);
+        THEN("no dialog is opened, and the dropped texture is reported")
+        {
+            // KHR_texture_basisu is only in extensionsUsed, so the file is not refused - but the
+            // colours are gone, and silently colourless is the outcome users file bugs about.
             REQUIRE(stub.called == false);
             REQUIRE_FALSE(warning.empty());
             REQUIRE(contains(warning, "texture"));
-            REQUIRE(model.objects.front()->volumes.size() == 2);
+            REQUIRE(model.objects.front()->volumes.size() == 1);
         }
     }
 
@@ -615,6 +647,86 @@ SCENARIO("glTF material colours become per-part filaments", "[gltf]")
         {
             REQUIRE(stub.called == false);
             REQUIRE(model.objects.front()->volumes.size() == 2);
+        }
+    }
+}
+
+SCENARIO("A baseColorTexture becomes per-face colours", "[gltf]")
+{
+    GIVEN("a box whose texture is half red and half blue")
+    {
+        Slic3r::Model model;
+        GltfInfo      info;
+        std::string   message;
+        REQUIRE(load_ok("textured_two_regions.glb", model, info, message));
+
+        THEN("every triangle gets a colour, and only two distinct ones appear")
+        {
+            REQUIRE(info.had_textures);
+            const size_t tris = model.objects.front()->volumes.front()->mesh().its.indices.size();
+            REQUIRE(tris == 12);
+            REQUIRE(info.face_colors.size() == tris);
+            // The UVs put three box faces wholly in the red half of the texture and three wholly
+            // in the blue half, so the dialog's k-means has exactly two clusters to find.
+            size_t red = 0, blue = 0;
+            for (const RGBA &c : info.face_colors) {
+                if (c[0] > 0.9f && c[2] < 0.1f) ++red;
+                else if (c[2] > 0.9f && c[0] < 0.1f) ++blue;
+            }
+            REQUIRE(red == 6);
+            REQUIRE(blue == 6);
+        }
+        THEN("the dropped-texture warning is gone, because the texture was used")
+        {
+            REQUIRE(message.empty());
+        }
+    }
+
+    GIVEN("the same file and a dialog that answers red -> 2 and blue -> 3")
+    {
+        ColorDialogStub stub;
+        stub.first     = 2;
+        // The stub stands in for the k-means: red faces to filament 2, blue faces to filament 3.
+        stub.per_color = nullptr;
+        Slic3r::Model probe;
+        GltfInfo      info;
+        std::string   message;
+        REQUIRE(load_ok("textured_two_regions.glb", probe, info, message));
+        std::vector<unsigned char> answer;
+        for (const RGBA &c : info.face_colors)
+            answer.push_back((unsigned char) (c[0] > 0.9f ? 2 : 3));
+        stub.answer = answer;
+
+        Slic3r::Model model = read_gltf_with_colors("textured_two_regions.glb", stub);
+        THEN("the faces are painted, and the right ones")
+        {
+            REQUIRE(stub.called);
+            REQUIRE(stub.seen.size() == 12);
+            const ModelVolume *v = model.objects.front()->volumes.front();
+            REQUIRE(v->is_mm_painted());
+            // Filament 2 is CONST_FILAMENTS[2] == "8" and filament 3 is "0C"; six triangles each.
+            size_t painted_2 = 0, painted_3 = 0;
+            for (int i = 0; i < (int) v->mesh().its.indices.size(); ++i) {
+                const std::string t = v->mmu_segmentation_facets.get_triangle_as_string(i);
+                if (t == "8") ++painted_2;
+                else if (t == "0C") ++painted_3;
+            }
+            REQUIRE(painted_2 == 6);
+            REQUIRE(painted_3 == 6);
+        }
+    }
+
+    GIVEN("a per-face array of the wrong length")
+    {
+        Slic3r::Model model;
+        GltfInfo      info;
+        std::string   message;
+        REQUIRE(load_ok("textured_two_regions.glb", model, info, message));
+        THEN("import_multi_volume_face_color_deal refuses and paints nothing")
+        {
+            std::vector<unsigned char> ids(11, 2);
+            REQUIRE_FALSE(Slic3r::Model::import_multi_volume_face_color_deal(ids, 2, &model));
+            REQUIRE(model.objects.front()->volumes.front()->is_mm_painted() == false);
         }
     }
 }

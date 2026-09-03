@@ -1617,6 +1617,9 @@ public:
     // Ultra (glTF): per-vertex colours across ALL volumes of the single imported object, with a
     // running vertex offset. Same encoding as obj_import_vertex_color_deal.
     static bool    import_multi_volume_vertex_color_deal(const std::vector<unsigned char> &vertex_filament_ids, const unsigned char &first_extruder_id, Model *model);
+    // Ultra (glTF textures): per-face colours across ALL volumes of the single imported object,
+    // with a running face offset. Same encoding as obj_import_face_color_deal.
+    static bool    import_multi_volume_face_color_deal(const std::vector<unsigned char> &face_filament_ids, const unsigned char &first_extruder_id, Model *model);
     static double findMaxSpeed(const ModelObject* object);
     static double getThermalLength(const ModelVolume* modelVolumePtr);
     static double getThermalLength(const std::vector<ModelVolume*> modelVolumePtrs);

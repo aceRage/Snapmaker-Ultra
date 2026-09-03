@@ -29,6 +29,10 @@ struct GltfInfo
     // Per-vertex COLOR_0, concatenated in volume order, only filled when EVERY drawn
     // primitive has COLOR_0. Parsed in v1, used from v2.
     std::vector<RGBA>        vertex_colors;
+    // One sRGB colour per surviving triangle, concatenated in volume order. Filled only when a
+    // baseColorTexture was actually sampled; triangles of untextured primitives get their flat
+    // material colour so the array always covers every triangle of the object.
+    std::vector<RGBA>        face_colors;
     bool                     is_single_material{false};
     bool                     had_textures{false};      // report, never used in v1/v2
     size_t                   dropped_primitives{0};    // points / lines / line loops / strips

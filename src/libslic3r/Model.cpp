@@ -343,6 +343,13 @@ Model Model::read_from_file(const std::string&                                  
                     objFn(gltf_info.vertex_colors, false, vertex_filament_ids, first_extruder_id);
                     if (!vertex_filament_ids.empty())
                         result = Model::import_multi_volume_vertex_color_deal(vertex_filament_ids, first_extruder_id, &model);
+                } else if (!gltf_info.face_colors.empty()) {
+                    // A sampled baseColorTexture: one colour per triangle across every volume, so
+                    // this becomes MMU painting, like the OBJ mtl face-colour path.
+                    std::vector<unsigned char> face_filament_ids;
+                    objFn(gltf_info.face_colors, false, face_filament_ids, first_extruder_id);
+                    if (!face_filament_ids.empty())
+                        result = Model::import_multi_volume_face_color_deal(face_filament_ids, first_extruder_id, &model);
                 } else if (gltf_info.material_colors.size() > 1 && !gltf_info.had_textures) {
                     // A glTF material is per primitive and a primitive is a volume, so whole parts
                     // go to whole filaments - no painting. One material means nothing to choose, so
@@ -3369,6 +3376,27 @@ bool Model::import_multi_volume_vertex_color_deal(const std::vector<unsigned cha
     return true;
 }
 
+// Paint one ModelVolume from a per-face filament id array; `face_filament_ids` addresses this
+// volume's triangles and must have exactly `face_count_in` entries. Lifted unchanged out of
+// Model::obj_import_face_color_deal so the OBJ path and the glTF texture path share one
+// implementation - the same treatment the vertex path got.
+static bool paint_volume_from_face_colors(ModelVolume *volume, const unsigned char *face_filament_ids,
+                                          size_t face_count_in)
+{
+    auto face_count    = volume->mesh().its.indices.size();
+    volume->mmu_segmentation_facets.reserve(face_count);
+    if (volume->mesh().its.indices.size() != face_count_in) { return false; }
+    for (size_t i = 0; i < volume->mesh().its.indices.size(); i++) {
+        auto face         = volume->mesh().its.indices[i];
+        auto filament_id = face_filament_ids[i];
+        if (filament_id <= 1) { continue; }
+        std::string result;
+        get_real_filament_id(filament_id, result);
+        volume->mmu_segmentation_facets.set_triangle_from_string(i, result);
+    }
+    return true;
+}
+
 bool Model::obj_import_face_color_deal(const std::vector<unsigned char> &face_filament_ids, const unsigned char &first_extruder_id, Model *model)
 {
     if (face_filament_ids.size() == 0) { return false; }
@@ -3379,21 +3407,37 @@ bool Model::obj_import_face_color_deal(const std::vector<unsigned char> &face_fi
         if (obj->volumes.size() == 1) {
             auto volume        = obj->volumes[0];
             volume->config.set("extruder", first_extruder_id);
-            auto face_count    = volume->mesh().its.indices.size();
-            volume->mmu_segmentation_facets.reserve(face_count);
-            if (volume->mesh().its.indices.size() != face_filament_ids.size()) { return false; }
-            for (size_t i = 0; i < volume->mesh().its.indices.size(); i++) {
-                auto face         = volume->mesh().its.indices[i];
-                auto filament_id = face_filament_ids[i];
-                if (filament_id <= 1) { continue; }
-                std::string result;
-                get_real_filament_id(filament_id, result);
-                volume->mmu_segmentation_facets.set_triangle_from_string(i, result);
-            }
-            return true;
+            return paint_volume_from_face_colors(volume, face_filament_ids.data(), face_filament_ids.size());
         }
     }
     return false;
+}
+
+// Ultra (glTF textures): per-face colours across ALL volumes of the single imported object,
+// concatenated in volume order. Same encoding as obj_import_face_color_deal, walked with a
+// running offset, and the total length is checked before anything is painted.
+bool Model::import_multi_volume_face_color_deal(const std::vector<unsigned char> &face_filament_ids, const unsigned char &first_extruder_id, Model *model)
+{
+    if (face_filament_ids.empty())
+        return false;
+    if (model->objects.size() != 1)
+        return false;
+    auto   obj   = model->objects[0];
+    size_t total = 0;
+    for (const ModelVolume *v : obj->volumes)
+        total += v->mesh().its.indices.size();
+    if (total != face_filament_ids.size())
+        return false;
+    obj->config.set("extruder", first_extruder_id);
+    size_t offset = 0;
+    for (ModelVolume *volume : obj->volumes) {
+        const size_t count = volume->mesh().its.indices.size();
+        volume->config.set("extruder", first_extruder_id);
+        if (!paint_volume_from_face_colors(volume, face_filament_ids.data() + offset, count))
+            return false;
+        offset += count;
+    }
+    return true;
 }
 
 // update the maxSpeed of an object if it is different from the global configuration

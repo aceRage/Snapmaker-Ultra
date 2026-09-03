@@ -446,6 +446,116 @@ def make_textured_two_materials():
     write_glb("textured_two_materials.glb", gltf, bytes(blob.data))
 
 
+def two_region_png(width=16, height=16):
+    """An RGB PNG: the left half pure red, the right half pure blue. Two regions, no gradient, so
+    the colour dialog's k-means has exactly two clusters to find."""
+    import struct
+    import zlib
+
+    raw = bytearray()
+    for _y in range(height):
+        raw.append(0)                                   # filter: none
+        for x in range(width):
+            raw += b"\xff\x00\x00" if x < width // 2 else b"\x00\x00\xff"
+
+    def chunk(kind, payload):
+        body = kind + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)   # 8-bit truecolour RGB
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+            chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b""))
+
+
+def make_textured_two_regions():
+    """A box whose baseColorTexture is half red, half blue, with UVs that put the +X face wholly in
+    the red half and the -X face wholly in the blue half.
+
+    The Stage 3d fixture: sampling at each triangle's centroid UV has to produce two clusters, and
+    the two triangles of each face have to land in the region their UVs point at. The texture is a
+    real PNG embedded in the GLB's buffer, which is how .glb files carry textures in the wild.
+    """
+    positions, normals, indices = box_mesh(-5, -5, -5, 5, 5, 5)
+    # box_faces() order is +X, -X, +Y, -Y, +Z, -Z, four vertices each.
+    # u = 0.25 lands in the red half, u = 0.75 in the blue half.
+    face_u = [0.25, 0.75, 0.25, 0.75, 0.25, 0.75]
+    uv = []
+    for u in face_u:
+        for _corner in range(4):
+            uv += [u, 0.5]
+
+    png = two_region_png()
+    blob = Blob()
+    v_pos = blob.add_floats(positions)
+    v_nrm = blob.add_floats(normals)
+    v_uv = blob.add_floats(uv)
+    v_idx = blob.add_ushorts(indices)
+    v_png = blob.add(png, target=None)
+    lo, hi = bounds(positions)
+    gltf = {
+        "asset": {"version": "2.0", "generator": "Snapmaker Orca test fixture"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0, "name": "painted box"}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2},
+                                    "indices": 3, "material": 0, "mode": MODE_TRIANGLES}]}],
+        "materials": [{"name": "two regions",
+                       "pbrMetallicRoughness": {"baseColorTexture": {"index": 0},
+                                                "baseColorFactor": [1.0, 1.0, 1.0, 1.0]}}],
+        "textures": [{"source": 0}],
+        "images": [{"bufferView": v_png, "mimeType": "image/png"}],
+        "accessors": [
+            {"bufferView": v_pos, "componentType": FLOAT, "count": len(positions) // 3, "type": "VEC3",
+             "min": lo, "max": hi},
+            {"bufferView": v_nrm, "componentType": FLOAT, "count": len(normals) // 3, "type": "VEC3"},
+            {"bufferView": v_uv, "componentType": FLOAT, "count": len(uv) // 2, "type": "VEC2"},
+            {"bufferView": v_idx, "componentType": UNSIGNED_SHORT, "count": len(indices), "type": "SCALAR"},
+        ],
+        "bufferViews": blob.views,
+    }
+    write_glb("textured_two_regions.glb", gltf, bytes(blob.data))
+
+
+def make_textured_undecodable():
+    """A box whose baseColorTexture is a KTX2 image, through KHR_texture_basisu in extensionsUsed.
+
+    Used, not required, so the file is not refused - but nothing here can decode KTX2, so this is
+    the case where the dropped-texture warning still has to fire after Stage 3d taught the reader
+    to sample PNG and JPEG.
+    """
+    positions, normals, indices = box_mesh(-5, -5, -5, 5, 5, 5)
+    uv = [0.5, 0.5] * (len(positions) // 3)
+    ktx2 = b"\xabKTX 20\xbb\r\n\x1a\n" + b"\x00" * 48   # a KTX2 identifier and nothing usable
+    blob = Blob()
+    v_pos = blob.add_floats(positions)
+    v_nrm = blob.add_floats(normals)
+    v_uv = blob.add_floats(uv)
+    v_idx = blob.add_ushorts(indices)
+    v_img = blob.add(ktx2, target=None)
+    lo, hi = bounds(positions)
+    gltf = {
+        "asset": {"version": "2.0", "generator": "Snapmaker Orca test fixture"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0, "name": "basis box"}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2},
+                                    "indices": 3, "material": 0, "mode": MODE_TRIANGLES}]}],
+        "materials": [{"name": "basis", "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+        "extensionsUsed": ["KHR_texture_basisu"],
+        "textures": [{"extensions": {"KHR_texture_basisu": {"source": 0}}, "source": 0}],
+        "images": [{"bufferView": v_img, "mimeType": "image/ktx2"}],
+        "accessors": [
+            {"bufferView": v_pos, "componentType": FLOAT, "count": len(positions) // 3, "type": "VEC3",
+             "min": lo, "max": hi},
+            {"bufferView": v_nrm, "componentType": FLOAT, "count": len(normals) // 3, "type": "VEC3"},
+            {"bufferView": v_uv, "componentType": FLOAT, "count": len(uv) // 2, "type": "VEC2"},
+            {"bufferView": v_idx, "componentType": UNSIGNED_SHORT, "count": len(indices), "type": "SCALAR"},
+        ],
+        "bufferViews": blob.views,
+    }
+    write_glb("textured_undecodable.glb", gltf, bytes(blob.data))
+
+
 def make_points_only():
     """No printable surface at all - the reader must say so by name, not fail generically."""
     pts = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
@@ -568,6 +678,8 @@ def main():
     make_nested_trs()
     make_strip_and_fan()
     make_textured_two_materials()
+    make_textured_two_regions()
+    make_textured_undecodable()
     make_points_only()
     make_sparse_triangle()
     make_box_quantized()
