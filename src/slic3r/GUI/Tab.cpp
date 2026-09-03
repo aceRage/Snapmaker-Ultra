@@ -60,6 +60,7 @@
 #include "libslic3r/SupportSet.hpp"
 #include "Widgets/ComboBox.hpp"
 #include <wx/textdlg.h>
+#include <wx/wrapsizer.h>
 #ifdef WIN32
 	#include <commctrl.h>
 #endif // WIN32
@@ -2521,7 +2522,9 @@ void TabPrint::build()
             optgroup = page->new_optgroup(L("Support set"), L"param_support");
             Line support_set_line = Line{ "", "" };
             support_set_line.full_width = 1;
-            support_set_line.append_widget([this](wxWindow* parent) { return support_set_create_widget(parent); });
+            // line.widget (not an extra widget): the description-line path spans the group from its
+            // left edge, where extra widgets are indented by the label column and clip on the right.
+            support_set_line.widget = [this](wxWindow* parent) { return support_set_create_widget(parent); };
             optgroup->append_line(support_set_line);
         }
         optgroup = page->new_optgroup(L("Support"), L"param_support");
@@ -2962,8 +2965,10 @@ wxSizer* TabPrint::support_set_create_widget(wxWindow* parent)
 {
     const int em = em_unit(parent);
 
+    // The combo takes the whole row; the buttons wrap underneath, since the process panel is
+    // narrow and four buttons beside a combo do not fit on one line.
     auto* vsizer = new wxBoxSizer(wxVERTICAL);
-    auto* hsizer = new wxBoxSizer(wxHORIZONTAL);
+    auto* hsizer = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
 
     m_support_set_combo = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
                                        wxSize(20 * em, -1), 0, nullptr, wxCB_READONLY);
@@ -2974,14 +2979,14 @@ wxSizer* TabPrint::support_set_create_widget(wxWindow* parent)
         support_set_update_buttons();
         support_set_set_note(wxEmptyString, false);
     });
-    hsizer->Add(m_support_set_combo, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, em / 2);
+    vsizer->Add(m_support_set_combo, 0, wxEXPAND);
 
     auto add_button = [this, parent, em, hsizer](ScalableButton** btn, const wxString& label,
                                                  void (TabPrint::*handler)()) {
         *btn = new ScalableButton(parent, wxID_ANY, "", label, wxDefaultSize, wxDefaultPosition, wxBU_EXACTFIT);
         (*btn)->SetFont(wxGetApp().normal_font());
         (*btn)->Bind(wxEVT_BUTTON, [this, handler](wxCommandEvent&) { (this->*handler)(); });
-        hsizer->Add(*btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, em / 2);
+        hsizer->Add(*btn, 0, wxRIGHT | wxTOP, em / 2);
     };
     add_button(&m_support_set_apply,  _L("Apply"),             &TabPrint::on_support_set_apply);
     add_button(&m_support_set_save,   _L("Save current as..."),&TabPrint::on_support_set_save_as);
