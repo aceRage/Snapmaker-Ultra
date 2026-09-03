@@ -39,6 +39,85 @@ Each stage builds, ships and is testable on its own. Do not start the next stage
 | 4 — Tree parity | organic tree: full parity through the same seam; classic tree: per-group interface *fill* only (documented limit) | K==1 corpus byte-identical with `support_type = tree(auto)` and both styles; organic-tree two-part fixture behaves like Stage 3's; classic tree shows per-group roof pattern/spacing/filament and an explicit "interface layer count is object-wide for classic tree supports" notice |
 | 5 — Polish | preview colouring by filament check, empty-group and conflict warnings, docs, `PART_CATEGORY_SETTINGS` "Support" group, tooltip copy | Preview colours the per-group interface with its resolved filament; a group with no parts, a group whose set no longer exists, and a group whose interface filament type cannot be resolved each raise a visible, non-fatal warning; `docs/superpowers/specs/` page written |
 
+## 2a. Stage 1 status (2026-09-03): DONE, gate held
+
+Shipped on `feat/support-sets-stage1` (cut from `feat/ultra-preferences` @ `d6e020124a`): the
+`SupportSet` model, the `<datadir>/user/<preset_folder>/support_set/*.json` store with the
+read-only `default` fallback of §5 item 5, the pure helpers (`support_set_keys`,
+`support_set_from_config`, `support_set_apply_to`, `resolve_interface_filament`,
+`support_set_interface_filament_type`, `sanitize_support_set_filename`, the JSON round trip); a
+"Support set" opt-group at the top of the process tab's Support page carrying a combo of the saved
+sets plus Apply / "Save current as…" / Rename / Delete and a note line for the
+filament-resolution message; `tests/libslic3r/test_support_set.cpp`. **No back-end change**: no
+file that participates in slicing was touched, so §3.7's byte identity holds by construction.
+
+Deviations from the plan, all deliberate:
+
+1. **The code lives in `src/libslic3r/SupportSet.{hpp,cpp}`, not `src/slic3r/GUI/`** (§1.1). The
+   plan's own gate note sanctions this ("move the pure helpers into `src/libslic3r/SupportSet.cpp`
+   if the link is awkward. Prefer the latter if it comes up") and it did come up:
+   `libslic3r_tests` links `test_common libslic3r OpenSSL::Crypto` and nothing wx, so a
+   `slic3r/GUI` TU cannot join it. Every helper *and* the store turn out to be wx-free —
+   `data_dir()`, `AppConfig` and `PresetBundle` are all libslic3r — so the only GUI-side input is
+   which per-account preset folder is live, handed over by `SupportSetStore::set_preset_folder()`.
+   Stage 2 gets the same names, in `Slic3r::` rather than `Slic3r::GUI::`.
+2. **`to_json` / `from_json` are named `support_set_to_json` / `support_set_from_json`**, to keep
+   them out of nlohmann's ADL serialisation lookup. String forms
+   (`support_set_{to,from}_json_string`) are what the store and the tests use; the header takes
+   only `nlohmann/json_fwd.hpp`.
+3. **The excluded-key list grew by seven.** The plan's mechanical rule (a `PrintObjectConfig`
+   member whose `print_config_def` category is `"Support"`) admits `brim_width`, `brim_type`,
+   `brim_object_gap`, `brim_ears_max_angle`, `brim_ears_detection_length`, `bridge_no_support`
+   and `max_bridge_length` — 54 such keys in this tree, not the 58 the plan counted. Applying a
+   support set must not silently rewrite the user's brim or bridging, so those seven joined
+   `support_set_excluded_keys()` next to the filament slots, `raft_*`, `enforce_support_layers`
+   and `independent_support_layer_height` (which is not a `PrintObjectConfig` member here, so it
+   is belt-and-braces). **39 keys remain.** The plan designates that list as the place such
+   adjustments live, so Stages 2 and 5 must read it from there rather than recomputing the rule.
+4. **`SupportSet::read_only` was added to the struct.** A set that came from the `default`
+   fallback while another account is logged in can be applied but not renamed or deleted, and
+   saving over it writes a shadowing copy into the account's own folder rather than editing the
+   shared one. The combo shows those as "*(shared)*".
+5. **Enumeration is not driven from `update()`.** The folder is scanned when the Support page is
+   built and when it *becomes* the active page, never from `TabPrint::update()` — `update()` runs
+   inside settings-change scopes, a phone `POST /api/settings/process` among them, and "Things
+   that must NOT change" forbids blocking file I/O there.
+
+Gate: `libslic3r_tests "[SupportSet]"` — 411 assertions in 8 test cases, all pass; the whole
+`libslic3r_tests` suite still passes (592 cases, 53 023 assertions, the 2 pre-existing
+`[!shouldfail]` cases unchanged). `build_main.bat` clean (0 `error C`, 0 `error LNK`). Runtime
+gate `test_support_sets.py` (snorca_hubtest) against a side install on an isolated data dir: the
+Support page's 51 option keys are unchanged in the same order, the widget-only group correctly
+does **not** reach the remote API or the phone Settings sheet, no `support_set` folder is created
+until the user saves one, and `POST /api/settings/process` + `/revert` still behave.
+`test_security.py` and `test_hidden.py` re-run on the new build.
+
+Findings:
+
+1. **A widget-only opt-group is invisible to the remote API by design.** `api_process_settings`
+   (`src/slic3r/GUI/RemoteAccess.cpp:1324-1328`) drops lines with no config options and then
+   groups with no lines, and the phone page applies the same filter
+   (`resources/web/orca/stream_center.html:1426`). So the Support-set row cannot be asserted
+   through the API — and, more usefully, it cannot leak into the phone Settings sheet either.
+   The row itself is only constructed when the Support page is first activated
+   (`OptionsGroup::activate` returns early once `sizer` exists), and no API route activates a
+   page, so **clicking it is manual-checklist work**; the automated gate proves only that the row
+   is compiled in and that nothing else on the page moved.
+2. **`Utils::iso_utc_timestamp()` is the basic ISO form** (`%Y%m%dT%H%M%SZ`,
+   `src/libslic3r/Time.cpp:24`), not the extended form the plan's JSON example shows.
+   `SupportSet::created` is written with a local `strftime` so the on-disk shape matches the plan;
+   it is informational metadata and is never parsed back.
+3. **`ConfigOptionBools{ 0, 1, 0 }` is ambiguous** between `initializer_list<bool>` and
+   `initializer_list<unsigned char>`; tests must spell `std::vector<unsigned char>{…}`.
+4. **The store creates nothing until a set is saved.** `reload()` returns early when the
+   directory is absent, so an existing profile tree is untouched by the feature until the user
+   uses it — worth keeping when Stage 2 adds its own reads.
+
+Not done in this stage: `scripts/support_group_identity.py` and `tests/data/support_corpus/`.
+The plan's task table puts them on the separate `feat/support-identity-harness` branch (T3), and
+Stage 1's gate calls them green "trivially"; that claim holds here by construction (no slicing
+file changed) but the script does not exist yet, so **T3 remains a prerequisite for Stage 2**.
+
 ## 3. Shared contract
 
 The stages are meant to be built by different agents on different branches. These names, shapes and
