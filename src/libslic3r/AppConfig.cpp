@@ -828,14 +828,18 @@ void AppConfig::merge_shared_from_disk(const std::string& path)
                 for (const auto& v : variants) variants_here.insert(v);
             }
         }
-        // Recent projects: this window's order first, then what other windows opened, up to the cap.
+        // Recent projects: entries on disk that this window does not know were opened by another
+        // window after this one loaded the file, so they are newer and go first; this window's own
+        // list follows in its order; the whole thing is cut at the cap.
         if (j.contains("recent_projects") && j["recent_projects"].is_object()) {
-            std::vector<std::string>           merged = get_recent_projects();
+            const std::vector<std::string>     mine = get_recent_projects();
             std::map<std::string, std::string> disk; // ordered by the "01".."NN" keys
             for (auto it = j["recent_projects"].begin(); it != j["recent_projects"].end(); ++it)
                 if (it.value().is_string()) disk[it.key()] = it.value().get<std::string>();
+            std::vector<std::string> merged;
             for (const auto& kv : disk)
-                if (std::find(merged.begin(), merged.end(), kv.second) == merged.end()) merged.push_back(kv.second);
+                if (std::find(mine.begin(), mine.end(), kv.second) == mine.end()) merged.push_back(kv.second);
+            merged.insert(merged.end(), mine.begin(), mine.end());
             size_t cap = 18;
             try {
                 const std::string c = get("max_recent_count");
