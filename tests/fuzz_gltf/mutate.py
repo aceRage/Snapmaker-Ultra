@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Drive tests/fuzz_gltf over mutations of the glTF fixture corpus.
 
-    cmake --build build --config Release --target fuzz_gltf
+    cmake --build build --target fuzz_gltf                 # Ninja / Makefiles
+    msbuild build/tests/fuzz_gltf/fuzz_gltf.vcxproj /p:Configuration=Release   # Visual Studio
     python tests/fuzz_gltf/mutate.py --minutes 10
 
 Seeds are every file in tests/data/test_gltf (plus its subdirectories). Each round writes a batch
@@ -91,7 +92,8 @@ def main():
 
     exe = find_exe(args.exe)
     if exe is None:
-        print("fuzz_gltf not built. cmake --build build --config Release --target fuzz_gltf")
+        print("fuzz_gltf not built. See the header of tests/fuzz_gltf/fuzz_gltf.cpp for the "
+              "per-generator build command.")
         return 2
     corpus = seeds()
     if not corpus:

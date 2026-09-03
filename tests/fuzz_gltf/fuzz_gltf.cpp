@@ -7,12 +7,20 @@
 //
 // Not built by default (tests/CMakeLists.txt adds it EXCLUDE_FROM_ALL). Build and run with:
 //
-//   cmake --build build --config Release --target fuzz_gltf
+//   # Ninja / Makefiles:
+//   cmake --build build --target fuzz_gltf
+//   # Visual Studio: EXCLUDE_FROM_ALL keeps the target out of the .sln, so build the project:
+//   msbuild build/tests/fuzz_gltf/fuzz_gltf.vcxproj /p:Configuration=Release /p:Platform=x64
+//
 //   python tests/fuzz_gltf/mutate.py --minutes 10
 //
 // It is deliberately a plain main() rather than an LLVMFuzzerTestOneInput: load_gltf takes a path,
 // so a libFuzzer harness would have to write a temp file per case anyway, and this shape also
 // drives AFL and the plain corpus runner in mutate.py.
+
+// <cassert> before Color.hpp: libslic3r/Color.hpp, reached through GLTF.hpp, uses assert()
+// without including it and only compiles today because every other consumer pulls it in first.
+#include <cassert>
 
 #include <cstdio>
 #include <cstring>
