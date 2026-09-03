@@ -175,6 +175,33 @@ def make_box_10_20_30():
     write_glb(os.path.join("Geräte", "box-čřšřěá.glb"), gltf, blob)
 
 
+def make_box_stl_twin():
+    """box_10_20_30 as a binary STL, already in the slicer's Z-up frame: 10 (X) x 30 (Y) x 20 (Z).
+
+    This is the Slice Compare control from the plan's manual checklist. Slicing it and the .glb
+    with the same printer/process/filament must produce identical G-code - the end-to-end proof
+    that the up-axis rule and the unit rule turn the glTF into the same solid a known-good STL
+    describes. Note the axes are the glTF box's after (x, y, z) -> (x, -z, y), not before.
+    """
+    tris = []
+    for quad, normal in box_faces(-5, -15, -10, 5, 15, 10):
+        a, b, c, d = quad
+        tris.append((normal, (a, b, c)))
+        tris.append((normal, (a, c, d)))
+    out = bytearray(b"Snapmaker Orca glTF test fixture: box 10x30x20, twin of box_10_20_30.glb")
+    out += b" " * (80 - len(out))
+    out += struct.pack("<I", len(tris))
+    for normal, verts in tris:
+        out += struct.pack("<3f", *normal)
+        for v in verts:
+            out += struct.pack("<3f", *v)
+        out += struct.pack("<H", 0)
+    path = os.path.join(HERE, "box_10_20_30.stl")
+    with open(path, "wb") as f:
+        f.write(out)
+    print("%-40s %6d bytes" % ("box_10_20_30.stl", len(out)))
+
+
 def make_box_meters():
     """0.01 x 0.02 x 0.03 units. At 1 unit = 1 mm this is 6e-6 mm3, below the 0.008 mm3 that
     makes Model::looks_like_saved_in_meters() offer to scale it - the rescue path the units
@@ -400,6 +427,7 @@ def make_truncated():
 
 def main():
     make_box_10_20_30()
+    make_box_stl_twin()
     make_box_meters()
     make_two_parts_two_materials()
     make_nested_trs()
