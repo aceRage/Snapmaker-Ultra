@@ -2379,6 +2379,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream& file, ThumbnailsGenerato
 
     file.write_format("; EXECUTABLE_BLOCK_START\n");
 
+    // Number the objects and their instances before any of the labels below can read the numbers.
+    assign_object_and_instance_ids(print);
+
     // SoftFever
     if (m_enable_exclude_object)
         file.write(set_object_info(&print));
@@ -9224,6 +9227,28 @@ inline std::string polygon_to_string(const Polygon& polygon, Print* print, bool 
     gcode << "]";
     return gcode.str();
 }
+// Number every object and every instance of it, in print order, once per export.
+//
+// These counters name the object in the `; printing object <name> id:<N> copy <n>` comments and in
+// the firmware exclude-object definitions. They used to be assigned inside set_object_info(), which
+// is only called when the exclude-object feature is on AND returns early for BBL printers and for
+// flavours without such a feature - so on every other printer the labels reported an uninitialised
+// PrintObject::m_id and changed from one run of the same binary to the next. Numbering here, for
+// every printer and every flavour, makes the labels a function of the print order alone.
+void GCode::assign_object_and_instance_ids(Print& print)
+{
+    size_t object_id = 0;
+    size_t unique_id = 0;
+    for (PrintObject* object : print.objects()) {
+        object->set_id(object_id++);
+        size_t inst_id = 0;
+        for (PrintInstance& inst : object->instances()) {
+            inst.unique_id = unique_id++;
+            inst.id        = inst_id++;
+        }
+    }
+}
+
 // this function iterator PrintObject and assign a seqential id to each object.
 // this id is used to generate unique object id for each object.
 std::string GCode::set_object_info(Print* print)
@@ -9233,7 +9258,6 @@ std::string GCode::set_object_info(Print* print)
         (gflavor != gcfKlipper && gflavor != gcfMarlinLegacy && gflavor != gcfMarlinFirmware && gflavor != gcfRepRapFirmware))
         return "";
     std::ostringstream gcode;
-    size_t             object_id = 0;
     // Orca: check if we are in pa calib mode
     if (print->calib_mode() == CalibMode::Calib_PA_Line || print->calib_mode() == CalibMode::Calib_PA_Pattern) {
         BoundingBoxf bbox_bed(print->config().printable_area.values);
@@ -9247,13 +9271,8 @@ std::string GCode::set_object_info(Print* print)
               << "Orca-PA-Calibration-Test"
               << " CENTER=" << 0 << "," << 0 << " POLYGON=" << polygon_to_string(polygon_bed, print, true) << "\n";
     } else {
-        size_t unique_id = 0;
         for (PrintObject* object : print->objects()) {
-            object->set_id(object_id++);
-            size_t inst_id = 0;
             for (PrintInstance& inst : object->instances()) {
-                inst.unique_id = unique_id++;
-                inst.id        = inst_id++;
                 auto bbox      = inst.get_bounding_box();
                 auto center    = print->translate_to_print_space(Vec2d(bbox.center().x(), bbox.center().y()));
                 auto inst_name = get_instance_name(object, inst);
