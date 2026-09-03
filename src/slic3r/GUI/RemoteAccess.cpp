@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <chrono>
 #include <ctime>
 #include <future>
@@ -44,6 +45,8 @@
 
 #include <wx/utils.h>
 #include <wx/modalhook.h>
+#include <boost/core/demangle.hpp>
+#include <typeinfo>
 #include <wx/msgdlg.h>
 #include <wx/timer.h>
 #include <wx/thread.h>
@@ -167,9 +170,29 @@ static const ClassRule k_class_rules[] = {
     { "SelectMachineDialog",     wxID_CANCEL, false }, { "SendToPrinterDialog",  wxID_CANCEL, false },
     { "SendMultiMachinePage",    wxID_CANCEL, false }, { "ConfirmBeforeSendDialog", wxID_CANCEL, false },
     { "PrintHostSendDialog",     wxID_CANCEL, false }, { "CaliHistoryDialog",    wxID_CANCEL, false },
+    // colour import (OBJ / glTF): its OK handler is what fills the filament ids, so a returned OK
+    // without a click imports without colour anyway; say so instead of pretending to agree
+    { "ObjColorDialog",          wxID_CANCEL, false },
 };
 
 static bool has_btn(wxDialog* d, int id) { return d->FindWindow(id) != nullptr; }
+
+// The dialog's own class name. wx RTTI only knows classes declared with wxDECLARE_CLASS, which
+// none of the fork's dialogs are: through it every one of them reports "wxDialog" and no rule
+// above could ever match. The C++ type is always right; wx's name is the fallback for wx's own
+// dialogs on toolchains whose demangler gives nothing usable.
+static std::string dialog_class_name(wxDialog* dlg)
+{
+    std::string name = boost::core::demangle(typeid(*dlg).name()); // e.g. "class Slic3r::GUI::SelectMachineDialog"
+    const size_t colons = name.rfind("::");
+    if (colons != std::string::npos) name = name.substr(colons + 2);
+    for (const char* prefix : { "class ", "struct " })
+        if (name.compare(0, std::strlen(prefix), prefix) == 0) name = name.substr(std::strlen(prefix));
+    while (!name.empty() && !(std::isalnum((unsigned char) name.back()) || name.back() == '_')) name.pop_back();
+    if (name.empty() || !(std::isalpha((unsigned char) name[0]) || name[0] == '_'))
+        name = dlg->GetClassInfo() ? std::string(wxString(dlg->GetClassInfo()->GetClassName()).ToUTF8().data()) : std::string("wxDialog");
+    return name;
+}
 
 static long style_of(wxDialog* d)
 {
@@ -219,7 +242,7 @@ protected:
             ++g_modal_depth; // somebody is looking; let it show
             return wxID_NONE;
         }
-        const std::string cls   = dlg->GetClassInfo() ? std::string(wxString(dlg->GetClassInfo()->GetClassName()).ToUTF8().data()) : std::string("wxDialog");
+        const std::string cls   = dialog_class_name(dlg);
         const std::string title = dlg->GetTitle().ToUTF8().data();
         const ClassRule*  rule  = nullptr;
         for (const ClassRule& r : k_class_rules)
