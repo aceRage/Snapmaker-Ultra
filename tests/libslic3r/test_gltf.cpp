@@ -104,6 +104,24 @@ SCENARIO("Reading a glTF/GLB file: geometry", "[gltf]")
         }
     }
 
+    GIVEN("the same box through KHR_mesh_quantization")
+    {
+        Slic3r::Model model;
+        GltfInfo      info;
+        std::string   message;
+        THEN("it is de-quantized to exactly the same size, not silently imported at the wrong scale")
+        {
+            // POSITION is normalized int16 and the real scale sits on the node.
+            // cgltf_accessor_unpack_floats de-quantizes and cgltf_node_transform_world picks the
+            // node scale up, so nothing extra is needed - but a silent wrong scale is the worst
+            // failure this importer could have, so it is asserted rather than assumed.
+            REQUIRE(load_ok("box_quantized.glb", model, info, message));
+            REQUIRE(model.objects.size() == 1);
+            REQUIRE(model.objects.front()->volumes.size() == 1);
+            REQUIRE(is_approx(model.objects.front()->volumes.front()->mesh().size(), Vec3d(10, 30, 20), 0.02));
+        }
+    }
+
     GIVEN("two nodes sharing one mesh (Khronos SimpleMeshes)")
     {
         Slic3r::Model model;

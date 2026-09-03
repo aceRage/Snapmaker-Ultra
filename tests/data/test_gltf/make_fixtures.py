@@ -163,6 +163,27 @@ def simple_box_gltf(x0, y0, z0, x1, y1, z1, material=None, node_name=None, scene
 
 # ----------------------------------------------------------------------------------- fixtures
 
+def _external_tool(command, out_name, src_name="box_10_20_30.glb"):
+    """Run one glTF-Transform command over a fixture. Needs node, so it only regenerates the file
+    when npx is available; otherwise the committed one stands. The committed files were produced
+    with glTF-Transform v4.5.0."""
+    import shutil
+    import subprocess
+
+    out = os.path.join(HERE, out_name)
+    if shutil.which("npx") is None:
+        print("%-40s skipped (no npx); keeping the committed file" % out_name)
+        return
+    src = os.path.join(HERE, src_name)
+    try:
+        subprocess.run(["npx", "--yes", "@gltf-transform/cli@4", command, src, out],
+                       check=True, shell=(os.name == "nt"),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("%-40s %6d bytes (gltf-transform %s)" % (out_name, os.path.getsize(out), command))
+    except Exception as exc:  # noqa: BLE001 - a missing network is not a test failure
+        print("%-40s skipped (%s); keeping the committed file" % (out_name, exc))
+
+
 def make_box_10_20_30():
     """10 (X) x 20 (Y) x 30 (Z) in glTF space -> Vec3d(10, 30, 20) in the slicer.
     The up-axis rule and the unit rule in one assertion; asymmetric on purpose so a wrong sign
@@ -474,6 +495,18 @@ def make_sparse_triangle():
     write_gltf_pair("sparse_triangle", gltf, bytes(blob.data))
 
 
+def make_box_quantized():
+    """box_10_20_30.glb through KHR_mesh_quantization.
+
+    gltf-transform rewrites POSITION as normalized 16-bit integers and moves the real scale onto
+    the node, so a reader that ignores quantization silently imports the box at the wrong size -
+    the one failure mode worse than an error. cgltf_accessor_unpack_floats de-quantizes for us and
+    cgltf_node_transform_world picks up the node scale, so the assertion is the same
+    Vec3d(10, 30, 20) as the uncompressed box.
+    """
+    _external_tool("quantize", "box_quantized.glb")
+
+
 def make_box_draco():
     """box_10_20_30.glb run through Draco compression.
 
@@ -485,21 +518,7 @@ def make_box_draco():
     Stage 1 refuses it by name on extensionsRequired. Stage 3 (Draco decode) inverts that
     assertion against the same file rather than deleting it.
     """
-    import shutil
-    import subprocess
-
-    out = os.path.join(HERE, "box_draco.glb")
-    if shutil.which("npx") is None:
-        print("%-40s skipped (no npx); keeping the committed file" % "box_draco.glb")
-        return
-    src = os.path.join(HERE, "box_10_20_30.glb")
-    try:
-        subprocess.run(["npx", "--yes", "@gltf-transform/cli@4", "draco", src, out],
-                       check=True, shell=(os.name == "nt"),
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("%-40s %6d bytes (gltf-transform draco)" % ("box_draco.glb", os.path.getsize(out)))
-    except Exception as exc:  # noqa: BLE001 - a missing network is not a test failure
-        print("%-40s skipped (%s); keeping the committed file" % ("box_draco.glb", exc))
+    _external_tool("draco", "box_draco.glb")
 
 
 def make_unknown_extension():
@@ -541,6 +560,7 @@ def main():
     make_textured_two_materials()
     make_points_only()
     make_sparse_triangle()
+    make_box_quantized()
     make_box_draco()
     make_unknown_extension()
     make_escaping_buffer()
