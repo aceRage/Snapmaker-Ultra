@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace Slic3r {
 namespace GUI {
 
@@ -77,6 +79,10 @@ public:
     void note_slice_progress(int plate, int percent, const std::string& text);
     void note_slice_done(bool finished_all, bool ok, const std::string& error);
 
+    // Send jobs (RemoteSend) report here from their worker thread.
+    void update_job(int id, int percent, const std::string& text);
+    void finish_job(int id, bool ok, const std::string& error, const nlohmann::json& result);
+
 private:
     RemoteAccess() = default;
     void accept_loop();
@@ -106,6 +112,7 @@ private:
     ApiResponse api_object_transform(const std::string& form_body);
     ApiResponse api_printers();
     ApiResponse api_slice(int plate, bool all);
+    ApiResponse api_send(int plate, const std::string& form_body);
     ApiResponse api_jobs(int id);
     ApiResponse api_presets();
     ApiResponse api_select_preset(const std::string& type, const std::string& name, int index);
@@ -119,10 +126,13 @@ private:
     struct Job
     {
         int         id { 0 };
-        int         plate { -1 }; // -1 = all plates
-        std::string state;        // running | done | error | cancelled
+        int         plate { -1 };       // -1 = all plates
+        std::string kind { "slice" };   // slice | send
+        std::string state;              // running | done | error | cancelled
         int         percent { 0 };
         std::string text, error;
+        std::string printer, mode;      // send jobs: the printer id and upload | print
+        nlohmann::json result;          // send jobs: what was (or, dry run, would have been) sent
     };
 
     std::mutex       m_mutex;
@@ -131,6 +141,7 @@ private:
     void*            m_acceptor { nullptr };
     std::vector<Job> m_jobs;
     int              m_next_job { 1 };
+    bool             m_send_running { false }; // one transfer at a time, like the desktop's dialogs
     std::string      m_title, m_path, m_last_error;
     bool             m_slicing { false };
     bool             m_hidden { false };
