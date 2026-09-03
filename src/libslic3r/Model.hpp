@@ -1601,11 +1601,22 @@ public:
                                 ImportstlProgressFn        stlFn                = nullptr,
                                 BBLProject *               project              = nullptr,
                                 int                        plate_id             = 0,
-                                ObjImportColorFn           objFn                = nullptr
+                                ObjImportColorFn           objFn                = nullptr,
+                                // Filled with a sentence worth showing the user on a load that
+                                // still SUCCEEDED - today only "this model's colours came from a
+                                // texture we dropped". `message` cannot carry it: read_from_file
+                                // only reads that on failure.
+                                std::string *               import_warning       = nullptr
                                 );
     // BBS
     static bool    obj_import_vertex_color_deal(const std::vector<unsigned char> &vertex_filament_ids, const unsigned char &first_extruder_id, Model *model);
     static bool    obj_import_face_color_deal(const std::vector<unsigned char> &face_filament_ids, const unsigned char &first_extruder_id, Model *model);
+    // Ultra (glTF): one filament id per ModelVolume of the single imported object. No painting -
+    // each part simply gets its own "extruder" config, which is what a per-primitive material means.
+    static bool    import_volume_color_deal(const std::vector<unsigned char> &volume_filament_ids, const unsigned char &first_extruder_id, Model *model);
+    // Ultra (glTF): per-vertex colours across ALL volumes of the single imported object, with a
+    // running vertex offset. Same encoding as obj_import_vertex_color_deal.
+    static bool    import_multi_volume_vertex_color_deal(const std::vector<unsigned char> &vertex_filament_ids, const unsigned char &first_extruder_id, Model *model);
     static double findMaxSpeed(const ModelObject* object);
     static double getThermalLength(const ModelVolume* modelVolumePtr);
     static double getThermalLength(const std::vector<ModelVolume*> modelVolumePtrs);

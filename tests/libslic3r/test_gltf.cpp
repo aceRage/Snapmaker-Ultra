@@ -1,13 +1,21 @@
 #include <catch2/catch.hpp>
 
 #include <algorithm>
+#include <functional>
 #include <string>
+#include <vector>
 
 #include "libslic3r/Format/GLTF.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/ObjColorUtils.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
 using namespace Slic3r;
+
+// Golden serialisations captured from the shared paint helper - see the two [golden] scenarios
+// at the end of this file for what they pin and why.
+static const char *GOLDEN_VERTEX_COLOR_SERIALISATION = "8|0C88A|0C1C80C893|80C0C6|80C0C2|0C886|0C886|8|1C88A|81C0C1C813|80C0C6|1C0C0CA|";
+static const char *GOLDEN_FACE_COLOR_SERIALISATION   = "|8|0C|1C||8|0C|1C||8|0C|1C|";
 
 static inline std::string gltf_path(const char *path)
 {
@@ -358,6 +366,285 @@ SCENARIO("Importing a glTF/GLB file through Model::read_from_file", "[gltf]")
             REQUIRE(model.looks_like_saved_in_meters());
             model.convert_from_meters(true);
             REQUIRE(is_approx(model.objects.front()->volumes.front()->mesh().size(), Vec3d(10, 30, 20), 1e-3));
+        }
+    }
+}
+
+// ===========================================================================================
+// Stage 2 - colours to filaments
+// ===========================================================================================
+
+// A stub for the GUI's ObjColorDialog: records what it was handed and answers with fixed ids.
+struct ColorDialogStub
+{
+    bool                       called{false};
+    std::vector<RGBA>          seen;
+    bool                       seen_single{false};
+    std::vector<unsigned char> answer;      // returned verbatim when non-empty
+    unsigned char              first{1};
+    // When set, the answer is generated per input colour instead of copied from `answer`.
+    std::function<unsigned char(size_t)> per_color;
+
+    ObjImportColorFn fn()
+    {
+        return [this](std::vector<RGBA> &input_colors, bool is_single_color,
+                      std::vector<unsigned char> &filament_ids, unsigned char &first_extruder_id) {
+            this->called      = true;
+            this->seen        = input_colors;
+            this->seen_single = is_single_color;
+            if (this->per_color) {
+                filament_ids.clear();
+                filament_ids.reserve(input_colors.size());
+                for (size_t i = 0; i < input_colors.size(); ++i)
+                    filament_ids.push_back(this->per_color(i));
+            } else {
+                filament_ids = this->answer;
+            }
+            first_extruder_id = this->first;
+        };
+    }
+};
+
+static Slic3r::Model read_gltf_with_colors(const char *fixture, ColorDialogStub &stub, std::string *warning = nullptr)
+{
+    return Slic3r::Model::read_from_file(gltf_path(fixture), nullptr, nullptr,
+                                         LoadStrategy::AddDefaultInstances, nullptr, nullptr, nullptr,
+                                         nullptr, nullptr, nullptr, nullptr, 0, stub.fn(), warning);
+}
+
+SCENARIO("The colour dialog's k-means copes with a handful of material colours", "[gltf]")
+{
+    // Experiment 5.3 from the plan. Stage 2 hands QuantKMeans 1-16 colours - one per glTF
+    // material - where the OBJ path hands it one per triangle. Nothing here may divide by zero,
+    // ask OpenCV for more clusters than it has samples, or come back empty.
+    GIVEN("between 1 and 30 well-separated colours")
+    {
+        auto palette = [](size_t n) {
+            std::vector<RGBA> out;
+            out.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                // Spread over the cube so the colours stay distinct after the 8-bit and Lab trips.
+                const float t = float(i) / float(n == 1 ? 1 : n - 1);
+                out.push_back(RGBA{t, 1.f - t, float((i * 7) % 5) / 4.f, 1.f});
+            }
+            return out;
+        };
+
+        THEN("automatic cluster selection returns one label per colour and at least one cluster")
+        {
+            for (size_t n : {size_t(1), size_t(2), size_t(3), size_t(4), size_t(8), size_t(16), size_t(30)}) {
+                const std::vector<RGBA> colors = palette(n);
+                std::vector<RGBA>       clusters;
+                std::vector<int>        labels;
+                QuantKMeans             quant(10);
+                quant.apply(colors, clusters, labels, -1);
+                INFO("n = " << n << ", clusters = " << clusters.size());
+                REQUIRE(labels.size() == n);
+                REQUIRE(clusters.size() >= 1);
+                REQUIRE(clusters.size() <= n);
+                for (int label : labels) {
+                    REQUIRE(label >= 0);
+                    REQUIRE(label < (int) clusters.size());
+                }
+            }
+        }
+        THEN("an explicit cluster count never asks for more clusters than there are colours")
+        {
+            for (size_t n : {size_t(1), size_t(2), size_t(5), size_t(16)}) {
+                const std::vector<RGBA> colors = palette(n);
+                for (int k = 1; k <= (int) n + 2; ++k) {
+                    std::vector<RGBA> clusters;
+                    std::vector<int>  labels;
+                    QuantKMeans       quant(10);
+                    quant.apply(colors, clusters, labels, k);
+                    INFO("n = " << n << ", k = " << k);
+                    REQUIRE(labels.size() == n);
+                    REQUIRE(clusters.size() >= 1);
+                    REQUIRE(clusters.size() <= n);
+                }
+            }
+        }
+    }
+}
+
+SCENARIO("glTF material colours become per-part filaments", "[gltf]")
+{
+    GIVEN("a two-material GLB and a dialog that answers filaments 2 and 3")
+    {
+        ColorDialogStub stub;
+        stub.answer = {2, 3};
+        stub.first  = 2;
+        Slic3r::Model model = read_gltf_with_colors("two_parts_two_materials.glb", stub);
+
+        THEN("the dialog saw one colour per material, not one per triangle")
+        {
+            REQUIRE(stub.called);
+            REQUIRE(stub.seen.size() == 2);
+            REQUIRE(stub.seen_single == false);
+        }
+        THEN("each part lands on its own filament, with no MMU painting at all")
+        {
+            REQUIRE(model.objects.size() == 1);
+            REQUIRE(model.objects.front()->volumes.size() == 2);
+            const ModelObject *obj = model.objects.front();
+            REQUIRE(obj->config.extruder() == 2);
+            REQUIRE(obj->volumes[0]->config.extruder() == 2);
+            REQUIRE(obj->volumes[1]->config.extruder() == 3);
+            // The whole point of per-part assignment: parts stay editable, nothing is painted.
+            REQUIRE(obj->volumes[0]->is_mm_painted() == false);
+            REQUIRE(obj->volumes[1]->is_mm_painted() == false);
+        }
+    }
+
+    GIVEN("a single-material GLB")
+    {
+        ColorDialogStub stub;
+        stub.answer = {2};
+        Slic3r::Model model = read_gltf_with_colors("box_10_20_30.glb", stub);
+        THEN("no dialog is opened - there is nothing to choose")
+        {
+            REQUIRE(stub.called == false);
+            REQUIRE(model.objects.size() == 1);
+            REQUIRE(model.objects.front()->volumes.front()->is_mm_painted() == false);
+        }
+    }
+
+    GIVEN("a two-material GLB whose first material paints from a texture")
+    {
+        ColorDialogStub stub;
+        stub.answer = {2, 3};
+        std::string   warning;
+        Slic3r::Model model = read_gltf_with_colors("textured_two_materials.glb", stub, &warning);
+        THEN("no dialog is opened, and the dropped texture is reported instead")
+        {
+            // Without the had_textures guard this file WOULD open the dialog - it has two
+            // materials - so this really tests the guard.
+            REQUIRE(stub.called == false);
+            REQUIRE_FALSE(warning.empty());
+            REQUIRE(contains(warning, "texture"));
+            REQUIRE(model.objects.front()->volumes.size() == 2);
+        }
+    }
+
+    GIVEN("a part with no material at all")
+    {
+        // strip_and_fan.glb has two primitives and no materials, so material_colors is empty and
+        // the dialog must stay shut.
+        ColorDialogStub stub;
+        stub.answer = {2, 3};
+        Slic3r::Model model = read_gltf_with_colors("strip_and_fan.glb", stub);
+        THEN("no dialog, no filament assignment")
+        {
+            REQUIRE(stub.called == false);
+            REQUIRE(model.objects.front()->volumes.size() == 2);
+        }
+    }
+}
+
+SCENARIO("glTF COLOR_0 becomes MMU painting", "[gltf]")
+{
+    GIVEN("BoxVertexColors.glb and a dialog that alternates two filaments")
+    {
+        ColorDialogStub stub;
+        stub.first     = 2;
+        stub.per_color = [](size_t i) { return (unsigned char) (2 + (i % 2)); };
+        Slic3r::Model model = read_gltf_with_colors("BoxVertexColors.glb", stub);
+
+        THEN("the dialog saw one colour per vertex and the volume ends up painted")
+        {
+            REQUIRE(stub.called);
+            REQUIRE(model.objects.size() == 1);
+            const ModelVolume *v = model.objects.front()->volumes.front();
+            REQUIRE(stub.seen.size() == v->mesh().its.vertices.size());
+            REQUIRE(v->is_mm_painted());
+            REQUIRE(v->config.extruder() == 2);
+        }
+    }
+
+    GIVEN("a vertex-colour array of the wrong total length")
+    {
+        Slic3r::Model    model;
+        GltfInfo         info;
+        std::string      message;
+        REQUIRE(load_ok("two_parts_two_materials.glb", model, info, message));
+        REQUIRE(model.objects.front()->volumes.size() == 2);
+        size_t total = 0;
+        for (const ModelVolume *v : model.objects.front()->volumes)
+            total += v->mesh().its.vertices.size();
+
+        THEN("it is refused and nothing at all is painted")
+        {
+            std::vector<unsigned char> ids(total - 1, 2);
+            REQUIRE_FALSE(Slic3r::Model::import_multi_volume_vertex_color_deal(ids, 2, &model));
+            for (const ModelVolume *v : model.objects.front()->volumes)
+                REQUIRE(v->is_mm_painted() == false);
+        }
+        THEN("the right length is accepted and paints every volume")
+        {
+            std::vector<unsigned char> ids;
+            ids.reserve(total);
+            for (size_t i = 0; i < total; ++i)
+                ids.push_back((unsigned char) (2 + (i % 2)));
+            REQUIRE(Slic3r::Model::import_multi_volume_vertex_color_deal(ids, 2, &model));
+            for (const ModelVolume *v : model.objects.front()->volumes)
+                REQUIRE(v->is_mm_painted());
+        }
+    }
+}
+
+// The golden regression for the refactor in change 2.2. paint_volume_from_vertex_colors is the
+// per-triangle body lifted verbatim out of Model::obj_import_vertex_color_deal; these strings are
+// the exact 3MF/AMF serialisation it produces, so any future edit to the shared helper that
+// changes OBJ behaviour fails here rather than silently shipping.
+SCENARIO("obj_import_vertex_color_deal serialisation is unchanged by the shared helper", "[gltf][golden]")
+{
+    GIVEN("a cube whose eight corners span all three vertex-colour cases")
+    {
+        Slic3r::Model model;
+        ModelObject  *object = model.add_object();
+        object->add_volume(TriangleMesh(its_make_cube(10., 10., 10.)), ModelVolumeType::MODEL_PART);
+        ModelVolume *volume = object->volumes.front();
+        REQUIRE(volume->mesh().its.vertices.size() == 8);
+        REQUIRE(volume->mesh().its.indices.size() == 12);
+
+        // Deliberately uneven so the cube's twelve faces hit _3_SAME_COLOR, _3_DIFF_COLOR and
+        // _2_SAME_1_DIFF_COLOR between them.
+        const std::vector<unsigned char> ids = {2, 2, 2, 3, 3, 4, 2, 3};
+
+        THEN("every painted triangle serialises to its recorded golden string")
+        {
+            REQUIRE(Slic3r::Model::obj_import_vertex_color_deal(ids, 2, &model));
+            REQUIRE(object->config.extruder() == 2);
+            REQUIRE(volume->config.extruder() == 2);
+            REQUIRE(volume->is_mm_painted());
+            std::string serialised;
+            for (int i = 0; i < (int) volume->mesh().its.indices.size(); ++i)
+                serialised += volume->mmu_segmentation_facets.get_triangle_as_string(i) + "|";
+            REQUIRE(serialised == GOLDEN_VERTEX_COLOR_SERIALISATION);
+        }
+    }
+}
+
+SCENARIO("obj_import_face_color_deal serialisation is unchanged", "[gltf][golden]")
+{
+    GIVEN("a cube with a per-face filament array")
+    {
+        Slic3r::Model model;
+        ModelObject  *object = model.add_object();
+        object->add_volume(TriangleMesh(its_make_cube(10., 10., 10.)), ModelVolumeType::MODEL_PART);
+        ModelVolume *volume = object->volumes.front();
+
+        std::vector<unsigned char> ids;
+        for (size_t i = 0; i < volume->mesh().its.indices.size(); ++i)
+            ids.push_back((unsigned char) (1 + (i % 4)));   // includes 1, which must be skipped
+
+        THEN("every painted triangle serialises to its recorded golden string")
+        {
+            REQUIRE(Slic3r::Model::obj_import_face_color_deal(ids, 2, &model));
+            std::string serialised;
+            for (int i = 0; i < (int) volume->mesh().its.indices.size(); ++i)
+                serialised += volume->mmu_segmentation_facets.get_triangle_as_string(i) + "|";
+            REQUIRE(serialised == GOLDEN_FACE_COLOR_SERIALISATION);
         }
     }
 }

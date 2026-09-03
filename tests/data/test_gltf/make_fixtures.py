@@ -320,6 +320,73 @@ def make_strip_and_fan():
     write_glb("strip_and_fan.glb", gltf, bytes(blob.data))
 
 
+def tiny_png_data_uri():
+    """A 1x1 opaque PNG as a data: URI. cgltf never decodes images, so the bytes only have to be a
+    well-formed PNG for the file to be honest about carrying a texture."""
+    import base64
+    import struct
+    import zlib
+
+    def chunk(kind, payload):
+        body = kind + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)          # 1x1, 8-bit, truecolour
+    idat = zlib.compress(b"\x00\xc0\x30\x60")                    # one filtered scanline
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def make_textured_two_materials():
+    """Two primitives and two materials, one of which paints from a baseColorTexture.
+
+    Two materials on purpose: without the had_textures guard this file WOULD open the colour
+    dialog, so the test proves the guard works rather than proving there was nothing to ask.
+    """
+    pos_a, nrm_a, idx_a = box_mesh(0, 0, 0, 10, 10, 10)
+    pos_b, nrm_b, idx_b = box_mesh(12, 0, 0, 22, 10, 10)
+    uv = [0.0, 0.0] * (len(pos_a) // 3)
+    blob = Blob()
+    va_p, va_n, va_i = blob.add_floats(pos_a), blob.add_floats(nrm_a), blob.add_ushorts(idx_a)
+    va_uv = blob.add_floats(uv)
+    vb_p, vb_n, vb_i = blob.add_floats(pos_b), blob.add_floats(nrm_b), blob.add_ushorts(idx_b)
+    lo_a, hi_a = bounds(pos_a)
+    lo_b, hi_b = bounds(pos_b)
+    gltf = {
+        "asset": {"version": "2.0", "generator": "Snapmaker Orca test fixture"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0, "name": "blocks"}],
+        "meshes": [{"name": "blocks", "primitives": [
+            {"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 3}, "indices": 2,
+             "material": 0, "mode": MODE_TRIANGLES},
+            {"attributes": {"POSITION": 4, "NORMAL": 5}, "indices": 6, "material": 1,
+             "mode": MODE_TRIANGLES},
+        ]}],
+        "materials": [
+            {"name": "painted", "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}},
+            {"name": "plain", "pbrMetallicRoughness": {"baseColorFactor": [0.0, 0.0, 1.0, 1.0]}},
+        ],
+        "textures": [{"source": 0}],
+        "images": [{"uri": tiny_png_data_uri()}],
+        "extensionsUsed": [],
+        "accessors": [
+            {"bufferView": va_p, "componentType": FLOAT, "count": len(pos_a) // 3, "type": "VEC3",
+             "min": lo_a, "max": hi_a},
+            {"bufferView": va_n, "componentType": FLOAT, "count": len(nrm_a) // 3, "type": "VEC3"},
+            {"bufferView": va_i, "componentType": UNSIGNED_SHORT, "count": len(idx_a), "type": "SCALAR"},
+            {"bufferView": va_uv, "componentType": FLOAT, "count": len(uv) // 2, "type": "VEC2"},
+            {"bufferView": vb_p, "componentType": FLOAT, "count": len(pos_b) // 3, "type": "VEC3",
+             "min": lo_b, "max": hi_b},
+            {"bufferView": vb_n, "componentType": FLOAT, "count": len(nrm_b) // 3, "type": "VEC3"},
+            {"bufferView": vb_i, "componentType": UNSIGNED_SHORT, "count": len(idx_b), "type": "SCALAR"},
+        ],
+        "bufferViews": blob.views,
+    }
+    del gltf["extensionsUsed"]
+    write_glb("textured_two_materials.glb", gltf, bytes(blob.data))
+
+
 def make_points_only():
     """No printable surface at all - the reader must say so by name, not fail generically."""
     pts = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
@@ -432,6 +499,7 @@ def main():
     make_two_parts_two_materials()
     make_nested_trs()
     make_strip_and_fan()
+    make_textured_two_materials()
     make_points_only()
     make_sparse_triangle()
     make_box_draco()
