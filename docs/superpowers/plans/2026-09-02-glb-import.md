@@ -1164,3 +1164,183 @@ gate on the merge of T6-T8.
 **Total: 6–8 days for Stage 1, plus 3.5–5 for Stage 2 — roughly two working weeks for the
 version users will actually want. Stage 3 adds 1–10 more depending on how much of it is taken;
 the recommended slice is 3a alone (0.5 d), deferring Draco until real files demand it.**
+
+---
+
+## Stage 1 status
+
+Done, on branch `feat/glb-import-stage1` (from `feat/ultra-preferences`), built and verified in the
+`C:\Dev\SnapmakerOrcaNext` worktree on 2026-09-03. All of Stage 1 shipped; the sections below list
+what changed, where it departs from this plan, the gate output, and what the next stage inherits.
+
+### What shipped
+
+| Plan item | File | Note |
+|---|---|---|
+| 1.1 | `deps_src/cgltf/{cgltf.h,CMakeLists.txt,README.md}` | cgltf 1.15 verbatim, MIT. `README.md` added for provenance and the "only `GLTF.cpp` defines `CGLTF_IMPLEMENTATION`" rule |
+| 1.2 | `deps_src/CMakeLists.txt` | `add_subdirectory(cgltf)` in the header-only group |
+| 1.3 | `src/libslic3r/CMakeLists.txt` | `Format/GLTF.{cpp,hpp}` in the source list; `cgltf` linked explicitly in the `PRIVATE` block |
+| 1.4, 1.5 | `src/libslic3r/Format/GLTF.{hpp,cpp}` | the header exactly as §3.1; the reader ~640 lines |
+| 1.6 | `src/libslic3r/Model.cpp` | one `else if` before the `else`, plus the updated message |
+| 1.7, 1.8 | `src/slic3r/GUI/GUI_App.cpp` | both `FT_MODEL` lists and both dialog titles |
+| 1.9 | `src/slic3r/GUI/MainFrame.cpp` | both `#ifdef` branches |
+| 1.10 | `src/slic3r/GUI/Plater.cpp` | `pattern_drop` |
+| 1.11 | `src/slic3r/GUI/RemoteHub.cpp` | `spool_upload` allow-list and the API manifest |
+| 1.12 | `resources/web/orca/stream_center.html` | picker label, regex and message |
+| 1.13 | `src/dev-utils/platform/osx/Info.plist.in` | a `glb`/`gltf` document type. The `obj` block's `CFBundleTypeName = "STL"` copy-paste bug was **not** replicated |
+| 1.14 | — | no CLI change, no Windows association, `Plater.cpp:11633-11637` untouched, all as planned |
+| 1.15 | `tests/libslic3r/test_gltf.cpp`, `tests/data/test_gltf/*` | 14 self-authored fixtures + 3 CC0 Khronos assets, `make_fixtures.py`, `SOURCES.md` |
+| fuzz | `tests/fuzz_gltf/` | driver, `nanosvg_impl.cpp`, `mutate.py` |
+
+`RemoteAccess.cpp` needed **no** change, exactly as §6 predicted: `api_project_open` only filters by
+extension for `mode == "load"` (`.3mf`-only), and a `.glb` arrives as `mode == "import"`.
+
+### Deviations from the plan
+
+1. **`cgltf_validate` refuses on `cgltf_result_data_too_short`** instead of only logging (§5 step 4
+   said "log a warning, do not refuse"). Reason, and it is not a style call: `cgltf_validate` is the
+   only thing that bounds-checks sparse accessor indices (`cgltf.h:1628`,
+   `index_bound >= accessor->count`), and `cgltf_accessor_unpack_floats` does **not** re-check the
+   sparse writer index before `out[writer_index * floats_per_element]` (`cgltf.h:2437-2440`). Without
+   the refusal, a crafted sparse index is a heap write past the end of the reader's own buffer — in a
+   parser reachable from the LAN upload endpoint. `data_too_short` is exactly the
+   "accessor points outside its buffer" family; every other `cgltf_validate` result (the cosmetic
+   `invalid_gltf` family that real files trip) is still only logged, so the plan's intent is kept.
+   The reader also does its own `accessor_data_fits()` check as belt and braces.
+2. **A fifth hygiene step**: `its_compactify_vertices` after `its_remove_degenerate_faces`. Vertices a
+   primitive declares but never indexes would otherwise stay in the mesh and inflate its bounding
+   box — which is what the up-axis/unit assertion measures. It also keeps
+   `GltfInfo::vertex_colors.size()` equal to the real vertex count.
+3. **`SimpleSparseAccessor` is CC-BY-4.0, not CC0.** §"Test assets" group B lists it as CC0; its
+   `README.md` says Creative Commons Attribution 4.0. It was **not** vendored. `sparse_triangle.gltf`
+   + `.bin` was authored instead and covers the same behaviour with numbers we chose (a base triangle
+   whose third vertex is moved from `(0,1,0)` to `(0,5,0)` by a sparse override, so ignoring sparse
+   gives a 1 mm triangle instead of a 5 mm one). The other three group-B assets were confirmed CC0.
+4. **`box_draco.glb` is genuinely Draco-compressed**, not the hand-declared stub the plan allowed for:
+   `npx --yes @gltf-transform/cli@4 draco box_10_20_30.glb box_draco.glb` (glTF-Transform v4.5.0).
+   Stage 3b can invert the assertion against this same file with no new fixture.
+5. **Six fixtures beyond the plan's list**, all cheap and all pinning a stated rule:
+   `unknown_extension.glb` (an unknown required extension is named), `escaping_buffer.gltf` (the
+   buffer-URI containment check), `truncated.glb` (gate item 13, committed rather than generated at
+   test time), `box_meters.glb` (proves the metres rescue fires, so §3.5's "zero new code" claim is
+   tested rather than asserted), `box_10_20_30.stl` (the Slice Compare control), and
+   `Geräte/box-čřšřěá.glb`.
+6. **The fuzz target lives in `tests/fuzz_gltf/`, not `tests/sandboxes/fuzz_gltf/`** — `tests/sandboxes`
+   does not exist in this fork. It is added `EXCLUDE_FROM_ALL`, following the `cpp17` precedent.
+7. **`MAX_GLTF_VOLUMES` is a hard, named error**, per §3.9's "produce a named error"; `skipped_nodes`
+   records how many (node, primitive) pairs were beyond the cap so the caller can still report it.
+8. **Draco is also refused per-primitive**, not only from `extensionsRequired`: an asset may carry
+   `KHR_draco_mesh_compression` on a primitive without requiring it, and cgltf still cannot decode it.
+9. **Cancel returns `false` with "Import cancelled."** — which `Model::read_from_file` turns into a
+   `RuntimeError` and the Plater shows as an error dialog. Honest and non-hanging, but a user-initiated
+   cancel arguably should not raise a dialog. **Reviewer decision**, noted rather than guessed at.
+10. **`GltfInfo::had_textures` sets a warning in `message` on success, where nothing reads it yet** —
+    `Model::read_from_file` only consumes `message` on failure. The flag and the sentence are in place
+    for §2.5's notification; in Stage 1 the warning only reaches the log.
+
+### Gate output
+
+**Automated** — `build/tests/libslic3r/Release/libslic3r_tests.exe "[gltf]"`:
+
+```
+All tests passed (109 assertions in 4 test cases)
+```
+
+Full suite, guarding the "must not change" list — `libslic3r_tests.exe`:
+
+```
+test cases:   588 |   586 passed | 2 failed as expected
+assertions: 52721 | 52719 passed | 2 failed as expected
+```
+
+Every numbered gate item holds. 1 `box_10_20_30.glb` → 1 object, 1 volume, `Vec3d(10,30,20)` (plus
+`open_edges == 0`, 8 welded vertices from 24, `its_volume == 6000`). 2 `.gltf`+`.bin` identical to the
+`.glb`. 3 `SimpleMeshes.gltf` → 2 volumes, distinct names, 1 mm apart in X. 4
+`two_parts_two_materials.glb` → 2 volumes, 2 material colours. 5 `nested_trs.glb` → centre `(5,1,0)`,
+size `(8,2,4)`, and identity rotation/scale on the volume. 6 `strip_and_fan.glb` → 2 and 3 triangles,
+with **both** strip triangles' face normals asserted (see finding 5 below). 7
+`TriangleWithoutIndices.gltf` → 1 triangle. 8 sparse accessor honoured. 9 `points_only.glb` → false,
+"points or lines". 10 `box_draco.glb` → false, "Draco". 11 `BoxVertexColors.glb` → one colour per
+surviving vertex, and `is_mm_painted()` still false. 12 non-ASCII path loads. 13 truncated file →
+"damaged or incomplete", no crash.
+
+**Fuzz** — `python tests/fuzz_gltf/mutate.py --minutes 10 --seed 20260903`:
+
+```
+seeds  : 21
+rounds=2573 cases=102920 findings=0
+```
+
+102,920 mutated files, no crash, no uncaught exception, no `false` with an empty message, and no
+`true` whose `info.parts` disagreed with the model. (The driver checks the return contract, not just
+survival.)
+
+**Manual**, against an instance on the isolated `dd_next` data dir (hub on port 13641), driven
+through its loopback API rather than the GUI:
+
+* `--datadir … box_10_20_30.glb` on the command line → `/api/plates` shows one object named
+  `box scene` (the glTF scene name) with plate footprint `[130.5, 121.0, 140.5, 151.0]`, i.e. 10 × 30
+  mm; `/api/plates/0/layout` reports `size [10.0, 30.0, 20.0]`, `offset [135.5, 136.0, 10.0]`,
+  `rz 0.0`, `scale 1.0` — the up-axis rule, the unit rule and the transform bake, in the real app.
+* `/api/plates/0/thumbnail.png` → a 512×512 render of a clean solid box, no manifold artefacts.
+* Phone upload: `POST /r/<token>/i/<pid>/open?mode=import` with `two_parts_two_materials.glb` →
+  `{"objects":1}` and a second plate object sized `[22.0, 10.0, 10.0]`, exactly the two-box extent
+  after the axis swap. A `.gif` is still refused: `only .3mf, .stl, .obj, .step and .glb files can be
+  opened`. `POST /r/<token>/api/instances/open` with `nested_trs.glb` spools the file and spawns an
+  instance (`ok:true`).
+* **Slice Compare control** — the plan asks for a GUI SliceCompare diff; `SliceCompare` is only
+  reachable from `MainFrame`, so it was run as the strictly stronger CLI equivalent via
+  `scripts/orca_cli.py`: slice `box_10_20_30.glb` and `box_10_20_30.stl` with the same printer,
+  process and filament and compare the G-code. Result: **9198 identical lines**, the only differences
+  being the `; printing object <name>` comment and the file-name header (the GLB's object is named
+  from the glTF scene, the STL's from its file). Identical G-code means no layer, feature or extrusion
+  differences by construction.
+
+### Findings
+
+1. **Experiment 5.1 answered: cgltf compiles clean as C++ under MSVC at this repo's warning level.**
+   Zero errors and zero warnings from `GLTF.cpp`. The `cgltf_impl.c` fallback is not needed. The
+   defensive `#pragma warning(push/disable/pop)` around the include stays as insurance for other
+   toolchains.
+2. **Experiment 5.4 answered:** `cgltf_node_transform_world` does compose the whole chain —
+   `SimpleMeshes` lands its two instances exactly 1 mm apart and `nested_trs` matches the
+   hand-computed centre and extents.
+3. **Experiment 5.5 answered differently than proposed.** Rather than author a closed solid out of a
+   triangle strip (fiddly, and a wrong winding could still cancel out), the test asserts the **face
+   normal of each strip triangle** directly. Triangle 1 only agrees with triangle 0 if the
+   odd-triangle vertex swap was applied, so the fixture discriminates exactly the bug the rule exists
+   to prevent.
+4. **`src/libslic3r/Color.hpp` calls `assert()` without including `<cassert>`.** It only compiles
+   today because every existing consumer pulls it in first. A new translation unit that includes
+   `Format/GLTF.hpp` early hits it. Worked around locally in `tests/fuzz_gltf/fuzz_gltf.cpp`; the
+   shared header was deliberately not touched. Worth a one-line fix in a separate change.
+5. **nanosvg's implementation section includes `<windows.h>`.** Its `min`/`max`/`GetObject` macros
+   break every libslic3r header that follows, so `tests/libslic3r/libslic3r_tests.cpp` only survives
+   `#define NANOSVG_IMPLEMENTATION` because no libslic3r header comes after it. The fuzz target puts
+   it in its own TU (`nanosvg_impl.cpp`), which is what any future test binary should copy.
+6. **`EXCLUDE_FROM_ALL` keeps a target out of the Visual Studio solution**, so
+   `cmake --build --target fuzz_gltf` fails with `MSB1009` there. The per-generator command is in the
+   header of `fuzz_gltf.cpp`.
+7. **Flat primitives log `its_convex_hull: Unable to create convex hull`** (twice for
+   `strip_and_fan.glb`'s two zero-volume sheets). Pre-existing qhull behaviour for planar meshes, not
+   caused by this change, harmless — but a glTF full of decorative flat geometry will produce log
+   noise.
+8. **Hidden instances spawned through `POST /api/instances/open` never register with the hub on this
+   branch.** The process starts, stays alive and responsive, but writes no `<datadir>/hub/instances/
+   <pid>.json`. Reproduced identically with a `.stl`, so it is pre-existing and unrelated to glTF —
+   flagged here because it makes that one phone route unverifiable end to end.
+9. **`C:\Dev\SnapmakerOrcaNext\build`'s `CMAKE_INSTALL_PREFIX` is `C:/Program Files/Snapmaker_Orca`**,
+   unlike the main checkout's `<build>/Snapmaker_Orca`, so `cmake --install` there needs an explicit
+   `--prefix` or it fails on permissions.
+10. **`build_next.bat`'s `bambu_networking` target does not exist in that build tree**, and the app
+    executable is the `Snapmaker_Orca_app_gui` target, not `Snapmaker_Orca` (which is the DLL).
+
+### What Stage 2 inherits
+
+`GltfInfo` is filled in completely already — `material_colors` (deduplicated, sRGB-encoded),
+`parts[i].material_index`, `vertex_colors` (only when *every* kept primitive had `COLOR_0`),
+`is_single_material`, `had_textures`, `dropped_primitives`, `skipped_nodes`,
+`unsupported_extensions`. The sRGB conversion is pinned by a test (`nested_trs.glb`'s linear
+0.2158605 → 0.5). The `Model.cpp` glTF branch has a comment marking where the `objFn` colour path
+hooks in. Nothing in Stage 1 writes `mmu_segmentation_facets`, and a test asserts
+`is_mm_painted() == false` after a `COLOR_0` import, so Stage 2's first change is visible.
