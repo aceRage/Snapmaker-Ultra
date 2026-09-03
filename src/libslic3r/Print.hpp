@@ -520,6 +520,31 @@ public:
     // Called by make_perimeters()
     void slice();
 
+    // Ultra (support groups): a set of MODEL_PART volumes that resolve to the same support
+    // configuration. Group 0 is always the default group - the object's own Support settings -
+    // even when no part carries an override, so downstream code can always address it.
+    // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 3.4.
+    struct SupportGroup {
+        // Display name. "" = the default group (parts with no support_group key).
+        std::string                      name;
+        // The object's PrintObjectConfig with this group's part-level support overrides applied.
+        PrintObjectConfig                config;
+        // The MODEL_PART volumes resolving to this group, in ModelObject::volumes order.
+        std::vector<const ModelVolume*>  volumes;
+        // Per object layer, the union of `volumes` sliced at that layer's slice_z. Empty until
+        // Stage 3 fills it; nothing in Stage 2 reads it.
+        std::vector<Polygons>            mask;
+    };
+    // Groups keyed by RESOLVED config, not by name: two parts land in the same group iff their
+    // configs do not differ over the part-level support key set. A part whose override happens to
+    // equal the object value therefore collapses into the default group and size() stays 1, which
+    // is the whole of the off-mode guarantee - callers must take today's code path unchanged when
+    // size() == 1.
+    std::vector<SupportGroup>   support_groups() const;
+    // True when any MODEL_PART volume of `object` asks for a soluble interface. See 3.6: a
+    // per-part top Z distance cannot be honoured, so the strictest group wins object-wide.
+    static bool                 support_groups_want_soluble(const ModelObject &object);
+
     // Helpers to slice support enforcer / blocker meshes by the support generator.
     std::vector<Polygons>       slice_support_volumes(const ModelVolumeType model_volume_type) const;
     std::vector<Polygons>       slice_support_blockers() const { return this->slice_support_volumes(ModelVolumeType::SUPPORT_BLOCKER); }

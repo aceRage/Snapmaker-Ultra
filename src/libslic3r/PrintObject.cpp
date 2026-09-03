@@ -3238,7 +3238,83 @@ PrintObjectConfig PrintObject::object_config_from_model_object(const PrintObject
     // Clamp invalid extruders to the default extruder (with index 1).
     clamp_exturder_to_default(config.support_filament,           num_extruders);
     clamp_exturder_to_default(config.support_interface_filament, num_extruders);
+    // Ultra (support groups): support_top_z_distance is object-wide behaviour - it decides
+    // SlicingParameters::soluble_interface (Slicing.cpp), bottom surface classification in
+    // detect_surfaces_type, and the organic-tree soluble static (TreeSupport3D.cpp). A per-part
+    // value cannot be honoured, so the strictest group wins: any group asking for a soluble
+    // interface makes the whole object soluble. No group -> no change, so this is a no-op for
+    // every project that carries no support_group data.
+    // It also routes through the EXISTING invalidation path: PrintApply.cpp recomputes this
+    // config and diffs it against the live PrintObject::config(), so flipping a group's Z gap
+    // forces posSlice through the support_top_z_distance entry of
+    // invalidate_state_by_config_options.
+    // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 3.6.
+    if (PrintObject::support_groups_want_soluble(object))
+        config.support_top_z_distance.value = 0.;
     return config;
+}
+
+bool PrintObject::support_groups_want_soluble(const ModelObject &object)
+{
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || ! volume->is_model_part())
+            continue;
+        const ConfigOption *opt = volume->config.option("support_top_z_distance");
+        if (opt != nullptr && opt->getFloat() < EPSILON)
+            return true;
+    }
+    return false;
+}
+
+std::vector<PrintObject::SupportGroup> PrintObject::support_groups() const
+{
+    std::vector<SupportGroup> groups;
+    // Group 0 is always the default group, even when no part resolves to it, so downstream code
+    // can address it unconditionally.
+    groups.push_back(SupportGroup{ std::string(), m_config, {}, {} });
+
+    const ModelObject *object = this->model_object();
+    if (object == nullptr)
+        return groups;
+
+    const std::vector<std::string> &keys = Slic3r::part_support_keys();
+    for (const ModelVolume *volume : object->volumes) {
+        // Only real parts carry a group: a modifier or an enforcer / blocker never does.
+        if (volume == nullptr || ! volume->is_model_part())
+            continue;
+
+        PrintObjectConfig cfg = m_config;
+        const DynamicPrintConfig &vol_cfg = volume->config.get();
+        for (const std::string &key : keys)
+            if (const ConfigOption *opt = vol_cfg.option(key); opt != nullptr)
+                if (ConfigOption *mine = cfg.option(key, false); mine != nullptr)
+                    mine->set(opt);
+
+        std::string name;
+        if (const ConfigOption *opt = vol_cfg.option("support_group"); opt != nullptr)
+            name = opt->serialize();
+
+        // Group by resolved config, never by name. Two differently named groups with identical
+        // settings collapse into one, and a group equal to the object's own collapses into the
+        // default group - which is what keeps K == 1 for every existing project.
+        size_t found = size_t(-1);
+        for (size_t g = 0; g < groups.size(); ++ g)
+            if (groups[g].config.diff(cfg).empty()) {
+                found = g;
+                break;
+            }
+        if (found == size_t(-1)) {
+            groups.push_back(SupportGroup{ name, cfg, {}, {} });
+            found = groups.size() - 1;
+        }
+        groups[found].volumes.push_back(volume);
+        // The group's name is the first non-empty one seen among its members (3.4 step 3), the
+        // default group included: two differently named parts whose values both match the
+        // object's collapse into group 0 and it takes the first of their names.
+        if (groups[found].name.empty() && ! name.empty())
+            groups[found].name = name;
+    }
+    return groups;
 }
 
 const std::string                                                    key_extruder { "extruder" };

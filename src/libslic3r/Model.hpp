@@ -1761,6 +1761,14 @@ bool model_volume_list_changed(const ModelObject &model_object_old, const ModelO
 // The function assumes that volumes list is synchronized.
 bool model_custom_supports_data_changed(const ModelObject& mo, const ModelObject& mo_new);
 
+// Ultra (support groups): test whether any MODEL_PART volume's support-group data changed -
+// the support_group label or any of the curated part-level support keys. A per-volume support
+// key reaches nothing on its own (apply_to_print_region_config silently drops every support key),
+// so without this a group assignment would change the model and not re-slice.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 3.8.
+// The function assumes that volumes list is synchronized.
+bool model_support_group_data_changed(const ModelObject& mo, const ModelObject& mo_new);
+
 // Test whether the now ModelObject has newer custom seam data than the old one.
 // The function assumes that volumes list is synchronized.
 bool model_custom_seam_data_changed(const ModelObject& mo, const ModelObject& mo_new);

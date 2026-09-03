@@ -1643,7 +1643,11 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             model_object.assign_copy(model_object_new);
         } else {
             model_object_status.print_object_regions_status = ModelObjectStatus::PrintObjectRegionsStatus::Valid;
-            if (supports_differ || model_custom_supports_data_changed(model_object, model_object_new)) {
+            // Ultra (support groups): a changed group assignment invalidates the support step
+            // too. It must NOT set supports_differ, which also stops background processing and
+            // shuffles volumes - neither is needed here.
+            if (supports_differ || model_custom_supports_data_changed(model_object, model_object_new) ||
+                model_support_group_data_changed(model_object, model_object_new)) {
                 // First stop background processing before shuffling or deleting the ModelVolumes in the ModelObject's list.
                 if (supports_differ) {
                     this->call_cancel_callback();

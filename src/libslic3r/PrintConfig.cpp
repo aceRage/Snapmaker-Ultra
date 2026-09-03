@@ -6004,6 +6004,18 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionInt(0));
 
+    // Ultra (support groups): the name of the support group this part belongs to. Empty or
+    // absent = the object's own Support settings (the default group). Stored per ModelVolume
+    // only; deliberately NOT a member of PrintObjectConfig or PrintRegionConfig and not in
+    // Preset::print_options(), so it never reaches the process preset, the project config or the
+    // G-code CONFIG_BLOCK - the same shape as "extruder". Label and category are left empty so
+    // is_improper_category (GUI_Factories.cpp) keeps it out of the "Add settings" menu.
+    // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 3.1.
+    def = this->add("support_group", coString);
+    def->tooltip = L("Name of the support group this part belongs to. Empty means the object's own support settings.");
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionString(""));
+
     def = this->add("support_filament_matching", coBool);
     def->label = L("Support Filament Matching");
     def->category = L("Support");
@@ -8108,6 +8120,29 @@ void PrintConfigDef::handle_legacy_composite(DynamicPrintConfig &config)
 }
 
 const PrintConfigDef print_config_def;
+
+const std::vector<std::string>& part_support_keys()
+{
+    static const std::vector<std::string> s_keys = {
+        // Tier A - per-group interface geometry and filament.
+        "support_interface_top_layers",
+        "support_interface_bottom_layers",
+        "support_interface_spacing",
+        "support_bottom_interface_spacing",
+        "support_interface_pattern",
+        "support_interface_loop_pattern",
+        "support_interface_filament",
+        "support_ironing",
+        "support_ironing_pattern",
+        "support_ironing_flow",
+        "support_ironing_spacing",
+        // Tier B - stored and resolved, object-wide in behaviour for now.
+        "support_top_z_distance",
+        "support_style",
+        "support_threshold_angle",
+    };
+    return s_keys;
+}
 
 DynamicPrintConfig DynamicPrintConfig::full_print_config()
 {

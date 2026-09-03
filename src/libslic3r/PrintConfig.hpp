@@ -587,6 +587,15 @@ private:
 // This definition is constant.
 extern const PrintConfigDef print_config_def;
 
+// Ultra (support groups): the curated support keys a MODEL_PART volume may override -
+// tiers A and B of the plan's 3.5. Tier A acts in Stage 3; tier B is stored, resolved and
+// shown but object-wide in behaviour. Tier C (raft_*, enforce_support_layers, support_type,
+// enable_support, support_filament) is deliberately absent: those cannot be per-part.
+// It lives here rather than on PrintObject because Model.cpp needs it too and cannot
+// include Print.hpp.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 3.5.
+const std::vector<std::string>& part_support_keys();
+
 class StaticPrintConfig;
 
 // Minimum object distance for arrangement, based on printer technology.
