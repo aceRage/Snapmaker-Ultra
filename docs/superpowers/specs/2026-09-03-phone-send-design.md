@@ -136,7 +136,131 @@ Progress and text come from the job every second; success and errors are shown, 
 + Developer Mode hint when a Bambu printer refuses a print. The sheet can be hidden while a
 transfer runs; the transfer continues on the PC.
 
-## 3. Safety rules
+## 3. Connecting the Snapmaker from the phone (2026-09-03)
+
+The send above only sees a Snapmaker when the PC's Device tab is *connected* to one
+(`wxGetApp().get_connect_host`). Until someone picks a device in that page's "My Devices" list the
+tab says "Unconnected", and the phone had no way to do the picking, so a phone send never had a
+Snapmaker to send to.
+
+### 3.1 What the desktop's pick does (anchors)
+
+The Device tab is the Flutter page (`resources/web/flutter_web`, loaded as
+`…/web/flutter_web/index.html?path=2`), talking to `src/slic3r/GUI/SSWCP.cpp`:
+
+1. **The list** — `SSWCP_MachineManage_Instance::sw_GetLocalDevices` (`SSWCP.cpp:5797`) returns
+   `wxGetApp().app_config->get_devices()` unchanged: `DeviceInfo` (`libslic3r/AppConfig.hpp:33`)
+   with ip, dev_id, dev_name, model_name, preset_name, connected, nozzle_sizes, sn, protocol,
+   api_key, user, password, ca, cert, key, clientId, port, link_mode, userid, id. There is no
+   discovery here; the list is what pairing wrote. `connected` is session state — `AppConfig::save`
+   writes it as `false` every time and drops `link_mode == "wan"` devices (`AppConfig.cpp:988-1000`).
+   The page keeps itself up to date through `sw_SubscribeLocalDevices` (`:5808`), which the app
+   pushes to with `GUI_App::device_card_notify` (`GUI_App.cpp:7336`, the
+   `m_device_card_subscribers` map, one entry per webview) alongside a legacy
+   `window.postMessage({command:"local_devices_arrived"…})`.
+2. **The socket** — `sw_create_mqtt_client` (`:6100`) builds a `MqttClient`
+   (`src/slic3r/Utils/MQTT.hpp:51`) from the page's own parameters: `server_address`
+   (`mqtts://ip:port` when it holds ca/cert/key, `mqtt://ip:port` otherwise), `clientId`, ca, cert,
+   key, username, password, clean_session; it is kept in `m_mqtt_engine_map`, keyed by the
+   *webview*. `sw_mqtt_connect` (`:6185`) then calls `MqttClient::Connect` on a worker thread (20 s
+   cap), and `sw_mqtt_subscribe` (`:6343`) subscribes `<sn>/response` and `<sn>/notification`.
+3. **The host** — `sw_mqtt_set_engine` (`:6433`) copies the printer preset's config, sets
+   `host_type = htMoonRaker_mqtt` and `print_host = ip:port`, builds the host with
+   `PrintHost::get_print_host` (a `Moonraker_Mqtt`), and stores it with
+   `wxGetApp().set_connect_host(host)` + `set_host_config(config)` (`GUI_App.cpp:2446`,
+   `GUI_App.hpp:391`). It mirrors sn / ca / cert / key / user / password / port / clientId onto the
+   host, hands the live socket over with `Moonraker_Mqtt::set_engine` (`MoonRaker.cpp:941`) and
+   registers `set_connection_lost`. Note it never calls `PrintHost::connect`: the page already
+   opened the socket, so `Moonraker_Mqtt::connect` (`MoonRaker.cpp:1111`) is dead code on this path.
+4. **Proof and bookkeeping** — a worker thread clears `connected` on the previously connected
+   device, asks the printer who it is with `SSWCP::query_machine_info` (`SSWCP.cpp:7489` →
+   `machine.system_info` over MQTT), and on the GUI thread saves the `DeviceInfo` with
+   `connected = true`, the model, the nozzle sizes and `preset_name` (`:6677-6789`).
+5. **What the PC then shows** (`:6908-6951`): the card push above, `use_new_connect = "true"`,
+   `sidebar().update_all_preset_comboboxes(reload)`, `mainframe->m_print_enable = true`,
+   `update_slice_print_status(eEventPlateUpdate)`, and a reload of the Device tab's page unless it
+   is already the Snapmaker one (`m_printer_view->isSnapmakerPage()`). That last check exists
+   because `update_all_preset_comboboxes` only loads that URL the first time (its `is_sm_page`
+   latch, `Plater.cpp:3663-3717`).
+6. **Disconnect** — `sw_Disconnect` (`:4121`) → `GUI_App::sm_disconnect_current_machine`
+   (`GUI_App.cpp:7674`): `host->disconnect`, `use_new_connect = "false"`, clear `connected`, notify
+   the cards, `update_all_preset_comboboxes(need_reload)`, `set_connect_host(nullptr)`,
+   `machine_filaments.clear()`, then `clear_filament_extruder_map()` and `load_current_presets()`.
+7. **Nozzles** — connecting does *not* switch the printer preset by itself. The sidebar's
+   "synchronise nozzle information" button does (`Plater.cpp:2136-2274`): `query_machine_info`, then
+   `get_similar_printer_preset({}, diameter)`, `Tab::select_preset(name, false, "", true)`,
+   `update_all_preset_comboboxes(true)`, `update_nozzle_settings(true)`.
+
+**The credential finding.** The printer answers only a client it has issued a certificate to: its
+plain MQTT port (1884) accepts a connection and a publish but never replies, and its MQTTS port
+(8883) refuses a client without a certificate (measured against three U1s on the LAN). The
+certificate comes from the pairing exchange (`Moonraker_Mqtt::ask_for_tls_info`, `MoonRaker.cpp:1000`
+— `server.request_key` under the PIN's topic), and this fork stores it **only in the Flutter page's
+own storage**: the success path deliberately blanks it before saving (`SSWCP.cpp:6716-6718`,
+`info.ca = /* auth_info["ca"] */ ""`). So AppConfig alone is not enough to reconnect a device.
+
+### 3.2 The headless connect
+
+`src/slic3r/GUI/RemoteSnapmaker.{hpp,cpp}` (new) performs steps 2-5 above without the page:
+
+- `list(json&)` (GUI thread) — the stored devices without anything secret, `is_host`, the current
+  printer preset and whether it is a Snapmaker; `probe_online(json&)` (request thread) adds
+  `online` from a short TCP probe of each device's MQTT port.
+- `connect(dev_id)` (request thread, blocking) — finds the device, fills in its certificate (§3.3),
+  builds the `Moonraker_Mqtt` host exactly as `sw_mqtt_set_engine` does, opens its own
+  `mqtts://ip:port` `MqttClient`, hands it over with `set_engine`, subscribes the printer's topics
+  (new helper `Moonraker_Mqtt::subscribe_device_topics`, the block `connect()` runs after its own
+  `Connect`), registers a connection-lost handler that tears the host down without putting a modal
+  on the PC, proves the printer answers with `SSWCP::query_machine_info` (10 s), then on the GUI
+  thread saves the device as connected and runs the desktop's own follow-up: the card push,
+  `use_new_connect`, `update_all_preset_comboboxes(true)`, the print button, and the Device tab's
+  page reload.
+- `disconnect()` — `GUI_App::sm_disconnect_current_machine(true)` plus the extra cleanup
+  `sw_Disconnect` does.
+- No pairing: a device with no certificate is refused with a 409 that says to connect it once on
+  the PC. No dialog is ever shown, and nothing here starts a print.
+
+### 3.3 The certificate, and why it is opt-in
+
+`RemoteSnapmaker::remember_credentials(sn, connect_params)` is called from `sw_mqtt_set_engine`
+(one line, where the connect parameters are complete) and keeps ca/cert/key/clientId/port for that
+printer under `<datadir>/hub/snapmaker_keys.json`, which `connect()` then uses. Because that is a
+private key at rest, it is **off unless the person turns it on**: app config `app` /
+`snapmaker_remember_keys` = `"1"`. With it off, the phone can still list devices, disconnect, and
+use a Snapmaker the PC connected; `connect` answers 409 and says what to do. Deleting the file (or
+clearing the setting) takes the phone's connect away again. Nothing in that file is ever sent to
+the phone: `/api/snapmaker/devices` reports only `can_connect`.
+
+### 3.4 The API (per instance)
+
+- `GET /api/snapmaker/devices` — `{devices: [{id, name, model, ip, port, sn, preset, nozzles,
+  connected, online, is_host, can_connect, link_mode}], connected, host, host_online,
+  printer_preset, is_snapmaker, use_new_connect}`.
+- `POST /api/snapmaker/connect?id={device}` — 200 (also when it is already the host), 400 without
+  an id, 404 unknown device, 409 no certificate (see §3.3), 502 the printer did not accept the
+  connection, 504 it accepted but did not answer.
+- `POST /api/snapmaker/disconnect` — 200, 409 when nothing is connected.
+- After a successful connect, `GET /api/printers` carries the `connect` printer
+  (`RemoteSend::list_hosts`) and a plate can be sent to it.
+
+### 3.5 Also on the phone page
+
+- **Devices tab**: a *Snapmaker* section above the Bambu list — one card per paired device (name,
+  model, state, ip, nozzles) with **Connect**, and **Disconnect** on the connected one; the 5 s
+  poll keeps it current. With nothing paired it says to pair on the PC first.
+- **Prepare tab**: a **nozzle dropdown** beside the printer dropdown, hidden when the printer model
+  has one variant. It lists `PresetCollection::diameters_of_selected_printer()` and shows
+  `printer_variant`, both new in `GET /api/presets` as `nozzles: {choices, current}`;
+  `POST /api/presets/select?type=nozzle&name={diameter}` does what the sidebar's combo does —
+  `get_similar_printer_preset({}, diameter)`, `select_preset(…, force)`,
+  `update_all_preset_comboboxes(true)`, `update_nozzle_settings(true)` — and refuses a diameter the
+  model does not have (`get_similar_printer_preset` otherwise falls back to an arbitrary preset).
+- The **printer** dropdown now runs those same two refreshes, so switching the printer from the
+  phone updates the PC's nozzle box and brings its Device page up the way the sidebar does.
+- The *Show on PC* / *Hide on PC* button is now an **eye icon** at the end of the slicer row: open
+  when the window is on the PC, struck through when it is hidden. The tooltip keeps the old wording.
+
+## 4. Safety rules
 
 - A print never starts without `confirm=1` from the phone, and the page asks the person first.
 - One send at a time per instance; the plate must be sliced and printable.
@@ -146,7 +270,7 @@ transfer runs; the transfer continues on the PC.
   only thing the automated gate sends to a Bambu printer.
 - The access code never leaves the PC (`password_set` only).
 
-## 4. Verified (2026-09-03, gate `snorca_hubtest\test_phone_send.py`)
+## 5. Verified (2026-09-03, gate `snorca_hubtest\test_phone_send.py`)
 
 Against an instance on the isolated `dd_phone` data dir with `mock_printhost.py` on
 127.0.0.1:18089 registered as the user preset "Snapmaker U1 (0.4 nozzle) - Mock host"
@@ -163,7 +287,7 @@ Against an instance on the isolated `dd_phone` data dir with `mock_printhost.py`
   the flags as requested (`bed_leveling=0 flow_cali=1 timelapse=0`), layer inspect on, vibration
   off, the plate's bed type and `<name>_plate_1` as preset name; no dry run reached the mock.
 
-## 5. For the user to verify on hardware (start with upload only)
+## 6. For the user to verify on hardware (start with upload only)
 
 1. **Bambu, upload only**: Prepare → Send → pick the printer (LAN mode) → Upload. The file should
    appear on the printer's SD card / storage under the project name; nothing starts.
@@ -178,7 +302,7 @@ Against an instance on the isolated `dd_phone` data dir with `mock_printhost.py`
    Upload works; Upload & print is refused for plain Moonraker (needs the PC's preprint page) and
    works for OctoPrint-style hosts.
 
-## 6. Not done / follow-ups
+## 7. Not done / follow-ups
 
 - Snapmaker filament mapping at print start (`server.files.start_local_print` payload).
 - Post-processing scripts and the output-name template for classic print hosts.
