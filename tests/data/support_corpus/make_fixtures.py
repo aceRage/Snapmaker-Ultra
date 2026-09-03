@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Generate the small 3MF fixtures of the support-group identity corpus.
+
+The corpus deliberately reuses the models already in resources/handy_models/ so it adds no new
+binary data to the repository; the two fixtures written here are the shapes those models do not
+provide - one object made of several MODEL_PART volumes, which is what support groups are about.
+
+They are plain core-spec 3MFs (one <object> holding several <component>s). Orca imports each
+component as a ModelVolume of one ModelObject, which is exactly the multi-part object the group
+resolver reasons over.
+
+    python tests/data/support_corpus/make_fixtures.py
+
+Regenerating is deterministic - byte-identical output for the same source - so the committed
+fixtures can be checked against a fresh run.
+"""
+import os
+import sys
+import zipfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+</Types>
+"""
+
+RELS = """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>
+"""
+
+
+def box(x0, y0, z0, dx, dy, dz):
+    """Axis-aligned box as (vertices, triangles) with outward-facing winding."""
+    v = [(x0, y0, z0), (x0 + dx, y0, z0), (x0 + dx, y0 + dy, z0), (x0, y0 + dy, z0),
+         (x0, y0, z0 + dz), (x0 + dx, y0, z0 + dz), (x0 + dx, y0 + dy, z0 + dz), (x0, y0 + dy, z0 + dz)]
+    t = [(0, 2, 1), (0, 3, 2),          # bottom
+         (4, 5, 6), (4, 6, 7),          # top
+         (0, 1, 5), (0, 5, 4),          # -Y
+         (1, 2, 6), (1, 6, 5),          # +X
+         (2, 3, 7), (2, 7, 6),          # +Y
+         (3, 0, 4), (3, 4, 7)]          # -X
+    return v, t
+
+
+def mesh_xml(vertices, triangles, indent="     "):
+    out = [indent + "<mesh>", indent + " <vertices>"]
+    for x, y, z in vertices:
+        out.append('%s  <vertex x="%g" y="%g" z="%g"/>' % (indent, x, y, z))
+    out.append(indent + " </vertices>")
+    out.append(indent + " <triangles>")
+    for a, b, c in triangles:
+        out.append('%s  <triangle v1="%d" v2="%d" v3="%d"/>' % (indent, a, b, c))
+    out.append(indent + " </triangles>")
+    out.append(indent + "</mesh>")
+    return "\n".join(out)
+
+
+def write_3mf(path, parts, assembly_id=100):
+    """parts: list of (name, vertices, triangles). One assembly object holds them all."""
+    objs = []
+    for i, (name, v, t) in enumerate(parts, start=1):
+        objs.append('  <object id="%d" name="%s" type="model">\n%s\n  </object>'
+                    % (i, name, mesh_xml(v, t)))
+    comps = "\n".join('    <component objectid="%d"/>' % (i + 1) for i in range(len(parts)))
+    objs.append('  <object id="%d" name="assembly" type="model">\n   <components>\n%s\n   </components>\n  </object>'
+                % (assembly_id, comps))
+    model = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" xml:lang="en-US" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
+        ' <resources>\n' + "\n".join(objs) + '\n </resources>\n'
+        ' <build>\n  <item objectid="%d"/>\n </build>\n'
+        '</model>\n' % assembly_id)
+
+    # Fixed timestamps so regenerating gives a byte-identical archive.
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in (("[Content_Types].xml", CONTENT_TYPES),
+                           ("_rels/.rels", RELS),
+                           ("3D/3dmodel.model", model)):
+            info = zipfile.ZipInfo(name, date_time=(2026, 9, 3, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o600 << 16
+            z.writestr(info, data)
+    print("wrote", path, os.path.getsize(path), "bytes")
+
+
+def main():
+    # Two side-by-side slabs floating 4 mm above the bed on nothing at all, so the support
+    # generator has to build a column under each. That is the fixture the plan's Stage 3 gate
+    # measures per part ("interface length above part B grows, above part A does not").
+    a_v, a_t = box(-16, -8, 4, 14, 16, 3)
+    b_v, b_t = box(2, -8, 4, 14, 16, 3)
+    write_3mf(os.path.join(HERE, "twopart_bridge.3mf"),
+              [("partA", a_v, a_t), ("partB", b_v, b_t)])
+
+    # One part with a long unsupported overhang plus a stubby pillar under one end: normal
+    # supports have to bridge, and there is a real contact/base split to keep identical.
+    p_v, p_t = box(-15, -6, 0, 6, 12, 6)
+    o_v, o_t = box(-15, -6, 6, 30, 12, 2)
+    write_3mf(os.path.join(HERE, "overhang_ledge.3mf"),
+              [("pillar", p_v, p_t), ("ledge", o_v, o_t)])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
