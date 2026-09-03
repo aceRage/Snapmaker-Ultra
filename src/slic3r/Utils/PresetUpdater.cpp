@@ -944,6 +944,9 @@ void PresetUpdater::priv::download_profiles_resource_async(const std::string& ur
                 }
             }
             
+            // The download outlives a quick quit (a hidden phone instance closed seconds after it
+            // started): with the wxApp already gone, wxGetApp() is a null reference and this crashed.
+            if (wxTheApp == nullptr) return;
             GUI::wxGetApp().CallAfter([isAuto_check]() {
                 Slic3r::GUI::GUI_App &app = GUI::wxGetApp();
                 if (app.flutter_web_config_update_dlg_open()) {
