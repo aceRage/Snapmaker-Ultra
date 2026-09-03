@@ -16,6 +16,7 @@
 #include <boost/filesystem/path.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/nowide/fstream.hpp>
+#include <algorithm>
 #include <boost/property_tree/ini_parser.hpp>
 #include <boost/property_tree/ptree_fwd.hpp>
 #include <boost/algorithm/string/predicate.hpp>
@@ -795,8 +796,13 @@ std::string AppConfig::load()
     return "";
 }
 
-void AppConfig::merge_models_from_disk(const std::string& path)
+// Ultra: several slicer instances share this file (the hub keeps them alive for the phone) and
+// whichever saved last used to win, so a printer added, a project opened or presets chosen in one
+// window vanished when another window saved its stale copy. These sections only ever grow, so
+// before writing we union what is on disk into what this instance knows.
+void AppConfig::merge_shared_from_disk(const std::string& path)
 {
+    json j;
     try {
         boost::nowide::ifstream ifs(path);
         if (!ifs.good()) return;
@@ -805,20 +811,49 @@ void AppConfig::merge_models_from_disk(const std::string& path)
         const std::string whole = ss.str();
         const size_t      last  = whole.find_last_of('}');
         if (last == std::string::npos) return;
-        const json j = json::parse(whole.substr(0, last + 1));
-        if (!j.contains(MODELS_STR) || !j[MODELS_STR].is_array()) return;
-        for (const auto& j_model : j[MODELS_STR]) {
-            const std::string vendor_name = j_model.value("vendor", "");
-            const std::string model_name  = j_model.value("model", "");
-            if (vendor_name.empty() || model_name.empty()) continue;
-            std::vector<std::string> variants;
-            if (!j_model.contains("nozzle_diameter") || !unescape_strings_cstyle(j_model["nozzle_diameter"].get<std::string>(), variants)) continue;
-            auto& variants_here = m_vendors[vendor_name][model_name];
-            for (const auto& v : variants) variants_here.insert(v);
-        }
+        j = json::parse(whole.substr(0, last + 1));
     } catch (...) {
-        // an unreadable or corrupt file: write what this instance knows, as before
+        return; // unreadable or corrupt: write what this instance knows, as before
     }
+    try {
+        // Installed printer models.
+        if (j.contains(MODELS_STR) && j[MODELS_STR].is_array()) {
+            for (const auto& j_model : j[MODELS_STR]) {
+                const std::string vendor_name = j_model.value("vendor", "");
+                const std::string model_name  = j_model.value("model", "");
+                if (vendor_name.empty() || model_name.empty()) continue;
+                std::vector<std::string> variants;
+                if (!j_model.contains("nozzle_diameter") || !unescape_strings_cstyle(j_model["nozzle_diameter"].get<std::string>(), variants)) continue;
+                auto& variants_here = m_vendors[vendor_name][model_name];
+                for (const auto& v : variants) variants_here.insert(v);
+            }
+        }
+        // Recent projects: this window's order first, then what other windows opened, up to the cap.
+        if (j.contains("recent_projects") && j["recent_projects"].is_object()) {
+            std::vector<std::string>           merged = get_recent_projects();
+            std::map<std::string, std::string> disk; // ordered by the "01".."NN" keys
+            for (auto it = j["recent_projects"].begin(); it != j["recent_projects"].end(); ++it)
+                if (it.value().is_string()) disk[it.key()] = it.value().get<std::string>();
+            for (const auto& kv : disk)
+                if (std::find(merged.begin(), merged.end(), kv.second) == merged.end()) merged.push_back(kv.second);
+            size_t cap = 18;
+            try {
+                const std::string c = get("max_recent_count");
+                if (!c.empty()) cap = (size_t) std::max(0, std::stoi(c));
+            } catch (...) {}
+            if (merged.size() > cap) merged.resize(cap);
+            set_recent_projects(merged);
+        }
+        // Per-project / per-machine preset memory: keep entries other windows wrote for projects
+        // this window never touched; for shared keys this window's latest choice wins.
+        if (j.contains("orca_presets") && j["orca_presets"].is_array()) {
+            for (const auto& j_model : j["orca_presets"]) {
+                if (!j_model.is_object() || !j_model.contains("machine") || !j_model["machine"].is_string()) continue;
+                const std::string key = j_model["machine"].get<std::string>();
+                if (m_printer_settings.find(key) == m_printer_settings.end()) m_printer_settings[key] = j_model;
+            }
+        }
+    } catch (...) {}
 }
 
 void AppConfig::save()
@@ -919,10 +954,8 @@ void AppConfig::save()
         }
     }
 
-    // Ultra: several slicer instances share this file (the hub keeps them alive for the phone), and
-    // whichever saves last used to win: a printer added in one window vanished when another window
-    // saved its stale copy. Installed printer models are additive, so union the on-disk list in.
-    merge_models_from_disk(path);
+    // Ultra: union the additive sections other windows saved (see merge_shared_from_disk).
+    merge_shared_from_disk(path);
 
     // Write vendor sections
     for (const auto& vendor : m_vendors) {
