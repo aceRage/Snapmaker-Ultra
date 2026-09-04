@@ -3,6 +3,7 @@
 #include "DeviceManager.hpp"
 #include "GUI_App.hpp"
 #include "HMS.hpp"
+#include "SnapmakerLan.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "slic3r/Utils/Http.hpp"
 
@@ -273,6 +274,32 @@ static std::pair<int, std::string> prepare_host(const Request& req, const Action
     return { 200, "" };
 }
 
+// A Snapmaker the LAN list knows (printer sm:<id>): Moonraker over the printer's own HTTP API,
+// gated by what the list's last probe saw. That probe runs off the GUI thread whenever the phone
+// lists printers, so this only reads it; a printer never probed is asked nothing here and the
+// command itself finds out. No MQTT socket to fall back on: the LAN path never opens one.
+static std::pair<int, std::string> prepare_snapmaker_lan(const Request& req, const ActionNames& a, std::shared_ptr<Prepared> p,
+                                                         std::shared_ptr<Prepared>& out)
+{
+    SnapmakerLan::Device d;
+    if (!SnapmakerLan::find(req.printer.substr(3), d)) return { 404, "no such printer: " + req.printer };
+    p->kind         = "snapmaker";
+    p->printer_name = d.name.empty() ? d.ip : d.name;
+    SnapmakerLan::Status s;
+    if (SnapmakerLan::cached_status(d, s)) {
+        if (!s.online) return { 409, p->printer_name + " is offline" };
+        if (s.login_required) return { 409, p->printer_name + " requires a login for its LAN API, so it cannot be controlled from here" };
+        if (!s.state.empty() && !klipper_allows(req.action, s.state)) {
+            const std::string what = req.action == "pause" ? "paused" : req.action == "resume" ? "resumed" : "stopped";
+            return { 409, p->printer_name + " cannot be " + what + " right now (it reports " + s.state + ")" };
+        }
+    }
+    p->url              = SnapmakerLan::base_url(d) + "/" + a.moonraker_path;
+    p->moonraker_method = a.moonraker_method;
+    out                 = p;
+    return { 200, "" };
+}
+
 std::pair<int, std::string> prepare(const Request& req, std::shared_ptr<Prepared>& out)
 {
     const ActionNames* a = action_names(req.action);
@@ -287,6 +314,7 @@ std::pair<int, std::string> prepare(const Request& req, std::shared_ptr<Prepared
     p->dry_run = req.dry_run || env_flag("SNORCA_SEND_DRYRUN");
     p->printer_id = req.printer;
     if (req.printer == "host" || req.printer == "connect") return prepare_host(req, *a, p, out);
+    if (req.printer.compare(0, 3, "sm:") == 0) return prepare_snapmaker_lan(req, *a, p, out);
     return prepare_bambu(req, *a, p, out);
 }
 

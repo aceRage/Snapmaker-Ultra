@@ -23,8 +23,9 @@ namespace RemoteControl {
 
 struct Request
 {
-    std::string printer;           // a Bambu dev_id, "host" (the printer preset's print host) or
-                                   // "connect" (the Snapmaker connected on the PC's Device tab)
+    std::string printer;           // a Bambu dev_id, "host" (the printer preset's print host),
+                                   // "connect" (the Snapmaker connected on the PC's Device tab) or
+                                   // "sm:<id>" (a Snapmaker on the LAN list, SnapmakerLan.hpp)
     std::string action;            // "pause" | "resume" | "stop"
     bool        confirm { false }; // stop needs it: the phone asks the person first
     bool        dry_run { false }; // work everything out but send nothing (SNORCA_SEND_DRYRUN=1 forces it)
@@ -33,7 +34,7 @@ struct Request
 // Everything prepare() worked out on the GUI thread; run() only sends the command.
 struct Prepared
 {
-    std::string kind;       // bambu | printhost | connect
+    std::string kind;       // bambu | printhost | connect | snapmaker (the LAN list)
     std::string action;     // pause | resume | stop
     bool        dry_run { false };
     std::string printer_id, printer_name;
