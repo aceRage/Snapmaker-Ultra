@@ -100,7 +100,18 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 .setup .procrow select.nozzle { flex: 0 0 auto; width: auto; }
 .setup .procrow .btn.eye { flex: none; display: inline-flex; align-items: center; padding: 6px 9px; }
 .setup .procrow .btn.eye svg { display: block; }
-.printer .acts { display: flex; gap: 8px; margin-top: 8px; }
+.printer .acts { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+.printer .heads { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.printer .heads .head { display: flex; align-items: center; gap: 5px; background: #262626; border-radius: 6px; padding: 4px 8px; font-size: 11px; color: #bbb; }
+.printer .heads .sw { width: 12px; height: 12px; border-radius: 3px; border: 1px solid #666; flex: none; }
+.printer .heads .head.empty { opacity: .45; }
+.view .addrow { display: flex; gap: 8px; margin: 8px 0 4px; }
+.view .addrow input { flex: 1; min-width: 0; background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 8px 10px; font-size: 14px; }
+#send .maprow { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+#send .maprow .sw { width: 22px; height: 22px; border-radius: 4px; border: 1px solid #666; flex: none; }
+#send .maprow .who { flex: 1; min-width: 0; font-size: 13px; }
+#send .maprow .who .sub { display: block; color: #8a8a8a; font-size: 11px; }
+#send .maprow select { flex: 1.2; min-width: 0; background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 8px 10px; font-size: 14px; }
 .view .smsec .lbl { color: #9a9a9a; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: 0 0 6px; }
 .setup .filerow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .setup .filerow label.btn { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2053,7 +2064,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     var sendState = null; // { plate, printers, sel, opts, name, force, phase: pick|confirm|running|done|error, mode, job, timer, percent, text, error, result }
     function sendOpen(plateInfo) {
         if (sendState && sendState.timer) clearTimeout(sendState.timer);
-        sendState = { plate: plateInfo, printers: [], sel: null, opts: {}, name: '', force: false, phase: 'pick', mode: '', job: null, timer: null, percent: 0, text: '', error: '', result: null };
+        sendState = { plate: plateInfo, printers: [], sel: null, opts: {}, name: '', force: false, phase: 'pick', mode: '', job: null, timer: null, percent: 0, text: '', error: '', result: null, filaments: [], map: {} };
         document.getElementById('send').style.display = 'flex';
         sendRender();
         var s = sendState;
@@ -2107,19 +2118,19 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         pl.appendChild(el('span', 'sub', fmtTime(s.plate.time_s) + ' · ' + Math.round(s.plate.filament_g || 0) + ' g · slicer ' + instIndex(instSel)));
         body.appendChild(pl);
         var p = sendPrinter();
-        if (s.phase === 'pick' || s.phase === 'confirm') {
+        if (s.phase === 'pick' || s.phase === 'confirm' || s.phase === 'map') {
             body.appendChild(el('div', 'lbl', 'Printer'));
             var sel = el('select');
             if (!s.printers.length) { var o0 = el('option', '', s.error ? 'No printers' : 'Loading printers…'); sel.appendChild(o0); sel.disabled = true; }
             s.printers.forEach(function(pr) {
-                var kind = pr.kind === 'printhost' ? ' · print host' : pr.kind === 'connect' ? ' · connected' : '';
+                var kind = pr.kind === 'printhost' ? ' · print host' : pr.kind === 'connect' ? ' · connected' : pr.kind === 'snapmaker' ? ' · LAN' : '';
                 var o = el('option', '', pr.name + (pr.model ? ' · ' + pr.model : '') + kind + (pr.online ? '' : ' (offline)'));
                 o.value = pr.id;
                 if (pr.id === s.sel) o.selected = true;
                 sel.appendChild(o);
             });
             sel.onchange = function() { sendSelect(sel.value); };
-            sel.disabled = s.phase === 'confirm' || !s.printers.length;
+            sel.disabled = s.phase !== 'pick' || !s.printers.length;
             body.appendChild(sel);
             if (p) {
                 var info = [];
@@ -2160,10 +2171,48 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 up.onclick = function() { sendStart('upload'); };
                 acts.appendChild(up);
                 var pr2 = el('span', 'btn' + (can && p.can_print !== false ? '' : ' dim'), s.force ? 'Upload & print anyway' : 'Upload & print');
-                pr2.onclick = function() { s.phase = 'confirm'; sendRender(); };
+                pr2.onclick = function() {
+                    // A Snapmaker has four toolheads: ask which one prints which filament first.
+                    if (p && p.kind === 'snapmaker') sendMappingPrepare();
+                    else { s.phase = 'confirm'; sendRender(); }
+                };
                 acts.appendChild(pr2);
                 body.appendChild(acts);
                 body.appendChild(el('div', 'info', 'Upload puts the file on the printer without starting it. Upload & print asks once more, then starts it.'));
+            } else if (s.phase === 'map') {
+                body.appendChild(el('div', 'lbl', 'Which toolhead prints what'));
+                var heads = (p && p.toolheads) || [];
+                (s.filaments || []).filter(function(f) { return f.used; }).forEach(function(f) {
+                    var row = el('div', 'maprow');
+                    var sw = el('span', 'sw');
+                    sw.style.background = /^#[0-9a-fA-F]{6}$/.test(f.color || '') ? f.color : '#444';
+                    row.appendChild(sw);
+                    var who = el('div', 'who', 'Filament ' + (f.index + 1) + (f.type ? ' · ' + f.type : ''));
+                    who.appendChild(el('span', 'sub', (f.used_g ? Math.round(f.used_g) + ' g' : '') ));
+                    row.appendChild(who);
+                    var pick = el('select');
+                    heads.forEach(function(t) {
+                        var o = el('option', '', 'Toolhead ' + (t.index + 1) + ' · ' + (t.loaded ? ((t.type || '?') + (t.color ? ' ' + t.color : '')) : 'empty'));
+                        o.value = String(t.index);
+                        if (String(t.index) === String(s.map[f.index])) o.selected = true;
+                        pick.appendChild(o);
+                    });
+                    pick.onchange = function() { s.map[f.index] = parseInt(pick.value); sendRender(); };
+                    row.appendChild(pick);
+                    body.appendChild(row);
+                    var head = heads.filter(function(t) { return t.index === s.map[f.index]; })[0];
+                    if (head && head.loaded && f.type && head.type && f.type.toUpperCase() !== head.type.toUpperCase())
+                        body.appendChild(el('div', 'info warn', 'Filament ' + (f.index + 1) + ' was sliced as ' + f.type + ' but toolhead ' + (head.index + 1) + ' holds ' + head.type + '.'));
+                    if (head && !head.loaded)
+                        body.appendChild(el('div', 'info warn', 'Toolhead ' + (head.index + 1) + ' is empty.'));
+                });
+                body.appendChild(el('div', 'info', 'Pre-filled by matching the colours, the way the printer\'s own app does. Change any row you like.'));
+                var cm = el('div', 'actions');
+                var gom = el('span', 'btn warn', 'Start print');
+                gom.onclick = function() { sendStart('print'); };
+                cm.appendChild(gom);
+                var nom = el('span', 'btn alt', 'Cancel'); nom.onclick = function() { s.phase = 'pick'; sendRender(); }; cm.appendChild(nom);
+                body.appendChild(cm);
             } else {
                 var c = el('div', 'confirm');
                 c.appendChild(el('div', '', 'Start printing ' + sendPlateLabel(s, false) + ' on ' + (p ? p.name : '') + ' now? Make sure the bed is clear and the right filaments are loaded.'));
@@ -2193,12 +2242,55 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             }
         }
     }
+    // Ask the PC what it would send: the file's filaments and the toolhead match it proposes.
+    // A dry run stops before the transfer, so nothing reaches the printer.
+    function sendMappingPrepare() {
+        var s = sendState, p = sendPrinter();
+        if (!s || !p) return;
+        s.phase = 'running'; s.percent = 0; s.text = 'Reading the plate and the printer…'; s.error = '';
+        sendRender();
+        var body = 'printer=' + encodeURIComponent(p.id) + '&mode=print&confirm=1&dry_run=1&force=1' + (s.name ? '&name=' + encodeURIComponent(s.name) : '');
+        api('/plates/' + s.plate.index + '/send', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+            .then(function(j) { return sendWaitJob(j.job); })
+            .then(function(job) {
+                if (sendState !== s) return;
+                var res = job.result || {};
+                s.filaments = res.filaments || [];
+                s.map = {};
+                s.filaments.forEach(function(f) { if (f.used) s.map[f.index] = f.toolhead >= 0 ? f.toolhead : 0; });
+                s.phase = 'map';
+                sendRender();
+            })
+            .catch(function(e) {
+                if (sendState !== s) return;
+                s.phase = 'pick'; s.error = e.message; sendRender();
+            });
+    }
+    function sendWaitJob(id) {
+        return new Promise(function(resolve, reject) {
+            var t0 = Date.now();
+            (function poll() {
+                api('/jobs/' + id).then(function(j) {
+                    if (j.state === 'running') {
+                        if (Date.now() - t0 > 300000) return reject(new Error('the PC is still preparing the file'));
+                        return setTimeout(poll, 800);
+                    }
+                    if (j.state === 'done') return resolve(j);
+                    reject(new Error(j.error || 'failed'));
+                }).catch(reject);
+            })();
+        });
+    }
     function sendStart(mode) {
         var s = sendState, p = sendPrinter();
         if (!s || !p) return;
         var body = 'printer=' + encodeURIComponent(p.id) + '&mode=' + mode + (mode === 'print' ? '&confirm=1' : '') + (s.force ? '&force=1' : '');
         if (p.kind === 'bambu') ['bed_leveling', 'flow_cali', 'timelapse', 'use_ams'].forEach(function(k) { if (k in s.opts) body += '&' + k + '=' + (s.opts[k] ? '1' : '0'); });
         else if (s.name) body += '&name=' + encodeURIComponent(s.name);
+        if (p.kind === 'snapmaker' && mode === 'print' && s.map) {
+            var pairs = Object.keys(s.map).map(function(k) { return k + ':' + s.map[k]; });
+            if (pairs.length) body += '&mapping=' + encodeURIComponent(pairs.join(','));
+        }
         s.mode = mode; s.phase = 'running'; s.percent = 0; s.text = 'Preparing the plate file on the PC…'; s.error = ''; s.result = null;
         sendRender();
         api('/plates/' + s.plate.index + '/send', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body }).then(function(j) {
@@ -2323,47 +2415,102 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             lastPresetsJson = '';
         });
     }
-    // The Snapmaker printers paired on the PC ("My Devices" on its Device page). Connecting one
-    // is what the PC's own page does when a device is picked there; the phone's Send then sees it.
-    var smBusy = '';
+    // The Snapmaker printers on the LAN. Everything here is plain HTTP to the printer itself, so a
+    // printer shows its state - and takes a file - whether or not the PC is connected to it.
+    var smBusy = '', smAddIp = '', smAddNote = '', smAddErr = false;
+    function smHead(t) {
+        var h = el('div', 'head' + (t.loaded ? '' : ' empty'));
+        var sw = el('span', 'sw');
+        sw.style.background = /^#[0-9a-fA-F]{6}$/.test(t.color || '') ? t.color : '#444';
+        h.appendChild(sw);
+        h.appendChild(el('span', '', (t.index + 1) + ' · ' + (t.loaded ? ((t.type || '?') + (t.sub_type && t.sub_type !== 'NONE' ? ' ' + t.sub_type : '')) : 'empty')));
+        return h;
+    }
     function refreshSnapmaker() {
         var root = document.getElementById('devices');
         api('/snapmaker/devices').then(function(d) {
             var sec = root.querySelector('.smsec');
             var devs = d.devices || [];
+            var conn = d.connect || {};
             if (!devs.length && !d.is_snapmaker) { if (sec) sec.remove(); return; }
             if (!sec) { sec = el('div', 'smsec'); root.insertBefore(sec, root.firstChild); }
             sec.innerHTML = '';
             sec.appendChild(el('div', 'lbl', 'Snapmaker'));
-            if (!devs.length) {
-                sec.appendChild(el('div', 'empty', 'No Snapmaker is paired on this PC. Pair one on the PC first (Device tab); the phone can then connect it.'));
-                return;
-            }
+            if (!devs.length)
+                sec.appendChild(el('div', 'empty', 'No Snapmaker found yet. Add one by its address below - the PC does not have to be connected to it.'));
             devs.forEach(function(p) {
-                var here = p.connected && p.is_host;
-                var card = el('div', 'printer' + (here ? ' online' : ''));
+                var card = el('div', 'printer' + (p.online ? ' online' : ''));
                 card.appendChild(el('div', 'name', (p.name || p.ip) + (p.model ? '  ·  ' + p.model : '')));
-                var meta = here ? 'connected' : (p.online ? 'reachable' : 'offline');
-                if (p.ip) meta += ' · ' + p.ip;
-                if ((p.nozzles || []).length) meta += ' · nozzle ' + p.nozzles.join(', ') + ' mm';
+                var meta = p.online ? (p.state || 'idle') : 'offline';
+                if (p.printing) meta += ' · ' + p.percent + '%' + (p.total_layers ? ' · layer ' + p.layer + '/' + p.total_layers : '') + (p.left_time_s ? ' · ' + fmtTime(p.left_time_s) + ' left' : '');
+                if (p.task) meta += ' · ' + p.task;
+                meta += ' · ' + p.ip;
+                if (p.login_required) meta += ' · asks for a login';
                 card.appendChild(el('div', 'meta', meta));
+                if (p.online) {
+                    var temps = el('div', 'temps');
+                    var bed = el('div'); bed.appendChild(el('div', 'v', Math.round(p.bed_temp) + '° / ' + Math.round(p.bed_target) + '°')); bed.appendChild(el('div', 'k', 'bed'));
+                    temps.appendChild(bed);
+                    var noz = el('div'); noz.appendChild(el('div', 'v', Math.round(p.nozzle_temp) + '° / ' + Math.round(p.nozzle_target) + '°')); noz.appendChild(el('div', 'k', 'nozzle'));
+                    temps.appendChild(noz);
+                    card.appendChild(temps);
+                    if ((p.toolheads || []).length) {
+                        var heads = el('div', 'heads');
+                        p.toolheads.forEach(function(t) { heads.appendChild(smHead(t)); });
+                        card.appendChild(heads);
+                    }
+                }
                 var acts = el('div', 'acts');
-                var busy = smBusy === p.id;
-                var b = el('span', 'btn small' + (busy || here ? ' dim' : ''),
-                           busy ? (here ? 'Disconnecting…' : 'Connecting…') : (here ? 'Disconnect' : 'Connect'));
-                b.title = here ? 'Disconnect this printer on the PC' : 'Connect this printer on the PC, as picking it there would';
-                b.onclick = function() {
-                    if (smBusy) return;
-                    smBusy = p.id;
-                    b.textContent = here ? 'Disconnecting…' : 'Connecting…';
-                    api(here ? '/snapmaker/disconnect' : '/snapmaker/connect?id=' + encodeURIComponent(p.id), { method: 'POST' })
-                        .then(function() { smBusy = ''; refreshSnapmaker(); })
-                        .catch(function(e) { smBusy = ''; fail(e); refreshSnapmaker(); });
-                };
-                acts.appendChild(b);
-                card.appendChild(acts);
+                if (p.added_by === 'manual') {
+                    var rm = el('span', 'btn small dim', 'Remove');
+                    rm.title = 'Forget this printer (it was added by hand)';
+                    rm.onclick = function() {
+                        api('/snapmaker/remove?id=' + encodeURIComponent(p.id), { method: 'POST' })
+                            .then(function() { refreshSnapmaker(); }).catch(fail);
+                    };
+                    acts.appendChild(rm);
+                }
+                // The PC-side MQTT connection: only the Device tab needs it, and only for its own page.
+                var known = (conn.devices || []).filter(function(c) { return c.id === p.id || c.ip === p.ip; })[0];
+                if (known) {
+                    var here = known.connected && known.is_host;
+                    var busy = smBusy === known.id;
+                    var b = el('span', 'btn small dim', busy ? (here ? 'Disconnecting…' : 'Connecting…') : (here ? 'Disconnect on PC' : 'Connect on PC'));
+                    b.title = here ? 'Disconnect this printer on the PC\'s Device tab'
+                                   : 'Optional: connect this printer on the PC\'s Device tab, as picking it there would. Sending from the phone does not need it.';
+                    b.onclick = function() {
+                        if (smBusy) return;
+                        smBusy = known.id;
+                        b.textContent = here ? 'Disconnecting…' : 'Connecting…';
+                        api(here ? '/snapmaker/disconnect' : '/snapmaker/connect?id=' + encodeURIComponent(known.id), { method: 'POST' })
+                            .then(function() { smBusy = ''; refreshSnapmaker(); })
+                            .catch(function(e) { smBusy = ''; fail(e); refreshSnapmaker(); });
+                    };
+                    acts.appendChild(b);
+                }
+                if (acts.childNodes.length) card.appendChild(acts);
                 sec.appendChild(card);
             });
+            // Add by address: what the phone needs when mDNS is quiet.
+            var row = el('div', 'addrow');
+            var ipin = el('input');
+            ipin.type = 'text'; ipin.placeholder = 'Add a printer by IP (10.0.0.x)'; ipin.value = smAddIp;
+            ipin.oninput = function() { smAddIp = ipin.value; };
+            ipin.onkeydown = function(e) { if (e.key === 'Enter') add.onclick(); };
+            row.appendChild(ipin);
+            var add = el('span', 'btn small', 'Add');
+            add.onclick = function() {
+                var ip = (smAddIp || '').trim();
+                if (!ip) return;
+                add.textContent = 'Adding…';
+                api('/snapmaker/add?ip=' + encodeURIComponent(ip), { method: 'POST' }).then(function(j) {
+                    smAddIp = ''; smAddErr = false; smAddNote = 'Added ' + (j.name || ip) + '.';
+                    refreshSnapmaker();
+                }).catch(function(e) { smAddErr = true; smAddNote = e.message; refreshSnapmaker(); });
+            };
+            row.appendChild(add);
+            sec.appendChild(row);
+            if (smAddNote) sec.appendChild(el('div', 'note' + (smAddErr ? ' err' : ''), smAddNote));
         }).catch(function() {});
     }
     function refreshDevices() {
