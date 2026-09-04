@@ -8,7 +8,7 @@
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: #2b2b2b; color: #ddd; font-family: 'Segoe UI', Roboto, -apple-system, sans-serif; font-size: 14px; padding: 20px; }
-h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
+h1 { font-size: 18px; color: #fff; margin-bottom: 16px; }
 .sub { color: #999; font-size: 12px; margin-bottom: 16px; }
 .row { display: flex; flex-direction: column; gap: 16px; align-items: stretch; max-width: 720px; }
 .card.hubcard { max-width: 720px; }
@@ -23,6 +23,7 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
 .inst .t { font-weight: 600; color: #fff; }
 .inst .m { color: #999; font-size: 12px; word-break: break-all; }
 .note { color: #999; font-size: 12px; margin-top: 8px; }
+.note.strong { color: #ccc; font-weight: 600; }
 .err { color: #e88; }
 .login { display: flex; justify-content: space-between; align-items: center; background: #2f2f2f; border-radius: 6px; padding: 4px 8px; margin: 3px 0; font-size: 13px; }
 .btn.small { padding: 2px 8px; font-size: 12px; margin: 0; }
@@ -43,29 +44,34 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
 .inline { display: flex; gap: 6px; align-items: center; }
 .inline input { flex: 1; min-width: 0; }
 .dest .btn.small, .dest select { margin: 8px 6px 0 0; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid #444; margin-bottom: 10px; }
+.tab { padding: 6px 12px; font-size: 13px; color: #999; cursor: pointer; user-select: none; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tab:hover { color: #ccc; }
+.tab.on { color: #fff; border-bottom-color: #0a9e50; }
+.phonerow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.phoneicon { width: 22px; height: 22px; color: #0a9e50; flex: none; vertical-align: middle; }
+.acts { margin-top: 8px; }
 </style>
 </head>
 <body>
 <h1>Snapmaker-Ultra Hub</h1>
-<div class="sub">Camera relays, phone access and the list of open slicer windows. This page only works on this PC.</div>
 <div class="row">
   <div class="card" id="phone"><h2>Local access (this Wi-Fi)</h2><div id="phonebody">Loading…</div></div>
   <div class="card" id="remote"><h2>Remote access (Tailscale)</h2><div id="remotebody">Loading…</div></div>
   <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div>
-    <div class="note">A hidden slicer runs without a window and serves the phone; Show puts its window on the desktop, Hide takes it away again (it keeps working). "Needs attention" means it hit something only a person at this PC can answer - a file dialog, first-run setup, a mandatory update - so its window has been shown; Dismiss clears the flag once handled.</div>
+    <div class="acts">
+      <span class="btn dim" id="new">Open a new slicer window</span>
+      <span class="btn dim" id="newhidden">Open Background Slicer</span>
+    </div>
   </div>
-  <div class="card" id="push"><h2>Phones (Web Push)</h2><div id="pushbody">Loading…</div>
-    <div class="note">The other way round from the relays below: the phone subscribes to its own browser's push service, and this PC posts each event straight there, encrypted so only that phone can read it. No account anywhere. It needs the Tailscale link (a secure origin), and on an iPhone the page has to be added to the Home Screen first - open the link, Devices tab, Enable notifications. The key below is the public half of this hub's identity; the private half stays in the data folder and is never shown or sent.</div>
-  </div>
-  <div class="card" id="notify"><h2>Notifications</h2><div id="notifybody">Loading…</div>
-    <div class="note">The hub sends printer events - print finished, paused, filament runout, an error - to a push service you pick, so your phone is told with the page closed. The PC makes the call, so this works on plain Wi-Fi with no Tailscale and no home-screen install. Topics, keys and tokens are treated as passwords: this page shows only their last four characters once saved, and they never reach the phone link.</div>
+  <div class="card" id="notify"><h2>Notifications</h2>
+    <div class="tabs" id="notifytabs"></div>
+    <div id="pushbody">Loading…</div>
+    <div id="notifybody">Loading…</div>
   </div>
 </div>
-<div class="card hubcard" style="margin-top:16px"><h2>Hub</h2>
-  <span class="btn dim" id="new">Open a new slicer window</span>
-  <span class="btn dim" id="newhidden">Open a hidden slicer</span>
-  <span class="btn warn" id="quit">Quit hub</span>
-  <div class="note">"Open a new slicer window" starts a slicer you can see; "Open a hidden slicer" starts one without a window (find it under Slicer windows or in the tray menu). Quitting the hub stops phone access and the camera relays; the next slicer window starts the hub again.</div>
+<div class="hubfoot" style="max-width:720px; margin-top:16px">
+  <span class="btn warn" id="quit">Stop Hub Service</span>
   <div class="note" id="status"></div>
 </div>
 <script src="/hub/qrcode.js"></script>
@@ -146,7 +152,7 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         (rm.allowed_logins || []).forEach(function(l) {
             var row = el('div', 'login');
             row.appendChild(el('span', '', l));
-            var x = el('span', 'btn dim small', '\u2715'); x.title = 'Remove';
+            var x = el('span', 'btn dim small', '✕'); x.title = 'Remove';
             x.onclick = function() { post('/hub/remote?remove=' + encodeURIComponent(l)).then(function(j) { info = j; renderRemote(); }); };
             row.appendChild(x);
             body.appendChild(row);
@@ -160,16 +166,39 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         if (rm.last_login) body.appendChild(el('div', 'note', 'Last remote visit: ' + rm.last_login));
         var tog = el('span', 'btn' + (rm.on ? ' dim' : ''), rm.on ? 'Turn off' : 'Turn on');
         tog.onclick = function() {
-            tog.textContent = rm.on ? 'Turning off\u2026' : 'Turning on\u2026 (the first time fetches a certificate, up to a minute)';
+            tog.textContent = rm.on ? 'Turning off…' : 'Turning on… (the first time fetches a certificate, up to a minute)';
             post('/hub/remote?on=' + (rm.on ? '0' : '1')).then(function(j) { info = j; renderRemote(); }).catch(function() { lastRemote = null; refresh(); });
         };
         body.appendChild(tog);
     }
     // ---- Notifications ------------------------------------------------------------------
-    // Everything here talks to /hub/notify on the loopback control plane with the secret. The
-    // hub masks every credential it hands back, so a saved topic or key can never be read off
-    // this page again - which is also why the ntfy QR code is drawn while you are typing the
-    // topic, not afterwards.
+    // One card, three tabs: the phones that subscribed to Web Push ("Mobile Web", /hub/push),
+    // and the two relay services that are offered ("Pushover", "Webhook", /hub/notify). Every
+    // call goes to the loopback control plane with the secret. The hub masks each credential it
+    // hands back, so a saved topic or key can never be read off this page again - which is also
+    // why the ntfy QR code is drawn while you are typing the topic, not afterwards.
+    var TAB_KEY = 'snorca.hub.notifyTab', TABS = [['mobile', 'Mobile Web'], ['pushover', 'Pushover'], ['webhook', 'Webhook']];
+    var tab = 'mobile';
+    try { var saved = window.localStorage.getItem(TAB_KEY); if (saved === 'mobile' || saved === 'pushover' || saved === 'webhook') tab = saved; } catch (e) {}
+    function buildTabs() {
+        var strip = document.getElementById('notifytabs');
+        strip.innerHTML = '';
+        TABS.forEach(function(t) {
+            var b = el('div', 'tab' + (tab === t[0] ? ' on' : ''), t[1]);
+            b.onclick = function() { setTab(t[0]); };
+            strip.appendChild(b);
+        });
+        // Only one tab's body is on screen at a time; both keep refreshing underneath.
+        document.getElementById('pushbody').style.display = tab === 'mobile' ? '' : 'none';
+        document.getElementById('notifybody').style.display = tab === 'mobile' ? 'none' : '';
+    }
+    function setTab(t) {
+        if (t === tab) return;
+        tab = t;
+        try { window.localStorage.setItem(TAB_KEY, t); } catch (e) {}
+        openForm = null; lastNotify = null; lastPush = null;
+        buildTabs(); renderPush(); renderNotify();
+    }
     var notify = null, lastNotify = null, openForm = null, testNote = {};
     function jfetch(path, method, obj) {
         var opt = { method: method, headers: hdrs() };
@@ -280,107 +309,127 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         if (d.type === 'pushover') return 'user ' + (d.user_key || '') + ', app ' + (d.app_token || '');
         return (d.url_host || '') + ' … ' + (d.url || '') + (d.header_name ? '  ·  ' + d.header_name + ': ' + (d.header_value || '') : '');
     }
+    function destRow(body, d) {
+        var row = el('div', 'dest' + (!d.enabled ? ' off' : (d.status === 'failing' ? ' bad' : '')));
+        var head = el('div', 't', (d.name || d.type) + ' · ' + d.type);
+        var badge = el('span', 'badge' + (!d.enabled ? '' : (d.status === 'failing' ? ' bad' : (d.status === 'ok' ? ' ok' : ''))),
+                       !d.enabled ? 'off' : (d.status === 'failing' ? 'failing' : (d.status === 'retrying' ? 'retrying' : 'on')));
+        head.appendChild(badge);
+        row.appendChild(head);
+        row.appendChild(el('div', 'm', destLine(d)));
+        if (d.last_error) row.appendChild(el('div', 'err', 'Last error: ' + d.last_error + (d.failures > 1 ? ' (' + d.failures + ' in a row)' : '')));
+        if (testNote[d.id]) row.appendChild(el('div', 'note', testNote[d.id]));
+        var sev = severitySelect(d.min_severity);
+        sev.onchange = function() { jfetch('/hub/notify', 'POST', { id: d.id, min_severity: sev.value }).then(function(r) { notify = r.j; lastNotify = null; renderNotify(); }); };
+        row.appendChild(sev);
+        var tog = el('span', 'btn dim small', d.enabled ? 'Disable' : 'Enable');
+        tog.onclick = function() { jfetch('/hub/notify', 'POST', { id: d.id, enabled: !d.enabled }).then(function(r) { notify = r.j; lastNotify = null; renderNotify(); }); };
+        row.appendChild(tog);
+        var test = el('span', 'btn dim small', 'Test');
+        test.onclick = function() {
+            test.textContent = 'Sending…';
+            jfetch('/hub/notify/test?id=' + encodeURIComponent(d.id), 'POST').then(function(r) {
+                testNote[d.id] = r.j.ok ? ('Test sent, the service answered ' + r.j.status + '.')
+                                        : ('Test failed: ' + (r.j.error || ('HTTP ' + r.j.status)) + '.');
+                lastNotify = null; refreshNotify();
+            });
+        };
+        row.appendChild(test);
+        var del = el('span', 'btn warn small', 'Remove');
+        del.onclick = function() {
+            if (!confirm('Remove "' + (d.name || d.type) + '"? The topic or key is forgotten and cannot be shown again.')) return;
+            jfetch('/hub/notify?id=' + encodeURIComponent(d.id), 'DELETE').then(function(r) { notify = r.j; lastNotify = null; renderNotify(); });
+        };
+        row.appendChild(del);
+        body.appendChild(row);
+    }
     function renderNotify() {
         var body = document.getElementById('notifybody');
         if (!notify) return;
-        var key = JSON.stringify(notify) + '|' + openForm;
+        if (tab === 'mobile') { body.innerHTML = ''; lastNotify = null; return; }
+        var key = JSON.stringify(notify) + '|' + openForm + '|' + tab;
         if (key === lastNotify) return; // do not blow away a form somebody is typing into
         lastNotify = key;
         body.innerHTML = '';
-        var list = notify.destinations || [];
-        if (!list.length && !openForm) body.appendChild(el('div', 'note', 'Nothing is set up yet. Pushover ($4.99 once per platform) is the reliable choice; a webhook feeds Home Assistant or IFTTT.'));
-        list.forEach(function(d) {
-            var row = el('div', 'dest' + (!d.enabled ? ' off' : (d.status === 'failing' ? ' bad' : '')));
-            var head = el('div', 't', (d.name || d.type) + ' · ' + d.type);
-            var badge = el('span', 'badge' + (!d.enabled ? '' : (d.status === 'failing' ? ' bad' : (d.status === 'ok' ? ' ok' : ''))),
-                           !d.enabled ? 'off' : (d.status === 'failing' ? 'failing' : (d.status === 'retrying' ? 'retrying' : 'on')));
-            head.appendChild(badge);
-            row.appendChild(head);
-            row.appendChild(el('div', 'm', destLine(d)));
-            if (d.last_error) row.appendChild(el('div', 'err', 'Last error: ' + d.last_error + (d.failures > 1 ? ' (' + d.failures + ' in a row)' : '')));
-            if (testNote[d.id]) row.appendChild(el('div', 'note', testNote[d.id]));
-            var sev = severitySelect(d.min_severity);
-            sev.onchange = function() { jfetch('/hub/notify', 'POST', { id: d.id, min_severity: sev.value }).then(function(r) { notify = r.j; lastNotify = null; renderNotify(); }); };
-            row.appendChild(sev);
-            var tog = el('span', 'btn dim small', d.enabled ? 'Disable' : 'Enable');
-            tog.onclick = function() { jfetch('/hub/notify', 'POST', { id: d.id, enabled: !d.enabled }).then(function(r) { notify = r.j; lastNotify = null; renderNotify(); }); };
-            row.appendChild(tog);
-            var test = el('span', 'btn dim small', 'Test');
-            test.onclick = function() {
-                test.textContent = 'Sending…';
-                jfetch('/hub/notify/test?id=' + encodeURIComponent(d.id), 'POST').then(function(r) {
-                    testNote[d.id] = r.j.ok ? ('Test sent, the service answered ' + r.j.status + '.')
-                                            : ('Test failed: ' + (r.j.error || ('HTTP ' + r.j.status)) + '.');
-                    lastNotify = null; refreshNotify();
-                });
-            };
-            row.appendChild(test);
-            var del = el('span', 'btn warn small', 'Remove');
-            del.onclick = function() {
-                if (!confirm('Remove "' + (d.name || d.type) + '"? The topic or key is forgotten and cannot be shown again.')) return;
-                jfetch('/hub/notify?id=' + encodeURIComponent(d.id), 'DELETE').then(function(r) { notify = r.j; lastNotify = null; renderNotify(); });
-            };
-            row.appendChild(del);
-            body.appendChild(row);
-        });
+        var all = notify.destinations || [];
+        // ntfy is not offered any more (its iOS app is unmaintained and ntfy:// codes do not open
+        // it there), but a hub that already has one keeps it listed - under Webhook, so it can
+        // still be turned off, retested and removed.
+        var list = all.filter(function(d) { return d.type === tab; });
+        var others = tab === 'webhook' ? all.filter(function(d) { return d.type !== 'pushover' && d.type !== 'webhook'; }) : [];
+        if (!list.length && !others.length && !openForm)
+            body.appendChild(el('div', 'note', tab === 'pushover'
+                ? 'No Pushover destination yet. Pushover ($4.99 once per platform) is the reliable choice.'
+                : 'No webhook yet. A webhook feeds Home Assistant, Gotify, Discord or a script of your own.'));
+        list.forEach(function(d) { destRow(body, d); });
+        if (others.length) {
+            body.appendChild(el('div', 'note', 'Other (set up before, not offered any more):'));
+            others.forEach(function(d) { destRow(body, d); });
+        }
         if (openForm === 'ntfy') ntfyForm(body);
         else if (openForm === 'pushover') pushoverForm(body);
         else if (openForm === 'webhook') webhookForm(body);
         else {
-            [['pushover', 'Add Pushover'], ['webhook', 'Add a webhook']] /* ntfy is kept in the hub but not offered: its iOS app is unmaintained and ntfy:// codes do not open it there */.forEach(function(o) {
-                var b = el('span', 'btn dim', o[1]);
-                b.onclick = function() { openForm = o[0]; lastNotify = null; renderNotify(); };
-                body.appendChild(b);
-            });
+            var add = el('span', 'btn dim', tab === 'pushover' ? 'Add Pushover' : 'Add a webhook');
+            add.onclick = function() { openForm = tab; lastNotify = null; renderNotify(); };
+            body.appendChild(add);
         }
     }
     function refreshNotify() {
         return fetch('/hub/notify', { headers: hdrs() }).then(function(r) { return r.json(); })
             .then(function(j) { notify = j; renderNotify(); }).catch(function() {});
     }
-    // ---- Phones (Web Push) --------------------------------------------------------------
-    // /hub/push on the same loopback control plane. The hub masks each subscription to the push
-    // service it belongs to plus the tail of its endpoint - enough to tell two phones apart,
-    // never enough to push to one from anywhere else.
+    // ---- Mobile Web (Web Push) ------------------------------------------------------------
+    // /hub/push on the same loopback control plane. A phone is one green icon and a Remove button:
+    // the endpoint the hub keeps is a secret of that phone's push service, and nobody at this PC
+    // has any use for it. The browser's user agent goes into the icon's tooltip instead.
     var push = null, lastPush = null, pushNote = '';
+    var PHONE_SVG = '<svg class="phoneicon" viewBox="0 0 24 24" aria-hidden="true">'
+        + '<path fill="currentColor" d="M7 1h10a3 3 0 0 1 3 3v16a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V4a3 3 0 0 1 3-3zm0 2a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1.6l-.45 1.11A1 1 0 0 1 14 5h-4a1 1 0 0 1-.93-.63L8.6 3H7zm5 14.5a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3z"/>'
+        + '</svg>';
     function renderPush() {
         var body = document.getElementById('pushbody');
         if (!push) return;
+        if (tab !== 'mobile') { body.innerHTML = ''; lastPush = null; return; }
         var key = JSON.stringify(push) + '|' + pushNote;
         if (key === lastPush) return;
         lastPush = key;
         body.innerHTML = '';
         var subs = push.subscriptions || [];
-        if (!subs.length) {
-            body.appendChild(el('div', 'note', 'No phone has subscribed yet. Open the phone link on the phone, go to the Devices tab and tap "Enable notifications".'));
-        }
+        if (!subs.length) body.appendChild(el('div', 'note', 'No phone has subscribed yet.'));
         subs.forEach(function(d) {
             var row = el('div', 'dest' + (d.status === 'failing' ? ' bad' : ''));
-            var head = el('div', 't', d.host || 'push service');
-            head.appendChild(el('span', 'badge' + (d.status === 'failing' ? ' bad' : (d.status === 'ok' ? ' ok' : '')),
+            var line = el('div', 'phonerow');
+            var left = el('span');
+            var icon = el('span'); icon.innerHTML = PHONE_SVG;
+            icon.title = d.ua || 'Phone';
+            left.appendChild(icon);
+            left.appendChild(el('span', 'badge' + (d.status === 'failing' ? ' bad' : (d.status === 'ok' ? ' ok' : '')),
                                 d.status === 'failing' ? 'failing' : (d.status === 'new' ? 'new' : (d.status === 'retrying' ? 'retrying' : 'on'))));
-            row.appendChild(head);
-            row.appendChild(el('div', 'm', d.endpoint + (d.last_status ? '  \u00b7  last answer ' + d.last_status : '')));
-            if (d.ua) row.appendChild(el('div', 'm', d.ua));
-            if (d.last_error) row.appendChild(el('div', 'err', 'Last error: ' + d.last_error + (d.failures > 1 ? ' (' + d.failures + ' in a row)' : '')));
+            line.appendChild(left);
             var del = el('span', 'btn warn small', 'Remove');
             del.onclick = function() {
                 if (!confirm('Stop pushing to this phone? It can subscribe again from the phone link.')) return;
                 jfetch('/hub/push?id=' + encodeURIComponent(d.id), 'DELETE').then(function(r) { push = r.j; lastPush = null; renderPush(); });
             };
-            row.appendChild(del);
+            line.appendChild(del);
+            row.appendChild(line);
+            if (d.last_error) row.appendChild(el('div', 'err', 'Last error: ' + d.last_error + (d.failures > 1 ? ' (' + d.failures + ' in a row)' : '')));
             body.appendChild(row);
         });
+        var acts = el('div', 'acts');
         var sev = severitySelect(push.min_severity);
         sev.onchange = function() { jfetch('/hub/push/options', 'POST', { min_severity: sev.value }).then(function(r) { push = r.j; lastPush = null; renderPush(); }); };
-        body.appendChild(sev);
+        acts.appendChild(sev);
         var tog = el('span', 'btn dim small', push.enabled ? 'Disable' : 'Enable');
+        tog.style.marginLeft = '6px';
         tog.onclick = function() { jfetch('/hub/push/options', 'POST', { enabled: !push.enabled }).then(function(r) { push = r.j; lastPush = null; renderPush(); }); };
-        body.appendChild(tog);
+        acts.appendChild(tog);
         if (subs.length) {
             var test = el('span', 'btn dim small', 'Test');
+            test.style.marginLeft = '6px';
             test.onclick = function() {
-                test.textContent = 'Sending\u2026';
+                test.textContent = 'Sending…';
                 jfetch('/hub/push/test', 'POST', {}).then(function(r) {
                     var res = r.j.results || [];
                     pushNote = r.j.ok ? ('Test sent to ' + res.length + ' phone(s).')
@@ -388,10 +437,12 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
                     lastPush = null; refreshPush();
                 });
             };
-            body.appendChild(test);
+            acts.appendChild(test);
         }
+        body.appendChild(acts);
         if (pushNote) body.appendChild(el('div', 'note', pushNote));
-        body.appendChild(el('div', 'm', 'Public key: ' + (push.public_key || '(none yet)')));
+        body.appendChild(el('div', 'note strong', 'Requires Tailscale Connection'));
+        body.appendChild(el('div', 'note', 'Open Devices tab on mobile, Enable notifications. Add the Page to the iOS Home by opening it in Safari, and using the Share option to Add to Home.'));
     }
     function refreshPush() {
         return fetch('/hub/push', { headers: hdrs() }).then(function(r) { return r.json(); })
@@ -435,6 +486,7 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         if (!confirm('Quit the hub? Phone access and the camera relays stop until a slicer window starts it again.')) return;
         post('/hub/quit').then(function() { document.body.innerHTML = '<h1>Hub stopped</h1><div class="sub">You can close this page.</div>'; });
     };
+    buildTabs();
     refresh();
     setInterval(refresh, 3000);
 })();
