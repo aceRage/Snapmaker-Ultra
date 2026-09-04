@@ -88,6 +88,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 .printer .name { font-weight: 600; margin-bottom: 4px; }
 .printer .meta { color: #aaa; font-size: 12px; line-height: 1.5; }
 .printer .temps { display: flex; gap: 14px; margin-top: 6px; }
+.printer .temps.wrap { flex-wrap: wrap; } /* more cells than a Bambu card ever has (a four-extruder print host) */
 .printer .temps div { background: #262626; border-radius: 6px; padding: 6px 10px; text-align: center; }
 .printer .temps .v { font-size: 16px; color: #fff; }
 .printer .temps .k { font-size: 11px; color: #888; }
@@ -2690,6 +2691,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                     if (isTemp(p.bed_temp) && isTemp(p.bed_target)) temps.appendChild(tempCell(p.bed_temp, p.bed_target, 'bed'));
                     var nozzles = (p.nozzles || []).filter(function(n) { return !!n && isTemp(n.temp) && isTemp(n.target); });
                     nozzles.forEach(function(n, i) { temps.appendChild(tempCell(n.temp, n.target, nozzles.length > 1 ? 'nozzle ' + (i + 1) : 'nozzle')); });
+                    // Bed plus two nozzles is the most a Bambu card has and it fits a phone in one
+                    // row; a print host with four extruders would run off the card, so it wraps.
+                    if (temps.childNodes.length > 3) temps.className = 'temps wrap';
                     if (temps.childNodes.length) card.appendChild(temps);
                     // What each toolhead holds (a Snapmaker's print_task_config).
                     if ((p.toolheads || []).length) {
