@@ -300,22 +300,27 @@ ConfigOption* ConfigOptionDef::create_default_option() const
             return new ConfigOptionEnumGeneric(this->enum_keys_map, this->default_value->getInt());
 
         if (type == coEnums) {
-            auto dft = this->default_value->clone();
-            if (dft->nullable()) {
-                ConfigOptionEnumsGenericNullable *opt = dynamic_cast<ConfigOptionEnumsGenericNullable *>(this->default_value->clone());
-                opt->keys_map = this->enum_keys_map;
-                return opt;
-            } else {
-                ConfigOptionEnumsGeneric *opt = dynamic_cast<ConfigOptionEnumsGeneric *>(this->default_value->clone());
-                opt->keys_map = this->enum_keys_map;
-                return opt;
-            }
-            delete dft;
+            // The clone inherits whatever map the default value carries; the definition's is authoritative.
+            ConfigOption *opt = this->default_value->clone();
+            this->bind_enum_keys_map(opt);
+            return opt;
         }
 
         return this->default_value->clone();
     }
     return this->create_empty_option();
+}
+
+void ConfigOptionDef::bind_enum_keys_map(ConfigOption *opt) const
+{
+    if (opt == nullptr || this->enum_keys_map == nullptr)
+        return;
+    if (auto *o = dynamic_cast<ConfigOptionEnumGeneric*>(opt); o != nullptr)
+        o->keys_map = this->enum_keys_map;
+    else if (auto *o = dynamic_cast<ConfigOptionEnumsGeneric*>(opt); o != nullptr)
+        o->keys_map = this->enum_keys_map;
+    else if (auto *o = dynamic_cast<ConfigOptionEnumsGenericNullable*>(opt); o != nullptr)
+        o->keys_map = this->enum_keys_map;
 }
 
 // Assignment of the serialization IDs is not thread safe. The Defs shall be initialized from the main thread!
