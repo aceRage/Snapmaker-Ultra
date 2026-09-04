@@ -754,6 +754,10 @@ protected:
                 assert(def != nullptr);
                 if (def->default_value)
                     opt->set(def->default_value.get());
+                // A generic enum member (coEnums) is constructed without a keys map. It normally adopts the
+                // default value's map in set() above; this covers a definition whose default value was set
+                // before its enum_keys_map, so that the member can always be serialized by name.
+                def->bind_enum_keys_map(opt);
             }
         }
 

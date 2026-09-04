@@ -1757,10 +1757,18 @@ public:
             throw ConfigurationError("ConfigOptionEnumGeneric: Assigning an incompatible type");
         // rhs could be of the following type: ConfigOptionEnumGeneric or ConfigOptionEnum<T>
         this->value = rhs->getInt();
+        // An instance created without a keys map takes the map of the value assigned to it,
+        // so that it can still be serialized by name.
+        if (this->keys_map == nullptr)
+            if (const auto *other = dynamic_cast<const ConfigOptionEnumGeneric*>(rhs); other != nullptr)
+                this->keys_map = other->keys_map;
     }
 
     std::string serialize() const override
     {
+        if (this->keys_map == nullptr)
+            // No map to name the value with: write the bare ordinal rather than dereference nothing.
+            return std::to_string(this->value);
         for (const auto &kvp : *this->keys_map)
             if (kvp.second == this->value)
                 return kvp.first;
@@ -1770,10 +1778,24 @@ public:
     bool deserialize(const std::string &str, bool append = false) override
     {
         UNUSED(append);
+        if (this->keys_map == nullptr)
+            // Without a map only the bare ordinal form can be read back.
+            return parse_ordinal(str, this->value);
         auto it = this->keys_map->find(str);
         if (it == this->keys_map->end())
             return false;
         this->value = it->second;
+        return true;
+    }
+
+    // Read a bare enum ordinal, the form a generic enum without a keys map serializes to.
+    static bool parse_ordinal(const std::string &str, int &out)
+    {
+        char *end = nullptr;
+        const long v = std::strtol(str.c_str(), &end, 10);
+        if (end == str.c_str() || *end != '\0')
+            return false;
+        out = int(v);
         return true;
     }
 
@@ -1789,7 +1811,7 @@ class ConfigOptionEnumsGenericTempl : public ConfigOptionInts
 public:
     ConfigOptionEnumsGenericTempl(const t_config_enum_values *keys_map = nullptr) : keys_map(keys_map) {}
     explicit ConfigOptionEnumsGenericTempl(const t_config_enum_values *keys_map, size_t size, int value) : ConfigOptionInts(size, value), keys_map(keys_map) {}
-    explicit ConfigOptionEnumsGenericTempl(std::initializer_list<int> il) : ConfigOptionInts(std::move(il)), keys_map(keys_map) {}
+    explicit ConfigOptionEnumsGenericTempl(std::initializer_list<int> il) : ConfigOptionInts(std::move(il)) {}
     explicit ConfigOptionEnumsGenericTempl(const std::vector<int> &vec) : ConfigOptionInts(vec) {}
     explicit ConfigOptionEnumsGenericTempl(std::vector<int> &&vec) : ConfigOptionInts(std::move(vec)) {}
 
@@ -1811,9 +1833,14 @@ public:
 
     void set(const ConfigOption* rhs) override {
         if (rhs->type() != this->type())
-            throw ConfigurationError("ConfigOptionEnumGeneric: Assigning an incompatible type");
-        // rhs could be of the following type: ConfigOptionEnumsGeneric
-        this->values = dynamic_cast<const ConfigOptionEnumsGenericTempl *>(rhs)->values;
+            throw ConfigurationError("ConfigOptionEnumsGeneric: Assigning an incompatible type");
+        // rhs could be of the following type: ConfigOptionEnumsGeneric or ConfigOptionEnumsGenericNullable
+        if (const auto *other = dynamic_cast<const ConfigOptionEnumsGenericTempl<false>*>(rhs); other != nullptr)
+            this->assign(other->values, other->keys_map);
+        else if (const auto *other = dynamic_cast<const ConfigOptionEnumsGenericTempl<true>*>(rhs); other != nullptr)
+            this->assign(other->values, other->keys_map);
+        else
+            throw ConfigurationError("ConfigOptionEnumsGeneric: Assigning an incompatible type");
     }
 
     std::string serialize() const override
@@ -1853,6 +1880,13 @@ public:
                 else
                     throw ConfigurationError("Deserializing nil into a non-nullable object");
             }
+            else if (this->keys_map == nullptr) {
+                // Without a map only the bare ordinal form can be read back.
+                int v;
+                if (! ConfigOptionEnumGeneric::parse_ordinal(item_str, v))
+                    return false;
+                this->values.push_back(v);
+            }
             else {
                 auto it = this->keys_map->find(item_str);
                 if (it == this->keys_map->end())
@@ -1864,6 +1898,16 @@ public:
     }
 
 private:
+    void assign(const std::vector<int> &new_values, const t_config_enum_values *new_keys_map)
+    {
+        this->values = new_values;
+        // An instance created without a keys map - a coEnums member of a static config class, initialized
+        // from the option definition's default value, for one - takes the map of the value assigned to it,
+        // so that it can still be serialized by name.
+        if (this->keys_map == nullptr)
+            this->keys_map = new_keys_map;
+    }
+
     void serialize_single_value(std::ostringstream& ss, const int v) const
     {
         if (v == nil_value()) {
@@ -1871,6 +1915,10 @@ private:
                 ss << "nil";
             else
                 throw ConfigurationError("Serializing NaN");
+        }
+        else if (this->keys_map == nullptr) {
+            // No map to name the value with: write the bare ordinal rather than dereference nothing.
+            ss << v;
         }
         else {
             for (const auto& kvp : *this->keys_map)
@@ -1916,13 +1964,17 @@ public:
 	bool								nullable		= false;
     // Default value of this option. The default value object is owned by ConfigDef, it is released in its destructor.
     Slic3r::clonable_ptr<const ConfigOption> default_value;
-    void 								set_default_value(const ConfigOption* ptr) { this->default_value = Slic3r::clonable_ptr<const ConfigOption>(ptr); }
+    void 								set_default_value(ConfigOption* ptr) { this->bind_enum_keys_map(ptr); this->default_value = Slic3r::clonable_ptr<const ConfigOption>(ptr); }
     template<typename T> const T* 		get_default_value() const { return static_cast<const T*>(this->default_value.get()); }
 
     // Create an empty option to be used as a base for deserialization of DynamicConfig.
     ConfigOption*						create_empty_option() const;
     // Create a default option to be inserted into a DynamicConfig.
     ConfigOption*						create_default_option() const;
+    // The generic enum options (ConfigOptionEnumGeneric, ConfigOptionEnumsGeneric and its nullable variant) name
+    // their values through a keys map borrowed from the option definition. Give opt this definition's map if it
+    // is such an option; any other option is left alone.
+    void                                bind_enum_keys_map(ConfigOption *opt) const;
 
     bool                                is_scalar()     const { return (int(this->type) & int(coVectorType)) == 0; }
 
@@ -2444,6 +2496,10 @@ public:
     // Be careful, as this method does not test the existence of opt_key in this->def().
     bool                    set_key_value(const std::string &opt_key, ConfigOption *opt)
     {
+        // A generic enum option constructed by hand carries no keys map; borrow the definition's, when there is one.
+        if (const ConfigDef *defs = this->def(); defs != nullptr)
+            if (const ConfigOptionDef *def = defs->get(opt_key); def != nullptr)
+                def->bind_enum_keys_map(opt);
         auto it = this->options.find(opt_key);
         if (it == this->options.end()) {
             this->options[opt_key].reset(opt);

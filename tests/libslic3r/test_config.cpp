@@ -3,6 +3,8 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/LocalesUtils.hpp"
 
+#include <boost/filesystem.hpp>
+
 #include <cereal/types/polymorphic.hpp>
 #include <cereal/types/string.hpp> 
 #include <cereal/types/vector.hpp> 
@@ -263,4 +265,121 @@ TEST_CASE("DynamicPrintConfig keeps ordinary filament types unchanged", "[Config
     std::string display_type;
     CHECK(config.get_filament_type(display_type, 0) == "PLA");
     CHECK(display_type == "PLA");
+}
+
+// True if the loader would drop or rename this key on the way in: PrintConfigDef::handle_legacy()
+// clears obsolete keys (extruder_type and silent_mode are in that set although print_config_def
+// still defines them), and a round trip cannot expect those back.
+static bool retired_on_load(const std::string &key)
+{
+    t_config_option_key legacy_key = key;
+    std::string         value;
+    PrintConfigDef::handle_legacy(legacy_key, value);
+    return legacy_key != key;
+}
+
+// The generic enum options name their values through a keys map borrowed from the option definition.
+// A coEnums member of a static config class - FullPrintConfig, which full_print_config() is built
+// from - is initialized from the definition's default value and used to be left without that map, so
+// serializing it dereferenced a null pointer. store_bbs_3mf and save_to_json serialize the whole
+// config, which is how a headless project save crashed.
+SCENARIO("Generic enum options keep their keys map outside of a preset bundle", "[Config]") {
+    GIVEN("the coEnums members of a static config class") {
+        const FullPrintConfig &defaults = FullPrintConfig::defaults();
+        THEN("each of them serializes by name") {
+            size_t checked = 0;
+            for (const std::string &key : defaults.keys()) {
+                const ConfigOption *opt = defaults.option(key);
+                if (opt->type() != coEnums)
+                    continue;
+                ++ checked;
+                INFO("option " << key);
+                const ConfigOptionDef *def = print_config_def.get(key);
+                REQUIRE(def != nullptr);
+                REQUIRE(def->enum_keys_map != nullptr);
+                const std::vector<std::string> names = static_cast<const ConfigOptionVectorBase*>(opt)->vserialize();
+                REQUIRE(! names.empty());
+                for (const std::string &name : names)
+                    CHECK(def->enum_keys_map->find(name) != def->enum_keys_map->end());
+            }
+            // nozzle_volume_type, extruder_type, z_hop_types and friends: the loop above proves nothing
+            // unless there are such members.
+            REQUIRE(checked > 0);
+        }
+    }
+
+    GIVEN("a coEnums option that has no keys map at all") {
+        ConfigOptionEnumsGeneric bare{ 1, 0 };
+        REQUIRE(bare.keys_map == nullptr);
+        THEN("it serializes as bare ordinals rather than crashing") {
+            CHECK(bare.serialize() == "1,0");
+            CHECK(bare.vserialize() == std::vector<std::string>{ "1", "0" });
+        }
+        THEN("it reads bare ordinals back, and nothing else") {
+            ConfigOptionEnumsGeneric read;
+            REQUIRE(read.deserialize("1,0"));
+            CHECK(read.values == std::vector<int>{ 1, 0 });
+            CHECK(! read.deserialize("Standard"));
+        }
+        THEN("assigning from an option that has a map hands the map over") {
+            const t_config_enum_values &map = ConfigOptionEnum<NozzleVolumeType>::get_enum_values();
+            ConfigOptionEnumsGeneric named(&map, 1, int(NozzleVolumeType::nvtHighFlow));
+            bare.set(&named);
+            CHECK(bare.keys_map == &map);
+            CHECK(bare.serialize() == "High Flow");
+        }
+    }
+
+    GIVEN("a coEnums option handed to a DynamicPrintConfig by hand") {
+        DynamicPrintConfig config;
+        config.set_key_value("nozzle_volume_type", new ConfigOptionEnumsGeneric{ int(NozzleVolumeType::nvtHighFlow) });
+        THEN("it is bound to the definition's map on the way in") {
+            CHECK(config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type")->keys_map == print_config_def.get("nozzle_volume_type")->enum_keys_map);
+            CHECK(config.opt_serialize("nozzle_volume_type") == "High Flow");
+        }
+    }
+}
+
+SCENARIO("A config built from the static defaults survives a JSON round trip", "[Config]") {
+    GIVEN("DynamicPrintConfig::full_print_config()") {
+        const DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        WHEN("it is written with save_to_json and read back") {
+            const boost::filesystem::path dir = boost::filesystem::temp_directory_path() / "snorca_tests";
+            boost::filesystem::create_directories(dir);
+            const boost::filesystem::path path = dir / "full_print_config_round_trip.json";
+            // This is the call that crashed on the first coEnums member.
+            config.save_to_json(path.string(), "probe", "project", "1.0");
+
+            DynamicPrintConfig loaded;
+            std::map<std::string, std::string> key_values;
+            std::string reason;
+            const ConfigSubstitutions substitutions = loaded.load_from_json(path.string(), ForwardCompatibilitySubstitutionRule::Enable, key_values, reason);
+            boost::filesystem::remove(path);
+
+            THEN("the header and every option the loader keeps come back, nothing substituted") {
+                CHECK(key_values["name"] == "probe");
+                CHECK(substitutions.empty());
+                for (const std::string &key : config.keys()) {
+                    if (retired_on_load(key))
+                        continue;
+                    INFO("option " << key);
+                    CHECK(loaded.has(key));
+                }
+            }
+
+            THEN("the coEnums options were written by name and read back to the same values") {
+                for (const std::string &key : config.keys()) {
+                    const ConfigOption *opt = config.option(key);
+                    if (opt->type() != coEnums || retired_on_load(key))
+                        continue;
+                    INFO("option " << key);
+                    REQUIRE(loaded.has(key));
+                    CHECK(*loaded.option(key) == *opt);
+                    const ConfigOptionDef *def = print_config_def.get(key);
+                    for (const std::string &name : static_cast<const ConfigOptionVectorBase*>(loaded.option(key))->vserialize())
+                        CHECK(def->enum_keys_map->find(name) != def->enum_keys_map->end());
+                }
+            }
+        }
+    }
 }
