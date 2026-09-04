@@ -657,5 +657,16 @@ specific requirements.
 
   You should also get your employer (if you work as a programmer) or school,
 if any, to sign a "copyright disclaimer" for the program, if necessary.
-For more information on this, and how to apply and follow the GNU AGPL, see
+  For more information on this, and how to apply and follow the GNU AGPL, see
 <http://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------------
+ImageMap FULL PR1 vendored notices (do not remove):
+
+  deps_src/colorsolver          AGPL-3.0   NOTICE + ColorSolver.hpp header
+  deps_src/pigment-painter      GPL-3.0    COPYING
+  deps_src/prusa-fdm-mixer      MIT        LICENSE
+
+Extracted from OrcaSlicer-ImageMap commit 92548381056dbf72836b0a1bdc455f238218dbfb.
+lut_wide.png.c is stored with Git LFS; see deps_src/pigment-painter/README.md.
+--------------------------------------------------------------------------

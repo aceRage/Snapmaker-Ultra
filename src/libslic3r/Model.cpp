@@ -1,4 +1,5 @@
 #include "Model.hpp"
+#include "Color.hpp"
 #include "libslic3r.h"
 #include "BuildVolume.hpp"
 #include "Exception.hpp"
@@ -18,6 +19,13 @@
 #include "libslic3r/Geometry/ConvexHull.hpp"
 
 #include <float.h>
+#include <cctype>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <iterator>
+#include <limits>
+#include <unordered_map>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -33,6 +41,7 @@
 // BBS: for segment
 #include "MeshBoolean.hpp"
 #include "Format/3mf.hpp"
+#include "Format/ImportedTexture.hpp"
 
 // Transtltion
 #include "I18N.hpp"
@@ -51,6 +60,309 @@ const std::vector<std::string> CONST_FILAMENTS = {
     // BBS initialization of static variables
     std::map<size_t, ExtruderParams> Model::extruderParamsMap = { {0,{"",0,0}}};
     GlobalSpeedMap Model::printSpeedMap{};
+namespace {
+
+static std::vector<std::string> split_obj_mtl_tokens(const std::string &line)
+{
+    std::vector<std::string> tokens;
+    std::string              current;
+    char                     quote_char = '\0';
+    for (const char c : line) {
+        if ((c == '"' || c == '\'') && (quote_char == '\0' || quote_char == c)) {
+            quote_char = quote_char == '\0' ? c : '\0';
+            continue;
+        }
+        if (quote_char == '\0' && std::isspace(static_cast<unsigned char>(c))) {
+            if (!current.empty()) {
+                tokens.emplace_back(std::move(current));
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty())
+        tokens.emplace_back(std::move(current));
+    return tokens;
+}
+
+static std::string extract_obj_texture_reference(const std::string &map_kd_value)
+{
+    const std::vector<std::string> tokens = split_obj_mtl_tokens(map_kd_value);
+    if (tokens.empty())
+        return {};
+    return tokens.back();
+}
+
+static std::vector<std::string> resolve_obj_texture_path_candidates(const std::string &obj_path, const std::string &texture_reference)
+{
+    std::vector<std::string> candidates;
+    if (texture_reference.empty())
+        return candidates;
+
+    auto push_unique = [&candidates](const boost::filesystem::path &path) {
+        if (path.empty())
+            return;
+        const std::string normalized = path.lexically_normal().string();
+        if (normalized.empty())
+            return;
+        if (std::find(candidates.begin(), candidates.end(), normalized) == candidates.end())
+            candidates.emplace_back(normalized);
+    };
+
+    const boost::filesystem::path texture_path(texture_reference);
+    const boost::filesystem::path obj_dir = boost::filesystem::path(obj_path).parent_path();
+
+    if (texture_path.is_absolute()) {
+        push_unique(texture_path);
+        if (!texture_path.filename().empty())
+            push_unique(obj_dir / texture_path.filename());
+    } else {
+        push_unique(obj_dir / texture_path);
+        if (!texture_path.filename().empty())
+            push_unique(obj_dir / texture_path.filename());
+    }
+
+    return candidates;
+}
+
+struct ObjTextureImage
+{
+    std::string          resolved_path;
+    std::vector<uint8_t> rgba;
+    uint32_t             width{0};
+    uint32_t             height{0};
+};
+
+struct ObjTextureImportData
+{
+    std::vector<ObjTextureImage>              textures;
+    std::unordered_map<std::string, size_t>   map_kd_to_texture_idx;
+};
+
+static std::vector<std::string> obj_texture_map_references(const ObjInfo &obj_info)
+{
+    std::vector<std::string> references;
+
+    auto push_unique = [&references](const std::string &reference) {
+        if (reference.empty())
+            return;
+        if (std::find(references.begin(), references.end(), reference) == references.end())
+            references.emplace_back(reference);
+    };
+
+    for (const auto &face_to_map : obj_info.uv_map_pngs)
+        push_unique(face_to_map.second);
+
+    if (references.empty())
+        push_unique(obj_info.single_texture_image);
+
+    return references;
+}
+
+static size_t count_resolved_obj_albedo_texture_references(const std::string &obj_path, const ObjInfo &obj_info)
+{
+    std::vector<std::string> resolved_paths;
+
+    for (const std::string &map_kd_raw : obj_texture_map_references(obj_info)) {
+        const std::string texture_ref = extract_obj_texture_reference(map_kd_raw);
+        const auto        candidates  = resolve_obj_texture_path_candidates(obj_path, texture_ref);
+        for (const std::string &candidate : candidates) {
+            if (!is_supported_image_texture_path(candidate) || !boost::filesystem::exists(candidate))
+                continue;
+
+            const std::string normalized = boost::filesystem::path(candidate).lexically_normal().string();
+            if (std::find(resolved_paths.begin(), resolved_paths.end(), normalized) == resolved_paths.end())
+                resolved_paths.emplace_back(normalized);
+            break;
+        }
+    }
+
+    return resolved_paths.size();
+}
+
+static ObjTextureImportData load_obj_albedo_textures(const std::string &obj_path, const ObjInfo &obj_info)
+{
+    ObjTextureImportData result;
+    std::unordered_map<std::string, size_t> loaded_texture_path_to_idx;
+
+    auto register_map = [&](const std::string &map_kd_raw) {
+        if (map_kd_raw.empty())
+            return;
+        if (result.map_kd_to_texture_idx.find(map_kd_raw) != result.map_kd_to_texture_idx.end())
+            return;
+
+        const std::string texture_ref = extract_obj_texture_reference(map_kd_raw);
+        const auto        candidates  = resolve_obj_texture_path_candidates(obj_path, texture_ref);
+
+        bool had_decode_failure = false;
+        std::string last_failed_path;
+        for (const std::string &candidate : candidates) {
+            if (!boost::filesystem::exists(candidate))
+                continue;
+
+            if (const auto existing = loaded_texture_path_to_idx.find(candidate);
+                existing != loaded_texture_path_to_idx.end()) {
+                result.map_kd_to_texture_idx[map_kd_raw] = existing->second;
+                return;
+            }
+
+            ObjTextureImage image;
+            image.resolved_path = candidate;
+            if (!decode_image_texture_rgba_from_file(candidate, image.rgba, image.width, image.height)) {
+                had_decode_failure = true;
+                last_failed_path = candidate;
+                continue;
+            }
+
+            const size_t texture_idx = result.textures.size();
+            loaded_texture_path_to_idx[candidate] = texture_idx;
+            result.textures.emplace_back(std::move(image));
+            result.map_kd_to_texture_idx[map_kd_raw] = texture_idx;
+            return;
+        }
+
+        if (had_decode_failure) {
+            BOOST_LOG_TRIVIAL(error) << "OBJ albedo texture map found but failed to decode image"
+                                     << " map_Kd='" << map_kd_raw
+                                     << "' last_path='" << last_failed_path
+                                     << "' (supported: PNG, JPEG).";
+        } else if (!candidates.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "OBJ albedo texture map file not found"
+                                     << " map_Kd='" << map_kd_raw
+                                     << "' (checked OBJ-relative and filename fallback paths).";
+        } else {
+            BOOST_LOG_TRIVIAL(error) << "OBJ albedo texture map reference is empty or invalid"
+                                     << " map_Kd='" << map_kd_raw << "'.";
+        }
+    };
+
+    for (const std::string &map_kd_raw : obj_texture_map_references(obj_info))
+        register_map(map_kd_raw);
+
+    return result;
+}
+
+struct ObjTextureAtlasEntry
+{
+    uint32_t x_offset{0};
+    uint32_t width{0};
+    uint32_t height{0};
+};
+
+static bool build_obj_texture_atlas(const ObjInfo &obj_info,
+                                    const ObjTextureImportData &texture_data,
+                                    std::vector<std::array<Vec2f, 3>> &triangle_uvs,
+                                    std::vector<uint8_t> &triangle_uv_valid,
+                                    std::vector<uint8_t> &atlas_rgba,
+                                    uint32_t &atlas_width,
+                                    uint32_t &atlas_height)
+{
+    atlas_rgba.clear();
+    atlas_width  = 0;
+    atlas_height = 0;
+
+    if (texture_data.textures.empty())
+        return false;
+    if (triangle_uvs.size() != obj_info.triangle_uvs.size() || triangle_uv_valid.size() != obj_info.triangle_uvs_valid.size())
+        return false;
+
+    std::vector<ObjTextureAtlasEntry> placements(texture_data.textures.size());
+    for (size_t i = 0; i < texture_data.textures.size(); ++i) {
+        const ObjTextureImage &texture = texture_data.textures[i];
+        if (texture.width == 0 || texture.height == 0 || texture.rgba.empty())
+            return false;
+        size_t texture_rgba_size = 0;
+        if (!checked_rgba_buffer_size(texture.width, texture.height, texture_rgba_size) ||
+            texture.rgba.size() < texture_rgba_size ||
+            texture.width > std::numeric_limits<uint32_t>::max() - atlas_width)
+            return false;
+
+        placements[i].x_offset = atlas_width;
+        placements[i].width    = texture.width;
+        placements[i].height   = texture.height;
+        atlas_width += texture.width;
+        atlas_height = std::max(atlas_height, texture.height);
+    }
+
+    if (atlas_width == 0 || atlas_height == 0)
+        return false;
+
+    size_t atlas_rgba_size = 0;
+    if (!checked_rgba_buffer_size(atlas_width, atlas_height, atlas_rgba_size))
+        return false;
+
+    atlas_rgba.assign(atlas_rgba_size, uint8_t(0));
+    for (size_t i = 0; i < texture_data.textures.size(); ++i) {
+        const ObjTextureImage      &texture = texture_data.textures[i];
+        const ObjTextureAtlasEntry &entry   = placements[i];
+        for (uint32_t y = 0; y < texture.height; ++y) {
+            const size_t src_off = size_t(y) * size_t(texture.width) * 4;
+            const size_t dst_off = (size_t(y) * size_t(atlas_width) + size_t(entry.x_offset)) * 4;
+            std::copy(texture.rgba.begin() + src_off,
+                      texture.rgba.begin() + src_off + size_t(texture.width) * 4,
+                      atlas_rgba.begin() + dst_off);
+        }
+    }
+
+    auto wrap_uv = [](float value) {
+        if (!std::isfinite(value))
+            return 0.f;
+
+        constexpr float k_uv_epsilon = 1e-6f;
+        if (value >= -k_uv_epsilon && value <= 1.f + k_uv_epsilon)
+            return std::clamp(value, 0.f, 1.f);
+
+        const float wrapped = value - std::floor(value);
+        return wrapped < 0.f ? wrapped + 1.f : wrapped;
+    };
+
+    auto remap_uv = [&wrap_uv, &atlas_width, &atlas_height](const Vec2f &uv, const ObjTextureAtlasEntry &entry) {
+        const float u = wrap_uv(uv.x());
+        const float v = wrap_uv(uv.y());
+        return Vec2f((float(entry.x_offset) + u * float(entry.width)) / float(atlas_width),
+                     v * float(entry.height) / float(atlas_height));
+    };
+
+    bool has_any_textured_triangle = false;
+    for (size_t tri_idx = 0; tri_idx < triangle_uvs.size(); ++tri_idx) {
+        triangle_uv_valid[tri_idx] = 0;
+        if (obj_info.triangle_uvs_valid[tri_idx] == 0)
+            continue;
+
+        size_t texture_idx = size_t(-1);
+        const auto face_to_texture = obj_info.uv_map_pngs.find(int(tri_idx));
+        if (face_to_texture != obj_info.uv_map_pngs.end() && !face_to_texture->second.empty()) {
+            const auto texture_it = texture_data.map_kd_to_texture_idx.find(face_to_texture->second);
+            if (texture_it != texture_data.map_kd_to_texture_idx.end())
+                texture_idx = texture_it->second;
+        }
+
+        if (texture_idx == size_t(-1) && texture_data.textures.size() == 1)
+            texture_idx = 0;
+        if (texture_idx == size_t(-1))
+            continue;
+
+        const ObjTextureAtlasEntry &entry = placements[texture_idx];
+        triangle_uvs[tri_idx][0]          = remap_uv(triangle_uvs[tri_idx][0], entry);
+        triangle_uvs[tri_idx][1]          = remap_uv(triangle_uvs[tri_idx][1], entry);
+        triangle_uvs[tri_idx][2]          = remap_uv(triangle_uvs[tri_idx][2], entry);
+        triangle_uv_valid[tri_idx]        = 1;
+        has_any_textured_triangle         = true;
+    }
+
+    if (!has_any_textured_triangle) {
+        atlas_rgba.clear();
+        atlas_width  = 0;
+        atlas_height = 0;
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
+
 Model& Model::assign_copy(const Model &rhs)
 {
     this->copy_id(rhs);
@@ -271,6 +583,47 @@ Model Model::read_from_file(const std::string&                                  
         result = load_obj(input_file.c_str(), &model, obj_info, message);
         if (result){
             unsigned char first_extruder_id;
+            const bool has_valid_texture_uvs = std::any_of(obj_info.triangle_uvs_valid.begin(), obj_info.triangle_uvs_valid.end(),
+                                                           [](uint8_t uv_valid) { return uv_valid != 0; });
+            if (!model.objects.empty() && model.objects.front() != nullptr && model.objects.front()->volumes.size() == 1) {
+                ModelVolume *volume = model.objects.front()->volumes.front();
+                const size_t triangle_count = volume->mesh().its.indices.size();
+                if (has_valid_texture_uvs && triangle_count == obj_info.triangle_uvs.size() &&
+                    triangle_count == obj_info.triangle_uvs_valid.size()) {
+                    std::vector<std::array<Vec2f, 3>> triangle_uvs = obj_info.triangle_uvs;
+                    std::vector<uint8_t>              triangle_uv_valid = obj_info.triangle_uvs_valid;
+                    const ObjTextureImportData        texture_import_data = load_obj_albedo_textures(input_file, obj_info);
+                    std::vector<uint8_t>              atlas_rgba;
+                    uint32_t                          atlas_width = 0;
+                    uint32_t                          atlas_height = 0;
+                    if (build_obj_texture_atlas(obj_info, texture_import_data, triangle_uvs, triangle_uv_valid, atlas_rgba, atlas_width,
+                                                atlas_height)) {
+                        volume->imported_texture_uvs_per_face.clear();
+                        volume->imported_texture_uv_valid.clear();
+                        volume->imported_texture_uvs_per_face.reserve(triangle_count * 6);
+                        volume->imported_texture_uv_valid.reserve(triangle_count);
+                        for (size_t face_idx = 0; face_idx < triangle_count; ++face_idx) {
+                            const std::array<Vec2f, 3> &uv = triangle_uvs[face_idx];
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[0].x());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[0].y());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[1].x());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[1].y());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[2].x());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[2].y());
+                            volume->imported_texture_uv_valid.emplace_back(triangle_uv_valid[face_idx]);
+                        }
+                        volume->imported_texture_width = atlas_width;
+                        volume->imported_texture_height = atlas_height;
+                        volume->imported_texture_rgba = std::move(atlas_rgba);
+                        volume->imported_texture_raw_filament_offsets.clear();
+                        volume->imported_texture_raw_top_surface_filament_slots.clear();
+                        volume->imported_texture_raw_top_surface_depths.clear();
+                        volume->imported_texture_raw_channels = 0;
+                        volume->imported_texture_raw_metadata_json.clear();
+                        volume->uv_map_generator_version = 0;
+                    }
+                }
+            }
             if (obj_info.vertex_colors.size() > 0) {
                 std::vector<unsigned char> vertex_filament_ids;
                 if (objFn) { // 1.result is ok and pop up a dialog
@@ -287,14 +640,12 @@ Model Model::read_from_file(const std::string&                                  
                         result = obj_import_face_color_deal(face_filament_ids, first_extruder_id, &model);
                     }
                 }
-            } /*else if (obj_info.has_uv_png && obj_info.uvs.size() > 0) {
-                boost::filesystem::path full_path(input_file);
-                std::string             obj_directory = full_path.parent_path().string();
-                obj_info.obj_dircetory = obj_directory;
-                result = false;
-                message = _L("Importing obj with png function is developing.");
-            }*/
+            }
         }
+    }
+    else if (boost::algorithm::iends_with(input_file, ".gltf") || boost::algorithm::iends_with(input_file, ".glb")) {
+        result = false;
+        message = _L("GLTF/GLB import is not supported.");
     }
     else if (boost::algorithm::iends_with(input_file, ".svg"))
         result = load_svg(input_file.c_str(), &model, message);
@@ -322,7 +673,7 @@ Model Model::read_from_file(const std::string&                                  
     }
 #endif
     else
-        throw Slic3r::RuntimeError(_L("Unknown file format. Input file must have .stl, .obj, .amf(.xml) extension."));
+        throw Slic3r::RuntimeError(_L("Unknown file format. Input file must have .stl, .obj, .amf(.xml), .3mf, .gltf or .glb extension."));
 
     if (is_cb_cancel) {
         Model empty_model;
@@ -694,6 +1045,12 @@ int Model::get_object_backup_id(ModelObject const& object)
 int Model::get_object_backup_id(ModelObject const& object) const
 {
     return object_backup_id_map.find(object.id().id)->second;
+}
+
+int Model::find_object_backup_id(ModelObject const& object) const
+{
+    auto it = object_backup_id_map.find(object.id().id);
+    return it == object_backup_id_map.end() ? -1 : it->second;
 }
 
 void Model::delete_material(t_model_material_id material_id)
@@ -1963,6 +2320,7 @@ void ModelObject::convert_units(ModelObjectPtrs& new_objects, ConversionType con
             vol->supported_facets.assign(volume->supported_facets);
             vol->seam_facets.assign(volume->seam_facets);
             vol->mmu_segmentation_facets.assign(volume->mmu_segmentation_facets);
+            vol->texture_mapping_color_facets.assign(volume->texture_mapping_color_facets);
             vol->fuzzy_skin_facets.assign(volume->fuzzy_skin_facets);
 
             // Perform conversion only if the target "imperial" state is different from the current one.
@@ -2075,6 +2433,7 @@ void ModelVolume::reset_extra_facets()
     this->supported_facets.reset();
     this->seam_facets.reset();
     this->mmu_segmentation_facets.reset();
+    this->texture_mapping_color_facets.reset();
     this->fuzzy_skin_facets.reset();
 }
 
@@ -2180,6 +2539,9 @@ void ModelObject::split(ModelObjectPtrs* new_objects)
                 if (new_vol->mmu_segmentation_facets.timestamp() == volume->mmu_segmentation_facets.timestamp())
                     new_vol->mmu_segmentation_facets.reset(); // BBS: let next assign take effect
                 new_vol->mmu_segmentation_facets.assign(volume->mmu_segmentation_facets);
+                if (new_vol->texture_mapping_color_facets.timestamp() == volume->texture_mapping_color_facets.timestamp())
+                    new_vol->texture_mapping_color_facets.reset();
+                new_vol->texture_mapping_color_facets.assign(volume->texture_mapping_color_facets);
             }
 
             // BBS: clear volume's config, as we already set them into object
@@ -2864,6 +3226,7 @@ size_t ModelVolume::split(unsigned int max_extruders)
 
             // BBS: reset facet annotations
             this->mmu_segmentation_facets.reset();
+            this->texture_mapping_color_facets.reset();
             this->exterior_facets.reset();
             this->supported_facets.reset();
             this->seam_facets.reset();
@@ -2928,6 +3291,14 @@ void ModelVolume::assign_new_unique_ids_recursive()
     supported_facets.set_new_unique_id();
     seam_facets.set_new_unique_id();
     mmu_segmentation_facets.set_new_unique_id();
+    texture_mapping_color_facets.set_new_unique_id();
+    imported_vertex_colors_rgba.set_new_unique_id();
+    imported_texture_uvs_per_face.set_new_unique_id();
+    imported_texture_uv_valid.set_new_unique_id();
+    imported_texture_rgba.set_new_unique_id();
+    imported_texture_raw_filament_offsets.set_new_unique_id();
+    imported_texture_raw_top_surface_filament_slots.set_new_unique_id();
+    imported_texture_raw_top_surface_depths.set_new_unique_id();
     fuzzy_skin_facets.set_new_unique_id();
 }
 
@@ -3572,6 +3943,14 @@ void FacetsAnnotation::get_facets(const ModelVolume& mv, std::vector<indexed_tri
     selector.get_facets(facets_per_type);
 }
 
+void FacetsAnnotation::get_facet_triangles(const ModelVolume& mv,
+                                           std::vector<std::vector<TriangleSelector::FacetStateTriangle>>& facets_per_type) const
+{
+    TriangleSelector selector(mv.mesh());
+    selector.deserialize(m_data, false);
+    selector.get_facet_triangles(facets_per_type);
+}
+
 void FacetsAnnotation::set_enforcer_block_type_limit(const ModelVolume&  mv,
                                                      EnforcerBlockerType max_type,
                                                      EnforcerBlockerType to_delete_filament,
@@ -3680,6 +4059,647 @@ bool FacetsAnnotation::equals(const FacetsAnnotation &other) const
 {
     const auto& data = other.get_data();
     return (m_data == data);
+}
+
+// ImageMap FULL PR1: ColorFacetsAnnotation helpers + methods
+// Extracted from OrcaSlicer-ImageMap Model.cpp @ 92548381056
+static char color_facets_hex_digit(unsigned int value)
+{
+    value &= 0x0Fu;
+    return value < 10u ? char('0' + value) : char('A' + value - 10u);
+}
+
+static int color_facets_hex_value(char ch)
+{
+    if (ch >= '0' && ch <= '9')
+        return int(ch - '0');
+    if (ch >= 'A' && ch <= 'F')
+        return 10 + int(ch - 'A');
+    if (ch >= 'a' && ch <= 'f')
+        return 10 + int(ch - 'a');
+    return -1;
+}
+
+static void color_facets_append_nibble(std::vector<bool> &bits, unsigned int code)
+{
+    for (int bit = 0; bit < 4; ++bit)
+        bits.emplace_back((code & (1u << bit)) != 0u);
+}
+
+static std::string color_facets_bits_to_hex(const std::vector<bool> &bits, int offset, int end)
+{
+    std::string out;
+    while (offset < end) {
+        int next_code = 0;
+        for (int bit = 3; bit >= 0; --bit) {
+            next_code <<= 1;
+            next_code |= int(bits[size_t(offset + bit)]);
+        }
+        offset += 4;
+        out.insert(out.begin(), color_facets_hex_digit(unsigned(next_code)));
+    }
+    return out;
+}
+
+static void color_facets_append_rgba_hex(std::string &out, uint32_t rgba)
+{
+    for (int shift = 28; shift >= 0; shift -= 4)
+        out.push_back(color_facets_hex_digit((rgba >> shift) & 0x0Fu));
+}
+
+static bool color_facets_parse_rgba_hex(const std::string &str, size_t offset, uint32_t &rgba)
+{
+    if (offset + 8 > str.size())
+        return false;
+    uint32_t value = 0;
+    for (size_t idx = 0; idx < 8; ++idx) {
+        const int hex = color_facets_hex_value(str[offset + idx]);
+        if (hex < 0)
+            return false;
+        value = (value << 4) | uint32_t(hex);
+    }
+    rgba = value;
+    return true;
+}
+
+static void color_facets_append_byte_hex(std::string &out, unsigned char value)
+{
+    out.push_back(color_facets_hex_digit((value >> 4) & 0x0Fu));
+    out.push_back(color_facets_hex_digit(value & 0x0Fu));
+}
+
+static std::string color_facets_string_to_hex(const std::string &str)
+{
+    std::string out;
+    out.reserve(str.size() * 2);
+    for (unsigned char ch : str)
+        color_facets_append_byte_hex(out, ch);
+    return out;
+}
+
+static std::string color_facets_hex_to_string(const std::string &str)
+{
+    std::string out;
+    if (str.size() % 2 != 0)
+        return out;
+
+    out.reserve(str.size() / 2);
+    for (size_t idx = 0; idx + 1 < str.size(); idx += 2) {
+        const int high = color_facets_hex_value(str[idx]);
+        const int low = color_facets_hex_value(str[idx + 1]);
+        if (high < 0 || low < 0)
+            return {};
+        out.push_back(char((high << 4) | low));
+    }
+    return out;
+}
+
+static ColorRGBA color_facets_unpack_rgba(uint32_t rgba)
+{
+    return ColorRGBA(float((rgba >> 24) & 0xFFu) / 255.f,
+                     float((rgba >> 16) & 0xFFu) / 255.f,
+                     float((rgba >> 8) & 0xFFu) / 255.f,
+                     float(rgba & 0xFFu) / 255.f);
+}
+
+static float color_facets_delta(uint32_t a, uint32_t b)
+{
+    const ColorRGBA ca = color_facets_unpack_rgba(a);
+    const ColorRGBA cb = color_facets_unpack_rgba(b);
+    return std::max({ std::abs(ca.r() - cb.r()),
+                      std::abs(ca.g() - cb.g()),
+                      std::abs(ca.b() - cb.b()),
+                      std::abs(ca.a() - cb.a()) });
+}
+
+static std::array<std::array<Vec3f, 3>, 4> color_facets_split_triangle(const std::array<Vec3f, 3> &vertices,
+                                                                       int                         split_sides,
+                                                                       int                         special_side)
+{
+    std::array<std::array<Vec3f, 3>, 4> children{};
+    special_side = std::clamp(special_side, 0, 2);
+    const int j = (special_side + 1) % 3;
+    const int k = (special_side + 2) % 3;
+    const Vec3f a = vertices[size_t(special_side)];
+    const Vec3f b = vertices[size_t(j)];
+    const Vec3f c = vertices[size_t(k)];
+    const Vec3f ab = 0.5f * (a + b);
+    const Vec3f bc = 0.5f * (b + c);
+    const Vec3f ca = 0.5f * (c + a);
+
+    if (split_sides == 1) {
+        children[0] = { a, b, bc };
+        children[1] = { bc, c, a };
+    } else if (split_sides == 2) {
+        children[0] = { a, ab, ca };
+        children[1] = { ab, b, ca };
+        children[2] = { b, c, ca };
+    } else {
+        children[0] = { a, ab, ca };
+        children[1] = { ab, b, bc };
+        children[2] = { bc, c, ca };
+        children[3] = { ab, bc, ca };
+    }
+
+    return children;
+}
+
+static void color_facets_append_sampled_triangle(TriangleColorSplittingData       &data,
+                                                 const TextureMappingColorSampler &sampler,
+                                                 size_t                            source_triangle,
+                                                 const std::array<Vec3f, 3>       &vertices,
+                                                 const std::array<Vec3f, 3>       &barycentrics,
+                                                 int                               depth,
+                                                 int                               min_depth,
+                                                 int                               max_depth,
+                                                 float                             split_color_threshold)
+{
+    const Vec3f centroid = (vertices[0] + vertices[1] + vertices[2]) / 3.f;
+    const Vec3f centroid_bary = (barycentrics[0] + barycentrics[1] + barycentrics[2]) / 3.f;
+    const uint32_t c0 = sampler(source_triangle, vertices[0], barycentrics[0]);
+    const uint32_t c1 = sampler(source_triangle, vertices[1], barycentrics[1]);
+    const uint32_t c2 = sampler(source_triangle, vertices[2], barycentrics[2]);
+    const uint32_t cc = sampler(source_triangle, centroid, centroid_bary);
+    const float max_delta = std::max({ color_facets_delta(c0, c1),
+                                       color_facets_delta(c1, c2),
+                                       color_facets_delta(c2, c0),
+                                       color_facets_delta(c0, cc),
+                                       color_facets_delta(c1, cc),
+                                       color_facets_delta(c2, cc) });
+
+    if (depth < max_depth && (depth < min_depth || max_delta > split_color_threshold)) {
+        color_facets_append_nibble(data.bitstream, 3u);
+        const std::array<std::array<Vec3f, 3>, 4> child_vertices = color_facets_split_triangle(vertices, 3, 0);
+        const std::array<std::array<Vec3f, 3>, 4> child_barycentrics = color_facets_split_triangle(barycentrics, 3, 0);
+        for (int child_idx = 3; child_idx >= 0; --child_idx) {
+            color_facets_append_sampled_triangle(data,
+                                                 sampler,
+                                                 source_triangle,
+                                                 child_vertices[size_t(child_idx)],
+                                                 child_barycentrics[size_t(child_idx)],
+                                                 depth + 1,
+                                                 min_depth,
+                                                 max_depth,
+                                                 split_color_threshold);
+        }
+        return;
+    }
+
+    color_facets_append_nibble(data.bitstream, 0u);
+    data.colors_rgba.emplace_back(cc);
+}
+
+static bool color_facets_append_existing_or_sampled_triangle(
+    const TriangleColorSplittingData                &old_data,
+    TriangleColorSplittingData                      &new_data,
+    const TextureMappingColorSampler                &sampler,
+    const TextureMappingColorLeafResamplePredicate  &resample_leaf,
+    size_t                                           source_triangle,
+    int                                              bitstream_end,
+    size_t                                           color_end,
+    int                                             &bit_idx,
+    size_t                                          &color_idx,
+    const std::array<Vec3f, 3>                      &vertices,
+    const std::array<Vec3f, 3>                      &barycentrics,
+    int                                              depth,
+    int                                              min_depth,
+    int                                              max_depth,
+    float                                            split_color_threshold)
+{
+    if (bit_idx + 3 >= bitstream_end)
+        return false;
+
+    int code = 0;
+    for (int bit = 0; bit < 4; ++bit)
+        code |= int(old_data.bitstream[size_t(bit_idx++)]) << bit;
+
+    const int split_sides = code & 0b11;
+    if (split_sides == 0) {
+        if (color_idx >= color_end || color_idx >= old_data.colors_rgba.size())
+            return false;
+
+        const uint32_t rgba = old_data.colors_rgba[color_idx++];
+        if (resample_leaf && resample_leaf(source_triangle, vertices, barycentrics, rgba)) {
+            color_facets_append_sampled_triangle(new_data,
+                                                 sampler,
+                                                 source_triangle,
+                                                 vertices,
+                                                 barycentrics,
+                                                 depth,
+                                                 min_depth,
+                                                 max_depth,
+                                                 split_color_threshold);
+        } else {
+            color_facets_append_nibble(new_data.bitstream, 0u);
+            new_data.colors_rgba.emplace_back(rgba);
+        }
+        return true;
+    }
+
+    const int special_side = (code >> 2) & 0b11;
+    color_facets_append_nibble(new_data.bitstream, unsigned(code));
+    const std::array<std::array<Vec3f, 3>, 4> child_vertices = color_facets_split_triangle(vertices, split_sides, special_side);
+    const std::array<std::array<Vec3f, 3>, 4> child_barycentrics = color_facets_split_triangle(barycentrics, split_sides, special_side);
+    for (int child_idx = split_sides; child_idx >= 0; --child_idx) {
+        if (!color_facets_append_existing_or_sampled_triangle(old_data,
+                                                              new_data,
+                                                              sampler,
+                                                              resample_leaf,
+                                                              source_triangle,
+                                                              bitstream_end,
+                                                              color_end,
+                                                              bit_idx,
+                                                              color_idx,
+                                                              child_vertices[size_t(child_idx)],
+                                                              child_barycentrics[size_t(child_idx)],
+                                                              depth + 1,
+                                                              min_depth,
+                                                              max_depth,
+                                                              split_color_threshold))
+            return false;
+    }
+    return true;
+}
+
+static void color_facets_extract_triangle(const TriangleColorSplittingData &data,
+                                          int                               bitstream_end,
+                                          size_t                            color_end,
+                                          int                              &bit_idx,
+                                          size_t                           &color_idx,
+                                          int                               source_triangle,
+                                          const std::array<Vec3f, 3>       &vertices,
+                                          std::vector<ColorFacetTriangle>  &facets)
+{
+    if (bit_idx + 3 >= bitstream_end)
+        return;
+
+    int code = 0;
+    for (int bit = 0; bit < 4; ++bit)
+        code |= int(data.bitstream[size_t(bit_idx++)]) << bit;
+
+    const int split_sides = code & 0b11;
+    if (split_sides == 0) {
+        if (color_idx >= color_end || color_idx >= data.colors_rgba.size())
+            return;
+        ColorFacetTriangle facet;
+        facet.vertices = vertices;
+        facet.source_triangle = source_triangle;
+        facet.rgba = data.colors_rgba[color_idx++];
+        facets.emplace_back(facet);
+        return;
+    }
+
+    const int special_side = (code >> 2) & 0b11;
+    const std::array<std::array<Vec3f, 3>, 4> children = color_facets_split_triangle(vertices, split_sides, special_side);
+    for (int child_idx = split_sides; child_idx >= 0; --child_idx)
+        color_facets_extract_triangle(data,
+                                      bitstream_end,
+                                      color_end,
+                                      bit_idx,
+                                      color_idx,
+                                      source_triangle,
+                                      children[size_t(child_idx)],
+                                      facets);
+}
+
+void ColorFacetsAnnotation::reset()
+{
+    m_data.triangles_to_split.clear();
+    m_data.bitstream.clear();
+    m_data.colors_rgba.clear();
+    m_data.metadata_json.clear();
+    this->touch();
+}
+
+void ColorFacetsAnnotation::set_metadata_json(std::string metadata_json)
+{
+    if (m_data.metadata_json != metadata_json) {
+        m_data.metadata_json = std::move(metadata_json);
+        this->touch();
+    }
+}
+
+bool ColorFacetsAnnotation::equals(const ColorFacetsAnnotation &other) const
+{
+    return m_data == other.get_data();
+}
+
+std::string ColorFacetsAnnotation::get_triangle_as_string(int triangle_idx) const
+{
+    std::string out;
+    auto triangle_it = std::lower_bound(m_data.triangles_to_split.begin(),
+                                        m_data.triangles_to_split.end(),
+                                        triangle_idx,
+                                        [](const ColorTriangleBitStreamMapping &lhs, int rhs) {
+                                            return lhs.triangle_idx < rhs;
+                                        });
+    if (triangle_it == m_data.triangles_to_split.end() || triangle_it->triangle_idx != triangle_idx)
+        return out;
+
+    const auto next_it = std::next(triangle_it);
+    const int bitstream_end = next_it == m_data.triangles_to_split.end() ? int(m_data.bitstream.size()) : next_it->bitstream_start_idx;
+    const size_t color_end = next_it == m_data.triangles_to_split.end() ? m_data.colors_rgba.size() : size_t(next_it->color_start_idx);
+    if (triangle_it->bitstream_start_idx < 0 ||
+        triangle_it->bitstream_start_idx >= bitstream_end ||
+        triangle_it->color_start_idx < 0 ||
+        size_t(triangle_it->color_start_idx) >= color_end)
+        return out;
+
+    if (triangle_it == m_data.triangles_to_split.begin() && !m_data.metadata_json.empty()) {
+        out = "~";
+        out += color_facets_string_to_hex(m_data.metadata_json);
+        out += "~";
+    }
+    out += color_facets_bits_to_hex(m_data.bitstream, triangle_it->bitstream_start_idx, bitstream_end);
+    out += "|";
+    for (size_t idx = size_t(triangle_it->color_start_idx); idx < color_end; ++idx)
+        color_facets_append_rgba_hex(out, m_data.colors_rgba[idx]);
+    return out;
+}
+
+void ColorFacetsAnnotation::set_triangle_from_string(int triangle_id, const std::string &str)
+{
+    assert(!str.empty());
+    assert(m_data.triangles_to_split.empty() || m_data.triangles_to_split.back().triangle_idx < triangle_id);
+
+    size_t data_start = 0;
+    if (!str.empty() && str.front() == '~') {
+        const size_t metadata_end = str.find('~', 1);
+        if (metadata_end == std::string::npos)
+            return;
+        if (m_data.triangles_to_split.empty())
+            m_data.metadata_json = color_facets_hex_to_string(str.substr(1, metadata_end - 1));
+        data_start = metadata_end + 1;
+    }
+
+    const size_t separator = str.find('|', data_start);
+    if (separator == std::string::npos || separator == data_start || separator + 8 > str.size())
+        return;
+
+    m_data.triangles_to_split.emplace_back(triangle_id, int(m_data.bitstream.size()), int(m_data.colors_rgba.size()));
+
+    const std::string tree = str.substr(data_start, separator - data_start);
+    for (auto it = tree.crbegin(); it != tree.crend(); ++it) {
+        const int dec = color_facets_hex_value(*it);
+        if (dec < 0)
+            continue;
+        color_facets_append_nibble(m_data.bitstream, unsigned(dec));
+    }
+
+    size_t color_offset = separator + 1;
+    while (color_offset + 8 <= str.size()) {
+        uint32_t rgba = 0xFFFFFFFFu;
+        if (color_facets_parse_rgba_hex(str, color_offset, rgba))
+            m_data.colors_rgba.emplace_back(rgba);
+        color_offset += 8;
+    }
+}
+
+bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume                 &mv,
+                                                      const TextureMappingColorSampler &sampler,
+                                                      int                               max_depth,
+                                                      float                             split_color_threshold,
+                                                      const TextureMappingColorSubdivisionDepths &subdivision_depths,
+                                                      const std::vector<bool> *resample_triangles,
+                                                      const TextureMappingColorLeafResamplePredicate &resample_leaf,
+                                                      const TextureMappingColorProgressFn &progress_fn)
+{
+    return this->set_from_triangle_sampler(mv.mesh().its, sampler, max_depth, split_color_threshold, subdivision_depths, resample_triangles, resample_leaf, progress_fn);
+}
+
+bool ColorFacetsAnnotation::set_from_triangle_sampler(const indexed_triangle_set         &its,
+                                                      const TextureMappingColorSampler &sampler,
+                                                      int                               max_depth,
+                                                      float                             split_color_threshold,
+                                                      const TextureMappingColorSubdivisionDepths &subdivision_depths,
+                                                      const std::vector<bool> *resample_triangles,
+                                                      const TextureMappingColorLeafResamplePredicate &resample_leaf,
+                                                      const TextureMappingColorProgressFn &progress_fn)
+{
+    TriangleColorSplittingData new_data;
+    new_data.metadata_json = m_data.metadata_json;
+    new_data.triangles_to_split.reserve(its.indices.size());
+    if (resample_triangles != nullptr) {
+        new_data.bitstream.reserve(m_data.bitstream.size());
+        new_data.colors_rgba.reserve(m_data.colors_rgba.size());
+    }
+
+    const std::array<Vec3f, 3> root_barycentrics = {
+        Vec3f(1.f, 0.f, 0.f),
+        Vec3f(0.f, 1.f, 0.f),
+        Vec3f(0.f, 0.f, 1.f)
+    };
+
+    max_depth = std::clamp(max_depth, 0, 7);
+    split_color_threshold = std::max(split_color_threshold, 0.f);
+
+    const size_t total_triangles = its.indices.size();
+    int last_progress = -1;
+    auto report_progress = [&progress_fn, total_triangles, &last_progress](size_t completed_triangles) {
+        if (!progress_fn)
+            return;
+        const int progress = total_triangles == 0 ?
+            100 :
+            int((uint64_t(completed_triangles) * 100u) / uint64_t(total_triangles));
+        if (progress != last_progress) {
+            last_progress = progress;
+            progress_fn(completed_triangles, total_triangles);
+        }
+    };
+    report_progress(0);
+
+    size_t preserved_mapping_idx = 0;
+    auto existing_triangle_range = [this, &preserved_mapping_idx](size_t tri_idx,
+                                                                  int &bitstream_start,
+                                                                  int &bitstream_end,
+                                                                  int &color_start,
+                                                                  size_t &color_end) {
+        while (preserved_mapping_idx < m_data.triangles_to_split.size() &&
+               m_data.triangles_to_split[preserved_mapping_idx].triangle_idx < int(tri_idx))
+            ++preserved_mapping_idx;
+
+        if (preserved_mapping_idx >= m_data.triangles_to_split.size() ||
+            m_data.triangles_to_split[preserved_mapping_idx].triangle_idx != int(tri_idx))
+            return false;
+
+        const auto mapping_it = m_data.triangles_to_split.begin() + preserved_mapping_idx;
+        const auto next_it = std::next(mapping_it);
+        bitstream_start = mapping_it->bitstream_start_idx;
+        bitstream_end = next_it == m_data.triangles_to_split.end() ?
+            int(m_data.bitstream.size()) :
+            next_it->bitstream_start_idx;
+        color_start = mapping_it->color_start_idx;
+        color_end = next_it == m_data.triangles_to_split.end() ?
+            m_data.colors_rgba.size() :
+            size_t(next_it->color_start_idx);
+
+        if (bitstream_start < 0 ||
+            bitstream_start >= bitstream_end ||
+            size_t(bitstream_end) > m_data.bitstream.size() ||
+            color_start < 0 ||
+            size_t(color_start) >= color_end ||
+            color_end > m_data.colors_rgba.size())
+            return false;
+
+        return true;
+    };
+
+    auto append_preserved_triangle = [this, &new_data, &existing_triangle_range](size_t tri_idx) {
+        int bitstream_start = 0;
+        int bitstream_end = 0;
+        int color_start = 0;
+        size_t color_end = 0;
+        if (!existing_triangle_range(tri_idx, bitstream_start, bitstream_end, color_start, color_end))
+            return false;
+
+        new_data.triangles_to_split.emplace_back(int(tri_idx), int(new_data.bitstream.size()), int(new_data.colors_rgba.size()));
+        new_data.bitstream.insert(new_data.bitstream.end(),
+                                  m_data.bitstream.begin() + bitstream_start,
+                                  m_data.bitstream.begin() + bitstream_end);
+        new_data.colors_rgba.insert(new_data.colors_rgba.end(),
+                                    m_data.colors_rgba.begin() + color_start,
+                                    m_data.colors_rgba.begin() + color_end);
+        return true;
+    };
+
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        auto report_triangle_done = [&report_progress, tri_idx]() {
+            report_progress(tri_idx + 1);
+        };
+        const auto &tri = its.indices[tri_idx];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0) {
+            report_triangle_done();
+            continue;
+        }
+        if (size_t(tri[0]) >= its.vertices.size() ||
+            size_t(tri[1]) >= its.vertices.size() ||
+            size_t(tri[2]) >= its.vertices.size()) {
+            report_triangle_done();
+            continue;
+        }
+
+        const std::array<Vec3f, 3> vertices = {
+            its.vertices[size_t(tri[0])].cast<float>(),
+            its.vertices[size_t(tri[1])].cast<float>(),
+            its.vertices[size_t(tri[2])].cast<float>()
+        };
+
+        const bool should_resample_triangle =
+            resample_triangles == nullptr ||
+            tri_idx >= resample_triangles->size() ||
+            (*resample_triangles)[tri_idx];
+        if (resample_triangles != nullptr &&
+            tri_idx < resample_triangles->size() &&
+            !(*resample_triangles)[tri_idx] &&
+            append_preserved_triangle(tri_idx)) {
+            report_triangle_done();
+            continue;
+        }
+
+        int triangle_min_depth = 0;
+        int triangle_max_depth = max_depth;
+        if (subdivision_depths) {
+            const std::pair<int, int> depths = subdivision_depths(tri_idx, vertices);
+            triangle_min_depth = std::clamp(depths.first, 0, 7);
+            triangle_max_depth = std::clamp(depths.second, 0, 7);
+            if (triangle_max_depth < triangle_min_depth)
+                triangle_max_depth = triangle_min_depth;
+        }
+
+        new_data.triangles_to_split.emplace_back(int(tri_idx), int(new_data.bitstream.size()), int(new_data.colors_rgba.size()));
+        if (resample_leaf && should_resample_triangle) {
+            int bitstream_start = 0;
+            int bitstream_end = 0;
+            int color_start = 0;
+            size_t color_end = 0;
+            if (existing_triangle_range(tri_idx, bitstream_start, bitstream_end, color_start, color_end)) {
+                int bit_idx = bitstream_start;
+                size_t color_idx = size_t(color_start);
+                const size_t new_bitstream_start = new_data.bitstream.size();
+                const size_t new_color_start = new_data.colors_rgba.size();
+                if (color_facets_append_existing_or_sampled_triangle(m_data,
+                                                                     new_data,
+                                                                     sampler,
+                                                                     resample_leaf,
+                                                                     tri_idx,
+                                                                     bitstream_end,
+                                                                     color_end,
+                                                                     bit_idx,
+                                                                     color_idx,
+                                                                     vertices,
+                                                                     root_barycentrics,
+                                                                     0,
+                                                                     triangle_min_depth,
+                                                                     triangle_max_depth,
+                                                                     split_color_threshold)) {
+                    report_triangle_done();
+                    continue;
+                }
+                new_data.bitstream.resize(new_bitstream_start);
+                new_data.colors_rgba.resize(new_color_start);
+            }
+        }
+        color_facets_append_sampled_triangle(new_data,
+                                             sampler,
+                                             tri_idx,
+                                             vertices,
+                                             root_barycentrics,
+                                             0,
+                                             triangle_min_depth,
+                                             triangle_max_depth,
+                                             split_color_threshold);
+        report_triangle_done();
+    }
+    report_progress(total_triangles);
+
+    new_data.triangles_to_split.shrink_to_fit();
+    new_data.bitstream.shrink_to_fit();
+    new_data.colors_rgba.shrink_to_fit();
+
+    if (new_data != m_data) {
+        m_data = std::move(new_data);
+        this->touch();
+        return true;
+    }
+    return false;
+}
+
+void ColorFacetsAnnotation::get_facet_triangles(const ModelVolume &mv, std::vector<ColorFacetTriangle> &facets) const
+{
+    this->get_facet_triangles(mv.mesh().its, facets);
+}
+
+void ColorFacetsAnnotation::get_facet_triangles(const indexed_triangle_set &its, std::vector<ColorFacetTriangle> &facets) const
+{
+    facets.clear();
+    if (its.vertices.empty() || its.indices.empty())
+        return;
+
+    facets.reserve(m_data.colors_rgba.size());
+    for (auto mapping_it = m_data.triangles_to_split.begin(); mapping_it != m_data.triangles_to_split.end(); ++mapping_it) {
+        if (mapping_it->triangle_idx < 0 || size_t(mapping_it->triangle_idx) >= its.indices.size())
+            continue;
+
+        const auto &tri = its.indices[size_t(mapping_it->triangle_idx)];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+            continue;
+        if (size_t(tri[0]) >= its.vertices.size() ||
+            size_t(tri[1]) >= its.vertices.size() ||
+            size_t(tri[2]) >= its.vertices.size())
+            continue;
+
+        const std::array<Vec3f, 3> vertices = {
+            its.vertices[size_t(tri[0])].cast<float>(),
+            its.vertices[size_t(tri[1])].cast<float>(),
+            its.vertices[size_t(tri[2])].cast<float>()
+        };
+        const auto next_it = std::next(mapping_it);
+        const int bitstream_end = next_it == m_data.triangles_to_split.end() ? int(m_data.bitstream.size()) : next_it->bitstream_start_idx;
+        const size_t color_end = next_it == m_data.triangles_to_split.end() ? m_data.colors_rgba.size() : size_t(next_it->color_start_idx);
+        int bit_idx = mapping_it->bitstream_start_idx;
+        size_t color_idx = size_t(mapping_it->color_start_idx);
+        color_facets_extract_triangle(m_data, bitstream_end, color_end, bit_idx, color_idx, mapping_it->triangle_idx, vertices, facets);
+    }
 }
 
 // Test whether the two models contain the same number of ModelObjects with the same set of IDs

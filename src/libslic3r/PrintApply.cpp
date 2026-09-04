@@ -1,6 +1,7 @@
 #include "MixedFilament.hpp"
 #include "Model.hpp"
 #include "Print.hpp"
+#include "nlohmann/json.hpp"
 
 #include <boost/log/trivial.hpp>
 #include <algorithm>
@@ -229,6 +230,90 @@ static inline bool config_options_equal(const ConfigOption *lhs, const ConfigOpt
     return *lhs == *rhs;
 }
 
+static void remove_texture_mapping_preview_options(nlohmann::json &root)
+{
+    if (!root.is_array())
+        return;
+    for (nlohmann::json &entry : root) {
+        if (!entry.is_object())
+            continue;
+        auto texture_it = entry.find("texture_options");
+        if (texture_it == entry.end() || !texture_it->is_object())
+            continue;
+        texture_it->erase("preview_opacity_pct");
+        texture_it->erase("simulate_preview_colors");
+        texture_it->erase("limit_preview_resolution");
+        texture_it->erase("simulate_top_surface_lod");
+    }
+}
+
+static bool texture_mapping_definitions_equal_for_gcode(const ConfigOption *lhs, const ConfigOption *rhs)
+{
+    if (config_options_equal(lhs, rhs))
+        return true;
+    if (lhs == nullptr || rhs == nullptr || lhs->type() != coString || rhs->type() != coString)
+        return false;
+
+    nlohmann::json lhs_json;
+    nlohmann::json rhs_json;
+    try {
+        lhs_json = nlohmann::json::parse(static_cast<const ConfigOptionString *>(lhs)->value);
+        rhs_json = nlohmann::json::parse(static_cast<const ConfigOptionString *>(rhs)->value);
+    } catch (const nlohmann::json::exception &) {
+        return false;
+    }
+
+    remove_texture_mapping_preview_options(lhs_json);
+    remove_texture_mapping_preview_options(rhs_json);
+    return lhs_json == rhs_json;
+}
+
+static bool texture_mapping_global_settings_json_for_gcode(const ConfigOption *opt, nlohmann::json &out)
+{
+    out = nlohmann::json::object();
+    if (opt == nullptr)
+        return true;
+    if (opt->type() != coString)
+        return false;
+    const std::string &value = static_cast<const ConfigOptionString *>(opt)->value;
+    if (value.empty())
+        return true;
+    try {
+        out = nlohmann::json::parse(value);
+    } catch (const nlohmann::json::exception &) {
+        return false;
+    }
+    if (!out.is_object())
+        return false;
+    out.erase("schema");
+    auto preview_it = out.find("preview_options");
+    if (preview_it != out.end() && preview_it->is_object()) {
+        preview_it->erase("preview_opacity_pct");
+        preview_it->erase("simulate_preview_colors");
+        preview_it->erase("limit_preview_resolution");
+        preview_it->erase("simulate_top_surface_lod");
+        if (preview_it->empty())
+            out.erase(preview_it);
+    }
+    out.erase("preview_opacity_pct");
+    out.erase("simulate_preview_colors");
+    out.erase("limit_preview_resolution");
+    out.erase("simulate_top_surface_lod");
+    return true;
+}
+
+static bool texture_mapping_global_settings_equal_for_gcode(const ConfigOption *lhs, const ConfigOption *rhs)
+{
+    if (config_options_equal(lhs, rhs))
+        return true;
+    nlohmann::json lhs_json;
+    nlohmann::json rhs_json;
+    return texture_mapping_global_settings_json_for_gcode(lhs, lhs_json) &&
+           texture_mapping_global_settings_json_for_gcode(rhs, rhs_json) &&
+           lhs_json == rhs_json;
+}
+
+
 static t_config_option_keys print_config_diffs(
     const PrintConfig        &current_config,
     const DynamicPrintConfig &new_full_config,
@@ -274,6 +359,10 @@ static t_config_option_keys print_config_diffs(
                 } else
                     delete opt_copy;
             }
+        } else if (opt_key == "texture_mapping_definitions" && texture_mapping_definitions_equal_for_gcode(opt_old, opt_new)) {
+            continue;
+        } else if (opt_key == "texture_mapping_global_settings" && texture_mapping_global_settings_equal_for_gcode(opt_old, opt_new)) {
+            continue;
         } else if (!config_options_equal(opt_new, opt_old)) {
             //BBS: add plate_index logic for wipe_tower_x/wipe_tower_y
             if (!opt_key.compare("wipe_tower_x") || !opt_key.compare("wipe_tower_y")) {
@@ -307,6 +396,12 @@ static t_config_option_keys full_print_config_diffs(const DynamicPrintConfig &cu
         //    continue;
         const ConfigOption *opt_old = current_full_config.option(opt_key);
         const ConfigOption *opt_new = new_full_config.option(opt_key);
+        if (opt_key == "texture_mapping_definitions" && texture_mapping_definitions_equal_for_gcode(opt_old, opt_new)) {
+            continue;
+        }
+        if (opt_key == "texture_mapping_global_settings" && texture_mapping_global_settings_equal_for_gcode(opt_old, opt_new)) {
+            continue;
+        }
         if (opt_old == nullptr || !config_options_equal(opt_new, opt_old)) {
             //BBS: add plate_index logic for wipe_tower_x/wipe_tower_y
             if (opt_old && (!opt_key.compare("wipe_tower_x") || !opt_key.compare("wipe_tower_y"))) {
@@ -1166,6 +1261,26 @@ static inline void append_unique_painted_extruder(std::vector<unsigned int> &pai
         painting_extruders.emplace_back(extruder_id);
 }
 
+
+static void append_texture_mapping_component_extruders(const TextureMappingManager   &texture_mgr,
+                                                       unsigned int                   zone_id,
+                                                       size_t                         num_physical,
+                                                       const std::vector<std::string> &filament_colours,
+                                                       std::vector<unsigned int>     &extruders)
+{
+    const TextureMappingZone *zone = texture_mgr.zone_from_id(zone_id);
+    if (zone == nullptr || !zone->enabled || zone->deleted)
+        return;
+    std::vector<std::string> colors = filament_colours;
+    colors.resize(num_physical, "#FFFFFF");
+    std::vector<unsigned int> component_ids = zone->is_image_texture() ?
+        TextureMappingManager::effective_texture_component_ids(*zone, num_physical, colors) :
+        TextureMappingManager::selected_component_ids(*zone, num_physical);
+    for (unsigned int component_id : component_ids)
+        if (component_id >= 1 && component_id <= num_physical)
+            extruders.emplace_back(component_id);
+}
+
 static void append_mixed_component_extruders(const MixedFilamentManager &mixed_mgr,
                                              unsigned int                state_id,
                                              size_t                      num_physical_extruders,
@@ -1281,6 +1396,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     new_full_config.option("mixed_filament_surface_indentation", true);
     new_full_config.option("mixed_filament_region_collapse", true);
     new_full_config.option("mixed_filament_definitions", true);
+    new_full_config.option("texture_mapping_definitions", true);
+    new_full_config.option("texture_mapping_global_settings", true);
     m_config.option("dithering_z_step_size", true);
     m_config.option("dithering_local_z_mode", true);
     m_config.option("dithering_local_z_whole_objects", true);
@@ -1297,6 +1414,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     m_config.option("mixed_filament_surface_indentation", true);
     m_config.option("mixed_filament_region_collapse", true);
     m_config.option("mixed_filament_definitions", true);
+    m_config.option("texture_mapping_definitions", true);
+    m_config.option("texture_mapping_global_settings", true);
     m_default_object_config.option("dithering_z_step_size", true);
     m_default_object_config.option("dithering_local_z_mode", true);
     m_default_object_config.option("dithering_local_z_whole_objects", true);
@@ -1313,6 +1432,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     m_default_object_config.option("mixed_filament_surface_indentation", true);
     m_default_object_config.option("mixed_filament_region_collapse", true);
     m_default_object_config.option("mixed_filament_definitions", true);
+    m_default_object_config.option("texture_mapping_definitions", true);
+    m_default_object_config.option("texture_mapping_global_settings", true);
     // BBS
     int used_filaments = this->extruders(true).size();
 
@@ -1468,6 +1589,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     m_mixed_filament_mgr.clear_custom_entries();
     m_mixed_filament_mgr.auto_generate(physical_filament_colors);
     m_mixed_filament_mgr.load_custom_entries(mixed_custom_definitions, physical_filament_colors);
+    TextureMappingGlobalSettings next_texture_mapping_global_settings;
+    next_texture_mapping_global_settings.load(new_full_config.opt_string("texture_mapping_global_settings"));
+    m_texture_mapping_global_settings = next_texture_mapping_global_settings;
+    m_texture_mapping_mgr.load_entries(new_full_config.opt_string("texture_mapping_definitions"), physical_filament_colors);
     m_mixed_filament_mgr.apply_gradient_settings(mixed_gradient_mode,
                                                  mixed_height_lower,
                                                  mixed_height_upper,
@@ -1483,7 +1608,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                             << ", mixed_custom=" << mixed_custom_count;
     // Total filaments = physical extruders + enabled mixed (virtual) filaments.
     // Used for extruder ID clamping so that virtual IDs are accepted.
-    size_t num_total_filaments = m_mixed_filament_mgr.total_filaments(num_extruders);
+    size_t num_total_filaments = std::max(m_mixed_filament_mgr.total_filaments(num_extruders),
+                                          m_texture_mapping_mgr.total_filaments(num_extruders));
 
     ModelObjectStatusDB model_object_status_db;
 
@@ -1895,6 +2021,12 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                                                      static_cast<unsigned int>(state_idx),
                                                      num_extruders,
                                                      painting_extruders);
+                    if (m_texture_mapping_mgr.is_texture_mapping_zone_id(static_cast<unsigned int>(state_idx)))
+                        append_texture_mapping_component_extruders(m_texture_mapping_mgr,
+                                                                   static_cast<unsigned int>(state_idx),
+                                                                   num_extruders,
+                                                                   physical_filament_colors,
+                                                                   painting_extruders);
                 } else
                     ++dropped_painted_states;
             }

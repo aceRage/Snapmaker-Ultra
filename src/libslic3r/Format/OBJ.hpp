@@ -1,6 +1,7 @@
 #ifndef slic3r_Format_OBJ_hpp_
 #define slic3r_Format_OBJ_hpp_
 #include "libslic3r/Color.hpp"
+#include <cstdint>
 #include <unordered_map>
 namespace Slic3r {
 
@@ -14,6 +15,9 @@ struct ObjInfo {
     std::vector<RGBA> face_colors;
     bool              is_single_mtl{false};
     std::vector<std::array<Vec2f,3>> uvs;
+    std::vector<std::array<Vec2f, 3>> triangle_uvs;
+    std::vector<uint8_t>              triangle_uvs_valid;
+    std::string                       single_texture_image;
     std::string        obj_dircetory;
     std::map<std::string,bool>  pngs;
     std::unordered_map<int, std::string> uv_map_pngs;

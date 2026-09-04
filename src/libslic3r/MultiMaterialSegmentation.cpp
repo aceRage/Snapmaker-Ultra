@@ -35,6 +35,15 @@
 namespace Slic3r {
 using boost::polygon::voronoi_diagram;
 
+static bool filament_id_uses_texture_mapping(const Print &print, unsigned int filament_id)
+{
+    if (filament_id == 0)
+        return false;
+    const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(filament_id);
+    return zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture();
+}
+
+
 static inline Point mk_point(const Voronoi::VD::vertex_type *point) { return {coord_t(point->x()), coord_t(point->y())}; }
 
 static inline Point mk_point(const Voronoi::Internal::point_type &point) { return {coord_t(point.x()), coord_t(point.y())}; }
@@ -1785,6 +1794,11 @@ static LayerColorStat compute_layer_color_stat(const ConstLayerPtrsAdaptor &laye
             //BBS: the extrusion line width is outer wall rather than inner wall
             const double nozzle_diameter = print_object.print()->config().nozzle_diameter.get_at(0);
             double outer_wall_line_width = config.get_abs_value("outer_wall_line_width", nozzle_diameter);
+            // ImageMap FULL PR2: TM outer-wall max width nests AROUND Ultra paint-depth clamp.
+            // Paint-depth clamp still bounds painted claims later in this function.
+            const unsigned int queried_filament_id = color_idx == 0 ? unsigned(config.wall_filament.value) : unsigned(color_idx);
+            if (filament_id_uses_texture_mapping(*print_object.print(), queried_filament_id))
+                outer_wall_line_width = std::max(0.05, print_object.print()->config().texture_mapping_outer_wall_gradient_max_line_width.value);
             out.extrusion_width     = std::max<float>(out.extrusion_width, outer_wall_line_width);
             const bool  gapfill_off = ! (config.gap_infill_speed.value > 0.f);
             float small_region_threshold = config.gap_infill_speed.value > 0 ?
@@ -3816,7 +3830,9 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
 // Returns multi-material segmentation based on painting in multi-material segmentation gizmo
 std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(const PrintObject &print_object, const std::function<void()> &throw_on_cancel_callback) {
     const size_t num_physical_filaments = print_object.print()->config().filament_colour.size();
-    const size_t num_total_filaments    = print_object.print()->mixed_filament_manager().total_filaments(num_physical_filaments);
+    const size_t num_total_filaments    = std::max(
+        print_object.print()->mixed_filament_manager().total_filaments(num_physical_filaments),
+        print_object.print()->texture_mapping_manager().total_filaments(num_physical_filaments));
     const size_t num_facets_states      = num_total_filaments + 1;
 
     // Paint Depth Stage 1, plan Task 2 item 1 (docs/superpowers/plans/2026-08-31-paint-depth.md,

@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <functional>
 #include <memory>
 
 #include "../ClipperUtils.hpp"
@@ -11,6 +12,8 @@
 
 #include "ExtrusionEntity.hpp"
 #include "FillBase.hpp"
+#include "TextureMapping.hpp"
+#include "FillTextureMapping.hpp"
 #include "FillRectilinear.hpp"
 #include "FillLightning.hpp"
 #include "FillConcentricInternal.hpp"
@@ -280,6 +283,13 @@ struct SurfaceFillParams
     // Params for Lateral honeycomb
     float infill_overhang_angle = 60.f;
 
+    bool texture_mapping_top_surface_image = false;
+    unsigned int texture_mapping_top_surface_zone_id = 0;
+    unsigned int texture_mapping_top_surface_component_id = 0;
+    int texture_mapping_top_surface_stack_depth = -1;
+    bool texture_mapping_top_surface_fixed_coloring = true;
+    bool texture_mapping_top_surface_contoning = false;
+
 	bool operator<(const SurfaceFillParams &rhs) const {
 #define RETURN_COMPARE_NON_EQUAL(KEY) if (this->KEY < rhs.KEY) return true; if (this->KEY > rhs.KEY) return false;
 #define RETURN_COMPARE_NON_EQUAL_TYPED(TYPE, KEY) if (TYPE(this->KEY) < TYPE(rhs.KEY)) return true; if (TYPE(this->KEY) > TYPE(rhs.KEY)) return false;
@@ -312,6 +322,12 @@ struct SurfaceFillParams
 		RETURN_COMPARE_NON_EQUAL(symmetric_infill_y_axis);
 		RETURN_COMPARE_NON_EQUAL(infill_lock_depth);
 		RETURN_COMPARE_NON_EQUAL(skin_infill_depth);		RETURN_COMPARE_NON_EQUAL(infill_overhang_angle);
+        RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_image);
+        RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_zone_id);
+        RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_component_id);
+        RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_stack_depth);
+        RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_fixed_coloring);
+        RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_contoning);
 
 		return false;
 	}
@@ -339,7 +355,13 @@ struct SurfaceFillParams
 				this->lateral_lattice_angle_2	    == rhs.lateral_lattice_angle_2 &&
 				this->infill_lock_depth      ==  rhs.infill_lock_depth &&
 				this->skin_infill_depth      ==  rhs.skin_infill_depth &&
-                this->infill_overhang_angle == rhs.infill_overhang_angle;
+                this->infill_overhang_angle == rhs.infill_overhang_angle &&
+                this->texture_mapping_top_surface_image == rhs.texture_mapping_top_surface_image &&
+                this->texture_mapping_top_surface_zone_id == rhs.texture_mapping_top_surface_zone_id &&
+                this->texture_mapping_top_surface_component_id == rhs.texture_mapping_top_surface_component_id &&
+                this->texture_mapping_top_surface_stack_depth == rhs.texture_mapping_top_surface_stack_depth &&
+                this->texture_mapping_top_surface_fixed_coloring == rhs.texture_mapping_top_surface_fixed_coloring &&
+                this->texture_mapping_top_surface_contoning == rhs.texture_mapping_top_surface_contoning;
 	}
 };
 
@@ -854,6 +876,30 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		        bool     is_bridge 	    = layer.id() > 0 && surface.is_bridge();
                 const unsigned int effective_extruder = layerm.extruder(extrusion_role);
 		        params.extruder 	 = effective_extruder;
+                params.texture_mapping_top_surface_image = false;
+                params.texture_mapping_top_surface_zone_id = 0;
+                params.texture_mapping_top_surface_component_id = 0;
+                params.texture_mapping_top_surface_stack_depth = -1;
+                params.texture_mapping_top_surface_fixed_coloring = true;
+                params.texture_mapping_top_surface_contoning = false;
+                if (layer.object() != nullptr && layer.object()->print() != nullptr) {
+                    const TextureMappingManager &tm = layer.object()->print()->texture_mapping_manager();
+                    // ImageMap keys TM top fills off the region's configured solid_infill_filament
+                    // (virtual zone ID). layerm.extruder() is already 1-based; do not add 1.
+                    const unsigned int filament_id_1based = unsigned(std::max(0, region_config.solid_infill_filament.value));
+                    if (tm.is_texture_mapping_zone_id(filament_id_1based)) {
+                        const TextureMappingZone *zone = tm.zone_from_id(filament_id_1based);
+                        if (zone != nullptr && zone->is_image_texture() && surface.is_top()) {
+                            params.texture_mapping_top_surface_image = true;
+                            params.texture_mapping_top_surface_zone_id = filament_id_1based;
+                            params.texture_mapping_top_surface_contoning = zone->top_surface_contoning_active();
+                            params.texture_mapping_top_surface_fixed_coloring = !zone->top_surface_contoning_active();
+                            const size_t num_physical = layer.object()->print()->config().filament_colour.size();
+                            params.texture_mapping_top_surface_component_id =
+                                tm.resolve_zone_component(filament_id_1based, num_physical, int(layer.id()));
+                        }
+                    }
+                }
 		        params.pattern 		 = region_config.sparse_infill_pattern.value;
 		        params.density       = float(region_config.sparse_infill_density);
                 params.lateral_lattice_angle_1 = region_config.lateral_lattice_angle_1;
@@ -1218,6 +1264,13 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
 // friend to Layer
 void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
 {
+    this->make_fills(adaptive_fill_octree, support_fill_octree, lightning_generator, {}, nullptr);
+}
+
+void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator, std::function<void()> throw_if_canceled, TopSurfaceImageContoningStackPlanCache * /*contoning_stack_plan_cache*/)
+{
+    if (throw_if_canceled)
+        throw_if_canceled();
 	for (LayerRegion *layerm : m_regions)
 		layerm->fills.clear();
 
@@ -1345,6 +1398,20 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 			f->fill_surface_extrusion(&surface_fill.surface,
 				params,
 				m_regions[surface_fill.region_id]->fills.entities);
+            if (surface_fill.params.texture_mapping_top_surface_image) {
+                ExtrusionEntitiesPtr &entities = m_regions[surface_fill.region_id]->fills.entities;
+                if (!entities.empty()) {
+                    if (auto *collection = dynamic_cast<ExtrusionEntityCollection*>(entities.back())) {
+                        collection->texture_mapping_top_surface_image = true;
+                        collection->texture_mapping_top_surface_zone_id = surface_fill.params.texture_mapping_top_surface_zone_id;
+                        collection->texture_mapping_top_surface_desired_component_id = surface_fill.params.texture_mapping_top_surface_component_id;
+                        collection->texture_mapping_top_surface_stack_depth = surface_fill.params.texture_mapping_top_surface_stack_depth;
+                        collection->texture_mapping_top_surface_fixed_coloring = surface_fill.params.texture_mapping_top_surface_fixed_coloring;
+                        if (surface_fill.params.texture_mapping_top_surface_component_id > 0)
+                            collection->texture_mapping_extruder_override = int(surface_fill.params.texture_mapping_top_surface_component_id) - 1;
+                    }
+                }
+            }
 		}
     }
 

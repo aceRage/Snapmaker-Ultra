@@ -26,11 +26,15 @@
 #include "GCode/SmallAreaInfillFlowCompensator.hpp"
 // ORCA: post processor below used for Dynamic Pressure advance
 #include "GCode/AdaptivePAProcessor.hpp"
+#include "GCodeTextureMapping.hpp"
 
+#include <array>
 #include <memory>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <cfloat>
 
 namespace Slic3r {
@@ -484,6 +488,11 @@ private:
 
     ExtrusionQualityEstimator m_extrusion_quality_estimator;
 
+    std::map<std::tuple<const PrintObject*, unsigned int, std::string>, VertexColorOverhangWeightField> m_vertex_color_overhang_weight_field_cache;
+    std::map<const PrintObject*, GCodeUVTextureTriangleCache> m_uv_texture_triangle_cache;
+    std::map<std::string, GCodeGenericMixCandidateSet> m_generic_solver_mix_candidate_cache;
+    bool                                m_warned_texture_mapping_filament_count_mismatch { false };
+    std::set<unsigned int>              m_warned_texture_mapping_color_match_zone_ids;
 
     /* Origin of print coordinates expressed in unscaled G-code coordinates.
        This affects the input arguments supplied to the extrude*() and travel_to()
@@ -633,6 +642,8 @@ private:
     int get_bed_temperature_max(const Print& print, const bool is_first_layer) const;
 
     std::string _extrude(const ExtrusionPath &path, std::string description = "", double speed = -1);
+    std::optional<PreferredSeamPoint> texture_mapping_seam_hiding_hint(const ExtrusionLoop &loop);
+    std::vector<double> texture_mapping_path_flow_scales(const ExtrusionPath &path);
     bool _needSAFC(const ExtrusionPath &path);
     void print_machine_envelope(GCodeOutputStream &file, Print &print);
     void _print_first_layer_bed_temperature(GCodeOutputStream &file, Print &print, const std::string &gcode, bool wait);

@@ -5,6 +5,7 @@
 #include "libslic3r.h"
 #include "I18N.hpp"
 #include "GCode.hpp"
+#include "GCodeTextureMapping.hpp"
 #include "LocalZOrderOptimizer.hpp"
 #include "Exception.hpp"
 #include "ExtrusionEntity.hpp"
@@ -1787,6 +1788,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     // BBS
     m_curr_print = print;
+    m_warned_texture_mapping_filament_count_mismatch = false;
+    m_warned_texture_mapping_color_match_zone_ids.clear();
+    m_generic_solver_mix_candidate_cache.clear();
+    m_uv_texture_triangle_cache.clear();
+    m_vertex_color_overhang_weight_field_cache.clear();
 
     GCodeWriter::full_gcode_comment = print->config().gcode_comments;
     CNumericLocalesSetter locales_setter;
@@ -1798,6 +1804,14 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     BOOST_LOG_TRIVIAL(info) << boost::format("Will export G-code to %1% soon") % path;
     GCodeProcessor::s_IsBBLPrinter = print->is_BBL_printer();
     print->set_started(psGCodeExport);
+    if (print_has_raw_offset_texture_zone_without_raw_data_for_gcode(*print)) {
+        print->active_step_add_warning(
+            PrintStateBase::WarningLevel::NON_CRITICAL,
+            _(L("An object is assigned to a Raw filament offset texture mapping zone, but it does not contain raw filament "
+                "offset atlas data. Slicing will interpret its regular RGB texture channels as raw offsets.")));
+    }
+    for (const std::string &warning_msg : collect_raw_atlas_warnings_for_gcode(*print))
+        print->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
 
     // check if any custom gcode contains keywords used by the gcode processor to
     // produce time estimation and gcode toolpaths
@@ -5728,7 +5742,8 @@ LayerResult GCode::process_layer(const Print& print,
 
                     const Point seam_reference = this->last_pos_defined() ? this->last_pos() : seam_loop.first_point();
                     float       seam_overhang  = std::numeric_limits<float>::lowest();
-                    m_seam_placer.place_seam(&layer, seam_loop, seam_reference, seam_overhang);
+                    m_seam_placer.place_seam(&layer, seam_loop, seam_reference, seam_overhang,
+                                             texture_mapping_seam_hiding_hint(src_loop));
                     seam_anchor = seam_loop.first_point();
                     return true;
                 };
@@ -7251,7 +7266,7 @@ std::string GCode::extrude_loop(
     float seam_overhang = std::numeric_limits<float>::lowest();
     if (!m_config.spiral_mode && description == "perimeter") {
         assert(m_layer != nullptr);
-        m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang);
+        m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang, texture_mapping_seam_hiding_hint(loop));
     } else
         loop.split_at(last_pos, false);
 
@@ -8126,6 +8141,15 @@ std::string GCode::_extrude(const ExtrusionPath& path, std::string description, 
 
     m_last_extrusion_role = path.role();
 
+    // ImageMap FULL PR3: modulate extrusion volume from texture LineWidth / outer-wall gradient
+    // (PR2 tagged Contoning / side-texture paths; this is the G-code emission hook).
+    const std::vector<double> tm_flow_scales = this->texture_mapping_path_flow_scales(path);
+    auto                      tm_flow_scale_at = [&](size_t idx) -> double {
+        if (tm_flow_scales.empty())
+            return 1.0;
+        return tm_flow_scales[std::min(idx, tm_flow_scales.size() - 1)];
+    };
+
     // adds processor tags and updates processor tracking data
     // PrusaMultiMaterial::Writer may generate GCodeProcessor::Height_Tag lines without updating m_last_height
     // so, if the last role was erWipeTower we force export of GCodeProcessor::Height_Tag lines
@@ -8317,13 +8341,15 @@ std::string GCode::_extrude(const ExtrusionPath& path, std::string description, 
             if (!m_config.enable_arc_fitting || path.polyline.fitting_result.empty() || m_config.spiral_mode || sloped != nullptr) {
                 double path_length  = 0.;
                 double total_length = sloped == nullptr ? 0. : path.polyline.length() * SCALING_FACTOR;
+                size_t tm_line_idx  = 0;
                 for (const Line& line : path.polyline.lines()) {
                     std::string  tempDescription = description;
                     const double line_length     = line.length() * SCALING_FACTOR;
+                    const double tm_scale        = tm_flow_scale_at(tm_line_idx++);
                     if (line_length < EPSILON)
                         continue;
                     path_length += line_length;
-                    auto dE = e_per_mm * line_length;
+                    auto dE = e_per_mm * line_length * tm_scale;
                     if (_needSAFC(path)) {
                         auto oldE = dE;
                         dE        = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
@@ -8361,7 +8387,7 @@ std::string GCode::_extrude(const ExtrusionPath& path, std::string description, 
                             const double line_length = line.length() * SCALING_FACTOR;
                             if (line_length < EPSILON)
                                 continue;
-                            auto dE = e_per_mm * line_length;
+                            auto dE = e_per_mm * line_length * tm_flow_scale_at(point_index - 1);
                             if (_needSAFC(path)) {
                                 auto oldE = dE;
                                 dE        = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
@@ -8383,7 +8409,20 @@ std::string GCode::_extrude(const ExtrusionPath& path, std::string description, 
                         if (arc_length < EPSILON)
                             continue;
                         const Vec2d center_offset = this->point_to_gcode(arc.center) - this->point_to_gcode(arc.start_point);
-                        auto        dE            = e_per_mm * arc_length;
+                        double      tm_arc_scale  = 1.0;
+                        if (!tm_flow_scales.empty()) {
+                            const size_t arc_start = fitting_result[fitting_index].start_point_index;
+                            const size_t arc_end   = fitting_result[fitting_index].end_point_index;
+                            double       sum       = 0.0;
+                            size_t       count     = 0;
+                            for (size_t line_idx = arc_start; line_idx < arc_end; ++line_idx) {
+                                sum += tm_flow_scale_at(line_idx);
+                                ++count;
+                            }
+                            if (count > 0)
+                                tm_arc_scale = sum / double(count);
+                        }
+                        auto        dE            = e_per_mm * arc_length * tm_arc_scale;
                         if (_needSAFC(path)) {
                             auto oldE = dE;
                             dE        = m_small_area_infill_flow_compensator->modify_flow(arc_length, dE, path.role());
@@ -8501,7 +8540,7 @@ std::string GCode::_extrude(const ExtrusionPath& path, std::string description, 
                 gcode += m_writer.set_speed(F, "", comment);
                 last_set_speed = F;
             }
-            auto dE = e_per_mm * line_length;
+            auto dE = e_per_mm * line_length * tm_flow_scale_at(i - 1);
             if (_needSAFC(path)) {
                 auto oldE = dE;
                 dE        = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());

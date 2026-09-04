@@ -78,6 +78,8 @@ public:
     const PrintRegionConfig     *config;
     const PrintObjectConfig     *object_config;
     const PrintConfig           *print_config;
+    // ImageMap FULL PR2: optional Contoning one-wall shell mask. Unused unless set by LayerRegion TM path.
+    const ExPolygons            *contoning_one_wall_shell_infill { nullptr };
     // Outputs:
     ExtrusionEntityCollection   *loops;
     ExtrusionEntityCollection   *gap_fill;
