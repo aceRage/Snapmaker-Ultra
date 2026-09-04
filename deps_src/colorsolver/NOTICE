@@ -1,0 +1,9 @@
+ColorSolver
+Copyright (C) 2026 sentientstardust
+
+Licensed under the GNU Affero General Public License v3.0 or later.
+See the license header in ColorSolver.hpp / ColorSolver.cpp.
+
+Vendored into Snapmaker-Ultra (AGPL) from OrcaSlicer-ImageMap
+https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap
+commit 92548381056dbf72836b0a1bdc455f238218dbfb.

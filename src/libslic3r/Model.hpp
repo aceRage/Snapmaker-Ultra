@@ -34,6 +34,8 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <optional>
 
@@ -795,6 +797,54 @@ private:
     friend class ModelVolume;
 };
 
+// ImageMap→Ultra PR1 stub: TextureMappingOffset samples ColorFacetsAnnotation /
+// imported_texture_* payloads on ModelVolume. Full triangle-color splitting,
+// ModelVolumeImportedVector undo IDs, and 3MF persistence belong with mesh-tex
+// (later PR). empty() is always true so Offset skips the color-facet path.
+struct ColorFacetTriangle
+{
+    std::array<Vec3f, 3> vertices;
+    int                  source_triangle = -1;
+    uint32_t             rgba = 0xFFFFFFFFu;
+};
+
+class ColorFacetsAnnotation final : public ObjectWithTimestamp {
+public:
+    ColorFacetsAnnotation() = default;
+    explicit ColorFacetsAnnotation(int) : ObjectWithTimestamp(-1) {}
+    ColorFacetsAnnotation(const ColorFacetsAnnotation &) = default;
+    ColorFacetsAnnotation(ColorFacetsAnnotation &&) = default;
+    ColorFacetsAnnotation &operator=(const ColorFacetsAnnotation &) = default;
+    ColorFacetsAnnotation &operator=(ColorFacetsAnnotation &&) = default;
+
+    const std::string &metadata_json() const noexcept { return m_metadata_json; }
+    void set_metadata_json(std::string metadata_json)
+    {
+        m_metadata_json = std::move(metadata_json);
+        this->touch();
+    }
+    bool empty() const { return true; }
+    void reset()
+    {
+        m_metadata_json.clear();
+        this->touch();
+    }
+    void get_facet_triangles(const ModelVolume &, std::vector<ColorFacetTriangle> &facets) const { facets.clear(); }
+    void get_facet_triangles(const indexed_triangle_set &, std::vector<ColorFacetTriangle> &facets) const { facets.clear(); }
+
+private:
+    friend class cereal::access;
+    friend class UndoRedo::StackImpl;
+    friend class ModelVolume;
+
+    template<class Archive> void serialize(Archive &ar)
+    {
+        ar(cereal::base_class<ObjectWithTimestamp>(this), m_metadata_json);
+    }
+
+    std::string m_metadata_json;
+};
+
 // An object STL, or a modifier volume, over which a different set of parameters shall be applied.
 // ModelVolume instances are owned by a ModelObject.
 class ModelVolume final : public ObjectBase
@@ -880,6 +930,22 @@ public:
 
     // List of mesh facets painted for MMU segmentation.
     FacetsAnnotation    mmu_segmentation_facets;
+
+    // ImageMap→Ultra PR1: texture-mapping payloads consumed by TextureMappingOffset.
+    // Vectors are plain (not ModelVolumeImportedVector); 3MF/undo persistence is later.
+    ColorFacetsAnnotation texture_mapping_color_facets;
+    std::vector<uint32_t> imported_vertex_colors_rgba;
+    std::vector<float>    imported_texture_uvs_per_face;
+    std::vector<uint8_t>  imported_texture_uv_valid;
+    std::vector<uint8_t>  imported_texture_rgba;
+    std::vector<uint8_t>  imported_texture_raw_filament_offsets;
+    std::vector<uint16_t> imported_texture_raw_top_surface_filament_slots;
+    std::vector<int>      imported_texture_raw_top_surface_depths;
+    uint32_t              imported_texture_width{0};
+    uint32_t              imported_texture_height{0};
+    uint32_t              imported_texture_raw_channels{0};
+    std::string           imported_texture_raw_metadata_json;
+    int                   uv_map_generator_version{0};
 
     // List of mesh facets painted for fuzzy skin.
     FacetsAnnotation    fuzzy_skin_facets;
@@ -1008,6 +1074,7 @@ public:
         this->supported_facets.set_new_unique_id();
         this->seam_facets.set_new_unique_id();
         this->mmu_segmentation_facets.set_new_unique_id();
+        this->texture_mapping_color_facets.set_new_unique_id();
         this->fuzzy_skin_facets.set_new_unique_id();
     }
 
@@ -1110,6 +1177,19 @@ private:
         name(other.name), source(other.source), m_mesh(other.m_mesh), m_convex_hull(other.m_convex_hull),
         config(other.config), m_type(other.m_type), object(object), m_transformation(other.m_transformation),
         supported_facets(other.supported_facets), seam_facets(other.seam_facets), mmu_segmentation_facets(other.mmu_segmentation_facets),
+        texture_mapping_color_facets(other.texture_mapping_color_facets),
+        imported_vertex_colors_rgba(other.imported_vertex_colors_rgba),
+        imported_texture_uvs_per_face(other.imported_texture_uvs_per_face),
+        imported_texture_uv_valid(other.imported_texture_uv_valid),
+        imported_texture_rgba(other.imported_texture_rgba),
+        imported_texture_raw_filament_offsets(other.imported_texture_raw_filament_offsets),
+        imported_texture_raw_top_surface_filament_slots(other.imported_texture_raw_top_surface_filament_slots),
+        imported_texture_raw_top_surface_depths(other.imported_texture_raw_top_surface_depths),
+        imported_texture_width(other.imported_texture_width),
+        imported_texture_height(other.imported_texture_height),
+        imported_texture_raw_channels(other.imported_texture_raw_channels),
+        imported_texture_raw_metadata_json(other.imported_texture_raw_metadata_json),
+        uv_map_generator_version(other.uv_map_generator_version),
         fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
     {
 		assert(this->id().valid()); 
@@ -1170,7 +1250,7 @@ private:
 	friend class cereal::access;
 	friend class UndoRedo::StackImpl;
 	// Used for deserialization, therefore no IDs are allocated.
-	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), fuzzy_skin_facets(-1), object(nullptr) {
+	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), texture_mapping_color_facets(-1), fuzzy_skin_facets(-1), object(nullptr) {
 		assert(this->id().invalid());
         assert(this->config.id().invalid());
         assert(this->supported_facets.id().invalid());
@@ -1640,6 +1720,8 @@ public:
     void         set_object_backup_id(ModelObject const & object, int uuid);
     int          get_object_backup_id(ModelObject const & object); // generate new if needed
     int          get_object_backup_id(ModelObject const & object) const; // generate new if needed
+    // ImageMap→Ultra PR1: TextureMappingOffset looks up a backup id without allocating.
+    int          find_object_backup_id(ModelObject const & object) const;
 
     ModelMaterial* add_material(t_model_material_id material_id);
     ModelMaterial* add_material(t_model_material_id material_id, const ModelMaterial &other);

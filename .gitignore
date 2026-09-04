@@ -39,6 +39,8 @@ src/Snapmaker_Orca-doc/
 resources/profiles/user/default
 *.code-workspace
 deps_src/build/
+# Pigment-painter LUT is download-at-build (~36 MiB). Never commit lut_wide.png.c.
+deps_src/pigment-painter/lut_wide.png.c
 .claude/
 .hermes/
 CLAUDE.md__pycache__/

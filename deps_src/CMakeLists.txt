@@ -30,6 +30,10 @@ add_subdirectory(minilzo)
 add_subdirectory(qhull)
 add_subdirectory(qoi)
 add_subdirectory(semver)      # Semver static library
+# ImageMap→Ultra PR1: ColorSolver (AGPL) + pigment-painter (GPL) + prusa-fdm-mixer (MIT)
+add_subdirectory(pigment-painter)
+add_subdirectory(prusa-fdm-mixer)
+add_subdirectory(colorsolver)
 
 # Eigen header-only library
 add_subdirectory(eigen)

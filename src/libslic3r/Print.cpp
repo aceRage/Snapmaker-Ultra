@@ -614,6 +614,14 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "filament_multi_colors",
         "filament_colour_mode",
         "default_filament_colour",
+        // ImageMap→Ultra PR1: no GCode/LayerRegion hooks yet; changing these must not
+        // fall through to invalidate_all_steps. PR2 will retarget invalidation.
+        "texture_mapping_definitions",
+        "texture_mapping_global_settings",
+        "texture_mapping_background_color",
+        "texture_mapping_outer_wall_gradient_global_strength",
+        "texture_mapping_outer_wall_gradient_max_line_width",
+        "texture_mapping_outer_wall_gradient_min_line_width",
         "filament_diameter",
         "filament_density",
         "filament_cost",

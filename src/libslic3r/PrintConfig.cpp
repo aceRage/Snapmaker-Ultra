@@ -2232,6 +2232,28 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionStrings{ "#F2754E" });
 
+    // ImageMap→Ultra PR1: six texture_mapping_* keys only. Do not touch paint_depth_*.
+    def = this->add("texture_mapping_definitions", coString);
+    def->label = L("Texture mapping definitions");
+    def->tooltip = L("Serialized texture mapping rows.");
+    def->gui_flags = "serialized";
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString(""));
+
+    def = this->add("texture_mapping_background_color", coString);
+    def->label = L("Texture mapping background color");
+    def->tooltip = L("Background color used when texture mapping samples translucent color data.");
+    def->gui_flags = "serialized";
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString("#FFFFFFFF"));
+
+    def = this->add("texture_mapping_global_settings", coString);
+    def->label = L("Texture mapping global settings");
+    def->tooltip = L("Serialized global texture mapping settings.");
+    def->gui_flags = "serialized";
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString(""));
+
     def = this->add("filament_multi_colors", coStrings);
     def->label = L("Filament multi colors");
     def->tooltip = L("Serialized filament color sequence. Multiple colors are separated by '|'.");
@@ -4786,6 +4808,36 @@ void PrintConfigDef::init_fff_params()
     def->min = 1;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("texture_mapping_outer_wall_gradient_global_strength", coFloat);
+    def->label = L("Outer wall offset gradient global strength");
+    def->category = L("Multimaterial");
+    def->tooltip = L("Global strength multiplier for texture mapping outer wall offset gradients.");
+    def->sidetext = "%";
+    def->min = 0.0;
+    def->max = 100.0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(100.0));
+
+    def = this->add("texture_mapping_outer_wall_gradient_max_line_width", coFloat);
+    def->label = L("Maximum outer wall line width");
+    def->category = L("Multimaterial");
+    def->tooltip = L("Upper bound for external perimeter line width used by texture mapping.");
+    def->sidetext = "mm";
+    def->min = 0.05;
+    def->max = 3.0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.95));
+
+    def = this->add("texture_mapping_outer_wall_gradient_min_line_width", coFloat);
+    def->label = L("Minimum outer wall line width");
+    def->category = L("Multimaterial");
+    def->tooltip = L("Lower bound for external perimeter line width used by texture mapping outer wall gradient effects.");
+    def->sidetext = "mm";
+    def->min = 0.05;
+    def->max = 2.0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.32));
 
     // Ultra: outer walls can use their own filament; 0 (Default) follows the Walls filament.
     def = this->add("outer_wall_filament", coInt);

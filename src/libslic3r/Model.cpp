@@ -696,6 +696,12 @@ int Model::get_object_backup_id(ModelObject const& object) const
     return object_backup_id_map.find(object.id().id)->second;
 }
 
+int Model::find_object_backup_id(ModelObject const &object) const
+{
+    auto i = object_backup_id_map.find(object.id().id);
+    return i == object_backup_id_map.end() ? -1 : i->second;
+}
+
 void Model::delete_material(t_model_material_id material_id)
 {
     ModelMaterialMap::iterator i = this->materials.find(material_id);
@@ -2075,6 +2081,7 @@ void ModelVolume::reset_extra_facets()
     this->supported_facets.reset();
     this->seam_facets.reset();
     this->mmu_segmentation_facets.reset();
+    this->texture_mapping_color_facets.reset();
     this->fuzzy_skin_facets.reset();
 }
 
@@ -2928,6 +2935,7 @@ void ModelVolume::assign_new_unique_ids_recursive()
     supported_facets.set_new_unique_id();
     seam_facets.set_new_unique_id();
     mmu_segmentation_facets.set_new_unique_id();
+    texture_mapping_color_facets.set_new_unique_id();
     fuzzy_skin_facets.set_new_unique_id();
 }
 

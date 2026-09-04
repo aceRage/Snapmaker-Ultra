@@ -912,6 +912,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,                 elefant_foot_compensation_layers))
     ((ConfigOptionFloat,               max_bridge_length))
     ((ConfigOptionFloatOrPercent,      line_width))
+    // ImageMap→Ultra PR1: background color for texture-mapping samples. Does not
+    // collide with paint_depth_* (those stay the Paint Depth Stage 1 keys below).
+    ((ConfigOptionString,              texture_mapping_background_color))
     // Force the generation of solid shells between adjacent materials/volumes.
     ((ConfigOptionBool,                interface_shells))
     ((ConfigOptionFloat,               layer_height))
@@ -1294,6 +1297,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     // Ultra: per-filament additive Z offset (applied for the first printing filament)
     ((ConfigOptionFloats,              filament_z_offset))
     ((ConfigOptionStrings,             default_filament_colour))
+    // ImageMap→Ultra PR1: serialized texture-mapping zone table + global JSON.
+    ((ConfigOptionString,              texture_mapping_definitions))
+    ((ConfigOptionString,              texture_mapping_global_settings))
     ((ConfigOptionInts,                temperature_vitrification))  //BBS
     ((ConfigOptionBools,               filament_is_high_temperature))
     ((ConfigOptionFloats,              filament_max_volumetric_speed))
@@ -1532,6 +1538,10 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionFloat,              mixed_filament_surface_indentation))
     ((ConfigOptionBool,               mixed_filament_region_collapse))
     ((ConfigOptionString,             mixed_filament_definitions))
+    // ImageMap→Ultra PR1: outer-wall offset gradient bounds used by TextureMappingOffset.
+    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_global_strength))
+    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_max_line_width))
+    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_min_line_width))
     ((ConfigOptionFloat,              dithering_z_step_size))
     ((ConfigOptionBool,               dithering_local_z_mode))
     ((ConfigOptionBool,               dithering_local_z_whole_objects))
