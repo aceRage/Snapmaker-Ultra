@@ -138,30 +138,38 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #sheet .hidden { display: none !important; }
 #sheet .toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%); background: #0a9e50; color: #fff; padding: 8px 14px; border-radius: 8px; font-size: 13px; display: none; z-index: 210; }
 .card .btns { display: flex; gap: 6px; flex: none; }
-/* Send sheet (full-screen): pick a printer, upload the sliced plate or upload and print it */
-#send { display: none; position: fixed; inset: 0; z-index: 230; background: #262626; color: #ddd; font-size: 13px; flex-direction: column; }
-#send .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top)); background: #1f1f1f; }
-#send .head .name { flex: 1; min-width: 0; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#send .head .btn { padding: 6px 12px; font-size: 13px; }
-#send .body { flex: 1; overflow-y: auto; padding: 10px 12px; padding-bottom: calc(12px + env(safe-area-inset-bottom)); -webkit-overflow-scrolling: touch; }
-#send .lbl { color: #9a9a9a; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: 14px 0 4px; }
+/* Send sheet (full-screen): pick a printer, upload the sliced plate or upload and print it.
+   The Stop confirmation (#ctlsheet) is the same sheet in every respect but its contents. */
+#send, #ctlsheet { display: none; position: fixed; inset: 0; z-index: 230; background: #262626; color: #ddd; font-size: 13px; flex-direction: column; }
+#send .head, #ctlsheet .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top)); background: #1f1f1f; }
+#send .head .name, #ctlsheet .head .name { flex: 1; min-width: 0; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#send .head .btn, #ctlsheet .head .btn { padding: 6px 12px; font-size: 13px; }
+#send .body, #ctlsheet .body { flex: 1; overflow-y: auto; padding: 10px 12px; padding-bottom: calc(12px + env(safe-area-inset-bottom)); -webkit-overflow-scrolling: touch; }
+#send .lbl, #ctlsheet .lbl { color: #9a9a9a; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: 14px 0 4px; }
 #send select, #send input[type=text] { width: 100%; background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 8px 10px; font-size: 14px; box-sizing: border-box; }
 #send .opt { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px solid #333; cursor: pointer; }
 #send .opt input[type=checkbox] { width: 22px; height: 22px; accent-color: #0a9e50; flex: none; margin: 0; }
-#send .info { color: #aaa; font-size: 12px; line-height: 1.5; margin-top: 6px; }
-#send .info.warn { color: #f0a030; }
-#send .info.err { color: #e88; }
-#send .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
-#send .btn { padding: 10px 18px; border-radius: 6px; background: #0a9e50; color: #fff; font-size: 14px; cursor: pointer; user-select: none; white-space: nowrap; }
-#send .btn.dim { background: #555; pointer-events: none; }
-#send .btn.alt { background: #3a3a3a; border: 1px solid #666; }
-#send .btn.warn { background: #b26a00; }
-#send .confirm { background: #3a2f1f; border: 1px solid #b26a00; border-radius: 8px; padding: 12px; margin-top: 14px; line-height: 1.5; }
+#send .info, #ctlsheet .info { color: #aaa; font-size: 12px; line-height: 1.5; margin-top: 6px; }
+#send .info.warn, #ctlsheet .info.warn { color: #f0a030; }
+#send .info.err, #ctlsheet .info.err { color: #e88; }
+#send .actions, #ctlsheet .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+#send .btn, #ctlsheet .btn { padding: 10px 18px; border-radius: 6px; background: #0a9e50; color: #fff; font-size: 14px; cursor: pointer; user-select: none; white-space: nowrap; }
+#send .btn.dim, #ctlsheet .btn.dim { background: #555; pointer-events: none; }
+#send .btn.alt, #ctlsheet .btn.alt { background: #3a3a3a; border: 1px solid #666; }
+#send .btn.warn, #ctlsheet .btn.warn { background: #b26a00; }
+#send .btn.stop, #ctlsheet .btn.stop { background: #8a3a3a; }
+#send .confirm, #ctlsheet .confirm { background: #3a2f1f; border: 1px solid #b26a00; border-radius: 8px; padding: 12px; margin-top: 14px; line-height: 1.5; }
 #send .bar { height: 8px; background: #222; border-radius: 4px; overflow: hidden; margin: 14px 0 6px; }
 #send .bar div { height: 100%; background: #0a9e50; width: 0; transition: width .3s; }
 #send .done { color: #5fd08a; font-weight: 600; margin-top: 12px; font-size: 15px; }
-#send .plate { background: #303030; border-radius: 8px; padding: 10px 12px; color: #fff; font-weight: 600; }
-#send .plate .sub { display: block; font-weight: 400; color: #aaa; font-size: 12px; margin-top: 2px; }
+#send .plate, #ctlsheet .plate { background: #303030; border-radius: 8px; padding: 10px 12px; color: #fff; font-weight: 600; }
+#send .plate .sub, #ctlsheet .plate .sub { display: block; font-weight: 400; color: #aaa; font-size: 12px; margin-top: 2px; }
+/* The control line under a printer card: what pause / resume / stop is doing, and why not */
+.printer .ctlline { font-size: 12px; line-height: 1.5; margin-top: 6px; color: #aaa; }
+.printer .ctlline.err { color: #e88; }
+.printer .ctlline.warn { color: #f0a030; }
+.printer .ctlline.ok { color: #5fd08a; }
+.printer .acts .btn.stop { background: #8a3a3a; }
 /* Plate layout editor (full-screen sheet): top-down plate, tap to select, drag to move */
 #plate { display: none; position: fixed; inset: 0; z-index: 220; background: #262626; color: #ddd; font-size: 13px; flex-direction: column; }
 #plate .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top)); background: #1f1f1f; }
@@ -239,6 +247,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 <div id="sheet"><div class="head"></div><div class="pagetabs"></div><div class="body"></div><div class="toast"></div></div>
 <div id="plate"><div class="head"></div><div class="canvas"></div><div class="ctl"></div></div>
 <div id="send"><div class="head"></div><div class="body"></div></div>
+<div id="ctlsheet"><div class="head"></div><div class="body"></div></div>
 <div id="modal-bg"><div id="modal"></div></div>
 <script>
 (function() {
@@ -2366,6 +2375,94 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             });
         }).catch(function() {});
     }
+    // ---- Pause / Resume / Stop on a printer card (POST /api/printers/{id}/control, followed
+    // through /api/jobs at 1 s like a send). Stop asks first in the Send sheet's style because it
+    // throws the print away; pause and resume act straight away, as the desktop's own buttons do. ----
+    var ctlJobs = {};   // printer id -> { action, phase: running|done|error, text, error, job, timer, line }
+    var ctlAsk  = null; // the printer whose Stop confirmation is open
+
+    function ctlWord(action, done) {
+        if (action === 'pause')  return done ? 'Paused.' : 'Pausing…';
+        if (action === 'resume') return done ? 'Resumed.' : 'Resuming…';
+        return done ? 'Stopped.' : 'Stopping…';
+    }
+    // Why a button is off. The predicates come from the printer itself (can_pause / can_resume /
+    // can_stop), so the phone never has to guess from the status string.
+    function ctlWhyNot(p, action) {
+        if (p.online === false) return 'This printer is offline.';
+        if (p.kind === 'bambu' && p.connected === false) return 'The PC is not connected to this printer.';
+        if (p.status_error) return 'The printer did not answer: ' + p.status_error;
+        var st = p.print_status || p.status || '';
+        if (action === 'resume') return st ? 'Only a paused print can be resumed (it reports ' + st + ').' : 'Nothing is paused.';
+        if (action === 'pause')  return st ? 'Only a running print can be paused (it reports ' + st + ').' : 'Nothing is printing.';
+        return st ? 'Nothing to stop (it reports ' + st + ').' : 'Nothing is printing.';
+    }
+    function ctlRun(p, action) {
+        var cur = ctlJobs[p.id];
+        if (cur && cur.phase === 'running') return;
+        if (cur && cur.timer) clearTimeout(cur.timer);
+        var s = ctlJobs[p.id] = { action: action, phase: 'running', text: ctlWord(action, false), error: '', job: null, timer: null, line: null };
+        refreshDevices();
+        api('/printers/' + encodeURIComponent(p.id) + '/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'action=' + action + (action === 'stop' ? '&confirm=1' : '')
+        }).then(function(j) {
+            if (ctlJobs[p.id] !== s) return;
+            s.job = j.job; s.dry_run = !!j.dry_run;
+            ctlPoll(p.id);
+        }).catch(function(e) {
+            if (ctlJobs[p.id] !== s) return;
+            s.phase = 'error'; s.error = e.message;
+            refreshDevices();
+        });
+    }
+    function ctlPoll(id) {
+        var s = ctlJobs[id];
+        if (!s || s.job === null) return;
+        api('/jobs/' + s.job).then(function(j) {
+            if (ctlJobs[id] !== s) return;
+            s.text = j.text || s.text;
+            if (j.state === 'running') {
+                if (s.line) s.line.textContent = s.text; // no re-render under a finger
+                s.timer = setTimeout(function() { ctlPoll(id); }, 1000);
+                return;
+            }
+            if (j.state === 'done') { s.phase = 'done'; s.text = s.dry_run ? 'Dry run: nothing was sent.' : ctlWord(s.action, true); }
+            else { s.phase = 'error'; s.error = j.error || ('The ' + s.action + ' ' + j.state); }
+            refreshDevices(); // the buttons follow the printer's new state
+        }).catch(function() { s.timer = setTimeout(function() { ctlPoll(id); }, 2000); });
+    }
+    function ctlAskStop(p) {
+        ctlAsk = p;
+        document.getElementById('ctlsheet').style.display = 'flex';
+        ctlAskRender();
+    }
+    function ctlAskClose() {
+        ctlAsk = null;
+        document.getElementById('ctlsheet').style.display = 'none';
+    }
+    function ctlAskRender() {
+        var p = ctlAsk; if (!p) return;
+        var sh = document.getElementById('ctlsheet'), head = sh.querySelector('.head'), body = sh.querySelector('.body');
+        head.innerHTML = ''; body.innerHTML = '';
+        head.appendChild(el('div', 'name', 'Stop the print'));
+        var close = el('span', 'btn alt', 'Close'); close.onclick = ctlAskClose; head.appendChild(close);
+        var pl = el('div', 'plate', p.name + (p.model ? '  ·  ' + p.model : ''));
+        var sub = p.task || p.stage || p.print_status || p.status || '';
+        if (p.printing) sub += (sub ? ' · ' : '') + (p.percent || 0) + '% · ' + fmtTime(p.left_time_s) + ' left';
+        pl.appendChild(el('span', 'sub', sub));
+        body.appendChild(pl);
+        var c = el('div', 'confirm');
+        c.appendChild(el('div', '', 'Stop the print on ' + p.name + '? It cannot be resumed: the printer throws the job away and the plate has to be started again.'));
+        var acts = el('div', 'actions');
+        var go = el('span', 'btn stop', 'Stop print');
+        go.onclick = function() { var t = p; ctlAskClose(); ctlRun(t, 'stop'); };
+        acts.appendChild(go);
+        var no = el('span', 'btn alt', 'Keep printing'); no.onclick = ctlAskClose; acts.appendChild(no);
+        c.appendChild(acts);
+        body.appendChild(c);
+    }
     function refreshDevices() {
         var root = document.getElementById('devices');
         if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); return; }
@@ -2380,9 +2477,10 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             printers.forEach(function(p) {
                 var card = el('div', 'printer' + (p.online ? ' online' : ''));
                 card.appendChild(el('div', 'name', p.name + (p.selected ? ' ★' : '') + (p.model ? '  ·  ' + p.model : '')));
-                var meta = p.online ? (p.status || 'idle') : 'offline';
+                var meta = p.online ? (p.print_status || p.status || 'idle') : 'offline';
                 if (p.printing) meta += ' · ' + p.percent + '% · ' + fmtTime(p.left_time_s) + ' left' + (p.total_layers ? ' · layer ' + p.layer + '/' + p.total_layers : '');
                 if (p.task) meta += ' · ' + p.task;
+                if (p.stage) meta += ' · ' + p.stage; // "Paused due to filament runout" rather than a bare PAUSE
                 card.appendChild(el('div', 'meta', meta));
                 if (p.online) {
                     var temps = el('div', 'temps');
@@ -2393,6 +2491,35 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                         temps.appendChild(d);
                     });
                     card.appendChild(temps);
+                }
+                // Why the printer stopped, in its own words (HMS for a Bambu one).
+                if (p.print_error && (p.print_error.message || p.print_error.code))
+                    card.appendChild(el('div', 'ctlline err', p.print_error.message || ('Printer error ' + p.print_error.code)));
+                // Pause / Resume / Stop. A button the printer's own predicate says no to stays in
+                // place, dimmed, with the reason in its tooltip.
+                var st = ctlJobs[p.id];
+                var busy = !!(st && st.phase === 'running');
+                if (p.can_pause !== undefined || p.can_stop !== undefined) {
+                    var acts = el('div', 'acts');
+                    [['pause', 'Pause', p.can_pause], ['resume', 'Resume', p.can_resume], ['stop', 'Stop', p.can_stop]].forEach(function(a) {
+                        var on = a[2] === true && !busy;
+                        var b = el('span', 'btn small' + (a[0] === 'stop' ? ' stop' : '') + (on ? '' : ' dim'), a[1]);
+                        b.title = on ? (a[0] === 'stop' ? 'Cancel this print on the printer' : a[1] + ' this print')
+                                     : (busy ? 'A command is already running' : ctlWhyNot(p, a[0]));
+                        if (on) b.onclick = function() { if (a[0] === 'stop') ctlAskStop(p); else ctlRun(p, a[0]); };
+                        acts.appendChild(b);
+                    });
+                    card.appendChild(acts);
+                }
+                if (st) {
+                    var line = el('div', 'ctlline' + (st.phase === 'error' ? ' err' : st.phase === 'done' ? ' ok' : ''),
+                                  st.phase === 'error' ? st.error : st.text);
+                    st.line = line;
+                    card.appendChild(line);
+                    // The same hint the Send sheet gives: an H2-series printer refuses third-party
+                    // commands unless LAN-only mode and Developer Mode are both on.
+                    if (st.phase === 'error' && p.kind === 'bambu' && /refus|verif|reject|accept|command/i.test(st.error || ''))
+                        card.appendChild(el('div', 'ctlline warn', 'Bambu H2-series printers accept commands from third-party slicers only in LAN-only mode with Developer Mode on (printer screen → Settings → Network). Turn both on and try again.'));
                 }
                 root.appendChild(card);
             });
