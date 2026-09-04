@@ -35,6 +35,20 @@ jobs:
         with:
           lfs: 'true'
 
+      - name: Verify pigment LUT LFS payload
+        shell: bash
+        run: |
+          lut="deps_src/pigment-painter/lut_wide.png.c"
+          if [[ ! -f "$lut" ]]; then
+            echo "::error::$lut is missing. Run: git lfs install && git lfs pull"
+            exit 1
+          fi
+          if head -c 80 "$lut" | grep -q "git-lfs"; then
+            echo "::error::$lut is still a Git LFS pointer, not the 38094965-byte payload. Checkout with lfs: true or run git lfs pull. See docs/imagemap-full-pr5.md"
+            exit 1
+          fi
+          echo "LUT payload present ($(wc -c < "$lut") bytes)"
+
       - name: load cached deps
         uses: actions/cache@v4
         with:

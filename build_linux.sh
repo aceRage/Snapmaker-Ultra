@@ -152,8 +152,28 @@ echo "Changing date in version..."
 echo "done"
 
 
+function check_imagemap_lut() {
+    local lut="${SCRIPT_PATH}/deps_src/pigment-painter/lut_wide.png.c"
+    if [[ ! -f "${lut}" ]]; then
+        echo "ERROR: ImageMap LUT missing: ${lut}"
+        echo "Run: git lfs install && git lfs pull"
+        echo "See docs/imagemap-full-pr5.md"
+        exit 1
+    fi
+    if head -c 80 "${lut}" | grep -q "git-lfs"; then
+        echo "ERROR: ${lut} is still a Git LFS pointer, not the 38094965-byte payload."
+        echo "Run: git lfs install && git lfs pull"
+        echo "Then rebuild. See docs/imagemap-full-pr5.md"
+        exit 1
+    fi
+}
+
 if [[ -z "${SKIP_RAM_CHECK}" ]] ; then
     check_available_memory_and_disk
+fi
+
+if [[ -n "${BUILD_DEPS}" || -n "${BUILD_ORCA}" || -n "${BUILD_TESTS}" || -n "${BUILD_IMAGE}" ]]; then
+    check_imagemap_lut
 fi
 
 export CMAKE_C_CXX_COMPILER_CLANG=()

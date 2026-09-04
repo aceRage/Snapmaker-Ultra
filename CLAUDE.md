@@ -71,6 +71,20 @@ build_release_vs2022.bat slicer
 ./build_linux.sh -l    # use Clang instead of GCC
 ```
 
+### Git LFS (required before cmake / tests)
+
+ImageMap FULL tracks `deps_src/pigment-painter/lut_wide.png.c` (~36.3 MiB) with Git LFS.
+A missing or pointer-only file fails cmake configure (`FATAL_ERROR`), not silently.
+
+```bash
+git lfs install
+git lfs pull
+wc -c deps_src/pigment-painter/lut_wide.png.c   # expect 38094965
+```
+
+See `docs/imagemap-full-pr5.md` and `docs/imagemap-full-known-gaps.md`.
+REAPER smoke: fetch the PR5 tip, `git lfs pull`, rebuild, then `[texturemapping]` + `[paintdepth]`.
+
 ### Build System
 - Uses CMake with minimum version 3.13 (maximum 3.31.x on Windows)
 - Primary build directory: `build/`

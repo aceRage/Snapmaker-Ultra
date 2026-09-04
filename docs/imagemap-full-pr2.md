@@ -45,6 +45,10 @@ It does **not** copy ImageMap debug SVG export or the polygonization / raster du
 
 After these hooks, hardening C3 beyond best-effort still looks **non-cheap**: paint-depth clamp, `cut_segmented_layers`, and TM outer-wall width share `compute_layer_color_stat` but the painted-claim geometry is still owned by Ultra paint-depth. A dedicated C3 product mode would need fixtures that paint **and** attach a TM zone on one object, then assert clamp bounds vs TM width — not just “doesn’t crash”.
 
+**PR5:** C3 stays best-effort. Crash-only coverage and the unsupported stance live in
+[`imagemap-full-known-gaps.md`](imagemap-full-known-gaps.md) and
+[`imagemap-full-pr5.md`](imagemap-full-pr5.md). Do not expand this into a supported harden.
+
 ## Out of scope (intentionally)
 
 - `MMUPaintedTexturePreview`, `GLGizmo*`, Plater (PR4)

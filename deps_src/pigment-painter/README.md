@@ -22,8 +22,9 @@ git lfs install
 git lfs pull
 ```
 
-If the pointer file is present but the payload is missing, cmake/link of
-`pigment_painter` will fail. Confirm the real file:
+If the pointer file is present but the payload is missing,
+`deps_src/pigment-painter/CMakeLists.txt` **FATAL_ERROR**s at configure
+(ImageMap FULL PR5). There is no silent empty LUT. Confirm the real file:
 
 ```bash
 # pointer is a tiny text file; the real LUT is ~36 MiB
@@ -50,5 +51,9 @@ git lfs pull
 
 `build_orca.yml` and `build_deps.yml` already set `lfs: true`.
 `build_all.yml` is updated to do the same.
+`build_orca.yml` also verifies the LUT is not still an LFS pointer after checkout.
+
+REAPER / local test hosts: `git lfs pull` **then rebuild** before
+`[texturemapping]` and `[paintdepth]`. See `docs/imagemap-full-pr5.md`.
 
 GLTF / tinygltf are **not** part of this vendored set.

@@ -262,6 +262,8 @@ struct TextureMappingZone
     static constexpr int   SlicerDefaultGenericSolverMode = int(GenericSolverOklabSoftCap4Dark4);
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverDefault);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
+    // PR5: keep heaviest MMUPaintedTexturePreview halftone paths opt-in. Do not flip
+    // DefaultDitheringEnabled / DefaultPreviewSimulateColors without a UI-thread budget.
     static constexpr bool  DefaultDitheringEnabled = false;
     static constexpr int   DefaultDitheringMethod = int(DitheringHalftoneV2);
     static constexpr float MinDitheringResolutionMm = 0.04f;
@@ -274,7 +276,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
     static constexpr int   DefaultTransmissionDistanceCalibrationMode = int(TDCalibrationAbsolute);
-    static constexpr bool  DefaultPreviewSimulateColors = false;
+    static constexpr bool  DefaultPreviewSimulateColors = false; // PR5: UI-thread conservative
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultPreviewSimulateTopSurfaceLod = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
