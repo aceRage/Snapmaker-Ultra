@@ -2778,13 +2778,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     for (const auto &entry : root["uvs_per_face"])
                         uvs_per_face.emplace_back(entry.get<float>());
                 }
-                if (uv_valid.size() != triangle_count || uvs_per_face.size() < triangle_count * 6) {
-                    BOOST_LOG_TRIVIAL(warning) << "Imported texture UV triangle mismatch for " << json_name;
-                    continue;
+                if (uv_valid.size() == triangle_count && uvs_per_face.size() >= triangle_count * 6) {
+                    volume->imported_texture_uv_valid.assign(uv_valid.begin(), uv_valid.end());
+                    volume->imported_texture_uvs_per_face.assign(uvs_per_face.begin(), uvs_per_face.begin() + triangle_count * 6);
+                } else {
+                    BOOST_LOG_TRIVIAL(warning) << "Imported texture UV triangle mismatch for " << json_name
+                                               << "; restoring image/atlas payload without UVs";
                 }
-
-                volume->imported_texture_uv_valid.assign(uv_valid.begin(), uv_valid.end());
-                volume->imported_texture_uvs_per_face.assign(uvs_per_face.begin(), uvs_per_face.begin() + triangle_count * 6);
 
                 ImageMapRawFilamentOffsetAtlas raw_atlas;
                 if (decode_image_map_raw_filament_offset_atlas(imported_rgba, imported_width, imported_height, raw_atlas, nullptr)) {
@@ -6390,8 +6390,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 // BBS: change to json format
                 // if (!_add_print_config_file_to_archive(archive, *config)) {
                 if (!_add_project_config_file_to_archive(archive, *config, model)) { return false; }
-                if (!_add_imported_texture_files_to_archive(archive, model)) { return false; }
             }
+            // Atlas / imported UV+RGBA is model-volume data; persist it even when print config is omitted.
+            if (!_add_imported_texture_files_to_archive(archive, model)) { return false; }
 
             // BBS progress point
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__ << boost::format(", before add project embedded settings\n");
@@ -7822,12 +7823,18 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 root["raw_channels"] = volume->imported_texture_raw_channels;
                 root["raw_metadata_json"] = volume->imported_texture_raw_metadata_json;
                 root["is_raw_atlas"] = has_imported_raw_atlas_texture_payload(*volume);
-                nlohmann::json uv_valid = nlohmann::json::array();
-                for (uint8_t valid : volume->imported_texture_uv_valid)
-                    uv_valid.push_back(int(valid));
-                root["uv_valid"] = std::move(uv_valid);
+                const size_t triangle_count = volume->mesh().its.indices.size();
+                std::vector<uint8_t> uv_valid(volume->imported_texture_uv_valid.begin(), volume->imported_texture_uv_valid.end());
+                std::vector<float> uvs_per_face(volume->imported_texture_uvs_per_face.begin(), volume->imported_texture_uvs_per_face.end());
+                uv_valid.resize(triangle_count, uint8_t(0));
+                if (uvs_per_face.size() < triangle_count * 6)
+                    uvs_per_face.resize(triangle_count * 6, 0.f);
+                nlohmann::json uv_valid_json = nlohmann::json::array();
+                for (uint8_t valid : uv_valid)
+                    uv_valid_json.push_back(int(valid));
+                root["uv_valid"] = std::move(uv_valid_json);
                 nlohmann::json uvs = nlohmann::json::array();
-                for (float value : volume->imported_texture_uvs_per_face)
+                for (float value : uvs_per_face)
                     uvs.push_back(value);
                 root["uvs_per_face"] = std::move(uvs);
                 const std::string json_body = root.dump();

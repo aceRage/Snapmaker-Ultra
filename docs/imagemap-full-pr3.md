@@ -41,7 +41,7 @@ Additional persist in this PR:
 | --- | --- |
 | `texture_mapping_color` triangle attr | Same pattern as `paint_color` / `mmu_segmentation` |
 | Virtual filament IDs 99–255 | `is_texture_mapping_virtual_filament_id` — do not clamp zone IDs to 0 |
-| Imported RGBA / UV / raw atlas | `Metadata/imported_texture/o{obj}_v{vol}.{png,json}` encoded with `encode_image_map_raw_filament_offset_atlas` when Offset raw data is present |
+| Imported RGBA / UV / raw atlas | `Metadata/imported_texture/o{obj}_v{vol}.{png,json}` encoded with `encode_image_map_raw_filament_offset_atlas` when Offset raw data is present. Written even if print config is omitted. Restore keeps atlas/RGBA if UV triangle counts do not match. |
 
 **Not** persisted: prime-tower image files / `Metadata/texture_mapping` prime-tower tree.
 
@@ -58,8 +58,8 @@ GUI gizmo simplify (`GLGizmoSimplify.cpp`) remains PR4.
 `tests/libslic3r/test_texture_mapping.cpp` tags `[texturemapping][pr3]`:
 
 - **C5:** `handle_legacy_composite` still migrates `mmu_segmented_region_max_width`.
-- **C6:** `store_bbs_3mf` / `load_bbs_3mf` round-trips the six `texture_mapping_*` keys **and** `paint_depth_*`.
-- **C7:** Remap snapshot/apply on ImageTexture (+ region-paint facets).
+- **C6:** `store_bbs_3mf` / `load_bbs_3mf` round-trips the six `texture_mapping_*` keys **and** `paint_depth_*`, plus raw atlas payload, virtual filament IDs 99–255, and `texture_mapping_color` triangle attributes.
+- **C7:** Remap snapshot/apply on ImageTexture (+ region-paint facets). `CutUtils::perform_with_plane` remaps ImageTexture UVs onto cut volumes.
 - GLTF stub throws a clear error.
 
 Do not change `test_paint_depth*.cpp`. Maintainers should run `[paintdepth],[texturemapping]`. Cloud cannot build `libslic3r_tests`.

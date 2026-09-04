@@ -3,10 +3,12 @@
 #include <array>
 #include <stdexcept>
 
+#include "libslic3r/CutUtils.hpp"
 #include "libslic3r/Exception.hpp"
 #include "libslic3r/Format/ImportedTexture.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/GCode/ToolOrdering.hpp"
+#include "libslic3r/Geometry.hpp"
 #include "libslic3r/ImageMapRawFilamentOffsetAtlas.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/ModelTextureDataRemap.hpp"
@@ -237,6 +239,90 @@ TEST_CASE("C6: bbs_3mf round-trips texture_mapping_* and paint_depth_* together"
     CHECK(dst.option<ConfigOptionInt>("paint_depth_walls")->value == 4);
 }
 
+TEST_CASE("C6: bbs_3mf round-trips atlas, virtual filament IDs, and texture_mapping_color", "[texturemapping][pr3]")
+{
+    DynamicPrintConfig src = DynamicPrintConfig::full_print_config();
+    REQUIRE(src.has("filament_colour"));
+    std::vector<std::string> colours = src.option<ConfigOptionStrings>("filament_colour")->values;
+    if (colours.size() < 2)
+        colours = {"#FF0000", "#00FF00", "#0000FF"};
+    src.set_key_value("filament_colour", new ConfigOptionStrings(colours));
+
+    TextureMappingManager mgr;
+    TextureMappingZone *zone = mgr.add_zone(colours.size(), colours, int(TextureMappingZone::ImageTexture));
+    REQUIRE(zone != nullptr);
+    REQUIRE(zone->zone_id >= 99);
+    REQUIRE(mgr.is_texture_mapping_zone_id(zone->zone_id));
+    src.set_key_value("texture_mapping_definitions", new ConfigOptionString(mgr.serialize_entries()));
+    src.set_key_value("paint_depth_mode", new ConfigOptionEnum<PaintDepthMode>(pdmMillimeters));
+    src.set_key_value("paint_depth_mm", new ConfigOptionFloat(0.9));
+
+    Model model;
+    ModelObject *object = model.add_object();
+    REQUIRE(object != nullptr);
+    ModelVolume *volume = object->add_volume(make_cube(10., 10., 10.));
+    REQUIRE(volume != nullptr);
+    object->config.set_key_value("extruder", new ConfigOptionInt(int(zone->zone_id)));
+    model.add_default_instances();
+
+    const size_t tri_count = volume->mesh().its.indices.size();
+    REQUIRE(tri_count > 0);
+    volume->imported_texture_width = 2;
+    volume->imported_texture_height = 2;
+    volume->imported_texture_raw_channels = 1;
+    volume->imported_texture_raw_filament_offsets = std::vector<uint8_t>{10, 20, 30, 40};
+    volume->imported_texture_raw_metadata_json = R"({"filaments":[{"slot":1,"color":"K","hex":"#000000"}]})";
+    volume->imported_texture_rgba.assign(16, uint8_t(255));
+    volume->imported_texture_uv_valid.assign(tri_count, uint8_t(1));
+    volume->imported_texture_uvs_per_face.assign(tri_count * 6, 0.25f);
+    volume->texture_mapping_color_facets.reserve(int(tri_count));
+    volume->texture_mapping_color_facets.set_triangle_from_string(0, "1|FF0000FF");
+    const std::string color_attr = volume->texture_mapping_color_facets.get_triangle_as_string(0);
+    REQUIRE_FALSE(color_attr.empty());
+
+    const boost::filesystem::path tmp_path = boost::filesystem::temp_directory_path() / "imagemap_full_pr3_c6_atlas.3mf";
+    const std::string tmp = tmp_path.string();
+    StoreParams store;
+    store.path = tmp.c_str();
+    store.model = &model;
+    store.config = &src;
+    store.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+    REQUIRE(store_bbs_3mf(store));
+
+    DynamicPrintConfig dst;
+    Model dst_model;
+    ConfigSubstitutionContext ctx{ForwardCompatibilitySubstitutionRule::Disable};
+    PlateDataPtrs plates;
+    std::vector<Preset *> presets;
+    bool is_bbl = false;
+    Semver file_version;
+    const bool loaded = load_bbs_3mf(tmp.c_str(), &dst, &ctx, &dst_model, &plates, &presets, &is_bbl, &file_version, nullptr,
+                                     LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
+    boost::filesystem::remove(tmp_path);
+    release_PlateData_list(plates);
+
+    REQUIRE(loaded);
+    REQUIRE_FALSE(dst_model.objects.empty());
+    REQUIRE_FALSE(dst_model.objects.front()->volumes.empty());
+    const ModelObject *dst_object = dst_model.objects.front();
+    const ModelVolume *dst_volume = dst_object->volumes.front();
+
+    REQUIRE(dst_object->config.has("extruder"));
+    CHECK(dst_object->config.opt_int("extruder") == int(zone->zone_id));
+    REQUIRE(dst.has("paint_depth_mm"));
+    CHECK(std::abs(dst.option<ConfigOptionFloat>("paint_depth_mm")->value - 0.9) < 1e-6);
+
+    CHECK(dst_volume->imported_texture_raw_channels == 1);
+    REQUIRE(dst_volume->imported_texture_raw_filament_offsets.size() >= 4);
+    CHECK(dst_volume->imported_texture_raw_filament_offsets[0] == 10);
+    CHECK(dst_volume->imported_texture_raw_filament_offsets[1] == 20);
+    CHECK(dst_volume->imported_texture_raw_filament_offsets[2] == 30);
+    CHECK(dst_volume->imported_texture_raw_filament_offsets[3] == 40);
+    CHECK(dst_volume->imported_texture_uv_valid.size() == tri_count);
+    CHECK(dst_volume->imported_texture_uvs_per_face.size() >= tri_count * 6);
+    CHECK(dst_volume->texture_mapping_color_facets.get_triangle_as_string(0).find("FF0000FF") != std::string::npos);
+}
+
 TEST_CASE("C7: Remap snapshot/apply is wired for ImageTexture and region paint", "[texturemapping][pr3][remap]")
 {
     Model model;
@@ -265,6 +351,46 @@ TEST_CASE("C7: Remap snapshot/apply is wired for ImageTexture and region paint",
     const SimplifyTextureDataSnapshot region_snapshot = snapshot_simplify_texture_data(*volume);
     SimplifyTextureDataResult region_result = remap_simplify_texture_data(region_snapshot, volume->mesh().its);
     apply_simplify_texture_data_result(*volume, std::move(region_result));
+}
+
+TEST_CASE("C7: CutUtils remaps ImageTexture data across a plane cut", "[texturemapping][pr3][remap]")
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    ModelVolume *volume = object->add_volume(make_cube(20., 20., 20.));
+    REQUIRE(volume != nullptr);
+    model.add_default_instances();
+
+    const size_t tri_count = volume->mesh().its.indices.size();
+    REQUIRE(tri_count > 0);
+    volume->imported_texture_width = 2;
+    volume->imported_texture_height = 2;
+    volume->imported_texture_rgba.assign(16, uint8_t(255));
+    volume->imported_texture_uv_valid.assign(tri_count, uint8_t(1));
+    volume->imported_texture_uvs_per_face.assign(tri_count * 6, 0.5f);
+    volume->mmu_segmentation_facets.reserve(int(tri_count));
+    volume->mmu_segmentation_facets.set_triangle_from_string(0, "4");
+
+    Cut cutter(object, 0, Geometry::translation_transform(Vec3d(0., 0., 10.)),
+               ModelObjectCutAttribute::KeepUpper | ModelObjectCutAttribute::KeepLower);
+    const ModelObjectPtrs &parts = cutter.perform_with_plane();
+    REQUIRE(parts.size() >= 2);
+
+    bool remapped_texture = false;
+    for (const ModelObject *part : parts) {
+        REQUIRE(part != nullptr);
+        for (const ModelVolume *cut_volume : part->volumes) {
+            if (!cut_volume->is_model_part())
+                continue;
+            const size_t cut_tris = cut_volume->mesh().its.indices.size();
+            if (cut_tris == 0)
+                continue;
+            if (cut_volume->imported_texture_uv_valid.size() == cut_tris &&
+                cut_volume->imported_texture_uvs_per_face.size() >= cut_tris * 6)
+                remapped_texture = true;
+        }
+    }
+    CHECK(remapped_texture);
 }
 
 TEST_CASE("load_gltf unsupported path does not crash", "[texturemapping][pr3]")
