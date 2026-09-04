@@ -118,6 +118,262 @@ The plan's task table puts them on the separate `feat/support-identity-harness` 
 Stage 1's gate calls them green "trivially"; that claim holds here by construction (no slicing
 file changed) but the script does not exist yet, so **T3 remains a prerequisite for Stage 2**.
 
+## 2b. Stage 2 status (2026-09-03): DONE — T3-T7 shipped, tolerance gate green
+
+Stage 2 first stopped at T3 because the plan's §5.1 experiment showed byte identity is
+unachievable on this tree. The reviewer chose option 2 from that finding: **§3.7's byte identity is
+replaced by a tolerance gate built on the fork's own Slice Compare engine**, and the
+nondeterminism itself is being chased separately on `fix/slice-determinism`. This section records
+the new gate, its calibration, and what Stage 2 delivered.
+
+### The gate (plan deviation, §3.7)
+
+`scripts/support_group_identity.py --gate tolerance` (the default) runs each pair of G-code files
+through `tests/slice_compare_cli`, a **test-only** executable that calls
+`SliceCompare::load_snapshot_from_file` and the `diff_*` functions directly. No hook was added to
+the shipped application - the engine was already headless libslic3r - and the tool is never
+installed. `--gate bytes` keeps the original comparison for the day the determinism fix lands.
+
+**Criteria:** zero changed config rows, zero changed layers, zero layers present on only one side,
+and at least `--segment-tolerance` per cent of segments matching (default 99.0).
+
+The plan asked for segments at 100 %. **The baseline cannot meet that against itself.** Measured
+on the untouched tree, one executable on both sides:
+
+| measurement | result |
+|---|---|
+| structural criteria (config rows, changed layers, one-sided layers) | stable at zero on every case, every run |
+| segments, baseline vs baseline | roughly one case per run loses 10-18 segments of several thousand, on 4-7 layers of a 41-66 layer print (99.4-99.95 %) |
+| `tree_classic`, baseline vs baseline | 6.6 % matching segments, 8 changed layers, 49 dirty layers - **every run** |
+
+So the structural criteria are required exactly and the segment count is thresholded. A
+support-group regression would move layers or a large fraction of segments, not 0.4 % of them.
+`tree_classic` was **removed from the corpus**: classic tree support is not self-reproducible at
+all, while organic tree, normal supports and rafts are all stable through this gate. §5.1's own
+instruction is to drop such a case and say so.
+
+**Gate result: green after every task.** The baseline is a build of the branch's pre-T4 commit
+(`aa5bda6932`), installed to a scratch prefix; the candidate is each task's build, likewise
+installed to a scratch prefix - the user's own `build/Snapmaker_Orca` tree is never written to.
+
+| after | corpus | passes | result |
+|---|---|---|---|
+| T4 | 8 cases | 3 | all within tolerance |
+| T6 | 8 cases | 3 | all within tolerance |
+| T7 | 8 cases | 3 | all within tolerance |
+| T5 | 9 cases (incl. `group_parts`) | 3 | all within tolerance |
+
+The `group_parts` case is the one the plan's gate item 4 asks for: **a project whose parts carry
+`support_group` and part-level support keys, sliced identically by a baseline that does not even
+know the key** (it drops it on load, §3.1) **and by the new build, which knows it and ignores it.**
+That is the whole off-mode claim, measured rather than asserted.
+
+### What shipped
+
+- **T3** - the harness and corpus, plus `tests/slice_compare_cli`. Corpus cases: normal grid /
+  snug / ledge, a dense interface, a soluble interface, organic tree, a raft, a no-support
+  control, and (T5) `group_parts`.
+- **T4** - the `support_group` key (in `print_config_def`, a member of no static config class and
+  not a print option, so it never reaches the process preset, the project config or the G-code
+  `CONFIG_BLOCK`); `part_support_keys()`; `PrintObject::support_groups()`; the soluble rule of
+  §3.6 as one line in `object_config_from_model_object`; and
+  `model_support_group_data_changed()` extending the `PrintApply` condition.
+  `tests/fff_print/test_support_groups.cpp` - 8 cases, 44 assertions.
+- **T6** - `is_improper_category` made key-aware at both call sites,
+  `SettingsFactory::get_options` / `part_support_keys` / `is_part_support_key` /
+  `part_support_group`, a `"Support"` group in `PART_CATEGORY_SETTINGS`, the Object-List
+  **"Support group ▸"** submenu on a part and on a multi-part selection, `TabPrintPart` widened to
+  render the curated keys, and the group badge in the object list's name column.
+- **T7** - `src/slic3r/GUI/SupportGroupsDialog.{hpp,cpp}`: the non-modal per-object Support-groups
+  window (groups, their part counts, the resolved tier values, the support set they reference;
+  New / Rename / Delete / Re-apply set / Select parts), opened from the object context menu and
+  from the tail of the part submenu.
+- **T5** - the project-3MF round trip, **proven** rather than skipped, plus the
+  `group_parts` corpus case and `make_group_fixture.py`: see below.
+
+### Deviations
+
+1. **`part_support_keys()` lives in `PrintConfig`, not on `PrintObject`** (§3.5 implied the
+   latter). `Model.cpp` needs the list for the invalidation predicate and cannot include
+   `Print.hpp`, which includes `Model.hpp`. The list is config metadata, so `PrintConfig` is where
+   it belongs; `Model.hpp` already includes `PrintConfig.hpp`. `SettingsFactory::part_support_keys()`
+   (§2.2) exists and simply returns it, so the GUI spelling the plan asks for is there with one
+   source of truth behind it.
+2. **The gate's segment criterion is a threshold, not 100 %** - forced, with the measurements
+   above.
+3. **Group 0 always exists, so the plan's gate item 4 counts differently.** §3.4 step 4 says the
+   default group is always present even when empty of parts, so "two differently named parts with
+   identical values" gives `size() == 2` (the empty default plus one shared group), not the
+   `size() == 1` that gate line quotes. The substantive claim - identical values collapse
+   regardless of the labels, and the survivor takes the first non-empty name - is asserted.
+4. **The group name rule applies to group 0 too**, per §3.4 step 3.
+5. **No modal text prompt asks for a group name.** §2.2 sketches "New group… opens a small dialog:
+   name + a set picker + four knobs". Instead the submenu offers **"New group from support set ▸
+   <set>"** (which names the group after the set and writes its *resolved* values) and **"New
+   group"** (auto-named `Group`, `Group 2`, …, seeded with the object's own values), and renaming
+   happens **in place** in the Support-groups window's name column. The reason is the fork's own
+   constraint in "Things that must NOT change": a raw `wxTextEntryDialog` on a path a phone
+   request can reach would block a GUI nobody is watching. One click assigns; the name is editable
+   afterwards. Every prompt this feature does raise is a `MessageDialog`, whose `ShowModal`
+   override auto-answers outside Interactive mode.
+6. **A group references its support set by name.** §3.1 allows exactly one new key, so there is no
+   second key holding a set id: the group's *label* is the reference, which is why "New group from
+   support set" names the group after the set. `SupportGroupsDialog` looks the set up by that name,
+   shows it in the "Support set" column, marks the group *modified* when any key the set defines no
+   longer matches on the parts, and offers "Re-apply set". A group whose set was renamed or deleted
+   simply stops showing one; its values are untouched, because the values live on the parts.
+7. **`get_visible_options` / `get_all_visible_options` strip the new part-level Support rows for an
+   *object*.** `PART_CATEGORY_SETTINGS` is the *base* both object and part tables are built from, so
+   adding a `"Support"` group there would have shown eight rows twice in the object settings table
+   and reordered the rest. Objects keep exactly the `OBJECT_CATEGORY_SETTINGS` list they had.
+8. **`support_interface_loop_pattern` is stored and resolved but never rendered.** Its
+   `append_single_option_line` is commented out on the process tab (`Tab.cpp`, "Advanced" group), so
+   `TabPrintModel::build()` has no line to keep for the part panel either. Stage 5 can uncomment it
+   in one place and both panels gain it.
+
+### T5: what IS proven now, and what still is not
+
+**The round trip is verified twice: once in a unit test, once by the application itself.**
+
+`tests/libslic3r/test_3mf.cpp` gained two `[3mf][SupportGroups]` scenarios. The first builds a
+two-volume `ModelObject`, puts one override on part A and `support_group = "B"` plus four tier A/B
+values on part B, and goes through **`store_bbs_3mf` + `load_bbs_3mf`** - the pair the application
+uses for a project, not the legacy `store_3mf`, which never writes a volume's `ModelConfig` at all
+and so could not have proven anything. It asserts both volumes' configs come back with the same
+keys and the same values, that `support_group` and every tier value survived, that nothing leaked
+onto part A, and that the mesh is unchanged.
+
+Three obstacles were in the way, and none needed a work-around:
+
+1. `StoreParams::config` is dereferenced unconditionally (`_add_model_config_file_to_archive` takes
+   a `const DynamicPrintConfig&`), so it must be a real config rather than `nullptr`. An empty
+   `plate_data_list` is fine - every loop over it is size-driven.
+2. Without `SaveStrategy::Silence` the exporter writes an `origin.txt` under the model's backup
+   path; and that path is rooted at `temporary_dir()`, which the application sets at startup and a
+   test must set too, or it resolves to the root of the current drive.
+3. **A libslic3r bug, and the real reason the earlier attempt "segfaulted".**
+   `ConfigOptionEnumsGenericTempl::set()` copies only the values, never `keys_map`, so a `coEnums`
+   member of a **static** config class - `FullPrintConfig`, i.e. what
+   `DynamicPrintConfig::full_print_config()` is built from - keeps `keys_map == nullptr`, and
+   `serialize_single_value()` dereferences it with no check. `save_to_json()` of a full print
+   config therefore crashes on `default_nozzle_volume_type`, and the exporter serialises the whole
+   config (`_add_project_config_file_to_archive`). A project config that came from a `PresetBundle`
+   has the maps, which is why the application never hits it. The test rebuilds those options from
+   `print_config_def` (whose default value carries the map) rather than dropping them. **Worth
+   fixing separately, in `Config.hpp`.**
+
+**The corpus fixture is produced by the slicer, and the application is what proves it loads.**
+`tests/data/support_corpus/make_group_fixture.py` (new) exports a project from
+`twopart_bridge.3mf` with `--export-3mf` - the importer turns that file's three `<component>`s
+into **one object with three MODEL_PART volumes**, contrary to the earlier note - injects the
+group metadata into one `<part>` of the project the application wrote, and then re-exports the
+result and requires every injected key to come back. That last step is the end-to-end proof: the
+slicer read the group and wrote it out again.
+
+The case deliberately carries **no `support_top_z_distance`**. That is the one part-level key that
+already *acts* in Stage 2, through the soluble rule of §3.6, so a corpus case carrying it would
+rightly change the G-code and the gate would rightly go red. `test_support_groups.cpp` covers the
+soluble rule instead.
+
+**Stock-Orca degradation is now measured, not just asserted.** The pre-T4 baseline is a build of
+this very tree that does not define `support_group` - functionally what stock Orca is for this key.
+Run against the fixture:
+
+```
+sg_base/snapmaker-orca.exe --export-3mf out.3mf tests/data/support_corpus/twopart_groups.3mf
+  support_group                      dropped
+  support_interface_top_layers       PRESENT
+  support_interface_bottom_layers    PRESENT
+  support_interface_spacing          PRESENT
+  support_interface_filament         PRESENT
+  parts: 3
+```
+
+It loads the project, silently drops exactly the key it does not know, keeps every other support
+value and all three parts, and saves again - no exception, no crash, geometry untouched. The
+mechanism behind it is pinned by the second unit scenario: `PrintConfigDef::handle_legacy` clears
+an opt_key it does not recognise, which is how `set_deserialize` drops it. A real stock
+Orca / Bambu Studio binary was still not run.
+
+**Undo/redo** is manual-checklist work (below). What the code guarantees: every write goes through
+one `take_snapshot`, `ModelConfig::set_key_value` bumps the timestamp the undo stack keys on, and
+`ObjectList::update_after_undo_redo` rebuilds the whole tree - where the badge is set as each row
+is created, so badge, part panel and `support_groups()` all follow the model back.
+
+### Decisions for the reviewer (the plan's risks)
+
+- **R2.1 - the settings node appears where it did not before.** Accepted. A part carrying group
+  values now gets a `"Support"` bundle from `get_bundle`, so `object_config_options_changed` adds a
+  settings child under it. That is the intended behaviour, and it also fires for anyone who was
+  already forcing support keys onto volumes by hand-editing a 3MF - those keys were silently
+  invisible before and are visible now.
+- **R2.2 - clipboard paste copies the values but not the label.** Accepted as the plan proposes.
+  `paste_settings_into_list` filters against `get_options(true)`, which now contains the curated
+  support keys but deliberately not `support_group`. So pasting a grouped part's settings gives the
+  target part the same *values* - and the resolver, which keys on values and not on names, folds it
+  into that same group, which then keeps its name from its first labelled member. The pasted part
+  shows no badge. Coherent, but it must not be an accident: it is documented here and in the code.
+- **R2.3 - the dead frequent-settings path.** Left commented out
+  (`GUI_Factories.cpp`, the only call site), with a comment saying that re-enabling it must filter
+  through `get_options(is_part)` first, because `add_category_to_settings_from_frequent` does no
+  legality check. The new key-aware `is_improper_category` makes that path *safe* rather than
+  dangerous in the meantime: a caller with no option key in hand blocks the whole `"Support"`
+  category on a part.
+- **R2.4 - undo/redo.** One `take_snapshot` per write, as above. Verified by construction and by
+  the manual checklist; no automated GUI test exists in this fork to assert it.
+
+### Manual checklist
+
+Run against a side install (`cmake --install <build> --config Release --prefix <scratch>`), never
+over `build/Snapmaker_Orca` while the user's slicer is running.
+
+1. Load a multi-part object. Right-click a part → **Support group ▸ New group**. The row gains a
+   `[Group]` badge, a settings node appears under the part, and the part parameter panel's Support
+   page shows the curated keys.
+2. Change one of those values on the part. The Support-groups window (object context menu →
+   **Support groups…**) shows the group with its own resolved values and the object row unchanged.
+3. Save a support set on the process tab's Support page, then **Support group ▸ New group from
+   support set ▸ <name>**. The group takes the set's name; the window's "Support set" column shows
+   it, and shows "(modified)" only after you edit one of the group's values.
+4. Save the project, close it, reopen it: badge, settings node, part panel and the window all agree.
+5. **Ctrl+Z** after an assignment: the badge disappears, the part panel loses the rows, and the
+   settings node goes. Ctrl+Y brings all three back.
+6. Part settings never show a non-support key from the Support category: the part's "Add settings"
+   menu offers exactly the 14 curated keys under "Support" and nothing else (no `enable_support`,
+   no `support_type`, no `raft_*`, no `brim_*`).
+7. Rename a part that has a badge: the editor opens with the part's own name, not the badge.
+
+### Suites
+
+`libslic3r_tests` - 594 cases / 53 051 assertions, the 2 `[!shouldfail]` cases unchanged;
+`[SupportSet]` 8 cases / 411 assertions; the new `[SupportGroups]` 3MF scenarios 2 cases /
+28 assertions. `fff_print_tests "[SupportGroups]"` - 8 cases / 44 assertions.
+
+**Pre-existing, and not reachable from this work:** the *whole* `fff_print_tests` suite has 9
+failing legacy PrusaSlicer-era scenarios (`test_data`, `test_flow`, `test_gcodewriter`,
+`test_model`, `test_print`, `test_printgcode`, `test_skirt_brim`, the last with a SIGSEGV). They
+fail on `boost::filesystem::create_directory: The system cannot find the path specified` and on a
+config `.ini` the loader calls an unsupported format - an environment/test-data gap, and they fail
+the same way from the build directory. Neither test binary links `libslic3r_gui`
+(`tests/*/CMakeLists.txt` link `test_common libslic3r OpenSSL::Crypto`), so no Stage 2 GUI change
+can reach them. `test_mixed_filament.cpp` also has two order-dependent failures that predate this
+work.
+
+Runtime gate `test_support_groups_ui.py` (snorca_hubtest, new), against a side install on an
+isolated data dir, driving a **hidden** instance - ALL PASS:
+
+- the DLL under test carries the new menu and window strings (the Object-List menu and the
+  Support-groups window are GUI-only, so no API route can open them; that is the most an automated
+  check can say about them, and clicking them is the manual checklist's job);
+- `GET /api/settings/process` returns the **same 51 Support-page option keys, in the same order**,
+  as the pre-change build (`ss_baseline_keys.txt`) - the part panel widened, the process tab did
+  not move;
+- neither the widget-only "Support set" row nor anything support-group shaped reaches the remote
+  sheet, and `support_group` itself never appears in it;
+- `POST /api/settings/process` and `/settings/process/revert` behave exactly as before.
+
+Nothing in `RemoteAccess`, `RemoteHub`, `StreamPanel` or `resources/web/orca/` was touched.
+
 ## 3. Shared contract
 
 The stages are meant to be built by different agents on different branches. These names, shapes and

@@ -16,6 +16,8 @@ class wxMenuItem;
 namespace Slic3r {
 
 enum class ModelVolumeType : int;
+class ModelVolume;
+class ModelObject;
 
 namespace GUI {
 
@@ -39,10 +41,38 @@ struct SettingsFactory
     static wxBitmap                             get_category_bitmap(const std::string& category_name, bool menu_bmp = true);
     static Bundle                               get_bundle(const DynamicPrintConfig* config, bool is_object_settings, bool is_layer_settings = false);
     static std::vector<std::string>             get_options(bool is_part);
+    // Ultra (support groups): the curated support keys a MODEL_PART volume may carry. The list
+    // itself lives in libslic3r (Slic3r::part_support_keys()) because PrintObject's group
+    // resolver and PrintApply's invalidation predicate read the same one; these are the GUI-side
+    // spellings used by the settings bundle, the part parameter panel and the group menu.
+    // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 3.5.
+    static const std::vector<std::string>&      part_support_keys();
+    static bool                                 is_part_support_key(const std::string& opt_key);
+    // The group label a MODEL_PART volume carries, "" when it carries none.
+    static std::string                          part_support_group(const ModelVolume* volume);
     //BBS: add api to get options for catogary
     static std::vector<SimpleSettingData> get_visible_options(const std::string& category, const bool is_part);
     static std::map<std::string, std::vector<SimpleSettingData>> get_all_visible_options(const bool is_part);
 };
+
+// Ultra (support groups): the reads and the one write everything that touches a group goes
+// through - the Object-List submenu here and SupportGroupsDialog. A group's values live on its
+// parts (the curated part-level support keys on ModelVolume::config); support_group is the label.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2.2, 2.5, 3.4.
+std::vector<ModelVolume*> selected_part_volumes();
+std::vector<std::string>  object_support_group_names(const ModelObject* object);
+std::string               unique_support_group_name(const ModelObject* object, const std::string& base);
+// The object's own effective support values: the edited process preset plus the object's overrides.
+DynamicPrintConfig        object_support_values(const ModelObject* object);
+// The overrides an existing group carries, read off its first member.
+DynamicPrintConfig        support_group_values(const ModelObject* object, const std::string& group);
+// A saved support set resolved against the loaded filaments and reduced to the part-level keys.
+DynamicPrintConfig        support_set_values_by_name(const std::string& set_name, std::string* warning);
+// Write a group assignment onto every volume, under one undo snapshot. values == nullptr clears.
+void                      assign_support_group(const std::vector<ModelVolume*>& volumes,
+                                               const std::string&               group_name,
+                                               const DynamicPrintConfig*        values,
+                                               const std::string&               snapshot);
 
 class MenuFactory
 {
@@ -152,6 +182,7 @@ private:
     void        append_menu_item_merge_to_multipart_object(wxMenu *menu);
     void        append_menu_item_assemble_separately(wxMenu *menu);
     void        append_menu_items_visibility(wxMenu *menu);
+    void        append_menu_items_support_group(wxMenu *menu);
     void        append_menu_item_merge_to_single_object(wxMenu* menu);
     void        append_menu_item_merge_parts_to_single_part(wxMenu *menu);
     void        append_menu_item_merge_some_parts_to_single_part(wxMenu *menu);

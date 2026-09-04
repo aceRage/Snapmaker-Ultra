@@ -3788,6 +3788,31 @@ bool model_custom_supports_data_changed(const ModelObject& mo, const ModelObject
         [](const ModelVolume &mv_old, const ModelVolume &mv_new){ return mv_old.supported_facets.timestamp_matches(mv_new.supported_facets); });
 }
 
+bool model_support_group_data_changed(const ModelObject& mo, const ModelObject& mo_new)
+{
+    // Compare the serialised values pairwise over MODEL_PART volumes: cheap, and it treats an
+    // added, removed or edited key the same way. Runs before model_volume_list_copy_configs
+    // copies the new configs over, so both sides are still available.
+    static const std::vector<std::string> keys = []() {
+        std::vector<std::string> k = Slic3r::part_support_keys();
+        k.emplace_back("support_group");
+        return k;
+    }();
+    return model_property_changed(mo, mo_new,
+        [](const ModelVolumeType t) { return t == ModelVolumeType::MODEL_PART; },
+        [](const ModelVolume &mv_old, const ModelVolume &mv_new) {
+            for (const std::string &key : keys) {
+                const ConfigOption *a = mv_old.config.option(key);
+                const ConfigOption *b = mv_new.config.option(key);
+                if ((a == nullptr) != (b == nullptr))
+                    return false;
+                if (a != nullptr && a->serialize() != b->serialize())
+                    return false;
+            }
+            return true;
+        });
+}
+
 bool model_custom_seam_data_changed(const ModelObject& mo, const ModelObject& mo_new)
 {
     return model_property_changed(mo, mo_new,

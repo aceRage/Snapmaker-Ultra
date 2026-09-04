@@ -87,6 +87,9 @@ class ObjectDataViewModelNode
     bool					        m_container = false;
     // BBS
     wxString				        m_extruder = wxEmptyString;
+    // Ultra (support groups): the part's group label, rendered as a suffix badge in colName.
+    // Empty for objects, for ungrouped parts and for every other node type.
+    wxString                        m_support_group;
     wxBitmap                        m_extruder_bmp;
     wxBitmap  		                m_action_icon;
     // BBS
@@ -263,6 +266,7 @@ public:
         m_bmp = from_node.m_bmp;
         m_idx = from_node.m_idx;
         m_extruder = from_node.m_extruder;
+        m_support_group = from_node.m_support_group;
         m_type = from_node.m_type;
     }
 
@@ -291,6 +295,11 @@ public:
     void        set_printable_icon(PrintIndicator printable);
     void        set_visibility_icon(int mode);
     int         get_visibility() const { return m_visibility; }
+    // Ultra (support groups)
+    const wxString& get_support_group() const { return m_support_group; }
+    bool        set_support_group(const wxString& group) {
+                    if (m_support_group == group) return false;
+                    m_support_group = group; return true; }
     void        set_action_icon(bool enable);
     // BBS
     void        set_color_icon(bool enable);

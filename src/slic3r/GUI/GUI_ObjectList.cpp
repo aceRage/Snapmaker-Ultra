@@ -2,6 +2,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "GUI_ObjectList.hpp"
 #include "GUI_Factories.hpp"
+#include "SupportGroupsDialog.hpp"
 //#include "GUI_ObjectLayers.hpp"
 #include "GUI_App.hpp"
 #include "I18N.hpp"
@@ -785,6 +786,11 @@ void ObjectList::object_config_options_changed(const ObjectVolumeID& ov_id)
 {
     if (ov_id.object == nullptr)
         return;
+
+    // Ultra (support groups): the single funnel every per-object/per-part config change goes
+    // through - the part parameter panel included - so the Support groups window learns about an
+    // edit made outside it without polling. No-op when the window is closed.
+    support_groups_dialog_refresh();
 
     ModelObjectPtrs& objects = wxGetApp().model().objects;
     ModelObject* mo = ov_id.object;
@@ -4081,6 +4087,10 @@ wxDataViewItemArray ObjectList::add_volumes_to_object_in_list(size_t obj_idx, st
             ui_and_3d_volume_map[ui_volume_idx] = volume_idx;
             ui_volume_idx++;
             add_settings_item(vol_item, &volume->config.get());
+            // Ultra (support groups): the badge is set as the row is created, so a project
+            // reopened from disk shows it without a separate refresh pass.
+            static_cast<ObjectDataViewModelNode*>(vol_item.GetID())
+                ->set_support_group(from_u8(SettingsFactory::part_support_group(volume)));
 
             if (add_to_selection && add_to_selection(volume))
                 items.Add(vol_item);
@@ -5689,6 +5699,26 @@ void ObjectList::update_visibility_icons()
                 node->set_visibility_icon(int(canvas->get_object_view_mode(mo->volumes[vol_idx]->id().id)));
                 m_objects_model->ItemChanged(vol_item);
             }
+        }
+    }
+}
+
+// Ultra (support groups): resync every part row's badge with the volume's support_group key.
+// Called after a group assignment and after undo/redo, which restore ModelVolume::config
+// without going through the menu handler.
+void ObjectList::update_support_group_badges()
+{
+    if (m_objects == nullptr || m_objects_model == nullptr)
+        return;
+    for (size_t obj_idx = 0; obj_idx < m_objects->size(); ++obj_idx) {
+        ModelObject* mo = (*m_objects)[obj_idx];
+        for (size_t vol_idx = 0; vol_idx < mo->volumes.size(); ++vol_idx) {
+            wxDataViewItem vol_item = m_objects_model->GetItemByVolumeId(int(obj_idx), int(vol_idx));
+            if (!vol_item.IsOk())
+                continue;
+            auto* node = static_cast<ObjectDataViewModelNode*>(vol_item.GetID());
+            if (node->set_support_group(from_u8(SettingsFactory::part_support_group(mo->volumes[vol_idx]))))
+                m_objects_model->ItemChanged(vol_item);
         }
     }
 }

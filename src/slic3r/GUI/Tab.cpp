@@ -58,6 +58,7 @@
 // #include "BonjourDialog.hpp"
 // Ultra (support sets): the Support-set row on the Support page.
 #include "libslic3r/SupportSet.hpp"
+#include "GUI_Factories.hpp"
 #include "Widgets/ComboBox.hpp"
 #include "Widgets/Button.hpp"
 #include <wx/textdlg.h>
@@ -3741,7 +3742,12 @@ void TabPrintObject::notify_changed(ObjectBase * object)
 //BBS: GUI refactor
 
 TabPrintPart::TabPrintPart(ParamsPanel* parent) :
-    TabPrintModel(parent, PrintRegionConfig().keys())
+    // Ultra (support groups): a part also carries the curated part-level support keys, so the
+    // part parameter panel has to render them. Everything else in the "Support" category stays
+    // object-only, and TabPrintLayer is deliberately NOT widened - support settings on a height
+    // range are out of scope.
+    // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2.3, 3.5.
+    TabPrintModel(parent, concat(PrintRegionConfig().keys(), SettingsFactory::part_support_keys()))
 {
     m_parent_tab = wxGetApp().get_model_tab();
 }
