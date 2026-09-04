@@ -43,10 +43,57 @@
 #include "nlohmann/json.hpp"
 
 #include "GCode/ConflictChecker.hpp"
+#include "TextureMapping.hpp"
 
 #include <codecvt>
 
 using namespace nlohmann;
+
+static void append_used_physical_extruders_for_filament_id(const TextureMappingManager        &texture_mapping_manager,
+                                                           int                                 filament_id,
+                                                           size_t                              num_physical,
+                                                           const std::vector<std::string>     &filament_colours,
+                                                           std::vector<unsigned int>          &extruders)
+{
+    if (filament_id <= 0 || num_physical == 0)
+        return;
+
+    auto append_physical = [num_physical, &extruders](unsigned int physical_id) {
+        if (physical_id >= 1 && physical_id <= num_physical)
+            extruders.emplace_back(physical_id - 1);
+    };
+
+    const TextureMappingZone *zone = texture_mapping_manager.zone_from_id(unsigned(filament_id));
+    if (zone != nullptr) {
+        if (!zone->enabled || zone->deleted)
+            return;
+
+        std::vector<std::string> colors = filament_colours;
+        colors.resize(num_physical, "#FFFFFF");
+        std::vector<unsigned int> component_ids = zone->is_image_texture() ?
+            TextureMappingManager::effective_texture_component_ids(*zone, num_physical, colors) :
+            TextureMappingManager::selected_component_ids(*zone, num_physical);
+
+        component_ids.erase(std::remove_if(component_ids.begin(),
+                                           component_ids.end(),
+                                           [num_physical](unsigned int id) { return id == 0 || id > num_physical; }),
+                            component_ids.end());
+        std::sort(component_ids.begin(), component_ids.end());
+        component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+
+        if (component_ids.empty()) {
+            const unsigned int resolved = texture_mapping_manager.resolve_zone_component(unsigned(filament_id), num_physical, 0);
+            append_physical(resolved);
+        } else {
+            for (unsigned int component_id : component_ids)
+                append_physical(component_id);
+        }
+        return;
+    }
+
+    append_physical(unsigned(filament_id));
+}
+
 
 // Mark string for localization and translate.
 #define L(s) Slic3r::I18N::translate(s)
@@ -707,14 +754,8 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "retraction_distances_when_cut",
         "filament_long_retractions_when_cut",
         "filament_retraction_distances_when_cut",
-        // ImageMap FULL PR1: TM keys exist before GCode/LayerRegion hooks (PR2).
-        // Keep them in steps_gcode so they do not fall through to invalidate_all_steps.
-        "texture_mapping_definitions",
-        "texture_mapping_global_settings",
-        "texture_mapping_background_color",
-        "texture_mapping_outer_wall_gradient_global_strength",
-        "texture_mapping_outer_wall_gradient_max_line_width",
-        "texture_mapping_outer_wall_gradient_min_line_width"
+        // Preview-only / G-code-note TM key. Slicer-affecting TM keys are handled below.
+        "texture_mapping_background_color"
     };
 
     static std::unordered_set<std::string> steps_ignore;
@@ -744,6 +785,16 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             || opt_key == "wipe_tower_x"
             || opt_key == "wipe_tower_y"
             || opt_key == "wipe_tower_rotation_angle") {
+            steps.emplace_back(psSkirtBrim);
+        } else if (
+               opt_key == "texture_mapping_outer_wall_gradient_global_strength"
+            || opt_key == "texture_mapping_outer_wall_gradient_max_line_width"
+            || opt_key == "texture_mapping_outer_wall_gradient_min_line_width"
+            || opt_key == "texture_mapping_definitions"
+            || opt_key == "texture_mapping_global_settings") {
+            osteps.emplace_back(posPerimeters);
+            osteps.emplace_back(posSupportMaterial);
+            steps.emplace_back(psWipeTower);
             steps.emplace_back(psSkirtBrim);
         } else if (
                opt_key == "initial_layer_print_height"
@@ -957,11 +1008,16 @@ std::vector<unsigned int> Print::object_extruders() const
 
     for (const PrintObject* object : m_objects) {
         const ModelObject* mo = object->model_object();
+        const size_t num_physical = m_config.filament_colour.size();
         for (const ModelVolume* mv : mo->volumes) {
             std::vector<int> volume_extruders = mv->get_extruders();
             for (int extruder : volume_extruders) {
                 assert(extruder > 0);
-                extruders.push_back(extruder - 1);
+                append_used_physical_extruders_for_filament_id(m_texture_mapping_mgr,
+                                                               extruder,
+                                                               num_physical,
+                                                               m_config.filament_colour.values,
+                                                               extruders);
             }
         }
 
@@ -972,8 +1028,11 @@ std::vector<unsigned int> Print::object_extruders() const
                 //Don't know why height range always save key "extruder" because of no change(should only save difference)...
                 //Add protection here to avoid overflow
                 auto value = layer_range.second.option("extruder")->getInt();
-                if (value > 0)
-                    extruders.push_back(value - 1);
+                append_used_physical_extruders_for_filament_id(m_texture_mapping_mgr,
+                                                               value,
+                                                               num_physical,
+                                                               m_config.filament_colour.values,
+                                                               extruders);
             }
         }
     }
@@ -1028,8 +1087,12 @@ std::vector<unsigned int> Print::extruders(bool conside_custom_gcode) const
         const size_t num_filaments = m_mixed_filament_mgr.total_filaments(num_physical);
         if (m_model.plates_custom_gcodes.find(m_model.curr_plate_index) != m_model.plates_custom_gcodes.end()) {
             for (auto item : m_model.plates_custom_gcodes.at(m_model.curr_plate_index).gcodes) {
-                if (item.type == CustomGCode::Type::ToolChange && item.extruder <= int(num_filaments))
-                    extruders.push_back((unsigned int)(item.extruder - 1));
+                if (item.type == CustomGCode::Type::ToolChange && item.extruder > 0)
+                    append_used_physical_extruders_for_filament_id(m_texture_mapping_mgr,
+                                                                   item.extruder,
+                                                                   m_config.filament_colour.size(),
+                                                                   m_config.filament_colour.values,
+                                                                   extruders);
             }
         }
     }

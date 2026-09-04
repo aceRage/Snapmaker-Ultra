@@ -94,6 +94,8 @@ set(lisbslic3r_sources
     TextureMappingOffset.hpp
     TextureMappingContoning.cpp
     TextureMappingContoning.hpp
+    LayerRegionTextureMapping.cpp
+    LayerRegionTextureMapping.hpp
     ModelTextureDataRemap.cpp
     ModelTextureDataRemap.hpp
     Format/ImportedTexture.cpp
@@ -165,6 +167,8 @@ set(lisbslic3r_sources
     Fill/FillConcentricInternal.cpp
     Fill/FillConcentricInternal.hpp
     Fill/Fill.cpp
+    Fill/FillTextureMapping.cpp
+    Fill/FillTextureMapping.hpp
     Fill/FillCrossHatch.cpp
     Fill/FillCrossHatch.hpp
     Fill/FillGyroid.cpp

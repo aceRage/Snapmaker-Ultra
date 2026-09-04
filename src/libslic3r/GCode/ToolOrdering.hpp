@@ -5,6 +5,7 @@
 
 #include "../libslic3r.h"
 #include "../MixedFilament.hpp"
+#include "../TextureMapping.hpp"
 #include "../MultiNozzleUtils.hpp" // Ultra (dual-nozzle): grouping result types
 
 #include <utility>
@@ -115,12 +116,16 @@ public:
     unsigned int solid_infill_filament(const PrintRegion &region) const;
 	// Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
 	unsigned int extruder(const ExtrusionEntityCollection &extrusions, const PrintRegion &region) const;
+    unsigned int resolve_filament_id(unsigned int filament_id_1based) const;
 
     coordf_t 					print_z	= 0.;
     bool 						has_object = false;
     bool						has_support = false;
     // Zero based extruder IDs, ordered to minimize tool switches.
     std::vector<unsigned int> 	extruders;
+    std::vector<unsigned int>   texture_mapping_extruders;
+    std::vector<unsigned int>   texture_mapping_component_extruders;
+    std::vector<unsigned int>   top_surface_image_no_fixed_desired_extruders;
     bool                        preserve_extruder_order = false;
     // If per layer extruder switches are inserted by the G-code preview slider, this value contains the new (1 based) extruder, with which the whole object layer is being printed with.
     // If not overriden, it is set to 0.
@@ -153,6 +158,10 @@ public:
     // Mixed-filament resolution context (set by ToolOrdering during collect_extruders).
     const MixedFilamentManager *mixed_mgr    = nullptr;
     size_t                      num_physical = 0;
+    // ImageMap FULL PR2: TextureMapping zone resolution (no-op when manager is empty).
+    const TextureMappingManager *texture_mapping_manager = nullptr;
+    size_t                      num_physical_filaments = 0;
+    bool                        has_texture_mapping_zone = false;
     // Optional mixed-layer cadence override from print settings.
     float                       mixed_layer_height_a    = 0.f;
     float                       mixed_layer_height_b    = 0.f;
@@ -283,6 +292,7 @@ private:
     // number of physical extruders.
     const MixedFilamentManager* m_mixed_mgr    = nullptr;
     size_t                      m_num_physical  = 0;
+    const TextureMappingManager* m_texture_mapping_mgr = nullptr;
     float                       m_mixed_layer_height_a    = 0.f;
     float                       m_mixed_layer_height_b    = 0.f;
     float                       m_mixed_base_layer_height = 0.2f;

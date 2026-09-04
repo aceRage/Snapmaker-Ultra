@@ -1034,6 +1034,7 @@ public:
     MixedFilamentManager&       mixed_filament_manager()       { return m_mixed_filament_mgr; }
     const TextureMappingManager& texture_mapping_manager() const { return m_texture_mapping_mgr; }
     TextureMappingManager&       texture_mapping_manager()       { return m_texture_mapping_mgr; }
+    const TextureMappingGlobalSettings& texture_mapping_global_settings() const { return m_texture_mapping_global_settings; }
     ConstPrintObjectPtrsAdaptor objects() const { return ConstPrintObjectPtrsAdaptor(&m_objects); }
     PrintObject*                get_object(size_t idx) { return const_cast<PrintObject*>(m_objects[idx]); }
     const PrintObject*          get_object(size_t idx) const { return m_objects[idx]; }
@@ -1174,6 +1175,7 @@ private:
     PrintRegionConfig                       m_default_region_config;
     MixedFilamentManager                    m_mixed_filament_mgr;
     TextureMappingManager                   m_texture_mapping_mgr;
+    TextureMappingGlobalSettings            m_texture_mapping_global_settings;
     PrintObjectPtrs                         m_objects;
     PrintRegionPtrs                         m_print_regions;
     // Ultra (dual-nozzle): filament->nozzle grouping result set externally before process(); null on

@@ -1,6 +1,7 @@
 #include "ExtrusionEntity.hpp"
 #include "Print.hpp"
 #include "ToolOrdering.hpp"
+#include "TextureMapping.hpp"
 #include "Layer.hpp"
 #include "ClipperUtils.hpp"
 #include "ParameterUtils.hpp"
@@ -299,8 +300,24 @@ unsigned int LayerTools::resolve_mixed_1based(unsigned int filament_id) const
 // (layer-cycle) pattern resolve_mixed_1based reads: gap fill (routed through wall_filament, since
 // it is generated as part of the wall stack) could then print on a different physical extruder
 // than the walls it sits directly behind, on a print with no MM painting anywhere.
+unsigned int LayerTools::resolve_filament_id(unsigned int filament_id_1based) const
+{
+    if (filament_id_1based == 0)
+        return 0;
+    // TM virtual zone IDs sit above physical filaments, same as mixed IDs. Resolve TM first;
+    // otherwise leave the id for mixed / physical handling. Do NOT clamp high IDs to 1.
+    if (texture_mapping_manager != nullptr &&
+        num_physical_filaments > 0 &&
+        texture_mapping_manager->is_texture_mapping_zone_id(filament_id_1based))
+        return texture_mapping_manager->resolve_zone_component(filament_id_1based, num_physical_filaments, layer_index);
+    return filament_id_1based;
+}
+
 unsigned int LayerTools::resolve_grouped_or_mixed_1based(const PrintRegion &region, unsigned int filament_id) const
 {
+    const unsigned int tm = resolve_filament_id(filament_id);
+    if (tm != filament_id)
+        return tm;
     const unsigned int grouped = grouped_manual_pattern_infill_filament_1based(*this, region, filament_id);
     return (grouped != 0) ? grouped : resolve_mixed_1based(filament_id);
 }
@@ -341,6 +358,18 @@ unsigned int LayerTools::solid_infill_filament(const PrintRegion &region) const
 // Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
 unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, const PrintRegion &region) const
 {
+    if (extrusions.texture_mapping_extruder_override >= 0 &&
+        (this->num_physical_filaments == 0 || unsigned(extrusions.texture_mapping_extruder_override) < this->num_physical_filaments))
+        return unsigned(extrusions.texture_mapping_extruder_override);
+
+    if (extrusions.texture_mapping_top_surface_image &&
+        !extrusions.texture_mapping_top_surface_fixed_coloring &&
+        extrusions.texture_mapping_top_surface_desired_component_id > 0) {
+        const unsigned int desired = extrusions.texture_mapping_top_surface_desired_component_id - 1;
+        if (this->has_extruder(desired))
+            return desired;
+    }
+
 	assert(region.config().wall_filament.value > 0);
 	assert(region.config().sparse_infill_filament.value > 0);
 	assert(region.config().solid_infill_filament.value > 0);
@@ -378,6 +407,7 @@ ToolOrdering::ToolOrdering(const PrintObject &object, unsigned int first_extrude
     // Mixed filament support.
     m_mixed_mgr   = &object.print()->mixed_filament_manager();
     m_num_physical = object.print()->config().filament_diameter.size();
+    m_texture_mapping_mgr = &object.print()->texture_mapping_manager();
     update_mixed_layer_height_settings();
     if (object.layers().empty())
         return;
@@ -425,6 +455,8 @@ bool ToolOrdering::insert_wipe_tower_extruder()
     bool changed = false;
     if (m_print_config_ptr->wipe_tower_filament != 0) {
         for (LayerTools& lt : m_layer_tools) {
+            if (lt.has_texture_mapping_zone && lt.extruders.size() <= 1)
+                continue;
             if (lt.wipe_tower_partitions > 0) {
                 lt.extruders.emplace_back(m_print_config_ptr->wipe_tower_filament - 1);
                 sort_remove_duplicates(lt.extruders);
@@ -448,6 +480,7 @@ ToolOrdering::ToolOrdering(const Print &print, unsigned int first_extruder, bool
     // Mixed filament support.
     m_mixed_mgr   = &print.mixed_filament_manager();
     m_num_physical = print.config().filament_diameter.size();
+    m_texture_mapping_mgr = &print.texture_mapping_manager();
     update_mixed_layer_height_settings();
 
     // Initialize the print layers for all objects and all layers.
@@ -715,6 +748,8 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
         // Set per-object context for the duration of this collect_extruders call.
         // Reset after the loops below so unrelated callers see nullptr.
         layer_tools.current_object           = &object;
+        layer_tools.texture_mapping_manager  = m_texture_mapping_mgr;
+        layer_tools.num_physical_filaments   = m_num_physical;
     }
 
     // Collect the support extruders.
@@ -790,6 +825,17 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             const PrintRegion &region = layerm->region();
 
             if (! layerm->perimeters.entities.empty()) {
+                for (const auto &eec : layerm->perimeters.entities) {
+                    const auto *collection = dynamic_cast<const ExtrusionEntityCollection*>(eec);
+                    if (collection == nullptr)
+                        continue;
+                    if (collection->texture_mapping_extruder_override >= 0 &&
+                        (layer_tools.num_physical_filaments == 0 ||
+                         unsigned(collection->texture_mapping_extruder_override) < layer_tools.num_physical_filaments)) {
+                        layer_tools.extruders.emplace_back(unsigned(collection->texture_mapping_extruder_override) + 1);
+                        layer_tools.has_texture_mapping_zone = true;
+                    }
+                }
                 bool something_nonoverriddable = true;
 
                 if (m_print_config_ptr) { // in this case print->config().print_sequence != PrintSequence::ByObject (see ToolOrdering constructors)
@@ -801,7 +847,13 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
 
                 if (something_nonoverriddable){
                     const unsigned int configured_wall = (extruder_override == 0) ? region.config().wall_filament.value : extruder_override;
-                    unsigned int       wall_ext        = resolve_mixed(configured_wall, layerCount, float(layer->print_z), float(layer->height), &object);
+                    const bool is_tm_wall = layer_tools.texture_mapping_manager != nullptr &&
+                                            layer_tools.texture_mapping_manager->is_texture_mapping_zone_id(configured_wall);
+                    unsigned int       wall_ext        = is_tm_wall ?
+                        layer_tools.resolve_filament_id(configured_wall) :
+                        resolve_mixed(configured_wall, layerCount, float(layer->print_z), float(layer->height), &object);
+                    if (is_tm_wall)
+                        layer_tools.has_texture_mapping_zone = true;
                     const unsigned int grouped_id =
                         grouped_manual_pattern_mixed_filament_id_for_layer(layer_tools, configured_wall);
                     if (grouped_id != 0) {
@@ -850,6 +902,17 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             for (const ExtrusionEntity *ee : layerm->fills.entities) {
                 // fill represents infill extrusions of a single island.
                 const auto *fill = dynamic_cast<const ExtrusionEntityCollection*>(ee);
+                if (fill != nullptr && fill->texture_mapping_extruder_override >= 0 &&
+                    (layer_tools.num_physical_filaments == 0 ||
+                     unsigned(fill->texture_mapping_extruder_override) < layer_tools.num_physical_filaments)) {
+                    layer_tools.extruders.emplace_back(unsigned(fill->texture_mapping_extruder_override) + 1);
+                    layer_tools.has_texture_mapping_zone = true;
+                }
+                if (fill != nullptr && fill->texture_mapping_top_surface_image &&
+                    !fill->texture_mapping_top_surface_fixed_coloring &&
+                    fill->texture_mapping_top_surface_desired_component_id > 0) {
+                    layer_tools.top_surface_image_no_fixed_desired_extruders.emplace_back(fill->texture_mapping_top_surface_desired_component_id);
+                }
                 ExtrusionRole role = fill->entities.empty() ? erNone : fill->entities.front()->role();
                 // Wave A fix-wave / I-3 (.superpowers/sdd/2026-08-31-paint-depth/wave-a-review.md):
                 // bucket through the SAME fill_filament_source resolution GCode.cpp's emission
@@ -904,6 +967,8 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             remove_duplicates_preserve_order(layer.extruders);
         else
             sort_remove_duplicates(layer.extruders);
+        sort_remove_duplicates(layer.texture_mapping_extruders);
+        sort_remove_duplicates(layer.texture_mapping_component_extruders);
 
         // make sure that there are some tools for each object layer (e.g. tall wiping object will result in empty extruders vector)
         if (layer.extruders.empty() && layer.has_object)

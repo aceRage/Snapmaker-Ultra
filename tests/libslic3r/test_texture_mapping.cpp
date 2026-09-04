@@ -1,5 +1,7 @@
 #include <catch2/catch.hpp>
 
+#include <array>
+
 #include "libslic3r/Format/ImportedTexture.hpp"
 #include "libslic3r/ImageMapRawFilamentOffsetAtlas.hpp"
 #include "libslic3r/Model.hpp"
@@ -108,4 +110,42 @@ TEST_CASE("ImportedTexture helpers construct", "[texturemapping][importedtexture
     CHECK(buffer_size == 16);
     CHECK_FALSE(is_supported_image_texture_path("model.gltf"));
     CHECK(is_supported_image_texture_path("atlas.png"));
+}
+
+
+TEST_CASE("TextureMappingManager empty is a no-op for zone resolve", "[texturemapping][pr2]")
+{
+    TextureMappingManager mgr;
+    CHECK(mgr.zones().empty());
+    CHECK_FALSE(mgr.is_texture_mapping_zone_id(1));
+    CHECK_FALSE(mgr.is_texture_mapping_zone_id(4));
+    CHECK(mgr.total_filaments(3) == 3);
+    CHECK(mgr.zone_from_id(1) == nullptr);
+}
+
+TEST_CASE("TextureMappingManager resolves virtual zone IDs to physical components", "[texturemapping][pr2]")
+{
+    const std::vector<std::string> colours = {"#FF0000", "#00FF00", "#0000FF"};
+    TextureMappingManager mgr;
+    TextureMappingZone *zone = mgr.add_zone(colours.size(), colours, int(TextureMappingZone::ImageTexture));
+    REQUIRE(zone != nullptr);
+    REQUIRE(zone->zone_id > colours.size());
+    REQUIRE(mgr.is_texture_mapping_zone_id(zone->zone_id));
+    CHECK(mgr.total_filaments(colours.size()) >= colours.size() + 1);
+
+    const unsigned int resolved = mgr.resolve_zone_component(zone->zone_id, colours.size(), 0);
+    CHECK(resolved >= 1);
+    CHECK(resolved <= colours.size());
+}
+
+TEST_CASE("TextureMappingContoningSolver remains callable for Fill schedule driver", "[texturemapping][contoning][pr2]")
+{
+    const PrintConfig config;
+    TextureMappingZone zone;
+    zone.component_ids = "12";
+    zone.surface_pattern = int(TextureMappingZone::ImageTexture);
+    const TextureMappingContoningSolver solver(zone, config, {1, 2}, 0.2f);
+    REQUIRE(solver.component_ids().size() == 2);
+    const unsigned int component = solver.component_for_depth({0.5f, 0.5f, 0.5f}, 4, 0);
+    CHECK(component >= 1);
 }
