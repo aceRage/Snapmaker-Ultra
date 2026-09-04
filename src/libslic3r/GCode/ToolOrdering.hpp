@@ -123,8 +123,14 @@ public:
     bool						has_support = false;
     // Zero based extruder IDs, ordered to minimize tool switches.
     std::vector<unsigned int> 	extruders;
+    // ImageMap leftover: virtual TM zone IDs for this layer. Declared and de-duplicated
+    // only — Ultra FULL never populates this. Resolve via resolve_filament_id + PrintApply
+    // painting_extruders. See docs/imagemap-full-known-gaps.md.
     std::vector<unsigned int>   texture_mapping_extruders;
+    // ImageMap leftover: physical TM component IDs. Same unused stub as above.
+    // Wipe-tower count uses TextureMappingManager::total_filaments (PR4 ArrangeJob).
     std::vector<unsigned int>   texture_mapping_component_extruders;
+    // Live: Contoning Fill tags (texture_mapping_top_surface_desired_component_id). Not a stub.
     std::vector<unsigned int>   top_surface_image_no_fixed_desired_extruders;
     bool                        preserve_extruder_order = false;
     // If per layer extruder switches are inserted by the G-code preview slider, this value contains the new (1 based) extruder, with which the whole object layer is being printed with.

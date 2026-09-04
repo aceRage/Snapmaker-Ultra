@@ -57,6 +57,9 @@ wc -c deps_src/pigment-painter/lut_wide.png.c
 # expect: 38094965
 ```
 
+PR5: `deps_src/pigment-painter/CMakeLists.txt` **FATAL_ERROR**s if this file is
+missing or still a Git LFS pointer. See [`imagemap-full-pr5.md`](imagemap-full-pr5.md).
+
 ## Licenses
 
 | Tree | License | Notice |

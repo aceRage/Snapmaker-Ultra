@@ -108,7 +108,7 @@ cd build && ctest --output-on-failure          # tests (Catch2)
 
 Headless slicing for scripts and agents: `python scripts/orca_cli.py --exe <snapmaker-orca.exe> --printer "Snapmaker U1 (0.4 nozzle)" --process "0.20 Standard @Snapmaker U1 (0.4 nozzle)" --filament "Snapmaker PLA Matte @U1" --export-3mf out.3mf model.stl` slices with presets by name, streams JSON progress, and returns time/filament estimates, G-code paths and warnings (`result.json`); see [docs/superpowers/specs/2026-09-01-headless-slicer-roadmap.md](docs/superpowers/specs/2026-09-01-headless-slicer-roadmap.md).
 
-Windows packaging: `cpack -G NSIS` in `build/` produces the installer (needs NSIS); zip `build/Snapmaker_Orca/` for the portable build. The optional connectivity plugin lives outside this tree and is only built when `src/ultranet/CMakeLists.txt` exists, so the repository builds without it. Run `git lfs pull` after cloning on Windows. See [`CLAUDE.md`](CLAUDE.md) and [`AGENTS.md`](AGENTS.md) for details.
+Windows packaging: `cpack -G NSIS` in `build/` produces the installer (needs NSIS); zip `build/Snapmaker_Orca/` for the portable build. The optional connectivity plugin lives outside this tree and is only built when `src/ultranet/CMakeLists.txt` exists, so the repository builds without it. After every clone, run `git lfs install && git lfs pull` (ImageMap `lut_wide.png.c` is LFS-tracked; cmake fails clearly if the pointer is still present). See [`docs/imagemap-full-pr5.md`](docs/imagemap-full-pr5.md), [`CLAUDE.md`](CLAUDE.md) and [`AGENTS.md`](AGENTS.md).
 
 ---
 

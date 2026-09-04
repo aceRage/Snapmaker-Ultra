@@ -279,3 +279,71 @@ TEST_CASE("load_gltf unsupported path does not crash", "[texturemapping][pr3]")
         CHECK(msg.find("GLTF") != std::string::npos);
     }
 }
+
+TEST_CASE("PR5 conservative preview defaults keep heaviest halftone paths off", "[texturemapping][pr5]")
+{
+    CHECK_FALSE(TextureMappingZone::DefaultDitheringEnabled);
+    CHECK_FALSE(TextureMappingZone::DefaultPreviewSimulateColors);
+    CHECK(TextureMappingZone::DefaultPreviewLimitResolution);
+    CHECK(TextureMappingZone::DefaultHighSpeedImageTextureSampling);
+    CHECK(TextureMappingZone::DefaultCompactOffsetMode);
+
+    TextureMappingZone zone;
+    CHECK_FALSE(zone.dithering_enabled);
+    TextureMappingGlobalSettings globals;
+    CHECK_FALSE(globals.preview_simulate_colors);
+    CHECK(globals.preview_limit_resolution);
+}
+
+TEST_CASE("C3 best-effort: same-object paint-depth facets + texture mapping does not crash", "[texturemapping][pr5][c3]")
+{
+    // Same-object paint-depth + TM is unsupported / best-effort (not a product claim).
+    // This case only asserts: no crash, paint-depth helpers still compute a band,
+    // Remap + TM manager remain callable. See docs/imagemap-full-known-gaps.md.
+
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    REQUIRE(config.has("paint_depth_mode"));
+    REQUIRE(config.has("paint_depth_mm"));
+    REQUIRE(config.has("texture_mapping_definitions"));
+
+    const float band = paint_depth_band_mm(pdmWalls, 2, 0.0, 0.45f, 0.4f, 0.45f);
+    CHECK(band >= 0.f);
+
+    Model model;
+    ModelObject *object = model.add_object();
+    ModelVolume *volume = object->add_volume(make_cube(20., 20., 10.));
+    REQUIRE(volume != nullptr);
+
+    const size_t tri_count = volume->mesh().its.indices.size();
+    REQUIRE(tri_count > 0);
+
+    volume->mmu_segmentation_facets.reserve(int(tri_count));
+    volume->mmu_segmentation_facets.set_triangle_from_string(0, "4");
+
+    volume->imported_texture_width = 2;
+    volume->imported_texture_height = 2;
+    volume->imported_texture_rgba.assign(16, uint8_t(128));
+    volume->imported_texture_uv_valid.assign(tri_count, uint8_t(1));
+    volume->imported_texture_uvs_per_face.assign(tri_count * 6, 0.5f);
+
+    const std::vector<std::string> colours = {"#FF0000", "#00FF00", "#0000FF"};
+    TextureMappingManager mgr;
+    TextureMappingZone *zone = mgr.add_zone(colours.size(), colours, int(TextureMappingZone::ImageTexture));
+    REQUIRE(zone != nullptr);
+    CHECK(mgr.resolve_zone_component(zone->zone_id, colours.size(), 0) >= 1);
+
+    const SimplifyTextureDataSnapshot snapshot = snapshot_simplify_texture_data(*volume);
+    CHECK(snapshot.source == SimplifyColorSource::ImageTexture);
+    SimplifyTextureDataResult result = remap_simplify_texture_data(snapshot, volume->mesh().its);
+    REQUIRE_NOTHROW(apply_simplify_texture_data_result(*volume, std::move(result)));
+
+    PrintConfig print_config;
+    print_config.filament_colour.values = colours;
+    zone->component_ids = "12";
+    const TextureMappingContoningSolver solver(*zone, print_config, {1, 2}, 0.2f);
+    REQUIRE(solver.valid());
+
+    LayerTools tools(0.);
+    CHECK(tools.texture_mapping_extruders.empty());
+    CHECK(tools.texture_mapping_component_extruders.empty());
+}

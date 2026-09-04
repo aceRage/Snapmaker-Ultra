@@ -63,6 +63,7 @@ GUI gizmo simplify (`GLGizmoSimplify.cpp`) remains PR4.
 - GLTF stub throws a clear error.
 
 Do not change `test_paint_depth*.cpp`. Maintainers should run `[paintdepth],[texturemapping]`. Cloud cannot build `libslic3r_tests`.
+PR5 adds `[texturemapping][pr5][c3]` crash-only coverage; see [`imagemap-full-pr5.md`](imagemap-full-pr5.md).
 
 ## Out of scope (intentionally)
 

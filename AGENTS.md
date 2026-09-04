@@ -5,6 +5,7 @@ Snapmaker_Orca’s C++17 sources live in `src/`, split by feature modules and pl
 
 ## Build, Test, and Development Commands
 Use out-of-source builds:
+- `git lfs install && git lfs pull` is required before cmake on the ImageMap FULL stack (`lut_wide.png.c`). CMake FATAL_ERRORs if the LUT is still an LFS pointer — see `docs/imagemap-full-pr5.md`.
 - `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release` configures dependencies and generates build files.
 - `cmake --build build --target Snapmaker_Orca --config Release` compiles the app; add `--parallel` to speed up.
 - `cmake --build build --target tests` then `ctest --test-dir build --output-on-failure` runs automated suites.

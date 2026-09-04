@@ -7,6 +7,7 @@ Depends on FULL **PR1** libs (#10), FULL **PR2** slicer hooks (#11), and FULL **
 This PR ships a usable ImageMap surface on Ultra: create/edit texture-mapping zones in the sidebar, preview painted/imported textures, and slice. Gizmo merge is **onto** Ultra (new IDs). Plater changes are **surgical hunks** plus extracted `TextureMappingPlaterHooks` — not a wholesale Plater replace.
 
 C3 is **best-effort**: no crash; paint-depth clamp holds. Same-object paint-depth + TM is easier with this UI but is not marketing-supported.
+See [`imagemap-full-known-gaps.md`](imagemap-full-known-gaps.md) (PR5) — do not treat the UI as a C3 product claim.
 
 ## How Ultra paint-depth gizmo paths were preserved
 
