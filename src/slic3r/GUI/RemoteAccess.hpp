@@ -116,6 +116,7 @@ private:
     ApiResponse api_snapmaker_disconnect();
     ApiResponse api_slice(int plate, bool all);
     ApiResponse api_send(int plate, const std::string& form_body);
+    ApiResponse api_printer_control(const std::string& printer, const std::string& form_body);
     ApiResponse api_jobs(int id);
     ApiResponse api_presets();
     ApiResponse api_select_preset(const std::string& type, const std::string& name, int index);
@@ -130,12 +131,13 @@ private:
     {
         int         id { 0 };
         int         plate { -1 };       // -1 = all plates
-        std::string kind { "slice" };   // slice | send
+        std::string kind { "slice" };   // slice | send | control
         std::string state;              // running | done | error | cancelled
         int         percent { 0 };
         std::string text, error;
         std::string printer, mode;      // send jobs: the printer id and upload | print
-        nlohmann::json result;          // send jobs: what was (or, dry run, would have been) sent
+                                        // control jobs: the printer id and pause | resume | stop
+        nlohmann::json result;          // what was (or, dry run, would have been) sent
     };
 
     std::mutex       m_mutex;
@@ -145,6 +147,7 @@ private:
     std::vector<Job> m_jobs;
     int              m_next_job { 1 };
     bool             m_send_running { false }; // one transfer at a time, like the desktop's dialogs
+    bool             m_control_running { false }; // and one pause/resume/stop at a time
     std::string      m_title, m_path, m_last_error;
     bool             m_slicing { false };
     bool             m_hidden { false };

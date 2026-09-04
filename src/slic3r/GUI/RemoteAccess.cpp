@@ -9,6 +9,7 @@
 #include "Plater.hpp"
 #include "OptionsGroup.hpp"
 #include "PresetComboBoxes.hpp"
+#include "RemoteControl.hpp"
 #include "RemoteHub.hpp"
 #include "RemoteSend.hpp"
 #include "RemoteSnapmaker.hpp"
@@ -939,13 +940,15 @@ RemoteAccess::ApiResponse RemoteAccess::api_object_transform(const std::string& 
 
 RemoteAccess::ApiResponse RemoteAccess::api_printers()
 {
-    auto out = std::make_shared<nlohmann::json>();
-    bool ok  = run_on_main([out]() {
+    auto out     = std::make_shared<nlohmann::json>();
+    auto targets = std::make_shared<std::vector<RemoteControl::HostTarget>>();
+    bool ok  = run_on_main([out, targets]() {
         nlohmann::json& j = *out;
         j["printers"]     = nlohmann::json::array();
         DeviceManager* dm = wxGetApp().getDeviceManager();
         // The printer preset's print host and the connected Snapmaker are printers too (RemoteSend).
         struct HostsAtEnd { nlohmann::json& list; ~HostsAtEnd() { try { RemoteSend::list_hosts(list); } catch (...) {} } } hosts_at_end { j["printers"] };
+        try { RemoteControl::list_host_targets(*targets); } catch (...) {} // where to ask those two what they are doing
         if (!dm)
             return;
         MachineObject* selected = dm->get_selected_machine();
@@ -978,13 +981,17 @@ RemoteAccess::ApiResponse RemoteAccess::api_printers()
                 p["nozzles"].push_back(n);
             }
             p["selected"] = (selected == m);
-            RemoteSend::describe_bambu(m, p); // kind, send capabilities, option defaults
+            RemoteSend::describe_bambu(m, p);    // kind, send capabilities, option defaults
+            RemoteControl::describe_bambu(m, p); // can_pause / can_resume / can_stop, stage, print error
             j["printers"].push_back(p);
         }
     });
     ApiResponse r;
-    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); }
-    else       r.body = out->dump();
+    if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+    // A print host has no live status in the app: ask it over Moonraker's HTTP API from this
+    // request thread, never from the GUI one (api_snapmaker_devices probes the same way).
+    try { RemoteControl::describe_hosts(*targets, (*out)["printers"]); } catch (...) {}
+    r.body = out->dump();
     return r;
 }
 
@@ -1037,7 +1044,8 @@ RemoteAccess::ApiResponse RemoteAccess::api_jobs(int id)
         nlohmann::json o;
         o["id"] = j.id; o["plate"] = j.plate; o["kind"] = j.kind; o["state"] = j.state; o["percent"] = j.percent;
         o["text"] = j.text; o["error"] = j.error;
-        if (j.kind == "send") { o["printer"] = j.printer; o["mode"] = j.mode; o["result"] = j.result; }
+        if (j.kind == "send" || j.kind == "control") { o["printer"] = j.printer; o["mode"] = j.mode; o["result"] = j.result; }
+        if (j.kind == "control") o["action"] = j.mode; // pause | resume | stop, under its own name
         return o;
     };
     if (id < 0) {
@@ -1138,6 +1146,67 @@ RemoteAccess::ApiResponse RemoteAccess::api_send(int plate, const std::string& f
     return r;
 }
 
+// Pause, resume or stop the print on a printer, the way the desktop's own Pause / Resume / Stop
+// buttons do (RemoteControl). Form: action=pause|resume|stop[&confirm=1][&dry_run=1]; stop needs
+// the confirmation because it throws the print away. Returns a job id; the command and the few
+// seconds of watching what the printer then reports run on their own thread, so the phone's
+// request comes straight back. Nothing here can start a print.
+RemoteAccess::ApiResponse RemoteAccess::api_printer_control(const std::string& printer, const std::string& form_body)
+{
+    ApiResponse r;
+    auto get = [&](const char* k) { return query_param(form_body, k); };
+    RemoteControl::Request req;
+    req.printer = printer;
+    req.action  = get("action");
+    req.confirm = get("confirm") == "1";
+    req.dry_run = get("dry_run") == "1";
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_control_running) { r.status = 409; r.body = json_error("another pause / resume / stop is still running"); return r; }
+        m_control_running = true; // reserved until the job ends, or preparing fails below
+    }
+    auto prepared = std::make_shared<std::shared_ptr<RemoteControl::Prepared>>();
+    auto result   = std::make_shared<std::pair<int, std::string>>(500, "not run");
+    take_error();
+    const bool ok = run_on_main([prepared, result, req]() { *result = RemoteControl::prepare(req, *prepared); }, 20000, "a printer control command");
+    if (!ok || result->first != 200 || !*prepared) {
+        { std::lock_guard<std::mutex> lock(m_mutex); m_control_running = false; }
+        if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
+        const std::string shown = take_error();
+        r.status = result->first == 200 ? 500 : result->first;
+        r.body   = json_error(result->second + (shown.empty() ? "" : ": " + shown));
+        return r;
+    }
+    Job job;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        job.id      = m_next_job++;
+        job.kind    = "control";
+        job.state   = "running";
+        job.printer = req.printer;
+        job.mode    = req.action;
+        job.text    = "sending " + req.action;
+        m_jobs.push_back(job);
+        if (m_jobs.size() > 50)
+            m_jobs.erase(m_jobs.begin());
+    }
+    const int           id = job.id;
+    RemoteControl::Sink sink;
+    sink.progress = [this, id](int pct, const std::string& text) { update_job(id, pct, text); };
+    sink.done     = [this, id](bool ok2, const std::string& error, const nlohmann::json& res) { finish_job(id, ok2, error, res); };
+    std::shared_ptr<RemoteControl::Prepared> p = *prepared;
+    std::thread([p, sink]() { RemoteControl::run(p, sink); }).detach();
+    nlohmann::json j;
+    j["job"]     = id;
+    j["kind"]    = p->kind;
+    j["printer"] = p->printer_id;
+    j["name"]    = p->printer_name;
+    j["action"]  = p->action;
+    j["dry_run"] = p->dry_run;
+    r.body       = j.dump();
+    return r;
+}
+
 // ------------------------------------------------------- Snapmaker connect ----
 
 // The paired Snapmaker printers ("My Devices" on the PC's Device page) and which one, if any, the
@@ -1188,16 +1257,18 @@ void RemoteAccess::update_job(int id, int percent, const std::string& text)
 void RemoteAccess::finish_job(int id, bool ok, const std::string& error, const nlohmann::json& result)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_send_running = false;
     for (Job& j : m_jobs)
         if (j.id == id && j.state == "running") {
             j.state   = ok ? "done" : "error";
             j.percent = ok ? 100 : j.percent;
             j.error   = error;
             j.result  = result;
-            if (ok) j.text = "sent";
+            if (ok) j.text = j.kind == "control" ? "sent to the printer" : "sent";
+            // Sends and controls each have their own single-flight flag; release this job's.
+            if (j.kind == "control") m_control_running = false;
+            else                     m_send_running = false;
         }
-    BOOST_LOG_TRIVIAL(info) << "RemoteAccess: send job " << id << (ok ? " done" : " failed: " + error);
+    BOOST_LOG_TRIVIAL(info) << "RemoteAccess: job " << id << (ok ? " done" : " failed: " + error);
 }
 
 // The sidebar's own combo boxes are the source of truth for "what can be picked" and selecting
@@ -1863,7 +1934,8 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "GET"},  {"path", "/api/plates/{index}/preview.png?view=front|rear|left|right&layer={index}&w=&h=[&zoom=&cx=&cy=]"}, {"description", "orthographic render of the toolpaths up to that layer (the PC's layer slider follows); zoom over the fit and the fitted-image fraction shown at the centre; X-Preview-Zoom = zoom really used"} },
             { {"method", "GET"},  {"path", "/api/plates/{index}/preview/status"}, {"description", "sliced / slicing / slicing_percent / result_id for that plate, without changing what the PC shows"} },
             { {"method", "POST"}, {"path", "/api/objects/transform"},       {"description", "form obj=&inst=[&x=&y=][&rz=][&scale=][&center=1]: move / rotate / scale one instance like the sidebar (undoable)"} },
-            { {"method", "GET"},  {"path", "/api/printers"},               {"description", "known printers with live status and what a send needs: kind bambu|printhost|connect, online, lan_mode, access_code_set, sdcard, has_ams, model_matches, can_upload, can_print, options (the desktop's remembered defaults)"} },
+            { {"method", "GET"},  {"path", "/api/printers"},               {"description", "known printers with live status and what a send needs: kind bambu|printhost|connect, online, lan_mode, access_code_set, sdcard, has_ams, model_matches, can_upload, can_print, options (the desktop's remembered defaults); and what a control needs: can_pause, can_resume, can_stop, print_status, stage, print_error {code, message} and the hms summary"} },
+            { {"method", "POST"}, {"path", "/api/printers/{id}/control"},  {"description", "form action=pause|resume|stop[&confirm=1][&dry_run=1]: pause, resume or stop the print on that printer, exactly as the desktop's own buttons do (stop = cancel the print and needs confirm=1; pause and resume do not). Returns a job id; the job's result says what the printer then reported. 409 when the printer's own state does not allow it (see can_pause / can_resume / can_stop)"} },
             { {"method", "POST"}, {"path", "/api/slice?plate={index}|all"}, {"description", "start slicing one plate (selects it) or all; returns a job id; 409 while slicing"} },
             { {"method", "POST"}, {"path", "/api/plates/{index}/send"},    {"description", "form printer={id}&mode=upload|print[&confirm=1][&force=1][&dry_run=1][&bed_leveling=0|1&flow_cali=0|1&timelapse=0|1&vibration_cali=0|1&use_ams=0|1][&name=]: send the sliced plate to a printer exactly like the desktop's Send / Print dialogs (upload = to the printer's storage, print = start it; print needs confirm=1); returns a job id; 409 unless the plate is sliced and no other send is running"} },
             { {"method", "GET"},  {"path", "/api/jobs"},                   {"description", "recent jobs"} },
@@ -1951,6 +2023,14 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
         return api_object_transform(body.empty() ? query : body);
     if (path == "/printers" && method == "GET")
         return api_printers();
+    if (path.compare(0, 10, "/printers/") == 0 && method == "POST") {
+        const std::string rest  = path.substr(10);
+        const size_t      slash = rest.find('/');
+        // The id is a Bambu dev_id or the literal "host" / "connect", never a number: a plain
+        // string segment, unlike the plate and job indices above.
+        if (slash != std::string::npos && rest.substr(slash) == "/control")
+            return api_printer_control(rest.substr(0, slash), body.empty() ? query : body);
+    }
     if (path == "/snapmaker/devices" && method == "GET")
         return api_snapmaker_devices();
     if (path == "/snapmaker/connect" && method == "POST") {
