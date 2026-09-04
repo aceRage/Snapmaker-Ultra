@@ -1958,6 +1958,16 @@ void PresetBundle::load_selections(AppConfig &config, const PresetPreferences& p
         unique_visible_printer() : nullptr;
     const Preset *selected_printer = preferred_printer ? preferred_printer : fallback_printer ? fallback_printer : initial_printer;
     printers.select_preset_by_name(selected_printer ? selected_printer->name : initial_printer_profile_name, true);
+    Preset &edited_printer = printers.get_edited_preset();
+    if (edited_printer.printer_technology() == ptFFF) {
+        BedType bed_type = edited_printer.get_default_bed_type(this);
+        const std::string saved_bed_type = config.get_printer_setting(edited_printer.name, "curr_bed_type");
+        const int saved_bed_type_value = atoi(saved_bed_type.c_str());
+        if (saved_bed_type_value > btDefault && saved_bed_type_value < btCount)
+            bed_type = static_cast<BedType>(saved_bed_type_value);
+        project_config.set_key_value("curr_bed_type", new ConfigOptionEnum<BedType>(bed_type));
+        config.set("curr_bed_type", std::to_string(static_cast<int>(bed_type)));
+    }
     CNumericLocalesSetter locales_setter;
 
     // Orca: load from orca_presets
