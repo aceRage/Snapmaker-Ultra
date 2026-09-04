@@ -61,6 +61,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #tabs { display: none; gap: 4px; margin-right: 6px; }
 #tabs .tab { padding: 6px 12px; border-radius: 6px; background: #3a3a3a; color: #ccc; font-size: 13px; cursor: pointer; user-select: none; }
 #tabs .tab.active { background: #0a9e50; color: #fff; }
+/* How many printer events have happened since this phone last looked at the Devices tab. */
+#tabs .tab .badge { display: inline-block; margin-left: 6px; min-width: 16px; padding: 0 4px; border-radius: 9px; background: #c8503a; color: #fff; font-size: 11px; line-height: 16px; text-align: center; font-weight: 600; }
+#tabs .tab.active .badge { background: #fff; color: #0a7a3e; }
 .view { display: none; position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; overflow-y: auto; padding: 10px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); color: #ddd; font-size: 13px; }
 .view .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; color: #ccc; }
 .view .btn { padding: 7px 14px; border-radius: 6px; background: #0a9e50; color: #fff; font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }
@@ -184,6 +187,18 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #send .plate, #ctlsheet .plate { background: #303030; border-radius: 8px; padding: 10px 12px; color: #fff; font-weight: 600; }
 #send .plate .sub, #ctlsheet .plate .sub { display: block; font-weight: 400; color: #aaa; font-size: 12px; margin-top: 2px; }
 /* The control line under a printer card: what pause / resume / stop is doing, and why not */
+/* The Devices tab's event list: what the printers have done, newest first, in the card styling. */
+.evbox { background: #2f2f2f; border-radius: 8px; padding: 8px 12px 10px; margin-bottom: 10px; }
+.evbox .evhead { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+.evbox .evhead .ttl { flex: 1; font-weight: 600; color: #fff; }
+.evbox .ev { display: flex; gap: 8px; padding: 5px 0; border-top: 1px solid #3a3a3a; font-size: 12px; line-height: 1.45; color: #ccc; }
+.evbox .ev .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; background: #5fd08a; }
+.evbox .ev.warn .dot { background: #f0a030; }
+.evbox .ev.err .dot { background: #e05a4a; }
+.evbox .ev.unread { color: #fff; }
+.evbox .ev .body { flex: 1; min-width: 0; }
+.evbox .ev .body .sub { color: #8f8f8f; }
+.evbox .ev .when { flex: none; color: #888; }
 .printer .ctlline { font-size: 12px; line-height: 1.5; margin-top: 6px; color: #aaa; }
 .printer .ctlline.err { color: #e88; }
 .printer .ctlline.warn { color: #f0a030; }
@@ -1326,7 +1341,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         if (v === 'streams') render(); // tile sizes come from the grid's on-screen size
         if (viewTimer) { clearInterval(viewTimer); viewTimer = null; }
         if (v === 'prepare') { lastPresetsJson = ''; refreshInstances(refreshPrepare); viewTimer = setInterval(function() { refreshInstances(refreshPrepare); }, 10000); }
-        if (v === 'devices') { refreshInstances(refreshDevices); viewTimer = setInterval(function() { refreshInstances(refreshDevices); }, 5000); }
+        if (v === 'devices') { refreshEvents(); refreshInstances(refreshDevices); viewTimer = setInterval(function() { refreshEvents(); refreshInstances(refreshDevices); }, 5000); }
         try { localStorage.setItem('snorca_remote_view', v); } catch (e) {}
     }
     function el(tag, cls, text) {
@@ -1334,6 +1349,83 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         if (cls) e.className = cls;
         if (text !== undefined) e.textContent = text;
         return e;
+    }
+
+    // ---- Printer events. The hub keeps the last 200 of them (RemoteEvents.hpp / RemoteHub.cpp);
+    // this asks for everything after the newest id it already holds, so the feed is one request
+    // whatever has happened. The highest id the person has actually looked at lives in
+    // localStorage, and the difference is the badge on the Devices tab. ----
+    var EV_SEEN_KEY = 'snorca_remote_events_seen';
+    var evList = [], evLastId = 0, evSeen = 0;
+    try { evSeen = parseInt(localStorage.getItem(EV_SEEN_KEY)) || 0; } catch (e) {}
+    function evUnread() {
+        var n = 0;
+        evList.forEach(function(e) { if ((e.id || 0) > evSeen) n++; });
+        return n;
+    }
+    function evBadge() {
+        var t = document.querySelector('#tabs .tab[data-view="devices"]');
+        if (!t) return;
+        var b = t.querySelector('.badge'), n = evUnread();
+        if (!n) { if (b) b.remove(); return; }
+        if (!b) { b = el('span', 'badge'); t.appendChild(b); }
+        b.textContent = n > 99 ? '99+' : String(n);
+    }
+    function evMarkSeen() {
+        if (evLastId <= evSeen) return;
+        evSeen = evLastId;
+        try { localStorage.setItem(EV_SEEN_KEY, String(evSeen)); } catch (e) {}
+        evBadge();
+    }
+    function refreshEvents(then) {
+        if (!REMOTE) { if (then) then(); return; }
+        fetch(REMOTE + 'events?since=' + evLastId).then(jsonOf).then(function(j) {
+            var last = typeof j.last_id === 'number' ? j.last_id : evLastId;
+            // A hub on a fresh data dir starts its ids at 1 again; a remembered "seen" from the old
+            // one would then hide everything for ever. Trust the hub's own last id over ours.
+            if (last < evSeen) { evSeen = last; try { localStorage.setItem(EV_SEEN_KEY, String(evSeen)); } catch (e) {} }
+            if (last < evLastId) { evList = []; evLastId = 0; }
+            (j.events || []).forEach(function(e) { evList.push(e); });
+            evLastId = Math.max(evLastId, last);
+            while (evList.length > 60) evList.shift();
+            evBadge();
+            if (view === 'devices') evRender();
+            if (then) then();
+        }).catch(function() { if (then) then(); });
+    }
+    function evAgo(ms) {
+        var s = Math.round((Date.now() - (ms || 0)) / 1000);
+        if (!ms || s < 0) return '';
+        if (s < 60) return 'just now';
+        if (s < 3600) return Math.floor(s / 60) + 'm ago';
+        if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+        return Math.floor(s / 86400) + 'd ago';
+    }
+    // Newest first, at the top of the Devices tab. Looking at the tab is what marks them read.
+    function evRender() {
+        var page = document.getElementById('devices');
+        var box = page.querySelector('.evbox');
+        if (!evList.length) { if (box) box.remove(); return; }
+        if (!box) { box = el('div', 'evbox'); page.insertBefore(box, page.firstChild); }
+        box.innerHTML = '';
+        var head = el('div', 'evhead');
+        head.appendChild(el('span', 'ttl', 'Printer events'));
+        box.appendChild(head);
+        var shown = evList.slice(-8).reverse();
+        shown.forEach(function(e) {
+            var sev = e.severity === 'error' ? 'err' : e.severity === 'warning' ? 'warn' : '';
+            var row = el('div', 'ev' + (sev ? ' ' + sev : '') + ((e.id || 0) > evSeen ? ' unread' : ''));
+            row.appendChild(el('div', 'dot'));
+            var body = el('div', 'body');
+            body.appendChild(el('div', '', e.title || e.kind || 'Event'));
+            var sub = e.text || '';
+            if (e.code) sub += (sub ? '  ·  ' : '') + e.code;
+            if (sub) body.appendChild(el('div', 'sub', sub));
+            row.appendChild(body);
+            row.appendChild(el('div', 'when', evAgo(e.time)));
+            box.appendChild(row);
+        });
+        evMarkSeen();
     }
     function fail(e) { document.getElementById('note').textContent = e.message || String(e); }
     function startSlice(plate) {
@@ -2649,7 +2741,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
     function refreshDevices() {
         var root = document.getElementById('devices');
-        if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); return; }
+        // No slicer, no printer cards - but the hub keeps the events after every instance is
+        // closed, so they stay on the tab.
+        if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); evRender(); return; }
         // One request per card source: the printers (every card) and the Snapmaker devices call for
         // the optional PC-side connect. A failing devices call only costs the connect button.
         Promise.all([api('/printers'), api('/snapmaker/devices').catch(function() { return {}; })]).then(function(res) {
@@ -2769,6 +2863,10 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     if (REMOTE) {
         fetchRemoteState();
         setInterval(fetchRemoteState, 15000);
+        // The badge has to be right whichever tab is open, so the events feed is polled on the
+        // page's own cadence too, not only while the Devices tab is showing.
+        refreshEvents();
+        setInterval(refreshEvents, 15000);
         var v = 'streams';
         try { v = localStorage.getItem('snorca_remote_view') || 'streams'; } catch (e) {}
         if (v === 'prepare' || v === 'devices' || v === 'plates') setView(v === 'plates' ? 'prepare' : v);

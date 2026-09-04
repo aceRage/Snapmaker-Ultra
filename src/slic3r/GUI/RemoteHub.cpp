@@ -21,6 +21,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <deque>
+#include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -94,6 +97,9 @@ static const uint64_t    UPLOAD_QUOTA       = 1ull * 1024 * 1024 * 1024;
 static const long long   UPLOAD_MIN_AGE_S   = 3600;
 // A slicer instance is a full wxWidgets + OpenGL process; a phone must not be able to fork the PC.
 static const int         MAX_INSTANCES      = 6;
+// Printer events (RemoteEvents.hpp): how many the hub keeps, and how many of those it writes back
+// to disk so a hub restart does not lose the last hour of a print.
+static const size_t      MAX_EVENTS         = 200;
 
 // ------------------------------------------------------------------ paths ----
 
@@ -104,6 +110,7 @@ std::string saves_dir()     { return (fs::path(hub_dir()) / "saves").string(); }
 static std::string hub_json_path()     { return (fs::path(hub_dir()) / "hub.json").string(); }
 static std::string streams_json_path() { return (fs::path(hub_dir()) / "streams.json").string(); }
 static std::string settings_json_path() { return (fs::path(hub_dir()) / "settings.json").string(); } // survives a hub quit (hub.json does not)
+static std::string events_json_path()   { return (fs::path(hub_dir()) / "events.json").string(); }   // the printer-event ring, likewise
 
 static void ensure_dirs()
 {
@@ -1195,7 +1202,15 @@ public:
     std::vector<Instance> instances(bool probe);
     int      instances_in_flight(); // live instances plus spawns that have not registered yet
 
+    // The single point where a printer event enters the hub, whoever sent it: it assigns the id
+    // and the time, stores it in the ring, mirrors the ring to <datadir>/hub/events.json and shows
+    // the tray balloon. Everything that delivers an event onwards hangs off this one function.
+    void accept_event(nlohmann::json& event);
+    json events_json(int since); // {events: [...], last_id: n} for /hub/events and /r/<token>/events
+
 private:
+    void load_events();          // start(): the ring from the last run
+    void save_events_locked();   // m_mutex held
     json  info_json();
     json  instances_json();
     void  write_hub_json();
@@ -1250,7 +1265,31 @@ private:
     long                           m_go2rtc_pid { 0 };
     void*                          m_job { nullptr };
     std::atomic<bool>              m_quit { false };
+    // Printer events, newest last. The hub owns the sequence, so ids keep increasing across every
+    // instance that reports and across a restart of the hub itself.
+    std::deque<json>               m_events;
+    int                            m_next_event_id { 0 };
 };
+
+// The tray balloon, set by HubApp once the icon exists (the server itself is wx-free and runs on
+// its own thread; the hook marshals to the GUI thread itself). Left empty in a headless hub, and
+// then an event simply is not shown on the PC. Its own lock: the listener is already accepting by
+// the time the icon is made, so setting and calling it really can race.
+using BalloonFn = std::function<void(const std::string& title, const std::string& text, const std::string& severity)>;
+static std::mutex s_balloon_mutex;
+static BalloonFn  s_balloon;
+
+static void set_balloon(BalloonFn fn)
+{
+    std::lock_guard<std::mutex> lock(s_balloon_mutex);
+    s_balloon = std::move(fn);
+}
+
+static BalloonFn balloon_fn()
+{
+    std::lock_guard<std::mutex> lock(s_balloon_mutex);
+    return s_balloon;
+}
 
 json HubServer::info_json()
 {
@@ -1304,6 +1343,117 @@ void HubServer::write_hub_json()
         st["old_tokens"] = m_old_tokens;
     }
     write_file(settings_json_path(), st.dump(2));
+}
+
+// ------------------------------------------------------- printer events ----
+
+// A short string a phone or a balloon can show, and nothing longer: an event comes from a printer
+// (an HMS message, a Klipper error, a file name) and none of that may become a way to push a wall
+// of text into the hub's memory, its state file or a notification.
+static std::string clip(const json& j, const char* key, size_t limit)
+{
+    if (!j.is_object() || !j.contains(key) || !j[key].is_string()) return std::string();
+    std::string s = j[key].get<std::string>();
+    if (s.size() > limit) s.resize(limit);
+    // Control characters would break the balloon and are never meaningful here.
+    for (char& c : s)
+        if ((unsigned char) c < 0x20) c = ' ';
+    return s;
+}
+
+static bool one_of(const std::string& v, std::initializer_list<const char*> allowed)
+{
+    for (const char* a : allowed)
+        if (v == a) return true;
+    return false;
+}
+
+void HubServer::accept_event(json& event)
+{
+    // Normalise before anything else: the kinds and severities are a closed set (the P4/P5
+    // contract), and everything else is text with a length. An event that names a kind nobody
+    // knows becomes "error"/"warning" rather than being passed through as written.
+    json e;
+    const std::string kind     = clip(event, "kind", 24);
+    const std::string severity = clip(event, "severity", 12);
+    e["kind"]     = one_of(kind, { "started", "finished", "failed", "cancelled", "paused", "resumed", "runout", "error" }) ? kind : "error";
+    e["severity"] = one_of(severity, { "info", "warning", "error" }) ? severity : "warning";
+    e["title"]    = clip(event, "title", 200);
+    e["text"]     = clip(event, "text", 500);
+    const std::string code = clip(event, "code", 64), job = clip(event, "job", 200);
+    if (!code.empty()) e["code"] = code;
+    if (!job.empty()) e["job"] = job;
+    e["instance"] = event.is_object() && event.contains("instance") && event["instance"].is_number_integer()
+                        ? event["instance"].get<long long>() : 0LL;
+    json p = json::object();
+    if (event.is_object() && event.contains("printer") && event["printer"].is_object()) {
+        const json& in = event["printer"];
+        p["id"]   = clip(in, "id", 128);
+        p["name"] = clip(in, "name", 128);
+        const std::string k = clip(in, "kind", 24);
+        p["kind"] = one_of(k, { "bambu", "snapmaker", "printhost", "connect" }) ? k : "printhost";
+    } else {
+        p = json { { "id", "" }, { "name", "" }, { "kind", "printhost" } };
+    }
+    e["printer"] = p;
+
+    std::string title, text, sev;
+    int         id = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        e["id"]   = ++m_next_event_id;
+        e["time"] = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+        m_events.push_back(e);
+        while (m_events.size() > MAX_EVENTS) m_events.pop_front();
+        save_events_locked();
+        id    = e["id"].get<int>();
+        title = e["title"].get<std::string>();
+        text  = e["text"].get<std::string>();
+        sev   = e["severity"].get<std::string>();
+    }
+    event = e; // the caller answers with what was really stored
+
+    // P5 (relay notifications) sends from here: one call with `e`, off this thread.
+
+    // On the PC: anything that went wrong, and the one piece of good news worth interrupting for.
+    if (sev == "warning" || sev == "error" || e["kind"] == "finished")
+        if (BalloonFn show = balloon_fn()) show(title, text, sev);
+    BOOST_LOG_TRIVIAL(info) << "RemoteHub: event " << id << " " << e["kind"].get<std::string>() << " on "
+                            << p.value("id", std::string()) << ": " << title;
+}
+
+json HubServer::events_json(int since)
+{
+    json out;
+    out["events"] = json::array();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const json& e : m_events)
+        if (e.value("id", 0) > since) out["events"].push_back(e);
+    out["last_id"] = m_next_event_id;
+    return out;
+}
+
+void HubServer::save_events_locked()
+{
+    json j;
+    j["last_id"] = m_next_event_id;
+    j["events"]  = json::array();
+    for (const json& e : m_events) j["events"].push_back(e);
+    write_file(events_json_path(), j.dump());
+}
+
+void HubServer::load_events()
+{
+    try {
+        json j = json::parse(read_file(events_json_path()));
+        for (const auto& e : j.value("events", json::array()))
+            if (e.is_object()) m_events.push_back(e);
+        while (m_events.size() > MAX_EVENTS) m_events.pop_front();
+        // Never go backwards, whatever the file says: the phone asks for everything after the last
+        // id it saw, and a reused id would hide an event from it for good.
+        m_next_event_id = std::max(j.value("last_id", 0), m_events.empty() ? 0 : m_events.back().value("id", 0));
+    } catch (...) {}
 }
 
 bool HubServer::bind(bool lan)
@@ -1924,6 +2074,24 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
         write_file(streams_json_path(), body);
         register_streams();
         respond_json(client, 200, "{\"ok\":true}");
+    } else if (r.path == "/hub/event" && r.method == "POST") {
+        // A slicer instance's watcher (RemoteEvents) handing over one printer event. Same shape as
+        // /hub/state: loopback, the per-run secret, JSON. The hub assigns the id and the time.
+        if (r.content_type.compare(0, 16, "application/json") != 0) { respond_json(client, 415, json_error("Content-Type must be application/json")); return; }
+        std::string body;
+        if (!read_small_body(client, r, body, MAX_API_BODY)) { respond_json(client, 413, json_error("event too large")); return; }
+        json e;
+        try {
+            e = json::parse(body);
+        } catch (...) {
+            respond_json(client, 400, json_error("the event is not JSON"));
+            return;
+        }
+        if (!e.is_object()) { respond_json(client, 400, json_error("the event must be an object")); return; }
+        accept_event(e);
+        respond_json(client, 200, e.dump());
+    } else if (r.path == "/hub/events" && r.method == "GET") {
+        respond_json(client, 200, events_json(std::atoi(query_param(r.query, "since").c_str())).dump());
     } else if (r.path == "/hub/phone" && r.method == "POST") {
         set_phone(query_param(r.query, "on") == "1", query_param(r.query, "token") /* only used by a hub with no link yet */);
         respond_json(client, 200, info_json().dump());
@@ -2012,6 +2180,7 @@ static bool instance_api_allowed(const std::string& method, const std::string& s
     if (sub == "/api/snapmaker/connect")             return post;
     if (sub == "/api/snapmaker/disconnect")          return post;
     if (sub == "/api/slice")                         return post;
+    if (sub == "/api/events")                        return get;
     if (sub == "/api/jobs")                          return get;
     if (sub == "/api/presets")                       return get;
     if (sub == "/api/presets/select")                return post;
@@ -2035,7 +2204,8 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
             { {"method", "POST"}, {"path", "/api/instances/open"},  {"description", "body = a .3mf/.stl/.obj/.step file, header X-File-Name = its name; starts a new (hidden) slicer instance with it; ?visible=1 opens a window"} },
             { {"method", "POST"}, {"path", "/i/{id}/open?mode=load|import"}, {"description", "same upload, opened in instance {id}: load = save the current project, then open this project (default for .3mf); import = add the model to the current plate (default otherwise)"} },
             { {"method", "*"},    {"path", "/i/{id}/api/..."},      {"description", "the instance's own API (see GET /i/{id}/api)"} },
-            { {"method", "GET"},  {"path", "/state"},               {"description", "camera list for the stream wall"} }
+            { {"method", "GET"},  {"path", "/state"},               {"description", "camera list for the stream wall"} },
+            { {"method", "GET"},  {"path", "/events?since={id}"},   {"description", "printer events the slicer instances reported (started / finished / failed / cancelled / paused / resumed / runout / error), newest last: {events, last_id}"} }
         });
         respond_json(client, 200, j.dump());
         return;
@@ -2263,6 +2433,11 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner, bool admin)
                 } catch (...) {}
             }
             respond_json(client, 200, st);
+        } else if (rest == "/events") {
+            // What the printers have been doing, for the Devices tab's badge and its list. Only the
+            // event fields: nothing here names this PC, its data dir, its instances' ports or the
+            // secret, and the token gate above is the same one the page itself passed.
+            respond_json(client, 200, events_json(std::atoi(query_param(r.query, "since").c_str())).dump());
         } else if (rest == "/bambu") {
             std::string ip, code;
             if (!lookup_host(query_param(r.query, "id"), ip, code) || code.empty()) { respond(client, 404, "text/plain", "unknown camera"); return; }
@@ -2326,6 +2501,7 @@ bool HubServer::start()
     if (!valid_token(m_token)) m_token = random_token();
     m_secret = random_hex(16);
     m_state  = read_file(streams_json_path());
+    load_events(); // what the printers did before this hub was restarted, and where the ids got to
 
     gc_uploads(); // whatever last time left behind, before anything new lands
     start_go2rtc();
@@ -2433,6 +2609,23 @@ public:
         refresh();
     }
 
+    // A printer event, as the balloon the tray icon already owns (Shell_NotifyIcon's NIF_INFO on
+    // Windows). Called from the server thread, so the work is handed to the GUI thread; the icon
+    // may be gone by then, which is why it is looked up again rather than captured.
+    void balloon(const std::string& title, const std::string& text, const std::string& severity)
+    {
+        wxTaskBarIcon* self = this;
+        const wxString t = wxString::FromUTF8(title), b = wxString::FromUTF8(text);
+        const int      flags = severity == "error" ? wxICON_ERROR : severity == "warning" ? wxICON_WARNING : wxICON_INFORMATION;
+        wxTheApp->CallAfter([self, t, b, flags]() {
+#if defined(__WXMSW__) && wxUSE_TASKBARICON_BALLOONS
+            self->ShowBalloon(t.IsEmpty() ? wxString("Snapmaker-Ultra Hub") : t, b, 10000, flags);
+#else
+            (void) self; (void) t; (void) b; (void) flags;
+#endif
+        });
+    }
+
     void refresh()
     {
         const HubServer::Snapshot st = m_server.snapshot();
@@ -2512,6 +2705,10 @@ public:
         wxIcon icon(wxString::FromUTF8(Slic3r::var("Snapmaker_Orca.ico")), wxBITMAP_TYPE_ICO);
         if (!icon.IsOk()) icon = wxIcon(wxString::FromUTF8(Slic3r::var("Snapmaker_Orca_128px.png")), wxBITMAP_TYPE_PNG);
         m_icon->set_icon(icon);
+        // From here on a printer event shows on the PC as well (accept_event decides which ones).
+        set_balloon([this](const std::string& title, const std::string& text, const std::string& severity) {
+            if (m_icon) m_icon->balloon(title, text, severity);
+        });
         m_thread = std::thread([this]() {
             m_server.loop(false);
             CallAfter([this]() {
@@ -2528,6 +2725,7 @@ public:
     int OnExit() override
     {
         m_timer.Stop();
+        set_balloon(nullptr); // the icon is about to go; nothing may reach it after this
         m_server.request_quit();
         if (m_thread.joinable()) m_thread.join();
         m_server.shutdown();
@@ -2698,6 +2896,21 @@ bool post_state(const std::string& state_json)
         .header("Content-Type", "application/json")
         .header("X-Hub-Secret", hf.secret)
         .set_post_body(state_json)
+        .on_complete([&ok](std::string, unsigned status) { ok = status == 200; })
+        .perform_sync();
+    return ok;
+}
+
+bool post_event(const std::string& event_json)
+{
+    const HubFile hf = hub_file();
+    if (hf.admin_port == 0) return false; // no hub: the instance keeps its own ring and that is all
+    bool ok = false;
+    Http::post("http://127.0.0.1:" + std::to_string(hf.admin_port) + "/hub/event")
+        .timeout_connect(1).timeout_max(5)
+        .header("Content-Type", "application/json")
+        .header("X-Hub-Secret", hf.secret)
+        .set_post_body(event_json)
         .on_complete([&ok](std::string, unsigned status) { ok = status == 200; })
         .perform_sync();
     return ok;
