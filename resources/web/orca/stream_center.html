@@ -88,6 +88,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 .printer .name { font-weight: 600; margin-bottom: 4px; }
 .printer .meta { color: #aaa; font-size: 12px; line-height: 1.5; }
 .printer .temps { display: flex; gap: 14px; margin-top: 6px; }
+.printer .temps.wrap { flex-wrap: wrap; } /* more cells than a Bambu card ever has (a four-extruder print host) */
 .printer .temps div { background: #262626; border-radius: 6px; padding: 6px 10px; text-align: center; }
 .printer .temps .v { font-size: 16px; color: #fff; }
 .printer .temps .k { font-size: 11px; color: #888; }
@@ -2636,6 +2637,16 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         c.appendChild(acts);
         body.appendChild(c);
     }
+    // One temperature cell of a printer card: "now° / target°" over its label. Only a number is
+    // a temperature; an entry without one (a print host that did not answer as a Moonraker
+    // printer) gets no cell, and a card with no cell gets no block.
+    function isTemp(v) { return typeof v === 'number' && isFinite(v); }
+    function tempCell(temp, target, label) {
+        var d = el('div');
+        d.appendChild(el('div', 'v', Math.round(temp) + '° / ' + Math.round(target) + '°'));
+        d.appendChild(el('div', 'k', label));
+        return d;
+    }
     function refreshDevices() {
         var root = document.getElementById('devices');
         if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); return; }
@@ -2672,14 +2683,18 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 if (p.login_required) meta += ' · asks for a login';
                 card.appendChild(el('div', 'meta', meta));
                 if (p.online) {
+                    // Temperatures only where the entry carries numbers. A Bambu printer and a
+                    // Snapmaker over the LAN always do; a print host only once it answered as a
+                    // Moonraker printer (describe_hosts), so its card goes without the block rather
+                    // than read "NaN° / NaN°".
                     var temps = el('div', 'temps');
-                    var bed = el('div'); bed.appendChild(el('div', 'v', Math.round(p.bed_temp) + '° / ' + Math.round(p.bed_target) + '°')); bed.appendChild(el('div', 'k', 'bed'));
-                    temps.appendChild(bed);
-                    (p.nozzles || []).forEach(function(n, i) {
-                        var d = el('div'); d.appendChild(el('div', 'v', Math.round(n.temp) + '° / ' + Math.round(n.target) + '°')); d.appendChild(el('div', 'k', (p.nozzles.length > 1 ? 'nozzle ' + (i + 1) : 'nozzle')));
-                        temps.appendChild(d);
-                    });
-                    card.appendChild(temps);
+                    if (isTemp(p.bed_temp) && isTemp(p.bed_target)) temps.appendChild(tempCell(p.bed_temp, p.bed_target, 'bed'));
+                    var nozzles = (p.nozzles || []).filter(function(n) { return !!n && isTemp(n.temp) && isTemp(n.target); });
+                    nozzles.forEach(function(n, i) { temps.appendChild(tempCell(n.temp, n.target, nozzles.length > 1 ? 'nozzle ' + (i + 1) : 'nozzle')); });
+                    // Bed plus two nozzles is the most a Bambu card has and it fits a phone in one
+                    // row; a print host with four extruders would run off the card, so it wraps.
+                    if (temps.childNodes.length > 3) temps.className = 'temps wrap';
+                    if (temps.childNodes.length) card.appendChild(temps);
                     // What each toolhead holds (a Snapmaker's print_task_config).
                     if ((p.toolheads || []).length) {
                         var heads = el('div', 'heads');
