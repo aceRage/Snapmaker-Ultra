@@ -23,10 +23,10 @@ This branch stacks PR1–PR5 on PR4 tip `e3e839962758b61bbb3542696b11c931bf79ef9
 ## What landed
 
 1. **C3 stance** — `docs/imagemap-full-known-gaps.md` plus a crash-only `[texturemapping][pr5][c3]` case in `tests/libslic3r/test_texture_mapping.cpp`. Same-object paint-depth + TM is **unsupported**. Do not market it. Do not expand this PR into a C3 harden.
-2. **LFS / CI** — `.gitattributes` already tracks `deps_src/pigment-painter/lut_wide.png.c`. `pigment_painter` cmake now refuses a Git LFS pointer or missing file (no silent empty LUT). Workflows already checkout with `lfs: true`; `build_orca.yml` also verifies the payload after checkout. Build docs require `git lfs pull`.
+2. **LFS / CI** — `.gitattributes` already tracks `deps_src/pigment-painter/lut_wide.png.c`. `pigment_painter` cmake now refuses a Git LFS pointer or missing file (no silent empty LUT). Workflows already checkout with `lfs: true`; `build_orca.yml` also verifies the payload after checkout. Build docs (`README.md`, `CLAUDE.md`, `AGENTS.md`, `deps_src/pigment-painter/README.md`) require `git lfs pull`. `doc/developer-reference/How-to-build.md` is **not** edited: the wiki validator indexes only `doc/` and a touch there reports the whole pre-existing wiki-link backlog.
 3. **Perf sanity** — Offset weight-field build stays on the slice/G-code path. UI preview simulation (`MMUPaintedTexturePreview` halftone) stays **off** by default (`DefaultPreviewSimulateColors = false`, `DefaultDitheringEnabled = false`). Create / edit / slice still work. Heaviest halftone paths remain opt-in.
 4. **Known gaps** — `docs/imagemap-full-known-gaps.md` lists ships, gaps, residual TODOs, and Claude-manager merge rules.
-5. **Cheap residual** — `LayerTools::texture_mapping_extruders` / `texture_mapping_component_extruders` are documented as unused ImageMap leftovers (Ultra uses `resolve_filament_id` + `PrintApply` painting extruders + PR4 wipe-tower count). No expensive ToolOrdering rewrite.
+5. **Cheap residual** — `LayerTools::texture_mapping_extruders` / `texture_mapping_component_extruders` are documented as unused ImageMap leftovers (Ultra uses `resolve_filament_id` + `PrintApply` painting extruders + PR4 wipe-tower count). No expensive ToolOrdering rewrite. `spike/verify_chameleon.sh` / `verify_paintdepth.sh` get `cd … || exit` so repo-wide Shellcheck (triggered by `build_linux.sh`) stays green; no paint-depth formula change.
 
 ## LFS / cmake fail-clearly
 

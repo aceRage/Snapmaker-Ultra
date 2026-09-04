@@ -82,6 +82,7 @@ wc -c deps_src/pigment-painter/lut_wide.png.c   # expect 38094965
 - `deps_src/pigment-painter/CMakeLists.txt` **FATAL_ERROR**s if the file is missing or still an LFS pointer. There is no silent empty LUT.
 - GitHub Actions: `actions/checkout` with `lfs: true` on `build_orca.yml` / `build_deps.yml` / `build_check_cache.yml` / `build_all.yml` (flatpak). `build_orca.yml` re-checks the payload after checkout.
 - `build_linux.sh` refuses to compile if the LUT is still a pointer.
+- Do **not** add ImageMap LFS notes to `doc/developer-reference/How-to-build.md`: the wiki validator indexes only `doc/` (so a `docs/` link is “missing”) and any `doc/**/*.md` touch reports the whole pre-existing wiki-link backlog. Use `docs/imagemap-full-pr5.md` + `README.md` instead.
 
 ## REAPER smoke before merge
 

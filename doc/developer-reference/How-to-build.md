@@ -5,12 +5,6 @@ It includes tool requirements, setup commands, and build steps for each platform
 
 Whether you're a contributor or just want a custom build, this guide will help you compile OrcaSlicer successfully.
 
-> [!IMPORTANT]
-> ImageMap FULL tracks `deps_src/pigment-painter/lut_wide.png.c` (~36.3 MiB) with **Git LFS**.
-> After every clone or branch switch onto this stack, run `git lfs install && git lfs pull`
-> **before** cmake / `build_linux.sh` / tests. CMake **FATAL_ERROR**s if the file is still
-> an LFS pointer (no silent empty LUT). See [`docs/imagemap-full-pr5.md`](../../docs/imagemap-full-pr5.md).
-
 - [Windows 64-bit](#windows-64-bit)
   - [Windows Tools Required](#windows-tools-required)
   - [Windows Instructions](#windows-instructions)
@@ -73,9 +67,8 @@ How to building with Visual Studio 2022 on Windows 64-bit.
      ```shell
      git clone https://github.com/SoftFever/OrcaSlicer
      ```
-     2. Materialize Git LFS objects (required for `lut_wide.png.c` and Windows tools):
+     2. Run lfs to download tools on Windows:
      ```shell
-     git lfs install
      git lfs pull
      ```
 2. Open the appropriate command prompt:
@@ -115,7 +108,6 @@ How to building with Xcode on MacOS 64-bit.
 - Xcode
 - CMake (version 3.31.x is mandatory)
 - Git
-- git-lfs (`brew install git-lfs` then `git lfs install`)
 - gettext
 - libtool
 - automake
@@ -151,12 +143,10 @@ cmake --version
 
 ### MacOS Instructions
 
-1. Clone the repository and materialize Git LFS:
+1. Clone the repository:
    ```shell
    git clone https://github.com/SoftFever/OrcaSlicer
    cd OrcaSlicer
-   git lfs install
-   git lfs pull
    ```
 2. Build the application:
    ```shell
@@ -242,7 +232,6 @@ The build system supports multiple Linux distributions including Ubuntu/Debian a
 - file
 - gettext
 - git
-- git-lfs
 - glew-devel / libglew-dev
 - gstreamer-devel / libgstreamerd-3-dev
 - gtk3-devel / libgtk-3-dev
@@ -264,12 +253,6 @@ The build system supports multiple Linux distributions including Ubuntu/Debian a
 - **Arch Linux**: mesa, wayland-protocols
 
 #### Linux Instructions
-
-0. **Materialize Git LFS** (required for ImageMap `lut_wide.png.c` before cmake):
-   ```shell
-   git lfs install
-   git lfs pull
-   ```
 
 1. **Install system dependencies:**
    ```shell
