@@ -577,7 +577,8 @@ void PrintObject::infill()
             [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree, cache = contoning_stack_plan_cache.get()](const tbb::blocked_range<size_t>& range) {
                 for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                     m_print->throw_if_canceled();
-                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get(), cache);
+                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get(),
+                                                    [this]() { m_print->throw_if_canceled(); }, cache);
                 }
             }
         );

@@ -338,7 +338,7 @@ unsigned int LayerTools::outer_wall_filament(const PrintRegion &region) const
 	const int outer = region.config().outer_wall_filament.value;
 	if (outer <= 0)
 		return wall_filament(region);
-	return resolve_mixed_1based(unsigned(outer)) - 1;
+	return resolve_grouped_or_mixed_1based(region, unsigned(outer)) - 1;
 }
 
 unsigned int LayerTools::sparse_infill_filament(const PrintRegion &region) const

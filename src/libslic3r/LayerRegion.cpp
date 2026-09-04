@@ -60,6 +60,8 @@ unsigned int effective_infill_filament_id(const Layer &layer, const PrintRegionC
     const Print       *print  = object ? object->print() : nullptr;
     if (print == nullptr)
         return filament_id;
+    if (print->texture_mapping_manager().is_texture_mapping_zone_id(filament_id))
+        return filament_id;
 
     const size_t num_physical = print->config().filament_diameter.size();
     if (num_physical == 0)

@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <functional>
 #include <memory>
 
 #include "../ClipperUtils.hpp"
@@ -883,7 +884,9 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 params.texture_mapping_top_surface_contoning = false;
                 if (layer.object() != nullptr && layer.object()->print() != nullptr) {
                     const TextureMappingManager &tm = layer.object()->print()->texture_mapping_manager();
-                    const unsigned int filament_id_1based = effective_extruder + 1;
+                    // ImageMap keys TM top fills off the region's configured solid_infill_filament
+                    // (virtual zone ID). layerm.extruder() is already 1-based; do not add 1.
+                    const unsigned int filament_id_1based = unsigned(std::max(0, region_config.solid_infill_filament.value));
                     if (tm.is_texture_mapping_zone_id(filament_id_1based)) {
                         const TextureMappingZone *zone = tm.zone_from_id(filament_id_1based);
                         if (zone != nullptr && zone->is_image_texture() && surface.is_top()) {
@@ -1261,11 +1264,13 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
 // friend to Layer
 void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
 {
-    this->make_fills(adaptive_fill_octree, support_fill_octree, lightning_generator, nullptr);
+    this->make_fills(adaptive_fill_octree, support_fill_octree, lightning_generator, {}, nullptr);
 }
 
-void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator, TopSurfaceImageContoningStackPlanCache * /*contoning_stack_plan_cache*/)
+void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator, std::function<void()> throw_if_canceled, TopSurfaceImageContoningStackPlanCache * /*contoning_stack_plan_cache*/)
 {
+    if (throw_if_canceled)
+        throw_if_canceled();
 	for (LayerRegion *layerm : m_regions)
 		layerm->fills.clear();
 

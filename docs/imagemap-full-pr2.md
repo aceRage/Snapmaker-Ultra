@@ -39,6 +39,8 @@ ImageMap `Fill.cpp` is ~15k lines with ~1198 Contoning hits. This PR ports:
 
 It does **not** copy ImageMap debug SVG export or the polygonization / raster dump. Full infill patterning of Contoning images remains a later thickening of this driver (still without GCode emission in this PR).
 
+`Layer::make_fills` is the ImageMap 5-arg form: octrees, lightning generator, `throw_if_canceled`, and optional `TopSurfaceImageContoningStackPlanCache *` (may be null). The 3-arg overload forwards with an empty cancel callback.
+
 ## C3 spike (optional)
 
 After these hooks, hardening C3 beyond best-effort still looks **non-cheap**: paint-depth clamp, `cut_segmented_layers`, and TM outer-wall width share `compute_layer_color_stat` but the painted-claim geometry is still owned by Ultra paint-depth. A dedicated C3 product mode would need fixtures that paint **and** attach a TM zone on one object, then assert clamp bounds vs TM width — not just “doesn’t crash”.

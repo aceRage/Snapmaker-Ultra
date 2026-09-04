@@ -3,6 +3,7 @@
 #include <array>
 
 #include "libslic3r/Format/ImportedTexture.hpp"
+#include "libslic3r/GCode/ToolOrdering.hpp"
 #include "libslic3r/ImageMapRawFilamentOffsetAtlas.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/ModelTextureDataRemap.hpp"
@@ -82,7 +83,8 @@ TEST_CASE("texture mapping offset helpers smoke", "[texturemapping]")
 
 TEST_CASE("TextureMappingContoningSolver constructs from a zone", "[texturemapping][contoning]")
 {
-    const PrintConfig config;
+    PrintConfig config;
+    config.filament_colour.values = {"#FF0000", "#00FF00", "#0000FF"};
     TextureMappingZone zone;
     zone.component_ids = "12";
     const TextureMappingContoningSolver solver(zone, config, {1, 2}, 0.2f);
@@ -140,12 +142,24 @@ TEST_CASE("TextureMappingManager resolves virtual zone IDs to physical component
 
 TEST_CASE("TextureMappingContoningSolver remains callable for Fill schedule driver", "[texturemapping][contoning][pr2]")
 {
-    const PrintConfig config;
+    PrintConfig config;
+    config.filament_colour.values = {"#FF0000", "#00FF00", "#0000FF"};
     TextureMappingZone zone;
     zone.component_ids = "12";
     zone.surface_pattern = int(TextureMappingZone::ImageTexture);
     const TextureMappingContoningSolver solver(zone, config, {1, 2}, 0.2f);
+    REQUIRE(solver.valid());
     REQUIRE(solver.component_ids().size() == 2);
+    const TextureMappingContoningStack stack = solver.solve({0.5f, 0.5f, 0.5f}, 4);
+    REQUIRE_FALSE(stack.bottom_to_top.empty());
     const unsigned int component = solver.component_for_depth({0.5f, 0.5f, 0.5f}, 4, 0);
     CHECK(component >= 1);
+}
+
+TEST_CASE("LayerTools resolve_filament_id is a no-op without a TextureMapping manager", "[texturemapping][pr2]")
+{
+    LayerTools tools(0.);
+    CHECK(tools.texture_mapping_manager == nullptr);
+    CHECK(tools.resolve_filament_id(0) == 0);
+    CHECK(tools.resolve_filament_id(4) == 4);
 }

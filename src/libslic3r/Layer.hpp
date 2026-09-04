@@ -207,6 +207,7 @@ public:
     void                    make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                                        FillAdaptive::Octree* support_fill_octree,
                                        FillLightning::Generator* lightning_generator,
+                                       std::function<void()> throw_if_canceled,
                                        TopSurfaceImageContoningStackPlanCache *contoning_stack_plan_cache);
     void                    prebuild_contoning_stack_plan_cache(std::function<void()> throw_if_canceled,
                                                                TopSurfaceImageContoningStackPlanCache *contoning_stack_plan_cache) const;

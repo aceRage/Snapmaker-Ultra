@@ -2849,7 +2849,7 @@ bool try_make_texture_mapping_perimeters(LayerRegion                 &layer_regi
                 active_external_width_mm +
                 std::max(0, region_config.wall_loops.value - 1) * float(layer_region.flow(frPerimeter).spacing());
             top_visible_recolor_path_mask =
-                perimeter_texture_top_visible_wall_band_mask(*this,
+                perimeter_texture_top_visible_wall_band_mask(layer_region,
                                                              slices,
                                                              wall_depth_mm,
                                                              perimeter_path_zone->top_visible_perimeter_recolor_above_layers,
@@ -2870,7 +2870,7 @@ bool try_make_texture_mapping_perimeters(LayerRegion                 &layer_regi
             top_visible_recolor_thresholds.min_run_length_mm = contoning_min_recolor_run_length_mm;
             top_visible_recolor_thresholds.min_visible_area_mm2 = contoning_min_recolor_run_length_mm * contoning_min_recolor_run_length_mm * 0.25f;
         } else if (perimeter_path_zone->recolor_top_visible_perimeter_sections) {
-            perimeter_texture_top_visible_recolor_data(*this,
+            perimeter_texture_top_visible_recolor_data(layer_region,
                                                        slices,
                                                        *perimeter_path_zone,
                                                        perimeter_texture_zone_id,
@@ -2881,7 +2881,7 @@ bool try_make_texture_mapping_perimeters(LayerRegion                 &layer_regi
                                                        perimeter_path_zone->uses_legacy_perimeter_path_modulation() ? &reusable_modulation_context : nullptr);
         }
         if (perimeter_path_zone->uses_legacy_perimeter_path_modulation()) {
-            modulated_slices = perimeter_path_modulated_surfaces(*this,
+            modulated_slices = perimeter_path_modulated_surfaces(layer_region,
                                                                  slices,
                                                                  *perimeter_path_zone,
                                                                  perimeter_texture_zone_id,
@@ -2905,7 +2905,7 @@ bool try_make_texture_mapping_perimeters(LayerRegion                 &layer_regi
     }
 
     auto set_perimeter_path_modulation_v2_fallback_slices =
-        [this, use_perimeter_path_modulation_v2](const SurfaceCollection &fallback_slices, bool is_modulated) {
+        [&layer_region, use_perimeter_path_modulation_v2](const SurfaceCollection &fallback_slices, bool is_modulated) {
             if (!use_perimeter_path_modulation_v2)
                 return;
             layer_region.perimeter_path_modulation_v2_fallback_slices = fallback_slices;
@@ -2976,7 +2976,7 @@ bool try_make_texture_mapping_perimeters(LayerRegion                 &layer_regi
             std::optional<float> active_texture_external_width_mm) {
             process_slices(input_slices, active_texture_external_width_mm);
             if (perimeter_path_zone != nullptr)
-                perimeter_texture_apply_top_visible_recolor_to_perimeters(*this,
+                perimeter_texture_apply_top_visible_recolor_to_perimeters(layer_region,
                                                                           layer_region.perimeters,
                                                                           top_visible_recolor_path_mask,
                                                                           *perimeter_path_zone,
@@ -3013,12 +3013,12 @@ bool try_make_texture_mapping_perimeters(LayerRegion                 &layer_regi
             reduced_external_width_mm &&
             *reduced_external_width_mm < active_external_width_mm - float(EPSILON);
         if (has_reduced_external_width && perimeter_path_zone->recolor_small_perimeter_loops) {
-            if (perimeter_texture_apply_recolor_small_perimeter_loops(*this,
+            if (perimeter_texture_apply_recolor_small_perimeter_loops(layer_region,
                                                                       *perimeter_path_zone,
                                                                       perimeter_texture_zone_id,
                                                                       active_external_width_mm)) {
                 set_perimeter_path_modulation_v2_fallback_slices(*fallback_original_slices, false);
-                return;
+                return true;
             }
         }
         if (has_reduced_external_width) {
@@ -3027,7 +3027,7 @@ bool try_make_texture_mapping_perimeters(LayerRegion                 &layer_regi
             *fill_surfaces = fill_surfaces_before;
             *fill_no_overlap = fill_no_overlap_before;
             SurfaceCollection reduced_modulated_slices =
-                perimeter_path_modulated_surfaces(*this,
+                perimeter_path_modulated_surfaces(layer_region,
                                                   *fallback_original_slices,
                                                   *perimeter_path_zone,
                                                   perimeter_texture_zone_id,
