@@ -848,6 +848,9 @@ Ordering notes:
    feature found that an H2 printer without LAN-only mode + Developer Mode refuses a print command
    (phone-send design §2). Verify whether `pause`/`stop` are refused the same way, and reuse the same
    hint if so.
+   **Update (hardware, 2026-09-04):** on the user's H2S in LAN mode, upload, upload + print, pause,
+   resume and stop all worked from the phone (`feat/phone-print-control` as merged in 8c072785a9).
+   The refusal, and the hint, remain untested on an H2 that is *not* in LAN-only + Developer Mode.
 6. **Multiple Bambu printers.** Confirm on the user's four printers (X1C, H2S, H2D, H2C) that only the
    selected one reports `print_status`, and decide whether the Devices tab should say "not watched"
    on the others rather than showing a stale idle.
