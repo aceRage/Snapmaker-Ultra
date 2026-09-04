@@ -32,6 +32,7 @@ struct Info
     bool                     alive { false };
     long                     pid { 0 };
     int                      port { 0 };      // the listener port (LAN when phone is on, loopback otherwise)
+    int                      admin_port { 0 }; // the loopback-only control plane: where /hub/* and the hub page answer
     bool                     phone { false }; // LAN listener + /r/<token>/ routes enabled
     std::string              token;
     std::string              secret;          // hub.json's per-run secret for /hub/* (client side only)
