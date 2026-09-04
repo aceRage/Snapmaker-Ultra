@@ -1263,7 +1263,8 @@ void RemoteAccess::finish_job(int id, bool ok, const std::string& error, const n
             j.percent = ok ? 100 : j.percent;
             j.error   = error;
             j.result  = result;
-            if (ok) j.text = j.kind == "control" ? "sent to the printer" : "sent";
+            const bool dry = result.is_object() && result.value("dry_run", false);
+            if (ok) j.text = j.kind != "control" ? "sent" : dry ? "dry run: nothing was sent" : "sent to the printer";
             // Sends and controls each have their own single-flight flag; release this job's.
             if (j.kind == "control") m_control_running = false;
             else                     m_send_running = false;
@@ -2027,9 +2028,10 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
         const std::string rest  = path.substr(10);
         const size_t      slash = rest.find('/');
         // The id is a Bambu dev_id or the literal "host" / "connect", never a number: a plain
-        // string segment, unlike the plate and job indices above.
+        // string segment, unlike the plate and job indices above, and the page sends it through
+        // encodeURIComponent - so it is decoded here, unlike every other path in this dispatch.
         if (slash != std::string::npos && rest.substr(slash) == "/control")
-            return api_printer_control(rest.substr(0, slash), body.empty() ? query : body);
+            return api_printer_control(percent_decode(rest.substr(0, slash)), body.empty() ? query : body);
     }
     if (path == "/snapmaker/devices" && method == "GET")
         return api_snapmaker_devices();
