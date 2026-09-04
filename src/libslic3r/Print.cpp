@@ -706,7 +706,15 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "long_retractions_when_cut",
         "retraction_distances_when_cut",
         "filament_long_retractions_when_cut",
-        "filament_retraction_distances_when_cut"
+        "filament_retraction_distances_when_cut",
+        // ImageMap FULL PR1: TM keys exist before GCode/LayerRegion hooks (PR2).
+        // Keep them in steps_gcode so they do not fall through to invalidate_all_steps.
+        "texture_mapping_definitions",
+        "texture_mapping_global_settings",
+        "texture_mapping_background_color",
+        "texture_mapping_outer_wall_gradient_global_strength",
+        "texture_mapping_outer_wall_gradient_max_line_width",
+        "texture_mapping_outer_wall_gradient_min_line_width"
     };
 
     static std::unordered_set<std::string> steps_ignore;

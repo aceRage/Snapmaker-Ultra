@@ -69,6 +69,8 @@ jobs:
       run:
         rm -rf /usr/local/lib/android/* /usr/share/dotnet/* /opt/ghc1/* "/usr/local/share/boost1/*"
     - uses: actions/checkout@v5
+      with:
+        lfs: true
     - name: Get the version and date
       run: |
         ver_pure=$(grep 'set(Snapmaker_VERSION' version.inc | cut -d '"' -f2)

@@ -86,6 +86,18 @@ set(lisbslic3r_sources
     BrimFilament.hpp
     PaintDepth.cpp
     PaintDepth.hpp
+    ImageMapRawFilamentOffsetAtlas.cpp
+    ImageMapRawFilamentOffsetAtlas.hpp
+    TextureMapping.cpp
+    TextureMapping.hpp
+    TextureMappingOffset.cpp
+    TextureMappingOffset.hpp
+    TextureMappingContoning.cpp
+    TextureMappingContoning.hpp
+    ModelTextureDataRemap.cpp
+    ModelTextureDataRemap.hpp
+    Format/ImportedTexture.cpp
+    Format/ImportedTexture.hpp
     BuildVolume.cpp
     BuildVolume.hpp
     calib.cpp
@@ -585,6 +597,8 @@ target_link_libraries(libslic3r
         libnest2d
         miniz
         opencv_world
+        colorsolver
+        nlohmann_json
     PRIVATE
         ${CMAKE_DL_LIBS}
         ${EXPAT_LIBRARIES}

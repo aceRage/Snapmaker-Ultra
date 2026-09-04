@@ -7,6 +7,7 @@ add_executable(${_TEST_NAME}_tests
 	test_chameleon_brim.cpp
 	test_paint_depth.cpp
 	test_paint_depth_clamp.cpp
+	test_texture_mapping.cpp
 	test_clipper_offset.cpp
 	test_clipper_utils.cpp
 	test_config.cpp
