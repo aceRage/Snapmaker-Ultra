@@ -660,6 +660,97 @@ them in a project file, never return them to the phone (report `configured: true
 - **Relay privacy.** ntfy.sh sees the whole message and the topic is the only secret. Generate a long
   random topic; never let the user type "printer".
 
+### 2.7 Update (P5): relay notifications, as built
+
+Branch `feat/phone-notify`. N1 above, shipped: `src/slic3r/GUI/RemoteNotify.{hpp,cpp}` (hub process
+only), the `/hub/notify*` routes in `RemoteHub.cpp`, and the Notifications card on the hub page.
+The watcher that produces the events is P4's, on its own branch; this branch carries a stand-in
+`POST /hub/event` so the path can be run end to end, marked in the code as the block P4's
+`accept_event()` replaces.
+
+**The event.** The contract shared with P4, unchanged by delivery:
+
+```json
+{"id": 12, "time": 1757000000000, "instance": 4242,
+ "printer": {"id": "p1", "name": "Bench H2D", "kind": "bambu"},
+ "kind": "finished", "severity": "info",
+ "title": "Print finished", "text": "Bench H2D finished bracket.3mf after 2 h 14 min.",
+ "code": "HMS_0300", "job": "bracket.3mf"}
+```
+
+`kind` is one of `started` `finished` `failed` `cancelled` `paused` `resumed` `runout` `error`;
+`severity` is `info` `warning` `error`; `code` and `job` are optional. `id` and `time` (unix ms)
+are assigned by the hub, not the sender.
+
+**Routes** — all on the loopback-only admin listener, all under the existing `/hub/*` gate
+(loopback peer, loopback `Host`, no `Sec-Fetch-Site: cross-site`, `X-Hub-Secret`):
+
+| Route | Purpose |
+|---|---|
+| `GET /hub/notify` | the destinations, every credential masked, with per-destination status |
+| `POST /hub/notify` | add one (no `id`) or update one (`id`), `application/json` |
+| `DELETE /hub/notify?id=` | forget one, credential and all |
+| `POST /hub/notify/test?id=` | one synthetic event to that destination, no retries; answers `{ok, status, error}` with the relay's own HTTP status |
+| `POST /hub/event` | an event to deliver (P4 owns this; this branch has a stand-in) |
+
+**Settings.** `<datadir>/hub/settings.json`, under a `notify` key next to the phone token — that
+file, not `hub.json`, because `shutdown()` deletes `hub.json`:
+
+```json
+"notify": {"destinations": [
+  {"id":"7f3a…","type":"ntfy","name":"Phone","enabled":true,"min_severity":"info","kinds":[],
+   "server":"https://ntfy.sh","topic":"<secret>","token":""},
+  {"id":"…","type":"pushover","name":"Pushover","enabled":true,"min_severity":"warning","kinds":[],
+   "user_key":"<secret>","app_token":"<secret>"},
+  {"id":"…","type":"webhook","name":"Home Assistant","enabled":true,"min_severity":"error",
+   "kinds":["runout","error"],"url":"<secret>","header_name":"Authorization","header_value":"<secret>"}]}
+```
+
+`kinds` empty means every kind; otherwise it is an allow-list applied after `min_severity`.
+
+**What each sender puts on the wire.**
+
+| Type | Request |
+|---|---|
+| ntfy | `POST {server}/{topic}`, body = the sentence (≤ 3800 bytes), headers `Title`, `Priority` (info 3, warning 4, error 5), `Tags` (one emoji short code per kind), `Click` = the phone link when there is one, `Authorization: Bearer <token>` when a token is set |
+| Pushover | `POST https://api.pushover.net/1/messages.json`, form fields `token`, `user`, `title`, `message`, `priority` (error 1, everything else 0 — emergency 2 is deliberately not a default), plus `url` + `url_title` when there is a phone link |
+| webhook | `POST {url}`, the whole event as JSON (plus `link`), and one configured header |
+
+`Click`/`url` is the Tailscale link when remote access is on, the Wi-Fi link otherwise, and is
+omitted entirely while phone access is off.
+
+**Security rules.**
+
+- The topic of an ntfy destination, a Pushover user key and app token, a webhook URL (a Discord or
+  Slack hook *is* its URL) and a webhook header value are credentials. They are never logged, never
+  put in an error string (libcurl's error text is scrubbed of them before it is stored), and every
+  `GET` masks them to `****` plus their last four characters. A webhook shows scheme and host only.
+- The page sends a masked value straight back when it saves a destination it only ever saw masked;
+  anything starting with `****` means "keep what is stored", so a secret only ever travels inward.
+- Nothing about destinations exists under `/r/<token>/`. The phone origin cannot read, write or
+  test one; `/hub/notify*` is loopback + secret, like the rest of the control plane.
+- `https` only, except to `127.0.0.1` (that exception is what the gate's mock relay uses). A plain
+  `http` relay would put the topic or the key on the wire in clear.
+- Header values built from event text are stripped of CR, LF and anything outside printable ASCII,
+  so a printer name can never inject a header.
+- A destination that fails five times in a row is marked `failing` with the last error text and
+  keeps being tried. Nothing is ever disabled behind the person's back.
+- Retries: three attempts, 1 s then 3 s apart, on a transport error, a 429 or a 5xx only; any other
+  4xx is the relay saying the request itself is wrong and repeating it only burns the rate limit.
+  Sending happens on one worker thread — `deliver()` queues (200 deep) and returns, so no request
+  thread ever waits on a relay.
+- `SNORCA_PUSHOVER_API` redirects Pushover's fixed endpoint for the gate, and the same https-or-
+  loopback rule applies to it.
+
+**Hub page.** A Notifications card: the destinations with their status, a severity picker,
+enable/disable, Test and Remove; add forms for ntfy (server, a *New topic* button that mints 24
+random characters in the browser, an optional access token) with a live QR of the subscribe link,
+for Pushover, and for a webhook. The QR is drawn **while the topic is being typed**, because after
+saving the hub will not show it again.
+
+**Gate.** `snorca_hubtest\test_phone_notify.py` with `mock_relay.py`: an isolated data dir, a hub
+of its own, a loopback mock recording every header and body. It never contacts a real relay.
+
 ---
 
 ## 3. Start / pause / stop on the Devices tab
