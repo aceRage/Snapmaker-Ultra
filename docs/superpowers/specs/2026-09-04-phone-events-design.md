@@ -96,20 +96,67 @@ cadence: every 5 s while the Devices tab is open, every 15 s otherwise so the ba
 any tab. A hub on a fresh data dir starts its ids at 1 again, and the page trusts the hub's
 `last_id` over its own remembered one so nothing is hidden for ever.
 
-## 5. Verified
+## 5. Verified (2026-09-04, gate `snorca_hubtest\test_phone_events.py`, 72 checks, all green)
 
-Gate `snorca_hubtest\test_phone_events.py`, run by `gate_events.sh` against this branch's build on
-the isolated `dd_events` data dir with `mock_printhost.py` standing in for a U1. Sections: the
-transition rule on hand-written snapshots (starts, pauses, runout, resume, finish, failure with an
-HMS code, cancelled, the unwatched/offline rule, the cooldown in and out of its window); the
-manifest / allow-list pair and that `/api/debug/events` is in neither; the live pipeline (the mock
-starts printing, a `started` event reaches `/hub/events` and `/r/<token>/events` with every contract
-field and nothing else); ids and `since=`; the cooldown against the running watcher; the ring
-across a hub restart; and the gating of both new routes.
+Run by `gate_events.sh` against this branch's build installed to `inst_events`, on the isolated
+`dd_events` data dir, with `mock_printhost.py` on 127.0.0.1:18089 standing in for a U1. No real
+printer was ever commanded.
+
+- **A, the rule alone** (through `POST /api/debug/events`, no printer, no clock): the first
+  snapshot of a printer only seeds it; `idle -> printing` is `started`, `printing -> printing`
+  nothing, `printing -> paused` `paused`, `paused -> printing` `resumed` (not `started`),
+  `printing -> finished` `finished`; stage 6 makes the pause a `runout`; a failure carrying a new
+  code is **one** event, not `failed` *and* `error`, and a further code while already failed is an
+  `error` on its own; an unwatched printer and an offline one produce nothing while the watched one
+  beside them does; the same file started again inside the cooldown makes no event, a different
+  file does, and past the window the same file does again.
+- **B, the pair**: `GET /api/events?since={id}` is in the manifest and proxied; `/api/debug/events`
+  is in neither, and the instance answers it only on loopback.
+- **C, the live pipeline**: the mock starts printing and a `started` event reaches `/hub/events`
+  with a hub-assigned increasing id and unix-ms time, the reporting instance's pid, the printer's
+  id/name/kind, severity `info`, a title, a sentence, the job — and no field outside the contract;
+  `/r/<token>/events` returns byte-identical objects; going idle gives `finished`.
+- **D**: ids increase and never repeat, `last_id` tracks them, `since=` filters on both routes.
+- **E**: against the running watcher, the same file restarted inside the window makes no second
+  `started` while a different file does; and a printer forgotten and taken back *while printing*
+  announces nothing (the seed rule, live).
+- **F**: the ring is mirrored to `events.json`, and a hub quit and restarted still serves every
+  event with the id sequence carrying on.
+- **G**: `/hub/events` and `/hub/event` refuse a missing or wrong secret (403), a non-loopback
+  `Host` and a cross-site fetch (404), a non-JSON body (415) and a broken one (400); a forged post
+  without the secret stores nothing; `/r/<wrong token>/events` and a bare `/events` are 404; and
+  the events carry no secret, no data dir and no address.
+
+`test_security_lan.py` pointed at this data dir passes, as do `test_phone_control_lan.py`,
+`test_phone_snapmaker_lan.py --real=` and `test_phone_ui.py` on the same build.
+
+In a browser at 375x812 against the same hub: the Devices tab carried a red **3** while the Streams
+tab was showing, and opening it listed the three events newest-first ("Mock U1 started printing /
+Mock U1 started a print - ev_two.gcode / 3m ago", and so on) above the printer cards, clearing the
+badge and leaving `snorca_remote_events_seen=3` in `localStorage`.
 
 ## 6. For the user to verify on hardware
 
-The Bambu half cannot be proven without a printer — see the checklist in the branch's report.
+Only the Snapmaker path can be proven without a printer. The Bambu half needs one:
+
+1. **A print started from the PC** on the connected Bambu printer: a `started` event within ~5 s,
+   with `subtask_name` as the job.
+2. **Finish**: a `finished` event and a tray balloon on the PC.
+3. **Pause and resume** from the printer's own screen (not from the phone): `paused` then
+   `resumed`, and the pause's text should carry `get_curr_stage()` ("Printing was paused by the
+   user").
+4. **Filament runout**: check that the pause arrives as `runout`, not `paused` — this is the one
+   place the fork's stage index (6) is being trusted, and it is the event most worth getting right.
+5. **An HMS error / `print_error`**: an `error` event with the printer's own text, and no second
+   one for the same code within three minutes.
+6. **Stop from the printer**: which of `FINISH` / `FAILED` a Bambu abort really lands on, and
+   therefore whether it reads as `finished` or `failed` (nothing here maps a Bambu abort to
+   `cancelled`; if it lands on `FINISH` the event will say "finished", which is wrong and is a
+   one-line fix once the answer is known).
+7. **Four printers at once**: only the connected one should ever produce events; the other three
+   must stay silent (research question 6).
+8. **A U1 runout**: confirm it arrives as a plain `paused` and note the Klipper object name so the
+   `runout` kind can be extended to it (research question 4).
 
 ## 7. Not done
 
