@@ -527,6 +527,35 @@ static void fill_from_print_stats(const json& stats, json& p)
         p["print_error"] = nullptr;
 }
 
+// A number the printer reported under `key`, or nothing. Klipper answers an object it does not
+// have (extruder2 on a two-nozzle printer) with an empty one, or leaves it out altogether.
+static bool num_of(const json& obj, const char* key, double& out)
+{
+    if (!obj.is_object() || !obj.contains(key) || !obj[key].is_number()) return false;
+    out = obj[key].get<double>();
+    return true;
+}
+
+// The temperatures a Bambu entry carries, from the same answer: the bed and every extruder Klipper
+// has (extruder, extruder1, ...). A host that reports none is left without bed_temp / nozzles, and
+// the phone then leaves the temperature block off its card instead of rendering NaN.
+static void fill_from_heaters(const json& status, json& p)
+{
+    double temp = 0, target = 0;
+    if (status.contains("heater_bed") && num_of(status["heater_bed"], "temperature", temp) &&
+        num_of(status["heater_bed"], "target", target)) {
+        p["bed_temp"]   = temp;
+        p["bed_target"] = target;
+    }
+    json nozzles = json::array();
+    for (int i = 0; i < 4; ++i) {
+        const std::string ex = i == 0 ? "extruder" : ("extruder" + std::to_string(i));
+        if (!status.contains(ex) || !num_of(status[ex], "temperature", temp) || !num_of(status[ex], "target", target)) continue;
+        nozzles.push_back(json { { "temp", temp }, { "target", target } });
+    }
+    if (!nozzles.empty()) p["nozzles"] = nozzles;
+}
+
 void describe_hosts(const std::vector<HostTarget>& targets, json& printers)
 {
     if (targets.empty() || !printers.is_array()) return;
@@ -536,13 +565,18 @@ void describe_hosts(const std::vector<HostTarget>& targets, json& printers)
             if (p.is_object() && p.value("id", std::string()) == t.id) { entry = &p; break; }
         if (!entry || t.base.empty()) continue;
         std::string body, error;
-        json        stats;
+        json        stats, status;
         if (ask_again(t.base)) {
-            // Read-only: what the printer says it is doing. Never a command.
-            if (moonraker_http(t.base + "/printer/objects/query?print_stats", false, body, error, 2)) {
+            // Read-only: what the printer says it is doing and how warm it is (the objects the LAN
+            // list asks a Snapmaker for; extruder1.. answer empty where there is no such nozzle).
+            // Never a command.
+            if (moonraker_http(t.base + "/printer/objects/query?print_stats&heater_bed&extruder&extruder1&extruder2&extruder3",
+                               false, body, error, 2)) {
                 const json j = parse_or_raw(body);
-                if (j.is_object())
-                    stats = j.value("result", json::object()).value("status", json::object()).value("print_stats", json::object());
+                if (j.is_object()) {
+                    status = j.value("result", json::object()).value("status", json::object());
+                    if (status.is_object()) stats = status.value("print_stats", json::object());
+                }
             }
             const bool ok = stats.is_object() && !stats.empty();
             remember_probe(t.base, ok, ok ? stats.value("state", std::string()) : std::string());
@@ -550,6 +584,7 @@ void describe_hosts(const std::vector<HostTarget>& targets, json& printers)
         const bool answered = stats.is_object() && !stats.empty();
         if (answered) {
             fill_from_print_stats(stats, *entry);
+            fill_from_heaters(status, *entry);
         } else {
             // It is not a Moonraker printer, or it is off: leave every button off rather than guess.
             (*entry)["can_pause"]   = false;
