@@ -21,8 +21,10 @@ namespace GUI {
 //
 // The first slicer instance that needs it spawns the hub detached; the hub exits on its
 // own once phone access is off and no instance has been alive for a minute. State the
-// hub needs across restarts (token, phone on/off, the camera list) lives in
-// <datadir>/hub/hub.json and streams.json.
+// hub needs across restarts (phone on/off, the camera list) lives in
+// <datadir>/hub/hub.json and streams.json. The phone link's token lives in settings.json
+// next to them, because hub.json is deleted on a clean quit and the link must survive that:
+// it is in QR codes people scanned and in home-screen icons they installed.
 namespace RemoteHub {
 
 struct Info
@@ -49,7 +51,11 @@ int run_server(const std::string& token_hint, bool phone_on);
 Info query();                                                       // is a hub running? (~1 s worst case)
 std::pair<int, std::string> onvif_discover();                       // ONVIF WS-Discovery via the hub's go2rtc: {http status, body}
 Info ensure_running(const std::string& token_hint, bool phone_on); // spawn one if needed; waits for it
-Info set_phone(bool on, const std::string& token = ""); // a valid token keeps a remembered link
+Info set_phone(bool on, const std::string& token = ""); // off and on keeps the same link; a valid
+                                                        // token seeds a hub that has none yet
+Info new_link();                                        // replace the phone link (explicit only):
+                                                        // saved links, QR codes and home-screen
+                                                        // icons made from the old one stop working
 bool post_state(const std::string& json); // full Stream-tab state; remembered for a hub started later
 void quit();
 

@@ -52,6 +52,7 @@
 #include <wx/image.h>
 #include <wx/init.h>
 #include <wx/menu.h>
+#include <wx/msgdlg.h>
 #include <wx/taskbar.h>
 #include <wx/timer.h>
 #include <wx/utils.h>
@@ -1180,7 +1181,12 @@ public:
         int         attention { 0 };
     };
     Snapshot snapshot();
-    bool     set_phone(bool on, const std::string& token); // rebinds the listener, persists
+    // Off and on again keeps the same link. The token is the hub's, remembered in settings.json,
+    // and `token` is only taken up by a hub that has none of its own yet (a fresh data dir):
+    // a phone's saved link, QR code or home-screen icon must not die because somebody used the
+    // toggle. new_link() is the one thing that replaces it.
+    bool        set_phone(bool on, const std::string& token); // rebinds the listener, persists
+    std::string new_link(); // rotate the phone token (explicit only); returns the new one
     long     spawn_slicer(const std::string& file, bool hidden = false); // "" = an empty window
     // One request to an instance's loopback API (HTTP: never on the tray's GUI thread).
     std::pair<int, std::string> instance_post(long pid, const std::string& sub);
@@ -1211,10 +1217,14 @@ private:
     void  remote_logins(const std::string& add, const std::string& remove);
     bool  login_allowed(const std::string& login);
     json  remote_json_locked() const;                  // m_mutex held
+    void  remember_old_token_locked(const std::string& token); // m_mutex held
     static Instance probe_instance(Instance inst);
 
     std::mutex                     m_mutex;
     std::string                    m_token;
+    // The last few links this hub replaced. They authenticate nothing - they exist so a phone
+    // that still has one is told what happened instead of getting a bare 404.
+    std::vector<std::string>       m_old_tokens;
     bool                           m_phone { false };
     bool                           m_lan { false };
     int                            m_port { 0 };
@@ -1286,6 +1296,13 @@ void HubServer::write_hub_json()
     json st;
     st["remote_on"]      = j["remote_on"];
     st["allowed_logins"] = j["allowed_logins"];
+    {
+        // hub.json is deleted on a clean quit; the phones' link has to outlive it, or every hub
+        // restart would hand out a new one and kill every saved link and home-screen icon.
+        std::lock_guard<std::mutex> lock(m_mutex);
+        st["token"]      = m_token;
+        st["old_tokens"] = m_old_tokens;
+    }
     write_file(settings_json_path(), st.dump(2));
 }
 
@@ -1666,6 +1683,9 @@ HubServer::Snapshot HubServer::snapshot()
     return s;
 }
 
+// Turning phone access off and on keeps the same link: a QR code somebody scanned, a saved
+// bookmark and a home-screen icon all carry the token, and minting a new one on every toggle
+// broke all three for no reason anybody asked for. new_link() is the only thing that replaces it.
 bool HubServer::set_phone(bool on, const std::string& token)
 {
     bool changed;
@@ -1673,15 +1693,44 @@ bool HubServer::set_phone(bool on, const std::string& token)
         std::lock_guard<std::mutex> lock(m_mutex);
         changed = on != m_phone;
         m_phone = on;
-        // A new link every time it is turned on (as the PC page promises), unless the caller
-        // brings the one it remembered.
-        if (changed && on) m_token = valid_token(token) ? token : random_token();
+        // Only a hub with no link of its own takes up the caller's remembered one (a fresh data
+        // dir). A hub that has one keeps it: it is what the phones out there are using.
+        if (!valid_token(m_token)) m_token = valid_token(token) ? token : random_token();
     }
     if (!changed) return true;
     const bool ok = bind(on);
     write_hub_json();
     BOOST_LOG_TRIVIAL(info) << "RemoteHub: phone access " << (on ? "on" : "off");
     return ok;
+}
+
+// Remember a link we are replacing, so the phones still holding it get told rather than a 404.
+// Three is enough for "I pressed it twice"; an old token is not a credential (nothing compares
+// against this list to let anybody in), but there is no reason to keep them forever either.
+void HubServer::remember_old_token_locked(const std::string& token)
+{
+    if (!valid_token(token)) return;
+    for (const std::string& t : m_old_tokens)
+        if (t == token) return;
+    m_old_tokens.push_back(token);
+    if (m_old_tokens.size() > 3) m_old_tokens.erase(m_old_tokens.begin(), m_old_tokens.end() - 3);
+}
+
+// An explicit "new link", and nothing else, replaces the token: every link, QR code and
+// home-screen icon made from the old one stops working, so both callers (the hub page and the
+// tray) ask the person first and say that in the question.
+std::string HubServer::new_link()
+{
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        remember_old_token_locked(m_token);
+        m_token = random_token();
+        token   = m_token;
+    }
+    write_hub_json();
+    BOOST_LOG_TRIVIAL(info) << "RemoteHub: a new phone link was made; anything saved from the old one stops working";
+    return token;
 }
 
 TailscaleState HubServer::remote_state(bool refresh)
@@ -1876,7 +1925,12 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
         register_streams();
         respond_json(client, 200, "{\"ok\":true}");
     } else if (r.path == "/hub/phone" && r.method == "POST") {
-        set_phone(query_param(r.query, "on") == "1", query_param(r.query, "token") /* a remembered link to keep */);
+        set_phone(query_param(r.query, "on") == "1", query_param(r.query, "token") /* only used by a hub with no link yet */);
+        respond_json(client, 200, info_json().dump());
+    } else if (r.path == "/hub/newlink" && r.method == "POST") {
+        // The one route that replaces the phone link. Everything saved from the old one stops
+        // working, so the hub page and the tray both ask the person before calling it.
+        new_link();
         respond_json(client, 200, info_json().dump());
     } else if (r.path == "/hub/quit" && r.method == "POST") {
         respond_json(client, 200, "{\"ok\":true}");
@@ -1952,6 +2006,8 @@ static bool instance_api_allowed(const std::string& method, const std::string& s
     if (sub == "/api/objects/transform")             return post;
     if (sub == "/api/printers")                      return get;
     if (sub == "/api/snapmaker/devices")             return get;
+    if (sub == "/api/snapmaker/add")                 return post;
+    if (sub == "/api/snapmaker/remove")              return post;
     if (sub == "/api/snapmaker/connect")             return post;
     if (sub == "/api/snapmaker/disconnect")          return post;
     if (sub == "/api/slice")                         return post;
@@ -2054,6 +2110,29 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
     respond_json(client, 404, json_error("no such route; see /api"));
 }
 
+// What a phone gets when it opens a link this hub has replaced. It says what happened and where
+// to get the new one, and deliberately nothing else: no token, no address, no name of this PC.
+static const char* const REPLACED_LINK_PAGE = R"HTML(<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>This link was replaced</title>
+<style>
+body { margin: 0; background: #2b2b2b; color: #ddd; font-family: 'Segoe UI', Roboto, -apple-system, sans-serif; font-size: 15px; line-height: 1.5; }
+.wrap { max-width: 26em; margin: 0 auto; padding: 12vh 22px 22px; }
+h1 { font-size: 20px; color: #fff; margin: 0 0 14px; }
+p { margin: 0 0 12px; }
+.note { color: #999; font-size: 13px; }
+</style></head>
+<body><div class="wrap">
+<h1>This link was replaced</h1>
+<p>A new phone link was made on the PC, so this one no longer works.</p>
+<p>On the PC, open the hub page from the Snapmaker Orca icon next to the clock and scan the new code.</p>
+<p class="note">Anything saved from the old link - a bookmark, a QR code, a home-screen icon - has to be made again from the new one.</p>
+</div></body></html>
+)HTML";
+
 void HubServer::serve(std::unique_ptr<tcp::socket> owner, bool admin)
 {
     // Each listener has its own budget: a flood on the phone listener must not stop the PC's own
@@ -2073,11 +2152,13 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner, bool admin)
         if (!guard.ok()) { respond(client, 503, "text/plain; charset=utf-8", "the hub has too many connections open; try again"); return; }
 
         std::string token, secret, auth;
+        std::vector<std::string> old_tokens;
         int         go2rtc_port;
         bool        phone;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             token       = m_token;
+            old_tokens  = m_old_tokens;
             secret      = m_secret;
             auth        = m_go2rtc_auth;
             go2rtc_port = m_go2rtc_port;
@@ -2141,14 +2222,25 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner, bool admin)
         // /r/<token>/... - the token pulled out of the path first, so it can be compared in
         // constant time instead of as a path prefix.
         const std::string prefix = "/r/" + token;
-        std::string       rest;
+        std::string       rest, given;
         bool              token_ok = false;
         if (r.path.compare(0, 3, "/r/") == 0) {
             const size_t slash = r.path.find('/', 3);
-            token_ok = ct_equal(r.path.substr(3, slash == std::string::npos ? std::string::npos : slash - 3), token);
+            given    = r.path.substr(3, slash == std::string::npos ? std::string::npos : slash - 3);
+            token_ok = ct_equal(given, token);
             if (slash != std::string::npos) rest = r.path.substr(slash);
         }
         if (!token_ok || (!phone && !peer.is_loopback())) {
+            // A link we replaced ourselves gets a page saying so - an installed icon or a saved QR
+            // would otherwise open a blank 404 and nobody could tell it from a typo. Same reach as
+            // a live link (the LAN only while phone access is on), same constant-time compare, and
+            // the page names neither the new token nor anything else.
+            if (!token_ok && (phone || peer.is_loopback()))
+                for (const std::string& old : old_tokens)
+                    if (ct_equal(given, old)) {
+                        respond(client, 404, "text/html; charset=utf-8", REPLACED_LINK_PAGE, "X-Frame-Options: DENY\r\n");
+                        return;
+                    }
             respond(client, 404, "text/plain", "not found");
             return;
         }
@@ -2218,7 +2310,18 @@ bool HubServer::start()
         json j      = json::parse(read_file(settings_json_path()));
         m_remote_on = j.value("remote_on", false);
         for (const auto& l : j.value("allowed_logins", json::array())) m_allowed_logins.push_back(lower(l.get<std::string>()));
-    } catch (...) {}
+        // ... and so does the phone link, for the same reason: hub.json is gone after a clean
+        // quit, and a hub that came back with a new token would break every saved link. The
+        // remembered one beats a --hub-token from the slicer, whose copy can be older than the
+        // last "New link" somebody made from the tray; a hint only seeds a data dir with none.
+        const std::string saved = j.value("token", "");
+        for (const auto& t : j.value("old_tokens", json::array())) remember_old_token_locked(t.get<std::string>());
+        if (valid_token(saved)) {
+            if (valid_token(m_token) && m_token != saved)
+                BOOST_LOG_TRIVIAL(info) << "RemoteHub: keeping this data dir's phone link, not the one passed on the command line";
+            m_token = saved;
+        }
+    } catch (...) {} // nothing else runs yet: start() is single-threaded, the _locked helper is safe here
     if (!valid_token(m_token)) m_token = random_token();
     m_secret = random_hex(16);
     m_state  = read_file(streams_json_path());
@@ -2288,13 +2391,23 @@ void HubServer::shutdown()
 class HubTaskBarIcon : public wxTaskBarIcon
 {
 public:
-    enum { ID_STATUS = wxID_HIGHEST + 100, ID_PHONE, ID_PAGE, ID_NEW, ID_NEW_HIDDEN, ID_QUIT,
+    enum { ID_STATUS = wxID_HIGHEST + 100, ID_PHONE, ID_NEWLINK, ID_PAGE, ID_NEW, ID_NEW_HIDDEN, ID_QUIT,
            ID_INST_FIRST = wxID_HIGHEST + 200, ID_INST_PER = 3, ID_INST_MAX = 32,
            ID_INST_LAST = ID_INST_FIRST + ID_INST_PER * ID_INST_MAX };
 
     HubTaskBarIcon(HubServer& server, std::function<void()> on_quit) : m_server(server), m_on_quit(std::move(on_quit))
     {
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_server.set_phone(!m_server.snapshot().phone, ""); refresh(); }, ID_PHONE);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+            // The only thing in this menu that breaks something a person made; ask in those words.
+            if (wxMessageBox("Make a new phone link?\n\nThe link this hub is using now stops working. Saved links, QR codes "
+                             "and home-screen icons made from it all have to be made again from the new code.",
+                             "New phone link", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION) != wxYES)
+                return;
+            m_server.new_link();
+            refresh();
+            open_page(); // where the new code is
+        }, ID_NEWLINK);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { open_page(); }, ID_PAGE);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_server.spawn_slicer(""); }, ID_NEW);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { m_server.spawn_slicer("", true); }, ID_NEW_HIDDEN);
@@ -2337,6 +2450,7 @@ public:
         menu->Append(ID_STATUS, wxString::Format("Snapmaker-Ultra Hub: %d slicer window%s open", st.instances, st.instances == 1 ? "" : "s"))->Enable(false);
         menu->AppendSeparator();
         menu->AppendCheckItem(ID_PHONE, "Phone access")->Check(st.phone);
+        menu->Append(ID_NEWLINK, "New phone link (breaks saved links and icons)...");
         menu->Append(ID_PAGE, st.phone ? "Open hub page (QR code, link, slicers)" : "Open hub page");
         menu->Append(ID_NEW, "Open a new slicer window");
         menu->Append(ID_NEW_HIDDEN, "Open a new hidden slicer");
@@ -2564,6 +2678,8 @@ Info set_phone(bool on, const std::string& token)
 {
     return hub_call("POST", std::string("/hub/phone?on=") + (on ? "1" : "0") + (valid_token(token) ? "&token=" + token : ""), "", 5);
 }
+
+Info new_link() { return hub_call("POST", "/hub/newlink", "", 5); }
 
 void quit() { hub_call("POST", "/hub/quit", "", 3); }
 

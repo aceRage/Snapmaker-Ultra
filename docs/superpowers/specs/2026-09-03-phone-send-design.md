@@ -136,14 +136,135 @@ Progress and text come from the job every second; success and errors are shown, 
 + Developer Mode hint when a Bambu printer refuses a print. The sheet can be hidden while a
 transfer runs; the transfer continues on the PC.
 
-## 3. Connecting the Snapmaker from the phone (2026-09-03)
+## 3. Snapmaker over the LAN (2026-09-03) - the primary path
+
+A U1 serves Moonraker's HTTP API on port 80 and, measured on all three of the user's printers,
+`GET /access/info` answers `{"login_required": false, "trusted": true}`: `/server/info`,
+`/printer/info`, `/machine/system_info`, `/printer/objects/query`, `/server/files/*`,
+`/printer/gcode/script` and `/printer/print/start` all answer with no credential at all. So the
+phone does not need the PC to be connected to a printer, and there is no connect step: listing,
+watching and feeding a printer is plain stateless HTTP from whichever slicer instance the phone is
+driving. (Why this replaced the MQTT connect of section 4: that connection succeeded only
+sometimes, and it died with the slicer instance that made it, so the whole handshake had to be
+redone before every send.)
+
+### 3.1 What the printers answer (measured, 2026-09-03, firmware 1.5.2)
+
+- `GET /machine/system_info` -> `result.system_info.product_info` = `machine_type` ("Snapmaker U1"),
+  `serial_number`, `device_name`, `nozzle_diameter[4]`. This is the identity of a printer.
+- `GET /printer/objects/query?print_stats&display_status&heater_bed&extruder&extruder1..3&print_task_config`:
+  `print_stats.state` (standby | printing | paused | complete | cancelled | error), `.filename`,
+  `.info.current_layer` / `.total_layer`, `display_status.progress` (0..1), the temperatures, and
+  per toolhead `nozzle_diameter`.
+- `print_task_config` carries the four toolheads as parallel arrays - `filament_type`,
+  `filament_sub_type`, `filament_vendor`, `filament_color_rgba` ("RRGGBBAA" hex text),
+  `filament_color` (ARGB int), `filament_official`, `filament_exist` (is anything loaded) - plus
+  `extruder_map_table` (32 entries: the file's filament -> the toolhead that prints it) and
+  `extruders_used`. `reprint_info` shows the same pair as the last print used them. This is the
+  object the desktop's own `update_filament_info` reads (`SSWCP.cpp:1485`).
+- `POST /server/files/upload`, multipart with `file` (plus `print=false` and `root=gcodes`), answers
+  201 `{"action": "create_file", "item": {...}, "print_started": false}`;
+  `GET /server/files/metadata?filename=` reads it back; `DELETE /server/files/gcodes/<name>` removes
+  it. Verified end to end against 10.0.0.108 with a comment-only file, then deleted.
+- `filament_detect` is the RFID spool reader: it is blank for third-party spools, so colours come
+  from `print_task_config`, not from it.
+
+### 3.2 Starting a print with a toolhead mapping
+
+The U1 has four toolheads, so "which toolhead prints which of the file's filaments" is part of
+starting a print. Three sources agree on how it is done, and it is *not* JSON-RPC:
+
+- the fork's own Device page: the shipped Flutter bundle builds
+  `SET_PRINT_EXTRUDER_MAP CONFIG_EXTRUDER=<file filament> MAP_EXTRUDER=<toolhead>` per filament,
+  `SET_PRINT_USED_EXTRUDERS EXTRUDERS=<each toolhead once>`, `SET_PRINT_PREFERENCES ...`, and then
+  `printer.print.start {filename}`. Its `server.files.start_local_print` path has the routing and
+  the enum entry but **no request builder**;
+- u1hub (dlgambill/u1hub, read only) sends exactly those macros over
+  `POST /printer/gcode/script?script=...` and finishes with `SDCARD_PRINT_FILE`, which is what
+  `/printer/print/start` runs;
+- the printer itself: `server.files.start_local_print` over `POST /server/jsonrpc` answers
+  `{"code": -32601, "message": "Method not found for transport HTTP"}` - it exists only on the
+  websocket and MQTT transports.
+
+So this build sends the macros in one `POST /printer/gcode/script`, then
+`POST /printer/print/start?filename=`, all over plain HTTP. The upload always carries
+`print=false`, so a print that will not start still leaves a usable file on the printer.
+
+**The default mapping** is the nearest loaded colour: greedy over the file's filaments by "redmean"
+colour distance, one toolhead per colour, a second filament of exactly the same colour shares that
+toolhead, and anything left over falls back to the first loaded toolhead. That is u1hub's rule; the
+desktop has none of its own (the Flutter page owns matching there, and `sw_GetFileFilamentMapping`
+only reports the file's filaments plus whatever slots the person picked by hand). Material never
+decides the match - a difference only earns a warning on the phone.
+
+### 3.3 Where the printers come from
+
+`<datadir>/hub/snapmaker_lan.json` (written atomically, shared by every instance on this PC) holds
+`{id, name, model, ip, port, added_by}`, keyed by the printer's serial number when it is known and
+its address otherwise. Four sources fill it:
+
+1. **the PC's own paired devices** - `AppConfig::get_devices()`, the Device tab's "My Devices";
+2. **mDNS** - one `Bonjour("snapmaker")` pass a minute at most, the same service and TXT keys the
+   Device page's own search uses (`SSWCP.cpp:1790`);
+3. **the Stream tab's cameras** - `<datadir>/hub/streams.json`; a camera host that answers as a
+   Snapmaker is that printer, with the camera's alias as its name (Bambu cameras are left alone;
+   those printers arrive through the device manager). Re-checked when that file changes;
+4. **an address typed on the phone** - `POST /api/snapmaker/add?ip=`, which only remembers a printer
+   that answers.
+
+Each listing probes the printers side by side, with the answer cached for four seconds, so a
+printer that is off never holds the list up.
+
+### 3.4 The API
+
+- `GET /api/snapmaker/devices` -> `{devices: [{id, name, model, ip, port, added_by, online,
+  login_required, state, printing, task, percent, layer, total_layers, bed_temp, bed_target,
+  nozzle_temp, nozzle_target, left_time_s, toolheads: [{index, type, sub_type, vendor, color,
+  loaded, official, nozzle}]}], connect: {...}, printer_preset, is_snapmaker}`. `connect` is the
+  optional PC-side MQTT connection of section 4.
+- `POST /api/snapmaker/add?ip={address}` (accepts `host:port`) -> the identified printer, or 404.
+- `POST /api/snapmaker/remove?id={device}` -> 200. A printer that a source keeps finding comes back
+  on the next pass; the phone only offers Remove on one that was typed in.
+- `GET /api/printers` carries every LAN printer as `sm:{id}`, `kind: "snapmaker"`, with `online`,
+  `printing`, `can_upload` / `can_print` (both false when the printer asks for a login), and its
+  `toolheads`.
+- `POST /api/plates/{i}/send` with `printer=sm:{id}`:
+  - `mode=upload` - multipart upload, then `/server/files/metadata` as proof;
+  - `mode=print&confirm=1[&mapping=0:2,1:1,...]` - the same upload, then the mapping macros and the
+    start. Every filament the file uses needs a toolhead; without `mapping` the colour match above
+    is used. `force=1` allows a toolhead that has nothing loaded.
+  - 409 when the printer is printing or paused, asks for a login, or is not answering.
+  - The job result carries `filaments` (index, colour, type, grams, the toolhead each got),
+    `mapping`, `mapping_script`, `uploaded`, `size`, `start`, and `printer_state` - what the printer
+    itself reported in the ten seconds after the start.
+  - `dry_run=1` stops before the transfer and reports all of the above: that is how the phone asks
+    for the proposed mapping before it shows the mapping step.
+
+A printer that is both on the LAN list and connected on the PC appears twice in the send picker -
+once as `sm:{id}` (marked *LAN*) and once as `connect` (marked *connected*). They are two different
+ways to reach the same machine and either works; the LAN one needs nothing set up.
+
+### 3.5 The phone
+
+The Devices tab's *Snapmaker* section lists the LAN printers with their live state, progress,
+temperatures and a swatch per toolhead, polled every five seconds like the Bambu cards; below them
+an address field adds a printer, and a printer that was typed in can be removed. The PC-side MQTT
+connect is a small secondary button on the printers that support it, marked optional.
+
+In the Send sheet, choosing **Upload & print** for a Snapmaker asks the PC for a dry run first and
+turns the confirmation into a **mapping step**: one row per filament the file uses (its colour, its
+material, its weight) with a toolhead picker showing what each toolhead holds, pre-filled with the
+colour match and warning where the material differs or a toolhead is empty. **Start print** then
+sends the mapping with the send.
+
+## 4. The PC-side MQTT connect (optional)
 
 The send above only sees a Snapmaker when the PC's Device tab is *connected* to one
 (`wxGetApp().get_connect_host`). Until someone picks a device in that page's "My Devices" list the
 tab says "Unconnected", and the phone had no way to do the picking, so a phone send never had a
 Snapmaker to send to.
 
-### 3.1 What the desktop's pick does (anchors)
+### 4.1 What the desktop's pick does (anchors)
 
 The Device tab is the Flutter page (`resources/web/flutter_web`, loaded as
 `…/web/flutter_web/index.html?path=2`), talking to `src/slic3r/GUI/SSWCP.cpp`:
@@ -199,14 +320,14 @@ certificate comes from the pairing exchange (`Moonraker_Mqtt::ask_for_tls_info`,
 own storage**: the success path deliberately blanks it before saving (`SSWCP.cpp:6716-6718`,
 `info.ca = /* auth_info["ca"] */ ""`). So AppConfig alone is not enough to reconnect a device.
 
-### 3.2 The headless connect
+### 4.2 The headless connect
 
 `src/slic3r/GUI/RemoteSnapmaker.{hpp,cpp}` (new) performs steps 2-5 above without the page:
 
 - `list(json&)` (GUI thread) — the stored devices without anything secret, `is_host`, the current
   printer preset and whether it is a Snapmaker; `probe_online(json&)` (request thread) adds
   `online` from a short TCP probe of each device's MQTT port.
-- `connect(dev_id)` (request thread, blocking) — finds the device, fills in its certificate (§3.3),
+- `connect(dev_id)` (request thread, blocking) — finds the device, fills in its certificate (§4.3),
   builds the `Moonraker_Mqtt` host exactly as `sw_mqtt_set_engine` does, opens its own
   `mqtts://ip:port` `MqttClient`, hands it over with `set_engine`, subscribes the printer's topics
   (new helper `Moonraker_Mqtt::subscribe_device_topics`, the block `connect()` runs after its own
@@ -220,7 +341,7 @@ own storage**: the success path deliberately blanks it before saving (`SSWCP.cpp
 - No pairing: a device with no certificate is refused with a 409 that says to connect it once on
   the PC. No dialog is ever shown, and nothing here starts a print.
 
-### 3.3 The certificate, and why it is opt-in
+### 4.3 The certificate, and why it is opt-in
 
 `RemoteSnapmaker::remember_credentials(sn, connect_params)` is called from `sw_mqtt_set_engine`
 (one line, where the connect parameters are complete) and keeps ca/cert/key/clientId/port for that
@@ -231,19 +352,19 @@ use a Snapmaker the PC connected; `connect` answers 409 and says what to do. Del
 clearing the setting) takes the phone's connect away again. Nothing in that file is ever sent to
 the phone: `/api/snapmaker/devices` reports only `can_connect`.
 
-### 3.4 The API (per instance)
+### 4.4 The API (per instance)
 
 - `GET /api/snapmaker/devices` — `{devices: [{id, name, model, ip, port, sn, preset, nozzles,
   connected, online, is_host, can_connect, link_mode}], connected, host, host_online,
   printer_preset, is_snapmaker, use_new_connect}`.
 - `POST /api/snapmaker/connect?id={device}` — 200 (also when it is already the host), 400 without
-  an id, 404 unknown device, 409 no certificate (see §3.3), 502 the printer did not accept the
+  an id, 404 unknown device, 409 no certificate (see §4.3), 502 the printer did not accept the
   connection, 504 it accepted but did not answer.
 - `POST /api/snapmaker/disconnect` — 200, 409 when nothing is connected.
 - After a successful connect, `GET /api/printers` carries the `connect` printer
   (`RemoteSend::list_hosts`) and a plate can be sent to it.
 
-### 3.5 Also on the phone page
+### 4.5 Also on the phone page
 
 - **Devices tab**: a *Snapmaker* section above the Bambu list — one card per paired device (name,
   model, state, ip, nozzles) with **Connect**, and **Disconnect** on the connected one; the 5 s
@@ -260,7 +381,7 @@ the phone: `/api/snapmaker/devices` reports only `can_connect`.
 - The *Show on PC* / *Hide on PC* button is now an **eye icon** at the end of the slicer row: open
   when the window is on the PC, struck through when it is hidden. The tooltip keeps the old wording.
 
-## 4. Safety rules
+## 5. Safety rules
 
 - A print never starts without `confirm=1` from the phone, and the page asks the person first.
 - One send at a time per instance; the plate must be sliced and printable.
@@ -270,7 +391,7 @@ the phone: `/api/snapmaker/devices` reports only `can_connect`.
   only thing the automated gate sends to a Bambu printer.
 - The access code never leaves the PC (`password_set` only).
 
-## 5. Verified (2026-09-03, gate `snorca_hubtest\test_phone_send.py`)
+## 6. Verified (2026-09-03, gate `snorca_hubtest\test_phone_send.py`)
 
 Against an instance on the isolated `dd_phone` data dir with `mock_printhost.py` on
 127.0.0.1:18089 registered as the user preset "Snapmaker U1 (0.4 nozzle) - Mock host"
@@ -287,7 +408,41 @@ Against an instance on the isolated `dd_phone` data dir with `mock_printhost.py`
   the flags as requested (`bed_leveling=0 flow_cali=1 timelapse=0`), layer inspect on, vibration
   off, the plate's bed type and `<name>_plate_1` as preset name; no dry run reached the mock.
 
-### 5.1 The Snapmaker connect (gate `snorca_hubtest\test_phone_snapmaker.py`)
+### 6.1 Snapmaker over the LAN (gate `snorca_hubtest	est_phone_snapmaker_lan.py`)
+
+All green on an instance over the isolated `dd_lan` data dir, with `mock_printhost.py` standing in
+for a U1 (four loaded toolheads, the real printer's own `print_task_config` shape):
+
+- the three routes are in the manifest and the hub's allow-list, and `GET` on the two POST routes is
+  not proxied;
+- the mock is added by address, identifies itself from `/machine/system_info`, and is listed with
+  four toolheads whose colours (`#FEE5A5`, `#E0E0E0`, `#F4C032`, `#000000`), materials, loaded flags
+  and nozzle diameters come straight from `print_task_config`; an address with nothing on it is
+  refused;
+- `GET /api/printers` carries it as `sm:{sn}`, kind `snapmaker`, with its toolheads;
+- a dry run reports the file's five filaments with grams and the colour match it proposes, and sends
+  nothing;
+- **upload**: the mock receives the plate's G-code with `print=false` and `root=gcodes`, the size is
+  read back with `/server/files/metadata`, and nothing is started;
+- **upload + print**: one `/printer/gcode/script` call carrying
+  `SET_PRINT_EXTRUDER_MAP CONFIG_EXTRUDER=0 MAP_EXTRUDER=2` … `SET_PRINT_USED_EXTRUDERS
+  EXTRUDERS=2,1,3,0` … `SET_PRINT_PREFERENCES …`, then one `/printer/print/start` for that file, and
+  the job waits until the printer reports `printing`;
+- refusals: a printer mid-print (409), a toolhead the printer does not have, a malformed mapping, a
+  mapping that leaves a filament out (400 each), an unknown printer (404);
+- the printer can be removed again.
+
+Against the user's own U1s, read-only: all three answer, 10.0.0.108 is listed with its four
+toolheads and colours, `login_required` is false, and the upload contract was proven once with a
+comment-only `snorca_phone_test.gcode` (201, `print_started: false`, metadata matched, deleted
+again). No print was started on a real printer. In a browser at 375x812 the Devices tab showed the
+two printers the Stream tab's cameras contributed with live state, temperatures and a swatch per
+toolhead, and the Send sheet's mapping step pre-filled itself from 10.0.0.106's real toolheads
+(black, red, blue, purple).
+
+`test_phone_send.py` (31 checks) and the phase-0a security gate pass unchanged on the same build.
+
+### 6.1a The Snapmaker connect (gate `snorca_hubtest\test_phone_snapmaker.py`)
 
 Against an instance on the isolated `dd_sm` data dir (three U1s seeded from what the printers
 themselves report, `seed_sm_device.py`), all green:
@@ -309,9 +464,9 @@ themselves report, `seed_sm_device.py`), all green:
 
 `test_phone_send.py` (31 checks) and the phase-0a security gate pass unchanged on the same build.
 What the gate cannot do is connect to a printer: the certificate for one only exists after a PC
-connect with `snapmaker_remember_keys` on (§3.3).
+connect with `snapmaker_remember_keys` on (§4.3).
 
-## 6. For the user to verify on hardware (start with upload only)
+## 7. For the user to verify on hardware (start with upload only)
 
 1. **Bambu, upload only**: Prepare → Send → pick the printer (LAN mode) → Upload. The file should
    appear on the printer's SD card / storage under the project name; nothing starts.
@@ -319,20 +474,22 @@ connect with `snapmaker_remember_keys` on (§3.3).
    an H2-series printer with LAN-only mode + Developer Mode on): the print should start; the sheet
    should end with "Printing started." within ~12 s. With Developer Mode off on an H2-series
    printer, expect the refusal with the hint instead of silence.
-3. **Snapmaker U1, connecting from the phone**: set `snapmaker_remember_keys` to `1` in the app
-   settings, then connect the U1 once on the PC's Device tab as usual — that connect leaves its
-   certificate behind. Restart the slicer (the Device tab says "Unconnected" again), open the
-   phone's **Devices** tab: the printer is listed under *Snapmaker* as *reachable*; tap **Connect**.
-   Within a few seconds it should read *connected*, the PC's Device tab should show the same
-   printer connected, and the phone's Send picker should offer "Snapmaker …". **Disconnect** takes
-   it back down.
-4. **Snapmaker U1, sending**: with it connected (from the phone or the PC), Upload, then
-   Upload & print. The print starts with the filaments as sliced (no mapping page).
-5. **A classic print host** (Moonraker/Klipper via HTTP): set `print_host` in the printer preset;
+3. **Snapmaker U1 over the LAN, nothing connected**: open the phone's **Devices** tab. The U1s
+   should be listed under *Snapmaker* with what they are doing, their temperatures and a swatch per
+   toolhead — with no connect anywhere. One that is missing can be added by its address.
+4. **Snapmaker U1, upload**: Prepare → Send → pick the printer (marked *LAN*) → Upload. The file
+   appears on the printer's own file list under the project name; nothing starts.
+5. **Snapmaker U1, upload and print**: Send → the printer → **Upload & print** → check the toolhead
+   for each filament (pre-filled by colour; change any row) → **Start print**. The printer should
+   begin that file on those toolheads, and the sheet should end with "Printing started."
+6. **Optional, the old path**: *Connect on PC* on a printer's card still makes the PC's Device tab
+   connect over MQTT (§4), and the picker then also offers it as *connected*. Sending does not
+   need it.
+7. **A classic print host** (Moonraker/Klipper via HTTP): set `print_host` in the printer preset;
    Upload works; Upload & print is refused for plain Moonraker (needs the PC's preprint page) and
    works for OctoPrint-style hosts.
 
-## 7. Not done / follow-ups
+## 8. Not done / follow-ups
 
 - Snapmaker filament mapping at print start (`server.files.start_local_print` payload).
 - Post-processing scripts and the output-name template for classic print hosts.

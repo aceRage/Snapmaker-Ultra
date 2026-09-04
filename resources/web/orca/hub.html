@@ -77,12 +77,20 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
             var canvas = el('canvas', 'qr'); body.appendChild(canvas); drawQr(canvas, info.url);
             body.appendChild(el('div', 'url', info.url));
             if (info.ips && info.ips.length > 1) body.appendChild(el('div', 'note', 'Other addresses of this PC: ' + info.ips.slice(1).join(', ')));
+            body.appendChild(el('div', 'note', 'This is the same link as last time: it survives turning phone access off and on, and restarting the PC. '
+                + '"New link" replaces it - saved links, QR codes and home-screen icons made from the old link all stop working.'));
             var off = el('span', 'btn dim', 'Turn off'); off.onclick = function() { post('/hub/phone?on=0').then(refresh); }; body.appendChild(off);
+            var relink = el('span', 'btn dim', 'New link');
+            relink.onclick = function() {
+                if (!confirm('Make a new link?\n\nThis link stops working. Saved links, QR codes and home-screen icons made from it all have to be made again from the new code.')) return;
+                post('/hub/newlink').then(refresh);
+            };
+            body.appendChild(relink);
         } else if (info.phone) {
             body.appendChild(el('div', 'err', 'On, but no network address was found on this PC.'));
             var off2 = el('span', 'btn dim', 'Turn off'); off2.onclick = function() { post('/hub/phone?on=0').then(refresh); }; body.appendChild(off2);
         } else {
-            body.appendChild(el('div', '', 'Off. Turn it on to get a link for phones on the same Wi-Fi; anyone with the link can watch the cameras and drive the slicers while it is on.'));
+            body.appendChild(el('div', '', 'Off. Turn it on to get a link for phones on the same Wi-Fi - the same link as last time; anyone with the link can watch the cameras and drive the slicers while it is on.'));
             var on = el('span', 'btn', 'Turn on'); on.onclick = function() { post('/hub/phone?on=1').then(refresh); }; body.appendChild(on);
         }
     }

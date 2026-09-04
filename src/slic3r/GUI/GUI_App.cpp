@@ -3973,8 +3973,10 @@ void GUI_App::start_remote_access()
     RemoteAccess::get().set_hidden(m_hub_managed); // before start(): goes into <pid>.json
     RemoteAccess::get().start();
 
-    // Phone access left on last time: bring the hub up with the same link. SNORCA_PHONE_ACCESS=<token>
-    // in the environment does the same without touching the saved settings (headless/agent use).
+    // Phone access left on last time: bring the hub up with the same link. The token here only
+    // seeds a data folder that has never had one - the hub remembers its own and keeps it, so a
+    // "New link" made from the tray is not undone by a slicer starting with an older copy.
+    // SNORCA_PHONE_ACCESS=<token> does the same without touching the saved settings (agent use).
     wxString    env_token;
     std::string token;
     bool        phone = false;

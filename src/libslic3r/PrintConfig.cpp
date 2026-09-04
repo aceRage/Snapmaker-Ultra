@@ -9250,7 +9250,7 @@ CLIMiscConfigDef::CLIMiscConfigDef()
 
     def = this->add("hub_token", coString);
     def->label = L("Hub phone-access token");
-    def->tooltip = L("With --hub: reuse this token for the phone link.");
+    def->tooltip = L("With --hub: the token for the phone link, used only if this data folder has no link yet. A link it already remembers is kept.");
     def->cli_params = "token";
     def->set_default_value(new ConfigOptionString());
 

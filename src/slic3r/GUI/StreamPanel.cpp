@@ -81,8 +81,10 @@ void StreamPanel::OnScriptMessage(wxWebViewEvent& evt)
         // for streams that outlive this window. Remembered here if no hub runs yet.
         const std::string state = msg.Mid(13).ToStdString(wxConvUTF8);
         std::thread([state]() { RemoteHub::post_state(state); }).detach();
-    } else if (msg == "remote_on" || msg == "remote_off" || msg == "remote_info") {
-        // The toggle is remembered (with its token, so a scanned link survives restarts).
+    } else if (msg == "remote_on" || msg == "remote_off" || msg == "remote_info" || msg == "remote_newlink") {
+        // The toggle is remembered, and so is the link: the same one comes back after off/on and
+        // after a restart, because it is in QR codes people scanned and icons they installed.
+        // "New link" is the only thing that replaces it, and the page says what that breaks.
         wxWeakRef<StreamPanel> weak(this);
         const std::string      saved_token = wxGetApp().app_config->get("stream_phone_token");
         const std::string      what        = msg.ToStdString();
@@ -92,17 +94,21 @@ void StreamPanel::OnScriptMessage(wxWebViewEvent& evt)
                 info = RemoteHub::ensure_running(saved_token, true);
             else if (what == "remote_off")
                 info = RemoteHub::set_phone(false);
+            else if (what == "remote_newlink")
+                info = RemoteHub::new_link();
             else
                 info = RemoteHub::query();
             wxGetApp().CallAfter([weak, what, info]() {
                 auto* cfg = wxGetApp().app_config;
-                if (what == "remote_on") {
+                if (what == "remote_on")
                     cfg->set("stream_phone_access", info.alive && info.phone ? "1" : "0");
-                    cfg->set("stream_phone_token", info.token);
-                } else if (what == "remote_off") {
+                else if (what == "remote_off")
                     cfg->set("stream_phone_access", "0");
-                    cfg->set("stream_phone_token", "");
-                }
+                // Remember whatever link the hub is using now - after a new one, and after it was
+                // turned off too: off stops the link, it does not throw it away. This is what a
+                // later hub is seeded with if it comes up with no memory of its own.
+                if (!info.token.empty())
+                    cfg->set("stream_phone_token", info.token);
                 if (weak == nullptr || weak->m_browser == nullptr)
                     return;
                 WebView::RunScript(weak->m_browser, wxString::Format("if (window.__remoteInfo) window.__remoteInfo(%s);", wxString::FromUTF8(info.json())));

@@ -177,27 +177,6 @@ static std::string client_id_for(const DeviceInfo& d)
     return d.sn.empty() ? std::string("Snapmaker Orca") : ("Snapmaker Orca " + d.sn);
 }
 
-// Is the device's MQTT port open? The stored list says nothing about liveness and the phone needs
-// to know which device it can connect to before it taps Connect.
-static bool port_open(const std::string& ip, int port, int timeout_ms)
-{
-    if (ip.empty())
-        return false;
-    try {
-        asio::io_context ioc;
-        asio::ip::tcp::socket        s(ioc);
-        asio::ip::tcp::endpoint      ep(asio::ip::make_address(ip), (unsigned short) port);
-        boost::system::error_code    ec = asio::error::would_block;
-        s.async_connect(ep, [&ec](const boost::system::error_code& e) { ec = e; });
-        ioc.run_for(std::chrono::milliseconds(timeout_ms));
-        boost::system::error_code ig;
-        s.close(ig);
-        return !ec;
-    } catch (...) {
-        return false;
-    }
-}
-
 static bool is_snapmaker_preset()
 {
     PresetBundle* bundle = wxGetApp().preset_bundle;
@@ -250,19 +229,6 @@ void list(json& out)
     out["printer_preset"]  = wxGetApp().preset_bundle ? wxGetApp().preset_bundle->printers.get_selected_preset_name() : "";
     out["is_snapmaker"]    = is_snapmaker_preset();
     out["use_new_connect"] = wxGetApp().app_config->get("use_new_connect") == "true";
-}
-
-// Request thread, after list(): is each device answering on its MQTT port? Sequential, with a
-// short deadline - the phone polls this and a device that is off must not hold the answer up.
-void probe_online(json& out)
-{
-    if (!out.contains("devices"))
-        return;
-    for (json& d : out["devices"]) {
-        const std::string ip   = d.value("ip", std::string());
-        const int         port = d.value("port", 1884);
-        d["online"] = d.value("connected", false) || port_open(ip, port, 700);
-    }
 }
 
 // --------------------------------------------------------------- connect ----
