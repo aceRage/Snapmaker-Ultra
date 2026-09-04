@@ -217,7 +217,8 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         function redraw() {
             var s = (server.value || 'https://ntfy.sh').replace(/\/+$/, ''), t = topic.value.trim();
             if (!t) { link.textContent = ''; return; }
-            drawQr(canvas, s + '/' + t);
+            // ntfy:// opens the ntfy app straight at the subscribe step; the https link only opens a browser tab.
+            drawQr(canvas, s.replace(/^https?:\/\//, 'ntfy://') + '/' + t);
             link.textContent = s + '/' + t + '   ·   ' + s.replace(/^https?:\/\//, 'ntfy://') + '/' + t;
         }
         gen.onclick = function() { topic.value = randomTopic(); redraw(); };
