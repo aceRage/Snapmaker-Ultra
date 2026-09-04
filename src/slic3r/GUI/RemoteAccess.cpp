@@ -10,6 +10,7 @@
 #include "OptionsGroup.hpp"
 #include "PresetComboBoxes.hpp"
 #include "RemoteControl.hpp"
+#include "RemoteEvents.hpp"
 #include "RemoteHub.hpp"
 #include "RemoteSend.hpp"
 #include "RemoteSnapmaker.hpp"
@@ -270,7 +271,13 @@ static DialogPolicyHook s_dialog_hook;
 class GuiHeartbeat : public wxTimer
 {
 public:
-    void Notify() override { RemoteAccess::get().heartbeat_review(g_modal_depth); }
+    void Notify() override
+    {
+        RemoteAccess::get().heartbeat_review(g_modal_depth);
+        // The printer event watcher rides on this tick: it needs the GUI thread for the Bambu
+        // MachineObjects anyway, and it polls at its own, slower rate (RemoteEvents.cpp).
+        RemoteEvents::heartbeat();
+    }
 };
 static GuiHeartbeat* s_heartbeat = nullptr;
 
@@ -436,6 +443,7 @@ void RemoteAccess::stop()
     if (!m_on)
         return;
     m_on = false;
+    RemoteEvents::stop();
     if (s_heartbeat) s_heartbeat->Stop();
     boost::system::error_code ig;
     fs::remove(fs::path(RemoteHub::instances_dir()) / (std::to_string(wxGetProcessId()) + ".json"), ig);
@@ -1793,13 +1801,33 @@ RemoteAccess::ApiResponse RemoteAccess::api_attention_clear()
     return api_info();
 }
 
+// What this instance's watcher has seen (RemoteEvents). The hub keeps the real, merged history;
+// this ring is per instance and is what a person debugging one printer wants to read.
+RemoteAccess::ApiResponse RemoteAccess::api_events(int since)
+{
+    ApiResponse r;
+    r.body = RemoteEvents::recent(since).dump();
+    return r;
+}
+
 // Test hooks, only with SNORCA_DEBUG_ROUTES=1: sleep = block the GUI thread (watchdog), modal =
-// a plain wxMessageDialog through the policy hook, file = a wxFileDialog (needs a person).
-RemoteAccess::ApiResponse RemoteAccess::api_debug(const std::string& what, const std::string& query)
+// a plain wxMessageDialog through the policy hook, file = a wxFileDialog (needs a person),
+// events = run the event watcher's transition rule over snapshots from the body (no printers).
+RemoteAccess::ApiResponse RemoteAccess::api_debug(const std::string& what, const std::string& query, const std::string& body)
 {
     ApiResponse r;
     wxString    on;
     if (!wxGetEnv("SNORCA_DEBUG_ROUTES", &on) || on != "1") { r.status = 404; r.body = json_error("debug routes are off"); return r; }
+    if (what == "events") {
+        // Pure: no GUI thread, no printer, no clock. This is how the transition rule is covered.
+        try {
+            r.body = RemoteEvents::replay(nlohmann::json::parse(body.empty() ? "{}" : body)).dump();
+        } catch (const std::exception& e) {
+            r.status = 400;
+            r.body   = json_error(std::string("the snapshots are not JSON: ") + e.what());
+        }
+        return r;
+    }
     auto out = std::make_shared<nlohmann::json>();
     int  ms  = 20000;
     try { const std::string v = query_param(query, "ms"); if (!v.empty()) ms = std::stoi(v); } catch (...) {}
@@ -1985,6 +2013,7 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "POST"}, {"path", "/api/printers/{id}/control"},  {"description", "form action=pause|resume|stop[&confirm=1][&dry_run=1]: pause, resume or stop the print on that printer, exactly as the desktop's own buttons do (stop = cancel the print and needs confirm=1; pause and resume do not). Returns a job id; the job's result says what the printer then reported. 409 when the printer's own state does not allow it (see can_pause / can_resume / can_stop). {id} is any id /api/printers lists, sm:{id} for a Snapmaker over the LAN included"} },
             { {"method", "POST"}, {"path", "/api/slice?plate={index}|all"}, {"description", "start slicing one plate (selects it) or all; returns a job id; 409 while slicing"} },
             { {"method", "POST"}, {"path", "/api/plates/{index}/send"},    {"description", "form printer={id}&mode=upload|print[&confirm=1][&force=1][&dry_run=1][&bed_leveling=0|1&flow_cali=0|1&timelapse=0|1&vibration_cali=0|1&use_ams=0|1][&name=][&mapping=0:1,1:2]: send the sliced plate to a printer exactly like the desktop's Send / Print dialogs (upload = to the printer's storage, print = start it; print needs confirm=1). A Snapmaker over the LAN (printer sm:{id}) takes `mapping` = which toolhead prints each of the file's filaments, defaulting to the colour match its own app makes; returns a job id; 409 unless the plate is sliced and no other send is running"} },
+            { {"method", "GET"},  {"path", "/api/events?since={id}"},      {"description", "what this instance's printer watcher has seen, newest last: {events, last_id}. Each event is {local_id, time, instance, printer {id, name, kind}, kind started|finished|failed|cancelled|paused|resumed|runout|error, severity info|warning|error, title, text, code?, job?}. The hub keeps the merged history of every instance at /events on the phone link"} },
             { {"method", "GET"},  {"path", "/api/jobs"},                   {"description", "recent jobs"} },
             { {"method", "GET"},  {"path", "/api/jobs/{id}"},              {"description", "job state: kind slice|send, running | done | error | cancelled, percent, text; send jobs add printer, mode and result (what was sent, or the composed parameters of a dry run)"} },
             { {"method", "GET"},  {"path", "/api/snapmaker/devices"},      {"description", "the Snapmaker printers on the LAN (from this PC's paired devices, an mDNS pass, the Stream tab's cameras and what was added by hand) with live state, temperatures and what each toolhead holds; plus `connect`, the optional MQTT connection the PC's Device tab makes"} },
@@ -2014,7 +2043,9 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
     if (path == "/attention/clear" && method == "POST")
         return api_attention_clear();
     if (path.compare(0, 7, "/debug/") == 0 && method == "POST")
-        return api_debug(path.substr(7), query);
+        return api_debug(path.substr(7), query, body);
+    if (path == "/events" && method == "GET")
+        return api_events(num(query_param(query, "since"), 0));
     if (path == "/quit" && method == "POST") {
         std::string d = query_param(query, "discard");
         if (d.empty()) d = query_param(body, "discard");
