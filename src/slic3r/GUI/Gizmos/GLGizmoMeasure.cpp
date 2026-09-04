@@ -17,7 +17,7 @@
 
 #include <numeric>
 
-#include <GL/glew.h>
+#include <glad/gl.h>
 
 #include <tbb/parallel_for.h>
 
