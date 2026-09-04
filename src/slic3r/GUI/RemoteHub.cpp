@@ -4,6 +4,7 @@
 #include "RemoteHub.hpp"
 
 #include "BambuCamRelay.hpp"
+#include "RemoteNotify.hpp"
 #include "libslic3r/Utils.hpp"
 #include "slic3r/Utils/Http.hpp"
 
@@ -1214,6 +1215,7 @@ private:
     json  info_json();
     json  instances_json();
     void  write_hub_json();
+    void  update_notify_link(); // tell RemoteNotify which link a notification should open
     bool  bind(bool lan);
     bool  bind_admin();
     void  accept_loop(std::shared_ptr<tcp::acceptor> acceptor, bool admin);
@@ -1342,7 +1344,32 @@ void HubServer::write_hub_json()
         st["token"]      = m_token;
         st["old_tokens"] = m_old_tokens;
     }
+    // The notification destinations live here too, and for the same reason: a hub restart must
+    // not lose the relay somebody set up. RemoteNotify owns them; this is the only writer of the
+    // file, so it asks for them rather than keeping a second copy.
+    st["notify"] = RemoteNotify::settings_json();
     write_file(settings_json_path(), st.dump(2));
+    update_notify_link();
+}
+
+// The link a notification should open on the phone. The Tailscale one first, because it works
+// from anywhere; the Wi-Fi one otherwise; nothing at all while phone access is off, and then the
+// relay simply gets no link rather than one that cannot resolve.
+void HubServer::update_notify_link()
+{
+    std::string link;
+    bool        phone;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        phone = m_phone;
+        if (m_remote_on && m_ts.serving && !m_ts.dns_name.empty()) link = "https://" + m_ts.dns_name + "/r/" + m_token + "/";
+    }
+    if (link.empty() && phone) {
+        const std::vector<std::string> ips = lan_ips();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!ips.empty()) link = "http://" + ips.front() + ":" + std::to_string(m_port) + "/r/" + m_token + "/";
+    }
+    RemoteNotify::set_phone_link(link);
 }
 
 // ------------------------------------------------------- printer events ----
@@ -1415,6 +1442,8 @@ void HubServer::accept_event(json& event)
     event = e; // the caller answers with what was really stored
 
     // P5 (relay notifications) sends from here: one call with `e`, off this thread.
+    update_notify_link();
+    RemoteNotify::deliver(e); // queued; this thread never waits on a relay
 
     // On the PC: anything that went wrong, and the one piece of good news worth interrupting for.
     if (sev == "warning" || sev == "error" || e["kind"] == "finished")
@@ -2100,6 +2129,26 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
         // working, so the hub page and the tray both ask the person before calling it.
         new_link();
         respond_json(client, 200, info_json().dump());
+    } else if (r.path == "/hub/notify" && r.method == "GET") {
+        // Every credential here (an ntfy topic, a Pushover key, a webhook's secret path) comes
+        // back masked to its last four characters. This route lives on the admin listener, so
+        // the phone origin cannot reach it at all.
+        respond_json(client, 200, RemoteNotify::masked_json().dump());
+    } else if (r.path == "/hub/notify" && r.method == "POST") {
+        if (r.content_type.compare(0, 16, "application/json") != 0) { respond_json(client, 415, json_error("Content-Type must be application/json")); return; }
+        std::string body;
+        if (!read_small_body(client, r, body, 64 * 1024)) { respond_json(client, 413, json_error("that is too large for a destination")); return; }
+        const auto res = RemoteNotify::configure(body);
+        if (res.first == 200) write_hub_json();
+        respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/notify" && r.method == "DELETE") {
+        const auto res = RemoteNotify::remove(query_param(r.query, "id"));
+        if (res.first == 200) write_hub_json();
+        respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/notify/test" && r.method == "POST") {
+        update_notify_link();
+        const auto res = RemoteNotify::test(query_param(r.query, "id"), "");
+        respond_json(client, res.first, res.second);
     } else if (r.path == "/hub/quit" && r.method == "POST") {
         respond_json(client, 200, "{\"ok\":true}");
         m_quit = true;
@@ -2482,9 +2531,13 @@ bool HubServer::start()
     // Remote access settings live in their own file: hub.json is removed on a clean quit (it
     // is how instances find a live hub), which used to lose remote_on and the allow-list and
     // left Tailscale Serve answering 403 until remote access was switched on again.
+    json notify_saved = json::object();
     try {
         json j      = json::parse(read_file(settings_json_path()));
         m_remote_on = j.value("remote_on", false);
+        // ... and so do the notification destinations: an ntfy topic or a Pushover key set up
+        // once must survive every hub restart.
+        notify_saved = j.value("notify", json::object());
         for (const auto& l : j.value("allowed_logins", json::array())) m_allowed_logins.push_back(lower(l.get<std::string>()));
         // ... and so does the phone link, for the same reason: hub.json is gone after a clean
         // quit, and a hub that came back with a new token would break every saved link. The
@@ -2502,6 +2555,7 @@ bool HubServer::start()
     m_secret = random_hex(16);
     m_state  = read_file(streams_json_path());
     load_events(); // what the printers did before this hub was restarted, and where the ids got to
+    RemoteNotify::start(notify_saved); // the relay worker; deliver() is a no-op until it has one
 
     gc_uploads(); // whatever last time left behind, before anything new lands
     start_go2rtc();
@@ -2557,6 +2611,7 @@ void HubServer::shutdown()
 #ifndef _WIN32
     if (m_go2rtc_pid > 0) ::kill((pid_t) m_go2rtc_pid, SIGTERM);
 #endif
+    RemoteNotify::stop(); // let an in-flight relay send finish, then join the worker
     // On Windows the kill-on-close job object takes go2rtc down with us.
     flush_logs();
 }

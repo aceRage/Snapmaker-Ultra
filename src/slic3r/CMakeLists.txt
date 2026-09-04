@@ -412,6 +412,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/SnapmakerLan.hpp
     GUI/RemoteHub.cpp
     GUI/RemoteHub.hpp
+    GUI/RemoteNotify.cpp
+    GUI/RemoteNotify.hpp
     GUI/PrintHostDialogs.cpp
     GUI/PrintHostDialogs.hpp
     GUI/PrintOptionsDialog.cpp

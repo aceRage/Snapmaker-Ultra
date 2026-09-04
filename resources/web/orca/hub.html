@@ -28,6 +28,21 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
 .btn.small { padding: 2px 8px; font-size: 12px; margin: 0; }
 .addrow { display: flex; gap: 6px; align-items: center; margin: 6px 0; }
 .addrow input { flex: 1; min-width: 0; background: #2a2a2a; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+.dest { padding: 8px 10px; border-left: 4px solid #0a9e50; background: #2f2f2f; border-radius: 6px; margin-bottom: 6px; }
+.dest.off { border-left-color: #666; }
+.dest.bad { border-left-color: #8a3a3a; }
+.dest .t { font-weight: 600; color: #fff; }
+.dest .m { color: #999; font-size: 12px; word-break: break-all; }
+.badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #444; color: #bbb; margin-left: 6px; vertical-align: 1px; }
+.badge.ok { background: #17402a; color: #7fd1a0; }
+.badge.bad { background: #4a2020; color: #e88; }
+.form { background: #2a2a2a; border-radius: 6px; padding: 10px 12px; margin: 8px 0; }
+.form label { display: block; color: #999; font-size: 12px; margin: 8px 0 2px; }
+.form input { width: 100%; background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6px; padding: 3px 6px; font-size: 12px; }
+.inline { display: flex; gap: 6px; align-items: center; }
+.inline input { flex: 1; min-width: 0; }
+.dest .btn.small, .dest select { margin: 8px 6px 0 0; }
 </style>
 </head>
 <body>
@@ -38,6 +53,9 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
   <div class="card" id="remote"><h2>Remote access (Tailscale)</h2><div id="remotebody">Loading…</div></div>
   <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div>
     <div class="note">A hidden slicer runs without a window and serves the phone; Show puts its window on the desktop, Hide takes it away again (it keeps working). "Needs attention" means it hit something only a person at this PC can answer - a file dialog, first-run setup, a mandatory update - so its window has been shown; Dismiss clears the flag once handled.</div>
+  </div>
+  <div class="card" id="notify"><h2>Notifications</h2><div id="notifybody">Loading…</div>
+    <div class="note">The hub sends printer events - print finished, paused, filament runout, an error - to a push service you pick, so your phone is told with the page closed. The PC makes the call, so this works on plain Wi-Fi with no Tailscale and no home-screen install. Topics, keys and tokens are treated as passwords: this page shows only their last four characters once saved, and they never reach the phone link.</div>
   </div>
 </div>
 <div class="card hubcard" style="margin-top:16px"><h2>Hub</h2>
@@ -144,6 +162,178 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
         };
         body.appendChild(tog);
     }
+    // ---- Notifications ------------------------------------------------------------------
+    // Everything here talks to /hub/notify on the loopback control plane with the secret. The
+    // hub masks every credential it hands back, so a saved topic or key can never be read off
+    // this page again - which is also why the ntfy QR code is drawn while you are typing the
+    // topic, not afterwards.
+    var notify = null, lastNotify = null, openForm = null, testNote = {};
+    function jfetch(path, method, obj) {
+        var opt = { method: method, headers: hdrs() };
+        if (obj !== undefined) { opt.headers = { 'X-Hub-Secret': SECRET, 'Content-Type': 'application/json' }; opt.body = JSON.stringify(obj); }
+        return fetch(path, opt).then(function(r) { return r.json().then(function(j) { return { status: r.status, j: j }; }, function() { return { status: r.status, j: {} }; }); });
+    }
+    function randomTopic() {
+        var abc = 'abcdefghijkmnpqrstuvwxyz23456789', out = '', a = new Uint8Array(24);
+        (window.crypto || window.msCrypto).getRandomValues(a);
+        for (var i = 0; i < a.length; i++) out += abc[a[i] % abc.length];
+        return out;
+    }
+    function field(parent, label, value, placeholder) {
+        parent.appendChild(el('label', '', label));
+        var i = el('input'); i.value = value || ''; if (placeholder) i.placeholder = placeholder;
+        parent.appendChild(i); return i;
+    }
+    function severitySelect(value) {
+        var s = document.createElement('select');
+        [['info', 'Everything'], ['warning', 'Warnings and errors'], ['error', 'Errors only']].forEach(function(o) {
+            var op = document.createElement('option'); op.value = o[0]; op.textContent = o[1]; s.appendChild(op);
+        });
+        s.value = value || 'info'; return s;
+    }
+    function saveDest(obj, onDone) {
+        jfetch('/hub/notify', 'POST', obj).then(function(r) {
+            if (r.status !== 200) { alert(r.j.error || ('The hub refused that (' + r.status + ').')); return; }
+            openForm = null; notify = r.j; lastNotify = null; renderNotify(); if (onDone) onDone();
+        });
+    }
+    function ntfyForm(body) {
+        var f = el('div', 'form');
+        f.appendChild(el('div', 't', 'ntfy'));
+        f.appendChild(el('div', 'note', 'Free, no account. Install "ntfy" from the App Store or Play Store, subscribe to the topic below, and this PC publishes to it. Anyone who knows the topic can read your notifications and publish to it, so let the hub pick a long random one.'));
+        var name = field(f, 'Name (yours, for this list)', 'My phone');
+        var server = field(f, 'Server', 'https://ntfy.sh', 'https://ntfy.sh');
+        var topicRow = el('div', 'inline');
+        f.appendChild(el('label', '', 'Topic (this is the password - keep it secret)'));
+        var topic = el('input'); topic.value = randomTopic(); topicRow.appendChild(topic);
+        var gen = el('span', 'btn dim small', 'New topic'); topicRow.appendChild(gen);
+        f.appendChild(topicRow);
+        var token = field(f, 'Access token (only for a server that needs one)', '', 'tk_…');
+        f.appendChild(el('label', '', 'Send me'));
+        var sev = severitySelect('info'); f.appendChild(sev);
+        f.appendChild(el('div', 'note', 'Scan this with the phone now - it subscribes the ntfy app to the topic. The hub will not show the topic again after you save.'));
+        var canvas = el('canvas', 'qr'); f.appendChild(canvas);
+        var link = el('div', 'url'); f.appendChild(link);
+        function redraw() {
+            var s = (server.value || 'https://ntfy.sh').replace(/\/+$/, ''), t = topic.value.trim();
+            if (!t) { link.textContent = ''; return; }
+            drawQr(canvas, s + '/' + t);
+            link.textContent = s + '/' + t + '   ·   ' + s.replace(/^https?:\/\//, 'ntfy://') + '/' + t;
+        }
+        gen.onclick = function() { topic.value = randomTopic(); redraw(); };
+        topic.oninput = redraw; server.oninput = redraw; redraw();
+        var save = el('span', 'btn', 'Save');
+        save.onclick = function() {
+            saveDest({ type: 'ntfy', name: name.value.trim() || 'ntfy', server: server.value.trim(), topic: topic.value.trim(),
+                       token: token.value.trim(), min_severity: sev.value, enabled: true });
+        };
+        f.appendChild(save);
+        var cancel = el('span', 'btn dim', 'Cancel'); cancel.onclick = function() { openForm = null; lastNotify = null; renderNotify(); };
+        f.appendChild(cancel);
+        body.appendChild(f);
+    }
+    function pushoverForm(body) {
+        var f = el('div', 'form');
+        f.appendChild(el('div', 't', 'Pushover'));
+        f.appendChild(el('div', 'note', 'A paid app (one-off, per platform) that is reliable and quiet. Your user key is on pushover.net after you sign in; make an application there to get its API token.'));
+        var name = field(f, 'Name', 'Pushover');
+        var user = field(f, 'User key', '', 'u…');
+        var tok = field(f, 'Application token', '', 'a…');
+        f.appendChild(el('label', '', 'Send me'));
+        var sev = severitySelect('info'); f.appendChild(sev);
+        var save = el('span', 'btn', 'Save');
+        save.onclick = function() {
+            saveDest({ type: 'pushover', name: name.value.trim() || 'Pushover', user_key: user.value.trim(),
+                       app_token: tok.value.trim(), min_severity: sev.value, enabled: true });
+        };
+        f.appendChild(save);
+        var cancel = el('span', 'btn dim', 'Cancel'); cancel.onclick = function() { openForm = null; lastNotify = null; renderNotify(); };
+        f.appendChild(cancel);
+        body.appendChild(f);
+    }
+    function webhookForm(body) {
+        var f = el('div', 'form');
+        f.appendChild(el('div', 't', 'Webhook'));
+        f.appendChild(el('div', 'note', 'The whole event as JSON, posted to an address you own - Home Assistant, Gotify, Discord, Slack, your own script. https only, except to 127.0.0.1.'));
+        var name = field(f, 'Name', 'Webhook');
+        var url = field(f, 'Address', '', 'https://…');
+        var hn = field(f, 'Extra header name (optional)', '', 'Authorization');
+        var hv = field(f, 'Extra header value (optional)', '', 'Bearer …');
+        f.appendChild(el('label', '', 'Send me'));
+        var sev = severitySelect('info'); f.appendChild(sev);
+        var save = el('span', 'btn', 'Save');
+        save.onclick = function() {
+            saveDest({ type: 'webhook', name: name.value.trim() || 'Webhook', url: url.value.trim(),
+                       header_name: hn.value.trim(), header_value: hv.value.trim(), min_severity: sev.value, enabled: true });
+        };
+        f.appendChild(save);
+        var cancel = el('span', 'btn dim', 'Cancel'); cancel.onclick = function() { openForm = null; lastNotify = null; renderNotify(); };
+        f.appendChild(cancel);
+        body.appendChild(f);
+    }
+    function destLine(d) {
+        if (d.type === 'ntfy') return (d.server || 'https://ntfy.sh') + '/' + (d.topic || '');
+        if (d.type === 'pushover') return 'user ' + (d.user_key || '') + ', app ' + (d.app_token || '');
+        return (d.url_host || '') + ' … ' + (d.url || '') + (d.header_name ? '  ·  ' + d.header_name + ': ' + (d.header_value || '') : '');
+    }
+    function renderNotify() {
+        var body = document.getElementById('notifybody');
+        if (!notify) return;
+        var key = JSON.stringify(notify) + '|' + openForm;
+        if (key === lastNotify) return; // do not blow away a form somebody is typing into
+        lastNotify = key;
+        body.innerHTML = '';
+        var list = notify.destinations || [];
+        if (!list.length && !openForm) body.appendChild(el('div', 'note', 'Nothing is set up yet. Pick one below; ntfy is free and takes about a minute.'));
+        list.forEach(function(d) {
+            var row = el('div', 'dest' + (!d.enabled ? ' off' : (d.status === 'failing' ? ' bad' : '')));
+            var head = el('div', 't', (d.name || d.type) + ' · ' + d.type);
+            var badge = el('span', 'badge' + (!d.enabled ? '' : (d.status === 'failing' ? ' bad' : (d.status === 'ok' ? ' ok' : ''))),
+                           !d.enabled ? 'off' : (d.status === 'failing' ? 'failing' : (d.status === 'retrying' ? 'retrying' : 'on')));
+            head.appendChild(badge);
+            row.appendChild(head);
+            row.appendChild(el('div', 'm', destLine(d)));
+            if (d.last_error) row.appendChild(el('div', 'err', 'Last error: ' + d.last_error + (d.failures > 1 ? ' (' + d.failures + ' in a row)' : '')));
+            if (testNote[d.id]) row.appendChild(el('div', 'note', testNote[d.id]));
+            var sev = severitySelect(d.min_severity);
+            sev.onchange = function() { jfetch('/hub/notify', 'POST', { id: d.id, min_severity: sev.value }).then(function(r) { notify = r.j; lastNotify = null; renderNotify(); }); };
+            row.appendChild(sev);
+            var tog = el('span', 'btn dim small', d.enabled ? 'Disable' : 'Enable');
+            tog.onclick = function() { jfetch('/hub/notify', 'POST', { id: d.id, enabled: !d.enabled }).then(function(r) { notify = r.j; lastNotify = null; renderNotify(); }); };
+            row.appendChild(tog);
+            var test = el('span', 'btn dim small', 'Test');
+            test.onclick = function() {
+                test.textContent = 'Sending…';
+                jfetch('/hub/notify/test?id=' + encodeURIComponent(d.id), 'POST').then(function(r) {
+                    testNote[d.id] = r.j.ok ? ('Test sent, the service answered ' + r.j.status + '.')
+                                            : ('Test failed: ' + (r.j.error || ('HTTP ' + r.j.status)) + '.');
+                    lastNotify = null; refreshNotify();
+                });
+            };
+            row.appendChild(test);
+            var del = el('span', 'btn warn small', 'Remove');
+            del.onclick = function() {
+                if (!confirm('Remove "' + (d.name || d.type) + '"? The topic or key is forgotten and cannot be shown again.')) return;
+                jfetch('/hub/notify?id=' + encodeURIComponent(d.id), 'DELETE').then(function(r) { notify = r.j; lastNotify = null; renderNotify(); });
+            };
+            row.appendChild(del);
+            body.appendChild(row);
+        });
+        if (openForm === 'ntfy') ntfyForm(body);
+        else if (openForm === 'pushover') pushoverForm(body);
+        else if (openForm === 'webhook') webhookForm(body);
+        else {
+            [['ntfy', 'Add ntfy (free)'], ['pushover', 'Add Pushover'], ['webhook', 'Add a webhook']].forEach(function(o) {
+                var b = el('span', 'btn dim', o[1]);
+                b.onclick = function() { openForm = o[0]; lastNotify = null; renderNotify(); };
+                body.appendChild(b);
+            });
+        }
+    }
+    function refreshNotify() {
+        return fetch('/hub/notify', { headers: hdrs() }).then(function(r) { return r.json(); })
+            .then(function(j) { notify = j; renderNotify(); }).catch(function() {});
+    }
     function renderSlicers(list) {
         var body = document.getElementById('slicerbody');
         body.innerHTML = '';
@@ -173,6 +363,7 @@ h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
     function refresh() {
         fetch('/hub/info', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { info = j; renderPhone(); renderRemote(); document.getElementById('status').textContent = 'Hub pid ' + j.pid + ', port ' + j.port + ', version ' + j.version; }).catch(function() {});
         fetch('/hub/instances', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { renderSlicers(j.instances || []); }).catch(function() {});
+        if (!openForm) refreshNotify(); // never while a form is half typed
     }
     document.getElementById('new').onclick = function() { post('/hub/new').then(function() { setTimeout(refresh, 3000); }); };
     document.getElementById('newhidden').onclick = function() { post('/hub/new?hidden=1').then(function() { setTimeout(refresh, 3000); }); };
