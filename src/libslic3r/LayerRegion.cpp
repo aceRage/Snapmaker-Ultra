@@ -9,6 +9,7 @@
 #include "BoundingBox.hpp"
 #include "SVG.hpp"
 #include "Algorithm/RegionExpansion.hpp"
+#include "LayerRegionTextureMapping.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +40,9 @@ unsigned int effective_layer_filament_id(const Layer &layer, unsigned int filame
     // Ordinary mixed rows still print with one physical filament per layer even
     // when region collapse is disabled, so geometry / flow decisions must use
     // that effective physical filament to avoid per-layer thin-feature drift.
+    if (print->texture_mapping_manager().is_texture_mapping_zone_id(filament_id))
+        return filament_id;
+
     return print->mixed_filament_manager().effective_painted_region_filament_id(filament_id,
                                                                                 num_physical,
                                                                                 int(layer.id()),
@@ -55,6 +59,8 @@ unsigned int effective_infill_filament_id(const Layer &layer, const PrintRegionC
     const PrintObject *object = layer.object();
     const Print       *print  = object ? object->print() : nullptr;
     if (print == nullptr)
+        return filament_id;
+    if (print->texture_mapping_manager().is_texture_mapping_zone_id(filament_id))
         return filament_id;
 
     const size_t num_physical = print->config().filament_diameter.size();
@@ -179,7 +185,7 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
     }
 }
 
-void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap)
+void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap, const ExPolygons *contoning_one_wall_shell_infill)
 {
     this->perimeters.clear();
     this->thin_fills.clear();
@@ -187,6 +193,9 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     const PrintConfig       &print_config  = this->layer()->object()->print()->config();
     const PrintRegionConfig &region_config = this->region().config();
     const PrintObjectConfig& object_config = this->layer()->object()->config();
+    // ImageMap FULL PR2: TM path uses original region filament IDs so virtual zone IDs survive.
+    if (try_make_texture_mapping_perimeters(*this, slices, compatible_regions, fill_surfaces, fill_no_overlap, contoning_one_wall_shell_infill, region_config))
+        return;
     PrintRegionConfig        perimeter_config = region_config;
     perimeter_config.wall_filament.value = int(effective_layer_filament_id(*this->layer(), unsigned(std::max(0, region_config.wall_filament.value))));
     if (region_config.outer_wall_filament.value > 0)

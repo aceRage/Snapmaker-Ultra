@@ -1,2 +1,6 @@
 # Set the default behavior, in case people don't have core.autocrlf set.
 * text=auto
+
+# ImageMap FULL PR1: pigment-painter LUT is ~36.3 MiB. Track via Git LFS.
+# CI must run `git lfs pull` (or checkout with `lfs: true`) before cmake configure/build.
+deps_src/pigment-painter/lut_wide.png.c filter=lfs diff=lfs merge=lfs -text

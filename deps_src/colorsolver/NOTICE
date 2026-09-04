@@ -1,0 +1,14 @@
+ColorSolver
+Copyright (C) 2026 sentientstardust
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Vendored from OrcaSlicer-ImageMap
+https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap
+commit 92548381056dbf72836b0a1bdc455f238218dbfb (v1.0.44 lineage)
+
+The AGPL-3.0 license text is in the repository LICENSE.txt.
+ColorSolver.hpp / ColorSolver.cpp carry the same license header.

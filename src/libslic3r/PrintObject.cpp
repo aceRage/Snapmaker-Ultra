@@ -1,5 +1,6 @@
 #include "Exception.hpp"
 #include "Print.hpp"
+#include "Fill/FillTextureMapping.hpp"
 #include "BoundingBox.hpp"
 #include "ClipperUtils.hpp"
 #include "ElephantFootCompensation.hpp"
@@ -382,6 +383,12 @@ void PrintObject::make_perimeters()
     }
 
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - start";
+    // PerimeterPathV2 modulation must run before walls so slices used by the generator are modulated.
+    // Reverse order matches ImageMap (upper layers first) for top-visible sampling.
+    for (int layer_idx = int(m_layers.size()) - 1; layer_idx >= 0; --layer_idx) {
+        m_print->throw_if_canceled();
+        m_layers[layer_idx]->apply_perimeter_path_modulation_v2();
+    }
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, m_layers.size()),
         [this](const tbb::blocked_range<size_t>& range) {
@@ -392,6 +399,10 @@ void PrintObject::make_perimeters()
         }
     );
     m_print->throw_if_canceled();
+    for (Layer *layer : m_layers) {
+        m_print->throw_if_canceled();
+        layer->commit_perimeter_path_modulation_v2_fallbacks();
+    }
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - end";
 
     this->set_done(posPerimeters);
@@ -547,12 +558,27 @@ void PrintObject::infill()
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
 
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - start";
+        auto contoning_stack_plan_cache = make_top_surface_image_contoning_stack_plan_cache();
+        const bool prebuild_contoning = !this->print()->texture_mapping_manager().zones().empty();
+        if (prebuild_contoning) {
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, m_layers.size()),
+                [this, cache = contoning_stack_plan_cache.get()](const tbb::blocked_range<size_t>& range) {
+                    for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+                        m_print->throw_if_canceled();
+                        m_layers[layer_idx]->prebuild_contoning_stack_plan_cache(
+                            [this]() { m_print->throw_if_canceled(); }, cache);
+                    }
+                }
+            );
+        }
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
+            [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree, cache = contoning_stack_plan_cache.get()](const tbb::blocked_range<size_t>& range) {
                 for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                     m_print->throw_if_canceled();
-                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get());
+                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get(),
+                                                    [this]() { m_print->throw_if_canceled(); }, cache);
                 }
             }
         );
