@@ -1,7 +1,41 @@
 #!/usr/bin/env sh
 
 # Work-around https://gitlab.gnome.org/GNOME/gnome-build-meta/-/issues/754
-grep -q org.freedesktop.Platform.GL.nvidia /.flatpak-info && export WEBKIT_DISABLE_DMABUF_RENDERER=1
+# Keep WebKit DMA-BUF disabled for all NVIDIA Flatpak sessions.
+if grep -q 'org.freedesktop.Platform.GL.nvidia-' /.flatpak-info; then
+    export WEBKIT_DISABLE_DMABUF_RENDERER=1
+fi
+
+# After GLEW→GLAD, native NVIDIA GL works. Prefer opt-in Zink everywhere
+# (ZINK_FORCE_OVERRIDE=1), matching the AppImage launcher from #351.
+# Flatpak auto-Zink from #713 is kept only as a temporary fallback behind
+# ZINK_AUTO_NVIDIA=1 (NVIDIA Wayland, driver major >555).
+# ZINK_DISABLE_OVERRIDE=1 skips Zink in all cases.
+if [ "${ZINK_DISABLE_OVERRIDE:-0}" != "1" ]; then
+    zink_enable=0
+    if [ "${ZINK_FORCE_OVERRIDE:-0}" = "1" ]; then
+        zink_enable=1
+    elif [ "${ZINK_AUTO_NVIDIA:-0}" = "1" ] && [ "$XDG_SESSION_TYPE" = "wayland" ] && \
+         grep -q 'org.freedesktop.Platform.GL.nvidia-' /.flatpak-info; then
+        nvidia_driver_major=$(sed -n 's/.*org\.freedesktop\.Platform\.GL\.nvidia-\([0-9][0-9]*\)-.*/\1/p' /.flatpak-info | head -n 1)
+        if [ -n "$nvidia_driver_major" ] && [ "$nvidia_driver_major" -gt 555 ]; then
+            zink_enable=1
+        fi
+    fi
+    if [ "$zink_enable" = "1" ]; then
+        for mesa_egl_vendor in \
+            /usr/lib/*-linux-gnu/GL/default/share/glvnd/egl_vendor.d/50_mesa.json \
+            /usr/share/glvnd/egl_vendor.d/50_mesa.json; do
+            if [ -f "$mesa_egl_vendor" ]; then
+                export __GLX_VENDOR_LIBRARY_NAME=mesa
+                export __EGL_VENDOR_LIBRARY_FILENAMES="$mesa_egl_vendor"
+                export MESA_LOADER_DRIVER_OVERRIDE=zink
+                export GALLIUM_DRIVER=zink
+                break
+            fi
+        done
+    fi
+fi
 
 # Work-around https://github.com/bambulab/BambuStudio/issues/3440
 export LC_ALL=C.UTF-8
