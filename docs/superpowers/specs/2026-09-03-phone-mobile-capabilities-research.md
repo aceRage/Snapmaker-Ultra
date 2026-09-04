@@ -801,7 +801,7 @@ would silently break every phone that ever subscribed:
 "webpush": {
   "enabled": true,
   "min_severity": "info",
-  "subject": "mailto:hub@snapmaker-orca.invalid",
+  "subject": "https://github.com/aceRage/Snapmaker-Ultra",
   "vapid": {"private": "<base64url 32-byte scalar>", "public": "<base64url 65-byte point>"},
   "subscriptions": [
     {"id": "3f7a...", "endpoint": "https://web.push.apple.com/...", "p256dh": "<65 bytes>",
