@@ -285,7 +285,7 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         lastNotify = key;
         body.innerHTML = '';
         var list = notify.destinations || [];
-        if (!list.length && !openForm) body.appendChild(el('div', 'note', 'Nothing is set up yet. Pick one below; ntfy is free and takes about a minute.'));
+        if (!list.length && !openForm) body.appendChild(el('div', 'note', 'Nothing is set up yet. Pushover ($4.99 once per platform) is the reliable choice; a webhook feeds Home Assistant or IFTTT.'));
         list.forEach(function(d) {
             var row = el('div', 'dest' + (!d.enabled ? ' off' : (d.status === 'failing' ? ' bad' : '')));
             var head = el('div', 't', (d.name || d.type) + ' · ' + d.type);
@@ -324,7 +324,7 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         else if (openForm === 'pushover') pushoverForm(body);
         else if (openForm === 'webhook') webhookForm(body);
         else {
-            [['ntfy', 'Add ntfy (free)'], ['pushover', 'Add Pushover'], ['webhook', 'Add a webhook']].forEach(function(o) {
+            [['pushover', 'Add Pushover'], ['webhook', 'Add a webhook']] /* ntfy is kept in the hub but not offered: its iOS app is unmaintained and ntfy:// codes do not open it there */.forEach(function(o) {
                 var b = el('span', 'btn dim', o[1]);
                 b.onclick = function() { openForm = o[0]; lastNotify = null; renderNotify(); };
                 body.appendChild(b);
