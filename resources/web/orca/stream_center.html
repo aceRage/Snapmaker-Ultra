@@ -169,7 +169,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 .printer .ctlline.err { color: #e88; }
 .printer .ctlline.warn { color: #f0a030; }
 .printer .ctlline.ok { color: #5fd08a; }
-.printer .acts .btn.stop { background: #8a3a3a; }
+.printer .acts .btn.stop:not(.dim) { background: #8a3a3a; border-color: #8a3a3a; }
 /* Plate layout editor (full-screen sheet): top-down plate, tap to select, drag to move */
 #plate { display: none; position: fixed; inset: 0; z-index: 220; background: #262626; color: #ddd; font-size: 13px; flex-direction: column; }
 #plate .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top)); background: #1f1f1f; }

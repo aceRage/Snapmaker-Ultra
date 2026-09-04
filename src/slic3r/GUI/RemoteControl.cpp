@@ -106,6 +106,8 @@ static bool moonraker_http(const std::string& url, bool post, std::string& body,
             ok   = true;
         })
         .perform_sync();
+    // A 3xx answers through neither callback (Http::priv::http_perform); say something either way.
+    if (!ok && error.empty()) error = "no answer";
     return ok;
 }
 
@@ -118,25 +120,56 @@ static json parse_or_raw(const std::string& body)
     }
 }
 
-// Whether an address answered as a Moonraker printer the last time it was asked. prepare() runs on
-// the GUI thread and must not touch the network, so it reads what the last /api/printers probe
-// (describe_hosts, every 5 s while the phone's Devices tab is open) found there.
+// What an address answered the last time it was asked. prepare() runs on the GUI thread and must
+// not touch the network, so it reads what the last /api/printers probe (describe_hosts, every 5 s
+// while the phone's Devices tab is open) found there: whether it is a Moonraker printer at all, and
+// what it said it was doing - the print host's equivalent of a Bambu printer's can_* predicates.
+struct Probe
+{
+    bool        moonraker { false };
+    std::string state; // Klipper print_stats.state: standby | printing | paused | complete | ...
+    long long   when { 0 };
+};
 static std::mutex                   s_probe_mutex;
-static std::map<std::string, bool>  s_probes;
+static std::map<std::string, Probe> s_probes;
 
-static void remember_probe(const std::string& base, bool moonraker)
+static long long now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void remember_probe(const std::string& base, bool moonraker, const std::string& state)
 {
     std::lock_guard<std::mutex> lock(s_probe_mutex);
-    s_probes[base] = moonraker;
+    s_probes[base] = Probe { moonraker, state, now_ms() };
+}
+
+// An address that did not answer is not asked again for half a minute: /api/printers is polled
+// every 5 s and must not wait on a printer that is off, or on a print host that is not a Klipper
+// one at all (an OctoPrint address never will be).
+static bool ask_again(const std::string& base)
+{
+    std::lock_guard<std::mutex> lock(s_probe_mutex);
+    auto it = s_probes.find(base);
+    return it == s_probes.end() || it->second.moonraker || now_ms() - it->second.when > 30000;
 }
 
 // tri-state: 1 = a Moonraker printer, 0 = it answered something else, -1 = never asked.
-static int probed(const std::string& base)
+static int probed(const std::string& base, std::string* state = nullptr)
 {
     std::lock_guard<std::mutex> lock(s_probe_mutex);
     auto it = s_probes.find(base);
     if (it == s_probes.end()) return -1;
-    return it->second ? 1 : 0;
+    if (state) *state = it->second.state;
+    return it->second.moonraker ? 1 : 0;
+}
+
+// The same rule fill_from_print_stats renders as can_pause / can_resume / can_stop.
+static bool klipper_allows(const std::string& action, const std::string& state)
+{
+    if (action == "pause")  return state == "printing";
+    if (action == "resume") return state == "paused";
+    return state == "printing" || state == "paused";
 }
 
 // ---------------------------------------------------------------- prepare ----
@@ -225,9 +258,15 @@ static std::pair<int, std::string> prepare_host(const Request& req, const Action
     // These three controls are Moonraker's; the printer itself decides whether it speaks it. The
     // last status probe (describe_hosts, from every /api/printers) is the answer when there is one
     // - the GUI thread cannot ask now. Never asked yet: let the command find out. A printer the PC
-    // holds an MQTT socket to is never refused here: that socket is run()'s fallback.
-    if (!p->host && probed(base) == 0)
+    // holds an MQTT socket to is never refused for the first reason: that socket is run()'s fallback.
+    std::string state;
+    const int   seen = probed(base, &state);
+    if (!p->host && seen == 0)
         return { 409, p->printer_name + " does not answer as a Klipper / Moonraker printer, so it cannot be paused, resumed or stopped from here" };
+    if (seen == 1 && !state.empty() && !klipper_allows(req.action, state)) {
+        const std::string what = req.action == "pause" ? "paused" : req.action == "resume" ? "resumed" : "stopped";
+        return { 409, p->printer_name + " cannot be " + what + " right now (it reports " + state + ")" };
+    }
     p->url              = base + "/" + a.moonraker_path;
     p->moonraker_method = a.moonraker_method;
     out                 = p;
@@ -468,16 +507,19 @@ void describe_hosts(const std::vector<HostTarget>& targets, json& printers)
         for (json& p : printers)
             if (p.is_object() && p.value("id", std::string()) == t.id) { entry = &p; break; }
         if (!entry || t.base.empty()) continue;
-        // Read-only: what the printer says it is doing. Never a command.
         std::string body, error;
         json        stats;
-        if (moonraker_http(t.base + "/printer/objects/query?print_stats", false, body, error, 3)) {
-            const json j = parse_or_raw(body);
-            if (j.is_object())
-                stats = j.value("result", json::object()).value("status", json::object()).value("print_stats", json::object());
+        if (ask_again(t.base)) {
+            // Read-only: what the printer says it is doing. Never a command.
+            if (moonraker_http(t.base + "/printer/objects/query?print_stats", false, body, error, 2)) {
+                const json j = parse_or_raw(body);
+                if (j.is_object())
+                    stats = j.value("result", json::object()).value("status", json::object()).value("print_stats", json::object());
+            }
+            const bool ok = stats.is_object() && !stats.empty();
+            remember_probe(t.base, ok, ok ? stats.value("state", std::string()) : std::string());
         }
         const bool answered = stats.is_object() && !stats.empty();
-        remember_probe(t.base, answered);
         if (answered) {
             fill_from_print_stats(stats, *entry);
         } else {
