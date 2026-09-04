@@ -1982,6 +1982,20 @@ static bool instance_api_allowed(const std::string& method, const std::string& s
                        what == "/preview.png" || what == "/preview/status");
     }
     if (sub.compare(0, 10, "/api/jobs/") == 0) return get && is_index(sub.substr(10));
+    // /api/printers/<id>/control - <id> is a Bambu dev_id, the literal "host" / "connect" or a LAN
+    // Snapmaker's sm:<id> (hence the colon and the percent escape the page makes of it), so this
+    // segment is a name, not an index; keep it to what a printer id can hold and nothing else. The
+    // page sends it through encodeURIComponent, so a percent escape is part of that (the instance
+    // decodes it); a slash is not, encoded or otherwise, so this stays one segment.
+    if (sub.compare(0, 14, "/api/printers/") == 0) {
+        const std::string rest  = sub.substr(14);
+        const size_t      slash = rest.find('/');
+        if (slash == std::string::npos || rest.substr(slash) != "/control") return false;
+        const std::string id = rest.substr(0, slash);
+        if (!post || id.empty() || id.size() > 64) return false;
+        if (id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:%") != std::string::npos) return false;
+        return id.find("%2f") == std::string::npos && id.find("%2F") == std::string::npos;
+    }
 
     if (sub == "/api" || sub == "/api/")             return get;
     if (sub == "/api/info")                          return get;

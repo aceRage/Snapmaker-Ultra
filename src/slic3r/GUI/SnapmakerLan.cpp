@@ -541,6 +541,15 @@ Status status(const Device& d) { return probe_cached(d).st; }
 
 Status status_now(const Device& d) { return probe_cached(d, true).st; }
 
+bool cached_status(const Device& d, Status& out)
+{
+    std::lock_guard<std::mutex> lock(s_status_mutex);
+    auto                        it = s_status.find(d.id);
+    if (it == s_status.end()) return false;
+    out = it->second.st;
+    return true;
+}
+
 std::vector<Toolhead> toolheads(const Device& d) { return probe_cached(d).heads; }
 
 static json toolheads_json(const std::vector<Toolhead>& heads)
@@ -631,6 +640,17 @@ void list_printers(json& printers)
         p["bed_target"]     = s.bed_target;
         p["nozzles"]        = json::array({ json { { "temp", s.nozzle_temp }, { "target", s.nozzle_target } } });
         p["toolheads"]      = toolheads_json(c.heads);
+        // The predicates RemoteControl derives for any Moonraker printer, so the phone's Pause /
+        // Resume / Stop buttons work on a printer found over the LAN too. `task` already names the
+        // job, so no `stage`; the printer's message is an error only when its state says so.
+        p["print_status"]   = s.state;
+        p["can_pause"]      = s.online && s.state == "printing";
+        p["can_resume"]     = s.online && s.state == "paused";
+        p["can_stop"]       = s.online && (s.state == "printing" || s.state == "paused");
+        if (s.online && s.state == "error")
+            p["print_error"] = json { { "code", "error" }, { "message", s.message } };
+        else
+            p["print_error"] = nullptr;
         printers.push_back(p);
     }
 }

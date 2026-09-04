@@ -84,6 +84,9 @@ void                merge_stream_devices();
 Status status(const Device& d);
 // The same, ignoring that cache: for watching a printer right after telling it to do something.
 Status status_now(const Device& d);
+// The last probe's answer without asking the printer: for the GUI thread, which must not wait on
+// the network. False when this printer has never been probed.
+bool cached_status(const Device& d, Status& out);
 // What each toolhead holds, from the same cached probe.
 std::vector<Toolhead> toolheads(const Device& d);
 // The whole list with each printer's state, probed in parallel. Any thread but the GUI one.
