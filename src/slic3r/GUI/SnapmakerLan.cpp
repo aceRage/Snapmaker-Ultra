@@ -570,6 +570,12 @@ static json toolheads_json(const std::vector<Toolhead>& heads)
     return out;
 }
 
+// The printer reports elapsed time and progress; the desktop's "time left" is the rest.
+static int left_time_s(const Status& s)
+{
+    return (s.progress > 0.01 && s.print_duration > 0) ? (int) (s.print_duration / s.progress - s.print_duration) : 0;
+}
+
 static json status_json(const Device& d, const Status& s)
 {
     json j;
@@ -592,8 +598,7 @@ static json status_json(const Device& d, const Status& s)
     j["bed_target"]     = s.bed_target;
     j["nozzle_temp"]    = s.nozzle_temp;
     j["nozzle_target"]  = s.nozzle_target;
-    // The printer reports elapsed time and progress; the desktop's "time left" is the rest.
-    j["left_time_s"] = (s.progress > 0.01 && s.print_duration > 0) ? (int) (s.print_duration / s.progress - s.print_duration) : 0;
+    j["left_time_s"]    = left_time_s(s);
     return j;
 }
 
@@ -628,10 +633,18 @@ void list_printers(json& printers)
         p["name"]           = d.name.empty() ? d.ip : d.name;
         p["model"]          = d.model;
         p["url"]            = base_url(d);
+        // The address and where the printer came from: the Devices tab shows one card per printer,
+        // built from this list, and offers Remove on a printer somebody typed in (added_by manual).
+        p["ip"]             = d.ip;
+        p["port"]           = d.port;
+        p["added_by"]       = d.added_by;
         p["online"]         = s.online;
         p["printing"]       = s.printing();
         p["status"]         = s.state;
         p["percent"]        = (int) (s.progress * 100 + 0.5);
+        p["layer"]          = s.layer;
+        p["total_layers"]   = s.total_layers;
+        p["left_time_s"]    = left_time_s(s);
         p["task"]           = s.filename;
         p["login_required"] = s.login_required;
         p["can_upload"]     = s.online && !s.login_required;

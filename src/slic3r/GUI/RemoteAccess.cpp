@@ -939,16 +939,17 @@ RemoteAccess::ApiResponse RemoteAccess::api_object_transform(const std::string& 
     return r;
 }
 
-RemoteAccess::ApiResponse RemoteAccess::api_printers()
+RemoteAccess::ApiResponse RemoteAccess::api_printers(int plate)
 {
     auto out     = std::make_shared<nlohmann::json>();
     auto targets = std::make_shared<std::vector<RemoteControl::HostTarget>>();
-    bool ok  = run_on_main([out, targets]() {
+    bool ok  = run_on_main([out, targets, plate]() {
         nlohmann::json& j = *out;
         j["printers"]     = nlohmann::json::array();
         DeviceManager* dm = wxGetApp().getDeviceManager();
         // The printer preset's print host and the connected Snapmaker are printers too (RemoteSend).
-        struct HostsAtEnd { nlohmann::json& list; ~HostsAtEnd() { try { RemoteSend::list_hosts(list); } catch (...) {} } } hosts_at_end { j["printers"] };
+        // `plate` (from ?plate=) says which plate the upload_name defaults are for; -1 = the current one.
+        struct HostsAtEnd { nlohmann::json& list; int plate; ~HostsAtEnd() { try { RemoteSend::list_hosts(list, plate); } catch (...) {} } } hosts_at_end { j["printers"], plate };
         try { RemoteControl::list_host_targets(*targets); } catch (...) {} // where to ask those two what they are doing
         if (!dm)
             return;
@@ -1980,7 +1981,7 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "GET"},  {"path", "/api/plates/{index}/preview.png?view=front|rear|left|right&layer={index}&w=&h=[&zoom=&cx=&cy=]"}, {"description", "orthographic render of the toolpaths up to that layer (the PC's layer slider follows); zoom over the fit and the fitted-image fraction shown at the centre; X-Preview-Zoom = zoom really used"} },
             { {"method", "GET"},  {"path", "/api/plates/{index}/preview/status"}, {"description", "sliced / slicing / slicing_percent / result_id for that plate, without changing what the PC shows"} },
             { {"method", "POST"}, {"path", "/api/objects/transform"},       {"description", "form obj=&inst=[&x=&y=][&rz=][&scale=][&center=1]: move / rotate / scale one instance like the sidebar (undoable)"} },
-            { {"method", "GET"},  {"path", "/api/printers"},               {"description", "known printers with live status and what a send needs: kind bambu|printhost|connect, online, lan_mode, access_code_set, sdcard, has_ams, model_matches, can_upload, can_print, options (the desktop's remembered defaults); and what a control needs: can_pause, can_resume, can_stop, print_status, stage, print_error {code, message} and the hms summary"} },
+            { {"method", "GET"},  {"path", "/api/printers[?plate={index}]"}, {"description", "known printers with live status and what a send needs: kind bambu|printhost|connect|snapmaker, online, lan_mode, access_code_set, sdcard, has_ams, model_matches, can_upload, can_print, options (the desktop's remembered defaults), upload_name (the file name the desktop's export would give plate {index}, the current plate without it - print hosts, the connected Snapmaker and a Snapmaker over the LAN); a Snapmaker over the LAN adds ip, port, added_by, toolheads, layer, total_layers and left_time_s, so one card can show everything /api/snapmaker/devices reports; and what a control needs: can_pause, can_resume, can_stop, print_status, stage, print_error {code, message} and the hms summary"} },
             { {"method", "POST"}, {"path", "/api/printers/{id}/control"},  {"description", "form action=pause|resume|stop[&confirm=1][&dry_run=1]: pause, resume or stop the print on that printer, exactly as the desktop's own buttons do (stop = cancel the print and needs confirm=1; pause and resume do not). Returns a job id; the job's result says what the printer then reported. 409 when the printer's own state does not allow it (see can_pause / can_resume / can_stop). {id} is any id /api/printers lists, sm:{id} for a Snapmaker over the LAN included"} },
             { {"method", "POST"}, {"path", "/api/slice?plate={index}|all"}, {"description", "start slicing one plate (selects it) or all; returns a job id; 409 while slicing"} },
             { {"method", "POST"}, {"path", "/api/plates/{index}/send"},    {"description", "form printer={id}&mode=upload|print[&confirm=1][&force=1][&dry_run=1][&bed_leveling=0|1&flow_cali=0|1&timelapse=0|1&vibration_cali=0|1&use_ams=0|1][&name=][&mapping=0:1,1:2]: send the sliced plate to a printer exactly like the desktop's Send / Print dialogs (upload = to the printer's storage, print = start it; print needs confirm=1). A Snapmaker over the LAN (printer sm:{id}) takes `mapping` = which toolhead prints each of the file's filaments, defaulting to the colour match its own app makes; returns a job id; 409 unless the plate is sliced and no other send is running"} },
@@ -2070,7 +2071,7 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
     if (path == "/objects/transform" && method == "POST")
         return api_object_transform(body.empty() ? query : body);
     if (path == "/printers" && method == "GET")
-        return api_printers();
+        return api_printers(num(query_param(query, "plate"), -1));
     if (path.compare(0, 10, "/printers/") == 0 && method == "POST") {
         const std::string rest  = path.substr(10);
         const size_t      slash = rest.find('/');

@@ -246,10 +246,11 @@ ways to reach the same machine and either works; the LAN one needs nothing set u
 
 ### 3.5 The phone
 
-The Devices tab's *Snapmaker* section lists the LAN printers with their live state, progress,
-temperatures and a swatch per toolhead, polled every five seconds like the Bambu cards; below them
-an address field adds a printer, and a printer that was typed in can be removed. The PC-side MQTT
-connect is a small secondary button on the printers that support it, marked optional.
+The Devices tab lists the LAN printers with their live state, progress, temperatures and a swatch
+per toolhead, polled every five seconds like the Bambu cards; below the list an address field adds a
+printer, and a printer that was typed in can be removed. The PC-side MQTT connect is a small
+secondary button on the printers that support it, marked optional. (Until §9 those printers had a
+*Snapmaker* section of their own **and** a card in the printer list: one card each now.)
 
 In the Send sheet, choosing **Upload & print** for a Snapmaker asks the PC for a dry run first and
 turns the confirmation into a **mapping step**: one row per filament the file uses (its colour, its
@@ -495,3 +496,50 @@ connect with `snapmaker_remember_keys` on (§4.3).
 - Post-processing scripts and the output-name template for classic print hosts.
 - Cancelling a running send from the phone.
 - "Print all plates" and sending an unsliced plate (slice-then-send in one tap).
+
+## 9. What the hardware pass found (2026-09-04)
+
+Four things about the phone page itself, after Bambu send / print / pause / resume / stop and the
+U1 LAN path all worked on real printers.
+
+### 9.1 One card per printer on the Devices tab
+
+A U1 was drawn twice: once by the *Snapmaker* section (state, temperatures, toolheads, Remove,
+Connect on PC) and once as its LAN printer card from `/api/printers` (Pause / Resume / Stop). The
+second renderer is gone. **`/api/printers` is the source of a card** - it already carried the state,
+the job, the temperatures, the toolheads and the control predicates, and now carries the rest of
+what the section showed: `ip`, `port`, `added_by`, `layer`, `total_layers`, `left_time_s`
+(`SnapmakerLan::list_printers`). `/api/snapmaker/devices` is asked for one thing only: `connect`,
+the optional PC-side MQTT connection, whose button the card still offers; adding a printer by
+address and forgetting one still go to `/api/snapmaker/add` / `remove`.
+
+So one card carries name and model, state and job, temperatures, a swatch per toolhead with its
+material, Pause / Resume / Stop with the result line, Remove (on a printer somebody typed in) and
+Connect on PC. The address field sits under the list. The Snapmaker cards are drawn first, where
+their section used to be; Bambu and print-host cards are untouched. A Snapmaker the PC is connected
+to over MQTT no longer gets a second card as the `connect` printer either - it is the same machine
+as its LAN card, whose Disconnect covers it. (The send picker still offers both ways, as §3.4 says.)
+
+### 9.2 The file name a send proposes
+
+The Send sheet's *File name on the printer* was empty for a U1: `upload_name` was only ever set on
+the print-host and connected-Snapmaker entries, and it named whichever plate the PC happened to
+show. Now **every printer kind that takes a file name reports `upload_name`**, and
+`GET /api/printers?plate={index}` names *that* plate: `RemoteSend::export_name_for(plate, ext)`
+mirrors `Plater::priv::get_export_gcode_filename` (the project's name, or the first object's when it
+was never saved, plus the plate's own name or `_plate_<n>`) without making that plate the current
+one on the PC, which a listing must not do. A Snapmaker over the LAN always gets `.gcode` (that is
+what `prepare_snapmaker` uploads); a print host gets `.gcode.3mf` when the preset is a Bambu one.
+The sheet asks for its own plate, so upload *and* print show the name the send would use, and it
+can still be typed over - the send's `name` parameter is unchanged, and so is what happens when it
+is left empty. Bambu printers have no file-name field (their sheet has the options instead) and are
+unchanged.
+
+### 9.3 The toolhead chooser
+
+The mapping step's per-filament `<select>` could only spell colours as hex. It is now a row of
+tappable chips, one per toolhead, radio-like: colour swatch, toolhead number, and the loaded
+material (type and sub type) or *empty* in italics for a toolhead with nothing in it. The
+colour-matched default is the selected chip, an empty toolhead that is chosen is outlined in the
+warning colour, and the material / empty warnings under the row are as they were. The mapping sent
+is unchanged (`mapping=0:2,1:1,…`).
