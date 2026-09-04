@@ -75,6 +75,12 @@ shared."*
   on from the tray, the hub page or the Stream tab mints a new token unless the slicer passes back
   the remembered one from `stream_phone_token`. This is the single biggest hazard for an installed
   icon, and is discussed at §1.3.
+  **Update (P1, `feat/phone-token-stability`): it no longer does.** The token is the hub's and is
+  remembered in `<datadir>/hub/settings.json`; `set_phone` never mints one, so off/on, a hub
+  restart and a slicer restart all keep the same link. `HubServer::new_link()`
+  (`POST /hub/newlink`, the hub page's *New link*, the tray's *New phone link*) is the only thing
+  that replaces it, and the last three replaced tokens are kept so those links can explain
+  themselves (§5.2).
 
 ### 0.3 What the hub is, in terms this document needs
 
@@ -226,6 +232,12 @@ do not lean on a session cookie surviving.
    must be treated as disposable. Recommendation: make it stable — the slicer already remembers it
    in `stream_phone_token`, the hub already accepts it back through `POST /hub/phone?token=…`
    (`RemoteHub.cpp:1878-1880`), and the tray toggle at `:2284` is the one caller that passes `""`.
+   **Update (P1, `feat/phone-token-stability`): done, stable.** The hub is the source of truth
+   (`settings.json`, which survives the clean quit that deletes `hub.json`); `stream_phone_token`
+   is the mirror a hub with no memory of its own is seeded from, and is no longer cleared when
+   phone access is turned off. Both ways of handing a token in — `POST /hub/phone?token=…` and
+   `--hub-token` / `SNORCA_PHONE_ACCESS` — now only seed a data folder that has no link yet, so a
+   slicer holding an older copy cannot undo a *New link* somebody made from the tray.
 3. **The `rt` cookie in standalone mode.** It is a session cookie on both paths, and on iOS the web
    app gets its own jar. It does not matter, because the page re-sets it from `location.pathname` on
    every load (`stream_center.html:259`) and everything except the go2rtc player is gated by the path
@@ -781,7 +793,7 @@ exist and only need joining up. Add the U1 alongside the state work in topic 2. 
 
 | Phase | Content | Depends on | Effort |
 |---|---|---|---|
-| **P1** | **Token stability**: `set_phone` keeps the remembered token unless the person explicitly asks for a new link; the tray toggle and the hub page pass it back; a *New link* action that says what it breaks | — | **½ day** |
+| **P1** | **Token stability**: `set_phone` keeps the remembered token unless the person explicitly asks for a new link; the tray toggle and the hub page pass it back; a *New link* action that says what it breaks | — | **½ day** · **done** on `feat/phone-token-stability`: the token lives in `settings.json`, `POST /hub/newlink` (hub page, tray, Stream tab) is the only thing that replaces it, a replaced link answers a 404 page that says so, gate `test_phone_token.py` |
 | **P2** | **Home-screen install**: per-token manifest + icon routes, a 512 px icon, `<link rel="manifest">`, `apple-touch-icon`, the Install chip, the iOS instruction sheet, "which link am I installing" | P1 | **1–2 days** |
 | **P3** | **Printer control**: `POST /api/printers/{id}/control` for Bambu, `can_*`/`stage`/`print_error` on `/api/printers`, allow-list + manifest entries, the Devices-tab buttons and the Stop confirm | — (independent of P1/P2) | **2–3 days** |
 | **P4** | **The event watcher**: `RemoteEvents` in the instance, `GET /api/events`, the hub tray balloon, the Devices-tab badge | P3's `/api/printers` extensions (shares the polling code) | **1 day** |
@@ -816,6 +828,14 @@ Ordering notes:
    `navigator.standalone`.* Decides whether the Install button appears on the LAN origin at all.
 2. **Does the installed icon survive a token change?** It will not — but confirm the failure is a
    clean 404 page and not a confusing blank, and decide what that page should say.
+   **Update (P1, `feat/phone-token-stability`): answered for the *replaced* case.** The hub keeps the
+   last three tokens it replaced and answers any path under one of them with a small page —
+   *"This link was replaced. A new phone link was made on the PC, so this one no longer works.
+   On the PC, open the hub page from the Snapmaker Orca icon next to the clock and scan the new
+   code."* — still HTTP 404, `X-Frame-Options: DENY`, no token, no address, nothing about this PC.
+   Rotating four times or replacing the data dir puts a link past that memory and it goes back to
+   the bare `not found`, which is the honest answer: the hub genuinely does not know it. What an
+   *installed icon* does with a 404 (iOS standalone in particular) still needs a phone to answer.
 3. **Does the `rt` cookie survive a relaunch of the standalone app** long enough for the camera tiles
    to render before the page re-sets it (`stream_center.html:259`)? WebKit bug 272325 says session
    cookies in home-screen web apps reset unpredictably; the self-heal should make this invisible, but

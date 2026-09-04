@@ -576,7 +576,8 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
 
     // "Phone" modal on the PC: toggle the LAN listener and show its address as a QR code.
-    var remoteInfo = null, phoneModalOpen = false;
+    // phoneNewLinkAsk is the second step of "New link" (this WebView services no confirm()).
+    var remoteInfo = null, phoneModalOpen = false, phoneNewLinkAsk = false;
     window.__remoteInfo = function(info) {
         remoteInfo = info || null;
         if (phoneModalOpen) showPhoneModal();
@@ -612,8 +613,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         txt.className = 'info';
         txt.textContent = on
             ? 'Phone access is on. Scan the code (or type the address) on a phone connected to the same Wi-Fi. ' +
-              'The link keeps working after this window is closed (a small hub process stays on until phone access is turned off); a new link is made each time it is turned on.'
-            : 'Turn on phone access to get a link for phones on the same Wi-Fi. The cameras\' addresses and passwords stay on this PC; ' +
+              'The link keeps working after this window is closed (a small hub process stays on until phone access is turned off), and it is the same link ' +
+              'again after it is turned back on or the PC restarts.'
+            : 'Turn on phone access to get a link for phones on the same Wi-Fi - the same link as last time. The cameras\' addresses and passwords stay on this PC; ' +
               'anyone who has the link can watch the streams while it is on.';
         info.appendChild(txt);
         modal.appendChild(info);
@@ -645,6 +647,13 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 far.textContent = 'Away from home (Tailscale, same account): ' + remoteInfo.remote_url;
                 modal.appendChild(far);
             }
+            if (phoneNewLinkAsk) {
+                var ask = document.createElement('div');
+                ask.className = 'info';
+                ask.textContent = 'Make a new link? This one stops working straight away: saved links, QR codes and home-screen icons made from it ' +
+                    'all have to be made again from the new code.';
+                modal.appendChild(ask);
+            }
         } else if (remoteInfo && remoteInfo.on && !remoteInfo.url) {
             var warn = document.createElement('div');
             warn.className = 'status';
@@ -657,17 +666,34 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         toggle.className = on || (remoteInfo && remoteInfo.on) ? 'cancel' : 'ok';
         toggle.textContent = (remoteInfo && remoteInfo.on) ? 'Turn off' : 'Turn on';
         toggle.onclick = function() { postToSlicer((remoteInfo && remoteInfo.on) ? 'remote_off' : 'remote_on'); };
-        buttons.appendChild(toggle);
+        if (!phoneNewLinkAsk) buttons.appendChild(toggle); // while asking, the only two answers are below
+        if (on) {
+            // Two steps, because it breaks every link, QR code and home-screen icon made from
+            // this one - and because the WebView never shows a confirm().
+            var relink = document.createElement('span');
+            relink.className = 'cancel';
+            relink.textContent = phoneNewLinkAsk ? 'Yes, make a new link' : 'New link';
+            relink.onclick = function() {
+                if (!phoneNewLinkAsk) { phoneNewLinkAsk = true; showPhoneModal(); return; }
+                phoneNewLinkAsk = false;
+                postToSlicer('remote_newlink');
+            };
+            buttons.appendChild(relink);
+        }
         var close = document.createElement('span');
         close.className = 'cancel';
-        close.textContent = 'Close';
-        close.onclick = function() { phoneModalOpen = false; bg.style.display = 'none'; modal.innerHTML = ''; };
+        close.textContent = phoneNewLinkAsk ? 'Keep this link' : 'Close';
+        close.onclick = function() {
+            if (phoneNewLinkAsk) { phoneNewLinkAsk = false; showPhoneModal(); return; }
+            phoneModalOpen = false; bg.style.display = 'none'; modal.innerHTML = '';
+        };
         buttons.appendChild(close);
         modal.appendChild(buttons);
         bg.style.display = 'flex';
         modal.onkeydown = function(e) { if (e.key === 'Escape') close.onclick(); };
     }
     document.getElementById('phonechip').onclick = function() {
+        phoneNewLinkAsk = false;
         showPhoneModal();
         postToSlicer('remote_info');
     };
