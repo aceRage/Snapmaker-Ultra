@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Snapmaker-Ultra Hub</title>
+<title>Ultra Hub</title>
 <meta name="hub-secret" content="__HUB_SECRET__">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -54,13 +54,13 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
 </style>
 </head>
 <body>
-<h1>Snapmaker-Ultra Hub</h1>
+<h1>Ultra Hub</h1>
 <div class="row">
   <div class="card" id="phone"><h2>Local Access (This Network)</h2><div id="phonebody">Loading…</div></div>
-  <div class="card" id="remote"><h2>Remote access (Tailscale)</h2><div id="remotebody">Loading…</div></div>
+  <div class="card" id="remote"><h2>Remote Access</h2><div id="remotebody">Loading…</div></div>
   <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div>
     <div class="acts">
-      <span class="btn dim" id="new">Open a new slicer window</span>
+      <span class="btn dim" id="new">Open New Slicer</span>
       <span class="btn dim" id="newhidden">Open Background Slicer</span>
     </div>
   </div>
@@ -102,9 +102,6 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         if (info.phone && info.url) {
             var canvas = el('canvas', 'qr'); body.appendChild(canvas); drawQr(canvas, info.url);
             body.appendChild(el('div', 'url', info.url));
-            if (info.ips && info.ips.length > 1) body.appendChild(el('div', 'note', 'Other addresses of this PC: ' + info.ips.slice(1).join(', ')));
-            body.appendChild(el('div', 'note', 'This is the same link as last time: it survives turning phone access off and on, and restarting the PC. '
-                + '"New link" replaces it - saved links, QR codes and home-screen icons made from the old link all stop working.'));
             var off = el('span', 'btn warn', 'Disable'); off.onclick = function() { post('/hub/phone?on=0').then(refresh); }; body.appendChild(off);
             var relink = el('span', 'btn dim', 'New link');
             relink.onclick = function() {
