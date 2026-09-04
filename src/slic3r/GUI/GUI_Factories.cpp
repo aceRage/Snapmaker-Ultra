@@ -18,6 +18,7 @@
 #include "PartPlate.hpp"
 #include "Gizmos/GLGizmoEmboss.hpp"
 #include "Gizmos/GLGizmoSVG.hpp"
+#include "Gizmos/GLGizmoTextureMappingTools.hpp"
 
 #include <boost/algorithm/string.hpp>
 #include "slic3r/GUI/Tab.hpp"
@@ -1434,6 +1435,7 @@ void MenuFactory::create_object_menu()
 
     append_submenu(&m_object_menu, split_menu, wxID_ANY, _L("Split"), _L("Split the selected object"), "",
         []() { return plater()->can_split(true) || plater()->can_split(false); }, m_parent);
+    append_menu_item_manage_color_data(&m_object_menu);
     m_object_menu.AppendSeparator();
 
     // BBS: remove Layers Editing
@@ -1447,6 +1449,7 @@ void MenuFactory::create_extra_object_menu()
     //append_menu_item_fill_bed(&m_object_menu);
     // Object Clone
     append_menu_item_clone(&m_object_menu);
+    append_menu_item_manage_color_data(&m_object_menu);
     // Ultra: per-object visibility (Normal / Ghost / Hidden)
     append_menu_items_visibility(&m_object_menu);
     // Object Repair
@@ -2090,6 +2093,30 @@ void MenuFactory::append_menu_item_clone(wxMenu* menu)
         []() {
             return true;
         }, m_parent);
+}
+
+void MenuFactory::append_menu_item_manage_color_data(wxMenu *menu)
+{
+    append_menu_item(menu, wxID_ANY, _L("Manage Color Data"), _L("Manage Color Data for this object"),
+        [this](wxCommandEvent &) {
+            Plater *app_plater = wxGetApp().plater();
+            if (app_plater == nullptr)
+                return;
+            GLCanvas3D *canvas = app_plater->get_view3D_canvas3D();
+            const Selection &selection = app_plater->get_selection();
+            if (canvas == nullptr || selection.is_empty())
+                return;
+            const int object_idx = selection.get_object_idx();
+            if (object_idx < 0 || object_idx >= int(app_plater->model().objects.size()))
+                return;
+            open_color_data_management_dialog(m_parent, *canvas, app_plater->model().objects[size_t(object_idx)]);
+        },
+        "", menu,
+        []() {
+            Plater *app_plater = wxGetApp().plater();
+            return app_plater != nullptr && !app_plater->get_selection().is_empty();
+        },
+        m_parent);
 }
 
 void MenuFactory::append_menu_item_simplify(wxMenu* menu)

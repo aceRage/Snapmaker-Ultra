@@ -13,6 +13,7 @@
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
+#include "slic3r/GUI/TextureMappingPlaterHooks.hpp"
 
 #include "libnest2d/common.hpp"
 
@@ -259,7 +260,11 @@ arrangement::ArrangePolygon estimate_wipe_tower_info(int plate_index, std::set<i
     int plate_index_valid = std::min(plate_index, plate_count - 1);
 
     // we have to estimate the depth using the extruder number of all plates
-    int extruder_size = extruder_ids.size();
+    int extruder_size = int(TextureMappingPlaterHooks::estimate_wipe_tower_filaments_count_for_texture_mapping(
+        std::vector<int>(extruder_ids.begin(), extruder_ids.end()),
+        &full_config));
+    if (extruder_size <= 0)
+        extruder_size = int(extruder_ids.size());
 
     auto arrange_poly = ppl.get_plate(plate_index_valid)->estimate_wipe_tower_polygon(full_config, plate_index, extruder_size);
     arrange_poly.bed_idx = plate_index;

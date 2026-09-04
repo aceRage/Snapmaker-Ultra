@@ -170,6 +170,7 @@ private:
     void        append_menu_item_per_object_process(wxMenu* menu);
     void        append_menu_item_per_object_settings(wxMenu* menu);
     void        append_menu_item_change_filament(wxMenu* menu);
+    void        append_menu_item_manage_color_data(wxMenu *menu);
     void        append_menu_item_set_printable(wxMenu* menu);
     void        append_menu_item_locked(wxMenu* menu);
     void        append_menu_item_fill_bed(wxMenu *menu);

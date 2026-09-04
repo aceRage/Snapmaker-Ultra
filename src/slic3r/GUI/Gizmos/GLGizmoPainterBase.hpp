@@ -9,6 +9,10 @@
 #include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/Model.hpp"
 
+#include "slic3r/GUI/MMUPaintedTexturePreview.hpp"
+
+#include <optional>
+
 #include <cereal/types/vector.hpp>
 #include <GL/glew.h>
 
@@ -23,11 +27,15 @@ struct Camera;
 class GLGizmoMmuSegmentation;
 class Selection;
 
+class GLGizmoTrueColorPainting;
+class GLShaderProgram;
+
 enum class PainterGizmoType {
     FDM_SUPPORTS,
     SEAM,
     MM_SEGMENTATION,
-    FUZZY_SKIN
+    FUZZY_SKIN,
+    TRUE_COLOR
 };
 
 class TriangleSelectorGUI : public TriangleSelector {
@@ -37,6 +45,11 @@ public:
     virtual ~TriangleSelectorGUI() = default;
 
     virtual void render(ImGuiWrapper* imgui, const Transform3d& matrix);
+    virtual void render_texture_preview(const Transform3d&          /*matrix*/,
+                                        const Transform3d&          /*view_matrix*/,
+                                        const Transform3d&          /*projection_matrix*/,
+                                        const std::array<float, 2>& /*z_range*/,
+                                        const std::array<float, 4>& /*clipping_plane*/) const {}
     //void         render(const Transform3d& matrix) { this->render(nullptr, matrix); }
     void         set_wireframe_needed(bool need_wireframe) { m_need_wireframe = need_wireframe; }
     bool         get_wireframe_needed() { return m_need_wireframe; }
@@ -101,11 +114,32 @@ class TriangleSelectorPatch : public TriangleSelectorGUI {
 public:
     explicit TriangleSelectorPatch(const TriangleMesh& mesh, const std::vector<ColorRGBA> ebt_colors, float edge_limit = 0.6f)
         : TriangleSelectorGUI(mesh, edge_limit), m_ebt_colors(ebt_colors) {}
+    explicit TriangleSelectorPatch(const TriangleMesh& mesh, const ModelVolume* model_volume, const std::vector<ColorRGBA> ebt_colors, float edge_limit = 0.6f)
+        : TriangleSelectorGUI(mesh, edge_limit), m_ebt_colors(ebt_colors), m_model_volume(model_volume) {}
     virtual ~TriangleSelectorPatch() = default;
 
     // Render current selection. Transformation matrices are supposed
     // to be already set.
     void render(ImGuiWrapper* imgui, const Transform3d& matrix) override;
+    void render_texture_preview(const Transform3d&          matrix,
+                                const Transform3d&          view_matrix,
+                                const Transform3d&          projection_matrix,
+                                const std::array<float, 2>& z_range,
+                                const std::array<float, 4>& clipping_plane) const override;
+    void set_texture_preview_needed(bool needed) { m_texture_preview_needed = needed; }
+    void set_texture_preview_opaque(bool opaque) { m_texture_preview_opaque = opaque; }
+    void set_texture_mapping_color_preview(const ColorFacetsAnnotation *preview) { m_texture_mapping_color_preview = preview; }
+    void set_texture_preview_color_match_settings(const std::optional<TexturePreviewColorMatchSettings> &settings)
+    {
+        m_texture_preview_color_match = settings;
+    }
+    void set_full_texture_preview_forced(bool forced)
+    {
+        if (m_force_full_texture_preview != forced) {
+            m_force_full_texture_preview = forced;
+            request_update_render_data(true);
+        }
+    }
     // TriangleSelector.m_triangles => m_gizmo_scene.triangle_patches
     void update_triangles_per_type();
     // m_gizmo_scene.triangle_patches => TriangleSelector.m_triangles
@@ -124,7 +158,7 @@ public:
 
 protected:
     // Release the geometry data, release OpenGL VBOs.
-    void release_geometry();
+    void release_geometry(bool release_preview_texture = true);
     // Finalize the initialization of the geometry, upload the geometry to OpenGL VBO objects
     // and possibly releasing it if it has been loaded into the VBOs.
     void finalize_vertices();
@@ -169,6 +203,23 @@ protected:
     std::vector<ColorRGBA> m_ebt_colors;
 
     bool                        m_filter_state = false;
+
+    const ModelVolume          *m_model_volume{nullptr};
+    mutable std::vector<GLModel> m_texture_preview_models;
+    std::vector<ColorRGBA>      m_texture_preview_colors;
+    std::vector<unsigned int>   m_texture_preview_filament_ids;
+    std::vector<bool>           m_texture_preview_used_states;
+    mutable GLTexture           m_texture_preview;
+    mutable size_t              m_texture_preview_signature{0};
+    size_t                      m_texture_preview_visual_signature{0};
+    mutable std::vector<GLModel> m_vertex_color_preview_models;
+    std::vector<ColorRGBA>      m_vertex_color_preview_colors;
+    std::vector<unsigned int>   m_vertex_color_preview_filament_ids;
+    const ColorFacetsAnnotation *m_texture_mapping_color_preview{nullptr};
+    bool                        m_texture_preview_needed{false};
+    bool                        m_texture_preview_opaque{false};
+    bool                        m_force_full_texture_preview{false};
+    std::optional<TexturePreviewColorMatchSettings> m_texture_preview_color_match;
 
 private:
     void update_render_data();
@@ -218,6 +269,25 @@ public:
 
 protected:
     virtual void render_triangles(const Selection& selection) const;
+    // Default matches Ultra paint-depth slope uniforms. ImageMap TM gizmos may override.
+    virtual void set_render_triangle_slope_uniforms(GLShaderProgram *shader, const ModelVolume *model_volume, const Matrix3f &normal_matrix) const;
+    // Default false: Ultra FdmSupports/Seam/FuzzySkin/MMU paint-depth do not render TM previews.
+    virtual bool should_render_triangle_texture_preview() const { return false; }
+    virtual bool render_triangle_texture_preview_before_selector() const { return false; }
+    virtual void render_extra_triangle_overlays(int mesh_id,
+                                                const Transform3d &matrix,
+                                                const Transform3d &view_matrix,
+                                                const Transform3d &projection_matrix,
+                                                const std::array<float, 2> &z_range,
+                                                const std::array<float, 4> &clipping_plane) const
+    {
+        (void)mesh_id;
+        (void)matrix;
+        (void)view_matrix;
+        (void)projection_matrix;
+        (void)z_range;
+        (void)clipping_plane;
+    }
     void render_cursor();
     void render_cursor_circle();
     void render_cursor_sphere(const Transform3d& trafo) const;
@@ -264,6 +334,10 @@ protected:
         int    mesh_idx;
         size_t facet_idx;
     };
+
+    virtual void on_brush_projected_mouse_positions(SLAGizmoEventType,
+                                                    int,
+                                                    const std::vector<ProjectedMousePosition> &) {}
 
     // BBS: projected result of mouse height range for a mesh
     struct ProjectedHeightRange
@@ -365,6 +439,7 @@ private:
 protected:
     void on_set_state() override;
     virtual void on_opening() = 0;
+    virtual bool on_before_shutdown() { return true; }
     virtual void on_shutdown() = 0;
     virtual PainterGizmoType get_painter_type() const = 0;
 
@@ -378,6 +453,7 @@ protected:
     virtual wxString handle_snapshot_action_name(bool shift_down, Button button_down) const = 0;
 
     friend class ::Slic3r::GUI::GLGizmoMmuSegmentation;
+    friend class ::Slic3r::GUI::GLGizmoTrueColorPainting;
 };
 
 

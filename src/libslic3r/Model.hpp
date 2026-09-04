@@ -1805,6 +1805,10 @@ public:
     int curr_plate_index{ 0 };
     std::map<int, CustomGCode::Info> plates_custom_gcodes; //map<plate_index, CustomGCode::Info>
 
+    // Texture mapping zone JSON mirrored onto the model for undo/redo sync.
+    std::string texture_mapping_definitions;
+    bool        texture_mapping_definitions_valid { false };
+
     const CustomGCode::Info get_curr_plate_custom_gcodes() const {
         if (plates_custom_gcodes.find(curr_plate_index) != plates_custom_gcodes.end()) {
             return plates_custom_gcodes.at(curr_plate_index);
@@ -1972,11 +1976,11 @@ private:
 	friend class UndoRedo::StackImpl;
     template<class Archive> void load(Archive& ar) {
         Internal::StaticSerializationWrapper<ModelWipeTower> wipe_tower_wrapper(wipe_tower);
-        ar(materials, objects, wipe_tower_wrapper);
+        ar(materials, objects, wipe_tower_wrapper, texture_mapping_definitions, texture_mapping_definitions_valid);
     }
     template<class Archive> void save(Archive& ar) const {
         Internal::StaticSerializationWrapper<ModelWipeTower const> wipe_tower_wrapper(wipe_tower);
-        ar(materials, objects, wipe_tower_wrapper);
+        ar(materials, objects, wipe_tower_wrapper, texture_mapping_definitions, texture_mapping_definitions_valid);
     }
 
     //BBS: add aux temp directory

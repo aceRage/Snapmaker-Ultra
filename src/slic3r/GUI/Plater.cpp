@@ -1,4 +1,5 @@
 #include "Plater.hpp"
+#include "TextureMappingPlaterHooks.hpp"
 #include "MixedFilamentDialog.hpp"
 #include "MixedFilamentBatchDialog.hpp"
 #include "MixedGradientSelector.hpp"
@@ -3388,6 +3389,8 @@ Sidebar::Sidebar(Plater *parent)
 
     // Add content panel to scrolled sizer
     scrolled_sizer->Add(p->m_panel_mixed_filaments_content, 0, wxEXPAND, 0);
+
+    init_texture_mapping_panel(p->scrolled, scrolled_sizer);
 
     // Bind collapse/expand event to title bar
     p->m_panel_mixed_filaments_title->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& e) {
@@ -11685,6 +11688,11 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     if (imported_physical_filaments == 0)
                         imported_physical_filaments = imported_float_count("nozzle_diameter");
 
+                    const std::set<unsigned int> imported_tm_zones =
+                        TextureMappingPlaterHooks::texture_mapping_zone_ids_from_import_config(config_loaded);
+                    if (load_model)
+                        TextureMappingPlaterHooks::assign_imported_3mf_texture_mapping_zones(model, imported_tm_zones);
+
                     // 1. add extruder for prusa model if the number of existing extruders is not enough
                     // 2. add extruder for BBS or Other model if only import geometry
                     if (en_3mf_file_type == En3mfType::From_Prusa || (load_model && !load_config)) {
@@ -12276,6 +12284,13 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             cancel        = !cont;
                     },
                     nullptr, 0, obj_color_fun);
+                    if (TextureMappingPlaterHooks::model_object_has_imported_texture_mapping_data(
+                            model.objects.empty() ? nullptr : model.objects.front()) ||
+                        std::any_of(model.objects.begin(), model.objects.end(),
+                                    [](const ModelObject *object) {
+                                        return TextureMappingPlaterHooks::model_object_has_imported_texture_mapping_data(object);
+                                    }))
+                        TextureMappingPlaterHooks::assign_imported_texture_mapping_zone(model);
                 }
 
                 if (designer_model_id.empty() && boost::algorithm::iends_with(path.string(), ".stl")) {
@@ -13559,6 +13574,8 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
         this->partplate_list.update_slice_context_to_current_plate(background_process);
         this->preview->update_gcode_result(partplate_list.get_current_slice_result());
     }
+    if (wxGetApp().preset_bundle != nullptr)
+        TextureMappingPlaterHooks::canonicalize_texture_mapping_config(*wxGetApp().preset_bundle, true);
     Print::ApplyStatus invalidated = background_process.apply(this->model, wxGetApp().preset_bundle->full_config());
     notify_filament_compatibility_after_apply();
 
@@ -17798,6 +17815,12 @@ void Plater::priv::update_after_undo_redo(const UndoRedo::Snapshot& snapshot, bo
         this->view3D->get_canvas3d()->get_gizmos_manager().update_after_undo_redo(snapshot);
 
     wxGetApp().obj_list()->update_after_undo_redo();
+
+    if (this->model.texture_mapping_definitions_valid && wxGetApp().preset_bundle != nullptr) {
+        TextureMappingPlaterHooks::load_texture_mapping_definitions(*wxGetApp().preset_bundle, this->model.texture_mapping_definitions);
+        if (this->sidebar)
+            this->sidebar->update_texture_mapping_panel(false);
+    }
 
     if (wxGetApp().get_mode() == comSimple && model_has_advanced_features(this->model)) {
         // If the user jumped to a snapshot that require user interface with advanced features, switch to the advanced mode without asking.
@@ -23492,8 +23515,13 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
             if (update_filament_colors_in_full_config()) {
                 p->sidebar->obj_list()->update_filament_colors();
                 p->sidebar->update_dynamic_filament_list();
+                p->sidebar->update_texture_mapping_panel(false);
                 continue;
             }
+        }
+        if (opt_key == "texture_mapping_definitions" || opt_key == "texture_mapping_global_settings") {
+            update_scheduled = true;
+            p->sidebar->update_texture_mapping_panel(true);
         }
         if (opt_key == "material_colour") {
             update_scheduled = true; // update should be scheduled (for update 3DScene)
@@ -23668,10 +23696,24 @@ std::vector<std::string> Plater::get_extruder_colors_from_plater_config(const GC
             const auto &mixed_mgr = wxGetApp().preset_bundle->mixed_filaments;
             for (const auto &dc : mixed_mgr.display_colors())
                 filament_colors.push_back(dc);
+            const std::vector<std::string> &tm_colors =
+                TextureMappingPlaterHooks::texture_mapping_display_colors(wxGetApp().preset_bundle, config, filament_colors);
+            if (tm_colors.size() > filament_colors.size())
+                filament_colors.insert(filament_colors.end(), tm_colors.begin() + filament_colors.size(), tm_colors.end());
         }
 
         return filament_colors;
     }
+}
+
+std::vector<ColorRGBA> Plater::get_extruders_colors()
+{
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    const DynamicPrintConfig *config = bundle != nullptr ? &bundle->project_config : nullptr;
+    if (config == nullptr || !config->has("filament_colour"))
+        return {};
+    const std::vector<std::string> filament_colors = config->option<ConfigOptionStrings>("filament_colour")->values;
+    return TextureMappingPlaterHooks::texture_mapping_rgba_colors(bundle, config, filament_colors);
 }
 
 /* Get vector of colors used for rendering of a Preview scene in "Color print" mode

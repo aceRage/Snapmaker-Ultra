@@ -303,6 +303,9 @@ PresetBundle& PresetBundle::operator=(const PresetBundle &rhs)
     physical_printers   = rhs.physical_printers;
 
     filament_presets    = rhs.filament_presets;
+    mixed_filaments     = rhs.mixed_filaments;
+    texture_mapping_zones = rhs.texture_mapping_zones;
+    texture_mapping_global_settings = rhs.texture_mapping_global_settings;
     project_config      = rhs.project_config;
     vendors             = rhs.vendors;
     obsolete_presets    = rhs.obsolete_presets;

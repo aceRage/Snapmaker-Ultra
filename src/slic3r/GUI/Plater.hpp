@@ -23,9 +23,11 @@
 #include "Jobs/Worker.hpp"
 #include "Search.hpp"
 #include "PartPlate.hpp"
+#include "TextureMappingSidebarPanel.hpp"
 #include "GUI_App.hpp"
 #include "Jobs/PrintJob.hpp"
 #include "Jobs/SendJob.hpp"
+#include "libslic3r/Color.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PrintBase.hpp"
 
@@ -176,6 +178,8 @@ public:
     void init_color_mix_panel(wxWindow* parent, wxSizer* sizer);
     void update_color_mix_panel();
     void update_mixed_filament_panel(bool sync_manager = true);
+    void init_texture_mapping_panel(wxWindow *parent, wxBoxSizer *scrolled_sizer);
+    void update_texture_mapping_panel(bool sync_manager = true);
     std::vector<unsigned int> get_ui_ordered_filament_ids() const;
     // BBS
     void on_bed_type_change(BedType bed_type);
@@ -236,6 +240,7 @@ public:
 private:
     struct priv;
     std::unique_ptr<priv> p;
+    std::unique_ptr<TextureMappingSidebarState> m_tm_state;
 
     wxBoxSizer* m_scrolled_sizer = nullptr;
     ComboBox* m_bed_type_list = nullptr;
@@ -668,6 +673,7 @@ public:
     // On activating the parent window.
     void on_activate();
     std::vector<std::string> get_extruder_colors_from_plater_config(const GCodeProcessorResult* const result = nullptr, bool include_mixed = true) const;
+    std::vector<ColorRGBA>   get_extruders_colors();
     std::vector<std::string> get_colors_for_color_print(const GCodeProcessorResult* const result = nullptr) const;
 
     void update_menus();
