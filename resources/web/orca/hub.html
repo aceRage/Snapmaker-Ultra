@@ -56,7 +56,7 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
 <body>
 <h1>Snapmaker-Ultra Hub</h1>
 <div class="row">
-  <div class="card" id="phone"><h2>Local access (this Wi-Fi)</h2><div id="phonebody">Loading…</div></div>
+  <div class="card" id="phone"><h2>Local Access (This Network)</h2><div id="phonebody">Loading…</div></div>
   <div class="card" id="remote"><h2>Remote access (Tailscale)</h2><div id="remotebody">Loading…</div></div>
   <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div>
     <div class="acts">
@@ -100,13 +100,12 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         lastUrl = info.url; body.dataset.done = '1';
         body.innerHTML = '';
         if (info.phone && info.url) {
-            body.appendChild(el('div', '', 'On. Scan the code (or type the address) on a phone connected to the same Wi-Fi.'));
             var canvas = el('canvas', 'qr'); body.appendChild(canvas); drawQr(canvas, info.url);
             body.appendChild(el('div', 'url', info.url));
             if (info.ips && info.ips.length > 1) body.appendChild(el('div', 'note', 'Other addresses of this PC: ' + info.ips.slice(1).join(', ')));
             body.appendChild(el('div', 'note', 'This is the same link as last time: it survives turning phone access off and on, and restarting the PC. '
                 + '"New link" replaces it - saved links, QR codes and home-screen icons made from the old link all stop working.'));
-            var off = el('span', 'btn dim', 'Turn off'); off.onclick = function() { post('/hub/phone?on=0').then(refresh); }; body.appendChild(off);
+            var off = el('span', 'btn warn', 'Disable'); off.onclick = function() { post('/hub/phone?on=0').then(refresh); }; body.appendChild(off);
             var relink = el('span', 'btn dim', 'New link');
             relink.onclick = function() {
                 if (!confirm('Make a new link?\n\nThis link stops working. Saved links, QR codes and home-screen icons made from it all have to be made again from the new code.')) return;
@@ -115,10 +114,10 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
             body.appendChild(relink);
         } else if (info.phone) {
             body.appendChild(el('div', 'err', 'On, but no network address was found on this PC.'));
-            var off2 = el('span', 'btn dim', 'Turn off'); off2.onclick = function() { post('/hub/phone?on=0').then(refresh); }; body.appendChild(off2);
+            var off2 = el('span', 'btn warn', 'Disable'); off2.onclick = function() { post('/hub/phone?on=0').then(refresh); }; body.appendChild(off2);
         } else {
-            body.appendChild(el('div', '', 'Off. Turn it on to get a link for phones on the same Wi-Fi - the same link as last time; anyone with the link can watch the cameras and drive the slicers while it is on.'));
-            var on = el('span', 'btn', 'Turn on'); on.onclick = function() { post('/hub/phone?on=1').then(refresh); }; body.appendChild(on);
+            body.appendChild(el('div', 'note', 'Anyone with the link can watch the cameras and drive the slicers while it is on.'));
+            var on = el('span', 'btn', 'Enable'); on.onclick = function() { post('/hub/phone?on=1').then(refresh); }; body.appendChild(on);
         }
     }
     var lastRemote = null;
@@ -140,15 +139,15 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
             return;
         }
         if (rm.on && rm.url) {
-            body.appendChild(el('div', '', 'On. Scan this on a phone that has the Tailscale app connected and is signed in as one of the people listed below; it works from anywhere.'));
+            body.appendChild(el('div', 'note', 'Tailscale required on this machine and remote device.'));
             var canvas = el('canvas', 'qr'); body.appendChild(canvas); drawQr(canvas, rm.url);
             body.appendChild(el('div', 'url', rm.url));
         } else {
-            body.appendChild(el('div', '', 'Off. Turn it on to reach this hub from outside your Wi-Fi through your Tailscale network' + (rm.dns_name ? ' (' + rm.dns_name + ')' : '') + '.'));
+            body.appendChild(el('div', 'note', 'Tailscale required on this machine and remote device.'));
             if (!rm.https) body.appendChild(el('div', 'err', 'HTTPS certificates are not enabled for your tailnet yet: Tailscale admin console > DNS > HTTPS Certificates > Enable.'));
         }
         if (rm.error) body.appendChild(el('div', 'err', rm.error));
-        body.appendChild(el('div', 'note', 'Who may connect (their Tailscale sign-in):'));
+        body.appendChild(el('div', 'note', 'Allowed Tailscale Users'));
         (rm.allowed_logins || []).forEach(function(l) {
             var row = el('div', 'login');
             row.appendChild(el('span', '', l));
@@ -164,9 +163,9 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         addrow.appendChild(add);
         body.appendChild(addrow);
         if (rm.last_login) body.appendChild(el('div', 'note', 'Last remote visit: ' + rm.last_login));
-        var tog = el('span', 'btn' + (rm.on ? ' dim' : ''), rm.on ? 'Turn off' : 'Turn on');
+        var tog = el('span', 'btn' + (rm.on ? ' warn' : ''), rm.on ? 'Disable' : 'Enable');
         tog.onclick = function() {
-            tog.textContent = rm.on ? 'Turning off…' : 'Turning on… (the first time fetches a certificate, up to a minute)';
+            tog.textContent = rm.on ? 'Disabling…' : 'Enabling… (the first time fetches a certificate, up to a minute)';
             post('/hub/remote?on=' + (rm.on ? '0' : '1')).then(function(j) { info = j; renderRemote(); }).catch(function() { lastRemote = null; refresh(); });
         };
         body.appendChild(tog);
