@@ -7,6 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "SnapmakerLan.hpp"
 #include "slic3r/Utils/PrintHost.hpp"
 #include "slic3r/Utils/bambu_networking.hpp"
 
@@ -32,6 +33,9 @@ struct Request
     // Bambu options; -1 = the desktop's remembered choice (AppConfig section "print").
     int         bed_leveling { -1 }, flow_cali { -1 }, vibration_cali { -1 }, timelapse { -1 }, use_ams { -1 };
     std::string name;              // print host: the file name on the printer (default: the export name)
+    // Snapmaker over the LAN: which toolhead prints which of the file's filaments,
+    // "<filament>:<toolhead>,..." (0-based). Empty = the auto-match the printer's own app makes.
+    std::string mapping;
 };
 
 // Everything prepare() worked out on the GUI thread; run() only performs the transfer.
@@ -52,6 +56,12 @@ struct Prepared
     std::shared_ptr<PrintHost> host;
     PrintHostUpload  upload {};
     bool             two_step { false };            // upload with print=false, then printer.print.start over MQTT
+    // Snapmaker over the LAN (Moonraker HTTP): no host object, just the printer and the mapping.
+    SnapmakerLan::Device                    lan {};
+    std::string                             lan_filename;
+    std::vector<SnapmakerLan::FileFilament> file_filaments;
+    std::vector<int>                        mapping;      // toolhead per file filament, -1 = unused
+    std::vector<SnapmakerLan::Toolhead>     toolheads;
 };
 
 struct Sink

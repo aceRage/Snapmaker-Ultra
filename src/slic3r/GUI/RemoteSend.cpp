@@ -418,6 +418,138 @@ static std::pair<int, std::string> prepare_bambu(const Request& req, PartPlate* 
     return { 200, "" };
 }
 
+// The sliced file's filaments, the way the Device page's own sw_GetFileFilamentMapping reads them:
+// the project's colours and types, and which slots this plate's slice result actually used.
+static std::vector<SnapmakerLan::FileFilament> file_filaments_of(PartPlate* plate)
+{
+    std::vector<SnapmakerLan::FileFilament> out;
+    PresetBundle*                           bundle = wxGetApp().preset_bundle;
+    if (!bundle)
+        return out;
+    const DynamicPrintConfig   full    = bundle->full_config();
+    const ConfigOptionStrings* colours = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    const ConfigOptionStrings* types   = full.option<ConfigOptionStrings>("filament_type");
+    const ConfigOptionFloats*  density = full.option<ConfigOptionFloats>("filament_density");
+    std::map<size_t, double>   volumes;
+    if (plate && plate->is_slice_result_valid() && plate->get_slice_result())
+        for (const auto& kv : plate->get_slice_result()->print_statistics.total_volumes_per_extruder)
+            volumes[kv.first] = kv.second;
+    for (size_t i = 0; i < bundle->filament_presets.size(); ++i) {
+        SnapmakerLan::FileFilament f;
+        f.index = (int) i;
+        f.color = (colours && i < colours->values.size()) ? colours->values[i] : "";
+        f.type  = (types && i < types->values.size()) ? types->values[i] : "";
+        auto it = volumes.find(i);
+        f.used  = it != volumes.end() && it->second > 0;
+        if (f.used) {
+            const double dens = (density && i < density->values.size()) ? density->values[i] : 1.24;
+            f.used_g          = it->second / 1000.0 * dens;
+        }
+        out.push_back(f);
+    }
+    return out;
+}
+
+// "0:1,1:2" - the file's filament 0 prints on toolhead 1, filament 1 on toolhead 2.
+static bool parse_mapping(const std::string& text, size_t filaments, std::vector<int>& out, std::string& error)
+{
+    out.assign(filaments, -1);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t      comma = text.find(',', pos);
+        const std::string item  = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        pos                     = comma == std::string::npos ? text.size() : comma + 1;
+        if (item.empty())
+            continue;
+        const size_t colon = item.find(':');
+        if (colon == std::string::npos) {
+            error = "mapping wants <filament>:<toolhead> pairs, not '" + item + "'";
+            return false;
+        }
+        int filament = -1, head = -1;
+        try {
+            filament = std::stoi(item.substr(0, colon));
+            head     = std::stoi(item.substr(colon + 1));
+        } catch (...) {
+            error = "mapping wants numbers, not '" + item + "'";
+            return false;
+        }
+        if (filament < 0 || filament >= (int) filaments) {
+            error = "this file has no filament " + std::to_string(filament);
+            return false;
+        }
+        if (head < 0 || head > 15) {
+            error = "toolhead " + std::to_string(head) + " is out of range";
+            return false;
+        }
+        out[filament] = head;
+    }
+    return true;
+}
+
+// A Snapmaker on the LAN: no connect, no host object, just its address (SnapmakerLan).
+static std::pair<int, std::string> prepare_snapmaker(const Request& req, PartPlate* plate, std::shared_ptr<Prepared> p,
+                                                     std::shared_ptr<Prepared>& out)
+{
+    Plater* plater = wxGetApp().plater();
+    SnapmakerLan::Device d;
+    if (!SnapmakerLan::find(req.printer.substr(3), d))
+        return { 404, "no such printer: " + req.printer };
+    const SnapmakerLan::Status st = SnapmakerLan::status(d);
+    if (!st.online)
+        return { 409, d.name + " is not answering on the network" };
+    if (st.login_required)
+        return { 409, d.name + " asks for a login; the phone can only reach a printer that does not" };
+    if (st.printing())
+        return { 409, d.name + " is " + (st.state == "paused" ? "paused mid-print" : "printing") + " (" + st.filename + ")" };
+    p->kind         = "snapmaker";
+    p->printer_name = d.name.empty() ? d.ip : d.name;
+    p->lan          = d;
+    p->toolheads    = SnapmakerLan::toolheads(d);
+    // The file: the plate's sliced G-code, exactly what the desktop's Snapmaker path uploads.
+    fs::path source = fs::path(plate->get_tmp_gcode_path());
+    boost::system::error_code ec;
+    if (!fs::is_regular_file(source, ec))
+        return { 409, "this plate has no G-code file; slice it again" };
+    std::string name = req.name.empty() ? std::string(plater->get_export_gcode_filename(".gcode", true).ToUTF8().data()) : req.name;
+    name             = fs::path(name).filename().string(); // never a directory from the phone
+    if (name.empty() || name == "." || name == "..")
+        name = "plate_" + std::to_string(req.plate + 1) + ".gcode";
+    if (!boost::iends_with(name, ".gcode"))
+        name += ".gcode";
+    p->upload.source_path = source;
+    p->upload.upload_path = fs::path(name);
+    p->lan_filename       = name;
+    p->file_filaments     = file_filaments_of(plate);
+    if (req.mode == "print") {
+        std::string error;
+        if (req.mapping.empty())
+            p->mapping = SnapmakerLan::auto_match(p->file_filaments, p->toolheads);
+        else if (!parse_mapping(req.mapping, p->file_filaments.size(), p->mapping, error))
+            return { 400, error };
+        for (const SnapmakerLan::FileFilament& f : p->file_filaments) {
+            if (!f.used || (size_t) f.index >= p->mapping.size())
+                continue;
+            if (p->mapping[f.index] < 0)
+                return { 400, "filament " + std::to_string(f.index + 1) + " has no toolhead; every filament the file uses needs one" };
+            if (!p->toolheads.empty() && p->mapping[f.index] >= (int) p->toolheads.size())
+                return { 400, p->printer_name + " has " + std::to_string(p->toolheads.size()) + " toolheads, so there is no toolhead " +
+                                  std::to_string(p->mapping[f.index] + 1) };
+        }
+        // A toolhead with nothing in it cannot print: say so before the file goes up.
+        if (!p->toolheads.empty() && !req.force)
+            for (const SnapmakerLan::FileFilament& f : p->file_filaments) {
+                if (!f.used || (size_t) f.index >= p->mapping.size())
+                    continue;
+                const int h = p->mapping[f.index];
+                if (h >= 0 && h < (int) p->toolheads.size() && !p->toolheads[h].loaded)
+                    return { 409, "toolhead " + std::to_string(h + 1) + " is empty; load it, pick another, or send force=1" };
+            }
+    }
+    out = p;
+    return { 200, "" };
+}
+
 static std::pair<int, std::string> prepare_host(const Request& req, PartPlate* plate, std::shared_ptr<Prepared> p, std::shared_ptr<Prepared>& out)
 {
     Plater*             plater = wxGetApp().plater();
@@ -479,7 +611,7 @@ std::pair<int, std::string> preselect(const Request& req, bool& wait)
 {
     wait = false;
     if (req.printer.empty()) return { 400, "printer is required" };
-    if (req.printer == "host" || req.printer == "connect") return { 200, "" };
+    if (req.printer == "host" || req.printer == "connect" || req.printer.compare(0, 3, "sm:") == 0) return { 200, "" };
     DeviceManager* dm = wxGetApp().getDeviceManager();
     if (!dm) return { 503, "no device manager" };
     MachineObject* obj = find_machine(dm, req.printer);
@@ -528,6 +660,7 @@ std::pair<int, std::string> prepare(const Request& req, std::shared_ptr<Prepared
     p->plate      = req.plate;
     p->dry_run    = req.dry_run || env_flag("SNORCA_SEND_DRYRUN");
     p->printer_id = req.printer;
+    if (req.printer.compare(0, 3, "sm:") == 0) return prepare_snapmaker(req, plate, p, out);
     if (req.printer == "host" || req.printer == "connect") return prepare_host(req, plate, p, out);
     return prepare_bambu(req, plate, p, out);
 }
@@ -694,11 +827,97 @@ static void run_host(std::shared_ptr<Prepared> p, Sink& sink)
     sink.done(true, "", result);
 }
 
+// A Snapmaker on the LAN: upload with print=false, then - for a print - the toolhead mapping and
+// the start, each a plain HTTP call. Nothing here needs the PC to be connected to the printer.
+static void run_snapmaker(std::shared_ptr<Prepared> p, Sink& sink)
+{
+    json result;
+    result["kind"]     = "snapmaker";
+    result["mode"]     = p->mode;
+    result["printer"]  = { { "id", p->printer_id }, { "name", p->printer_name } };
+    result["url"]      = SnapmakerLan::base_url(p->lan);
+    result["source"]   = p->upload.source_path.string();
+    result["filename"] = p->lan_filename;
+    json filaments = json::array();
+    for (const SnapmakerLan::FileFilament& f : p->file_filaments) {
+        json j;
+        j["index"]   = f.index;
+        j["color"]   = f.color;
+        j["type"]    = f.type;
+        j["used"]    = f.used;
+        j["used_g"]  = f.used_g;
+        j["toolhead"] = (size_t) f.index < p->mapping.size() ? p->mapping[f.index] : -1;
+        filaments.push_back(j);
+    }
+    result["filaments"] = filaments;
+    if (p->mode == "print") {
+        result["mapping"]        = p->mapping;
+        result["mapping_script"] = SnapmakerLan::mapping_script(p->mapping);
+    }
+    if (p->dry_run) {
+        result["dry_run"] = true;
+        sink.progress(99, "dry run: nothing was sent");
+        sink.done(true, "", result);
+        return;
+    }
+    std::string error;
+    sink.progress(1, "uploading " + p->lan_filename);
+    if (!SnapmakerLan::upload(p->lan, p->upload.source_path.string(), p->lan_filename,
+                              [&sink](int pct) { sink.progress(std::min(95, pct * 95 / 100), "uploading " + std::to_string(pct) + "%"); },
+                              error)) {
+        sink.done(false, error.empty() ? "the upload failed" : error, result);
+        return;
+    }
+    result["uploaded"] = true;
+    long long size     = 0;
+    if (SnapmakerLan::metadata(p->lan, p->lan_filename, size, error))
+        result["size"] = size;
+    else
+        result["metadata_error"] = error; // the file may still be there; the print start will tell
+    if (p->mode != "print") {
+        sink.progress(100, "uploaded");
+        sink.done(true, "", result);
+        return;
+    }
+    sink.progress(97, "starting the print");
+    json sent;
+    // A printer that reports no toolheads at all (a plain Klipper machine someone added by IP) has
+    // nothing to map: the standard start is right for it.
+    const bool mapped = !p->toolheads.empty();
+    bool       ok     = mapped ? SnapmakerLan::start_print_mapped(p->lan, p->lan_filename, p->mapping, sent, error)
+                               : SnapmakerLan::start_print(p->lan, p->lan_filename, error);
+    result["start"] = sent;
+    if (!ok) {
+        sink.done(false, error + " (the file is on the printer)", result);
+        return;
+    }
+    // What the printer itself says a moment later - the only proof the job took.
+    for (int i = 0; i < 6; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        const SnapmakerLan::Status st = SnapmakerLan::status_now(p->lan); // never the cached answer here
+        result["printer_state"]       = st.state;
+        result["printer_file"]        = st.filename;
+        if (st.state == "printing" || st.state == "paused") {
+            sink.progress(100, "printing");
+            sink.done(true, "", result);
+            return;
+        }
+        if (st.state == "error") {
+            sink.done(false, "the printer refused the print" + (st.message.empty() ? "" : ": " + st.message), result);
+            return;
+        }
+    }
+    // It accepted every call but has not started yet: not a failure, just not proof.
+    sink.progress(100, "sent");
+    sink.done(true, "", result);
+}
+
 void run(std::shared_ptr<Prepared> p, Sink sink)
 {
     try {
-        if (p->kind == "bambu") run_bambu(p, sink);
-        else                    run_host(p, sink);
+        if (p->kind == "bambu")           run_bambu(p, sink);
+        else if (p->kind == "snapmaker")  run_snapmaker(p, sink);
+        else                              run_host(p, sink);
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(error) << "RemoteSend: " << e.what();
         sink.done(false, std::string("send failed: ") + e.what(), json::object());
@@ -729,6 +948,8 @@ void describe_bambu(MachineObject* m, json& p)
 
 void list_hosts(json& printers)
 {
+    // Every Snapmaker on the LAN is a printer the phone can send to, with no connect step.
+    try { SnapmakerLan::list_printers(printers); } catch (...) {}
     Plater*             plater = wxGetApp().plater();
     PresetBundle*       bundle = wxGetApp().preset_bundle;
     DynamicPrintConfig& cfg    = bundle->printers.get_edited_preset().config;

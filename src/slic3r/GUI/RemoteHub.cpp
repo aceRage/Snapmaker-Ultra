@@ -1939,6 +1939,8 @@ static bool instance_api_allowed(const std::string& method, const std::string& s
     if (sub == "/api/objects/transform")             return post;
     if (sub == "/api/printers")                      return get;
     if (sub == "/api/snapmaker/devices")             return get;
+    if (sub == "/api/snapmaker/add")                 return post;
+    if (sub == "/api/snapmaker/remove")              return post;
     if (sub == "/api/snapmaker/connect")             return post;
     if (sub == "/api/snapmaker/disconnect")          return post;
     if (sub == "/api/slice")                         return post;

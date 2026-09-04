@@ -112,6 +112,8 @@ private:
     ApiResponse api_object_transform(const std::string& form_body);
     ApiResponse api_printers();
     ApiResponse api_snapmaker_devices();
+    ApiResponse api_snapmaker_add(const std::string& ip, int port);
+    ApiResponse api_snapmaker_remove(const std::string& id);
     ApiResponse api_snapmaker_connect(const std::string& id);
     ApiResponse api_snapmaker_disconnect();
     ApiResponse api_slice(int plate, bool all);
