@@ -1,14 +1,21 @@
 #include <catch2/catch.hpp>
 
+#include <algorithm>
 #include <numeric>
 #include <sstream>
+#include <string>
 
+#include "libslic3r/AABBTreeLines.hpp"
 #include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Fill/Fill.hpp"
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/Geometry.hpp"
+#include "libslic3r/Layer.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/SVG.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/libslic3r.h"
 
 #include "test_data.hpp"
@@ -475,4 +482,60 @@ bool test_if_solid_surface_filled(const ExPolygon& expolygon, double flow_spacin
 #endif
 
     return uncovered.empty(); // solid surface is fully filled
+}
+
+TEST_CASE("Sparse plane-path anchors match the printed infill", "[Fill][InternalBridge][Regression]")
+{
+    // Orca: Compare generated anchors with actual extrusion across plane-path patterns,
+    // multiline and rotations; an origin shift must not pass as valid support.
+    // Ultra has no sparse_infill_smooth_factor / separated_infills, so those
+    // dimensions from OrcaSlicer#15206 are omitted.
+    const std::string pattern = GENERATE("hilbertcurve", "octagramspiral", "archimedeanchords");
+    const int multiline = GENERATE(1, 2);
+    const bool rotated = GENERATE(false, true);
+    CAPTURE(pattern, multiline, rotated);
+
+    auto config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"sparse_infill_pattern", pattern},
+                                   {"sparse_infill_density", "15%"},
+                                   {"fill_multiline", multiline},
+                                   {"infill_direction", 45},
+                                   {"sparse_infill_rotate_template", rotated ? "0,25,50" : ""},
+                                   {"align_infill_direction_to_model", rotated},
+                                   {"top_shell_layers", 0},
+                                   {"bottom_shell_layers", 0},
+                                   {"top_shell_thickness", 0},
+                                   {"bottom_shell_thickness", 0},
+                                   {"layer_height", 0.2},
+                                   {"initial_layer_print_height", 0.2},
+                                   {"resolution", 0.012}});
+    Print print;
+    Model model;
+    Slic3r::Test::init_print({make_cube(30, 24, 1)}, print, model, config, false);
+    if (rotated) {
+        model.objects.front()->instances.front()->set_rotation(Vec3d(0., 0., Geometry::deg2rad(23.)));
+        print.apply(model, config);
+    }
+    print.process();
+
+    const Layer &layer = *print.objects().front()->get_layer(4);
+    Polylines printed;
+    for (const LayerRegion *region : layer.regions())
+        for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+            if (entity->role() == erInternalInfill)
+                entity->collect_polylines(printed);
+    REQUIRE_FALSE(printed.empty());
+    const AABBTreeLines::LinesDistancer<Line> printed_tree(to_lines(printed));
+
+    // Orca: Exclude perimeter connections: anchoring and extrusion can trim those differently.
+    const Polylines anchors = intersection_pl(layer.generate_sparse_infill_polylines_for_anchoring(nullptr, nullptr, nullptr),
+                                              shrink(to_polygons(layer.lslices), scale_(3.)));
+    REQUIRE_FALSE(anchors.empty());
+    double max_distance = 0.;
+    for (const Polyline &path : anchors)
+        for (const Point &point : path.equally_spaced_points(scale_(0.25)))
+            max_distance = std::max(max_distance, printed_tree.distance_from_lines<false>(point));
+    // Orca: Allow only the configured simplification tolerance; infill-scale offsets
+    // would hide anchors that no longer coincide with printed lines.
+    CHECK(unscale<double>(max_distance) <= config.opt_float("resolution"));
 }
