@@ -2,6 +2,7 @@
 // hub server: libcurl through the fork's Http wrapper, nlohmann::json, one worker thread.
 #include "RemoteNotify.hpp"
 
+#include "WebPush.hpp"
 #include "slic3r/Utils/Http.hpp"
 
 #include <boost/log/trivial.hpp>
@@ -422,6 +423,11 @@ static void worker()
             if (!wants(d, ev)) continue;
             record(d.id, send_with_retries(d, ev, link));
         }
+        // Web Push (P7) is not a destination somebody configures - it is a built-in fan-out over
+        // whatever phones have subscribed, with its own minimum severity. It rides this worker
+        // because the reason for the worker is the same: nobody's request thread may wait on a
+        // network service half a world away.
+        if (g_running) WebPush::deliver(ev);
     }
 }
 
@@ -550,8 +556,11 @@ void set_phone_link(const std::string& url)
 
 void deliver(const json& event)
 {
+    // Nowhere to send it - no relay and no subscribed phone - means there is nothing to queue;
+    // the tray balloon and the event ring are the hub's own, and happen either way.
+    const bool phones = WebPush::has_subscriptions();
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_dests.empty()) return; // nowhere to send it; the tray balloon and the ring are P4's job
+    if (g_dests.empty() && !phones) return;
     g_queue.push_back(event);
     if (g_queue.size() > MAX_QUEUE) g_queue.pop_front();
     g_cv.notify_one();

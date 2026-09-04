@@ -5,6 +5,7 @@
 
 #include "BambuCamRelay.hpp"
 #include "RemoteNotify.hpp"
+#include "WebPush.hpp"
 #include "libslic3r/Utils.hpp"
 #include "slic3r/Utils/Http.hpp"
 
@@ -1348,6 +1349,9 @@ void HubServer::write_hub_json()
     // not lose the relay somebody set up. RemoteNotify owns them; this is the only writer of the
     // file, so it asks for them rather than keeping a second copy.
     st["notify"] = RemoteNotify::settings_json();
+    // Web Push lives here for the same reason and one more: the VAPID key pair *is* this hub's
+    // identity to every phone that ever subscribed, so losing it would silently break all of them.
+    st["webpush"] = WebPush::settings_json();
     write_file(settings_json_path(), st.dump(2));
     update_notify_link();
 }
@@ -1370,6 +1374,7 @@ void HubServer::update_notify_link()
         if (!ips.empty()) link = "http://" + ips.front() + ":" + std::to_string(m_port) + "/r/" + m_token + "/";
     }
     RemoteNotify::set_phone_link(link);
+    WebPush::set_phone_link(link);
 }
 
 // ------------------------------------------------------- printer events ----
@@ -2149,6 +2154,37 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
         update_notify_link();
         const auto res = RemoteNotify::test(query_param(r.query, "id"), "");
         respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/push" && r.method == "GET") {
+        // The phones that subscribed to Web Push, each one masked to the push service it uses and
+        // the tail of its endpoint. The VAPID public key is here because it is public by design;
+        // the private half of that pair never leaves settings.json.
+        respond_json(client, 200, WebPush::masked_json().dump());
+    } else if (r.path == "/hub/push" && r.method == "DELETE") {
+        const auto res = WebPush::remove(query_param(r.query, "id"));
+        if (res.first == 200) write_hub_json();
+        respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/push/options" && r.method == "POST") {
+        if (r.content_type.compare(0, 16, "application/json") != 0) { respond_json(client, 415, json_error("Content-Type must be application/json")); return; }
+        std::string body;
+        if (!read_small_body(client, r, body, 16 * 1024)) { respond_json(client, 413, json_error("that is too large")); return; }
+        const auto res = WebPush::set_options(body);
+        if (res.first == 200) write_hub_json();
+        respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/push/test" && r.method == "POST") {
+        // Sent on this thread to every subscribed phone, with no retries: somebody is watching
+        // the page for the answer, and a dead endpoint should show as itself.
+        update_notify_link();
+        const auto res = WebPush::test("");
+        write_hub_json(); // a test can prune a subscription the push service says is gone
+        respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/push/debug" && r.method == "POST") {
+        // Only answers at all with SNORCA_DEBUG_ROUTES=1 (WebPush::debug_op checks): the gate
+        // cross-checks this hub's RFC 8291 and VAPID output against Python and the RFC's own
+        // test vectors, and there is no reason for a shipped hub to expose its primitives.
+        std::string body;
+        if (!read_small_body(client, r, body, 64 * 1024)) { respond_json(client, 413, json_error("that is too large")); return; }
+        const auto res = WebPush::debug_op(body);
+        respond_json(client, res.first, res.second);
     } else if (r.path == "/hub/quit" && r.method == "POST") {
         respond_json(client, 200, "{\"ok\":true}");
         m_quit = true;
@@ -2243,6 +2279,93 @@ static bool instance_api_allowed(const std::string& method, const std::string& s
 
 void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string& rest)
 {
+    // ---- the installable web app: manifest, icons, service worker (P2/P7) ----
+    // Everything here is under /r/<token>/, which means three things at once: the token gate the
+    // caller already passed is the only gate these need, the manifest's relative start_url and
+    // scope resolve to this phone link by construction, and the service worker's scope is exactly
+    // this link and nothing wider. A manifest fetch is credentials-omitted by default in every
+    // browser - which is fine precisely because the gate is the path and not the cookie. Do not
+    // "improve" that into a cookie gate.
+    if (r.method == "GET" && rest == "/manifest.webmanifest") {
+        std::string token;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            token = m_token;
+        }
+        json m;
+        m["id"]               = "/r/" + token + "/";
+        m["name"]             = "Snapmaker Orca";
+        m["short_name"]       = "Orca";
+        m["description"]      = "The cameras, printers and prints on the PC in your workshop.";
+        m["start_url"]        = "./"; // resolved against this manifest's own URL, so it keeps the token
+        m["scope"]            = "./";
+        m["display"]          = "standalone";
+        m["orientation"]      = "any";
+        m["theme_color"]      = "#1f1f1f";
+        m["background_color"] = "#1f1f1f";
+        m["icons"]            = json::array({
+            json{ { "src", "icon-192.png" }, { "sizes", "192x192" }, { "type", "image/png" }, { "purpose", "any" } },
+            json{ { "src", "icon-512.png" }, { "sizes", "512x512" }, { "type", "image/png" }, { "purpose", "any" } },
+            json{ { "src", "icon-512-maskable.png" }, { "sizes", "512x512" }, { "type", "image/png" }, { "purpose", "maskable" } }
+        });
+        respond(client, 200, "application/manifest+json", m.dump(2));
+        return;
+    }
+    if (r.method == "GET" && (rest == "/icon-192.png" || rest == "/icon-512.png" || rest == "/icon-512-maskable.png" ||
+                              rest == "/apple-touch-icon.png")) {
+        // A closed set of names mapped to a closed set of files: no part of the request reaches
+        // the filesystem, so there is nothing here to traverse out of.
+        const char* file = rest == "/icon-192.png"          ? "Snapmaker_Orca_192px.png" :
+                           rest == "/icon-512.png"          ? "Snapmaker_Orca_512px.png" :
+                           rest == "/icon-512-maskable.png" ? "Snapmaker_Orca_512px_maskable.png" :
+                                                              "Snapmaker_Orca_180px.png";
+        const std::string png = read_file(resources_dir() + "/images/" + file);
+        if (png.empty()) { respond(client, 404, "text/plain", "not found"); return; }
+        respond(client, 200, "image/png", png);
+        return;
+    }
+    if (r.method == "GET" && rest == "/sw.js") {
+        // Served from under the token so its scope is /r/<token>/ - a worker served from the root
+        // would claim every phone link this hub ever hands out.
+        const std::string js = read_file(resources_dir() + "/web/orca/sw.js");
+        if (js.empty()) { respond(client, 404, "text/plain", "not found"); return; }
+        respond(client, 200, "application/javascript", js);
+        return;
+    }
+    // ---- Web Push (P7) ----
+    if (rest == "/push/key" && r.method == "GET") {
+        // The application server key the page hands to PushManager.subscribe(). Public by
+        // definition: it is what the push service checks our signature against.
+        json j;
+        j["key"] = WebPush::public_key_b64u();
+        respond_json(client, 200, j.dump());
+        return;
+    }
+    if (rest == "/push/subscription" && r.method == "POST") {
+        if (r.content_type.compare(0, 16, "application/json") != 0) { respond_json(client, 415, json_error("Content-Type must be application/json")); return; }
+        std::string body;
+        if (!read_small_body(client, r, body, 16 * 1024)) { respond_json(client, 413, json_error("that is too large for a subscription")); return; }
+        const auto res = WebPush::add_subscription(body);
+        if (res.first == 200) write_hub_json();
+        respond_json(client, res.first, res.second);
+        return;
+    }
+    if (rest == "/push/subscription" && r.method == "DELETE") {
+        // The page saying it unsubscribed. It has to name the endpoint in full, which only the
+        // phone that owns it knows, and the answer is the same either way so this cannot be used
+        // to find out whether some endpoint is subscribed here.
+        std::string body;
+        if (!read_small_body(client, r, body, 16 * 1024)) { respond_json(client, 413, json_error("that is too large")); return; }
+        std::string endpoint;
+        try {
+            const json in = json::parse(body);
+            if (in.is_object() && in.contains("endpoint") && in["endpoint"].is_string()) endpoint = in["endpoint"].get<std::string>();
+        } catch (...) {}
+        const auto res = WebPush::remove_subscription(endpoint);
+        write_hub_json();
+        respond_json(client, res.first, res.second);
+        return;
+    }
     // ---- hub-level API (instances, uploads) ----
     if (rest == "/api" || rest == "/api/") {
         json j;
@@ -2254,7 +2377,10 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
             { {"method", "POST"}, {"path", "/i/{id}/open?mode=load|import"}, {"description", "same upload, opened in instance {id}: load = save the current project, then open this project (default for .3mf); import = add the model to the current plate (default otherwise)"} },
             { {"method", "*"},    {"path", "/i/{id}/api/..."},      {"description", "the instance's own API (see GET /i/{id}/api)"} },
             { {"method", "GET"},  {"path", "/state"},               {"description", "camera list for the stream wall"} },
-            { {"method", "GET"},  {"path", "/events?since={id}"},   {"description", "printer events the slicer instances reported (started / finished / failed / cancelled / paused / resumed / runout / error), newest last: {events, last_id}"} }
+            { {"method", "GET"},  {"path", "/events?since={id}"},   {"description", "printer events the slicer instances reported (started / finished / failed / cancelled / paused / resumed / runout / error), newest last: {events, last_id}"} },
+            { {"method", "GET"},  {"path", "/push/key"},            {"description", "the hub's VAPID public key, for PushManager.subscribe()"} },
+            { {"method", "POST"}, {"path", "/push/subscription"},   {"description", "this browser's PushSubscription JSON; re-post it on every launch"} },
+            { {"method", "DELETE"}, {"path", "/push/subscription"}, {"description", "body {endpoint} - this browser unsubscribed"} }
         });
         respond_json(client, 200, j.dump());
         return;
@@ -2531,13 +2657,14 @@ bool HubServer::start()
     // Remote access settings live in their own file: hub.json is removed on a clean quit (it
     // is how instances find a live hub), which used to lose remote_on and the allow-list and
     // left Tailscale Serve answering 403 until remote access was switched on again.
-    json notify_saved = json::object();
+    json notify_saved = json::object(), webpush_saved = json::object();
     try {
         json j      = json::parse(read_file(settings_json_path()));
         m_remote_on = j.value("remote_on", false);
         // ... and so do the notification destinations: an ntfy topic or a Pushover key set up
         // once must survive every hub restart.
         notify_saved = j.value("notify", json::object());
+        webpush_saved = j.value("webpush", json::object());
         for (const auto& l : j.value("allowed_logins", json::array())) m_allowed_logins.push_back(lower(l.get<std::string>()));
         // ... and so does the phone link, for the same reason: hub.json is gone after a clean
         // quit, and a hub that came back with a new token would break every saved link. The
@@ -2555,6 +2682,9 @@ bool HubServer::start()
     m_secret = random_hex(16);
     m_state  = read_file(streams_json_path());
     load_events(); // what the printers did before this hub was restarted, and where the ids got to
+    // Web Push before the relay worker: RemoteNotify::deliver() asks it whether any phone is
+    // subscribed before deciding there is nothing to queue.
+    WebPush::start(webpush_saved); // mints the VAPID key pair the first time this data dir runs
     RemoteNotify::start(notify_saved); // the relay worker; deliver() is a no-op until it has one
 
     gc_uploads(); // whatever last time left behind, before anything new lands
@@ -2583,6 +2713,9 @@ void HubServer::loop(bool idle_exit)
     while (!m_quit) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
         flush_logs(); // the file sink buffers; keep hub.log readable while we run
+        // A phone subscribed, or the sender pruned one the push service said was gone. Saving
+        // from here means the sender thread never has to reach back into HubServer.
+        if (WebPush::consume_dirty()) write_hub_json();
         if (!idle_exit) continue;
         bool phone;
         {
@@ -2611,6 +2744,9 @@ void HubServer::shutdown()
 #ifndef _WIN32
     if (m_go2rtc_pid > 0) ::kill((pid_t) m_go2rtc_pid, SIGTERM);
 #endif
+    // WebPush first: it only sets a flag, and it is that flag which lets a push waiting out a
+    // retry backoff give up, so the join below does not have to wait for it.
+    WebPush::stop();
     RemoteNotify::stop(); // let an in-flight relay send finish, then join the worker
     // On Windows the kill-on-close job object takes go2rtc down with us.
     flush_logs();

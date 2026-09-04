@@ -7,6 +7,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#1f1f1f">
+<!-- Both are relative, so they resolve under /r/<token>/ and the installed icon keeps the token
+     in its start_url. iOS prefers apple-touch-icon over the manifest's icons, so ship both and
+     make them the same picture. Off the hub (the PC's own Stream tab) these simply 404. -->
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
 <title>Stream</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -187,6 +193,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #send .plate, #ctlsheet .plate { background: #303030; border-radius: 8px; padding: 10px 12px; color: #fff; font-weight: 600; }
 #send .plate .sub, #ctlsheet .plate .sub { display: block; font-weight: 400; color: #aaa; font-size: 12px; margin-top: 2px; }
 /* The control line under a printer card: what pause / resume / stop is doing, and why not */
+/* "Enable notifications": the Web Push control, in the same card styling as the event list. */
+.pushbox { background: #2f2f2f; border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pushbox .txt { flex: 1; min-width: 150px; font-size: 12px; line-height: 1.45; color: #bbb; }
+.pushbox .txt b { color: #fff; font-weight: 600; display: block; font-size: 13px; margin-bottom: 2px; }
+.pushbox .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #555; }
+.pushbox.on .dot { background: #5fd08a; }
 /* The Devices tab's event list: what the printers have done, newest first, in the card styling. */
 .evbox { background: #2f2f2f; border-radius: 8px; padding: 8px 12px 10px; margin-bottom: 10px; }
 .evbox .evhead { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
@@ -1389,7 +1401,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             evLastId = Math.max(evLastId, last);
             while (evList.length > 60) evList.shift();
             evBadge();
-            if (view === 'devices') evRender();
+            if (view === 'devices') { pushRender(); evRender(); }
             if (then) then();
         }).catch(function() { if (then) then(); });
     }
@@ -1426,6 +1438,121 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             box.appendChild(row);
         });
         evMarkSeen();
+    }
+    // ------------------------------------------------------------ Web Push (P7) ----
+    // The phone subscribes to its own browser's push service and hands the hub the endpoint; the
+    // PC then posts printer events straight there, encrypted, with the page closed and the phone
+    // off the LAN. Everything below needs a secure origin - on the plain-http Wi-Fi link
+    // serviceWorker, PushManager and Notification simply do not exist, and the control stays
+    // hidden rather than offering something that cannot work.
+    var pushReg = null, pushSub = null, pushBusy = false, pushNote = '';
+    function pushStandalone() {
+        return window.navigator.standalone === true ||
+               (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+    }
+    function pushIos() { return /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); }
+    function pushSupported() {
+        return !!(window.isSecureContext && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window);
+    }
+    function pushKeyBytes(b64) {
+        var pad = new Array((4 - b64.length % 4) % 4 + 1).join('=');
+        var raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+        var out = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+        return out;
+    }
+    function pushPost(sub) {
+        var body = sub.toJSON ? sub.toJSON() : sub;
+        body.ua = (navigator.userAgent || '').slice(0, 120);
+        return fetch(REMOTE + 'push/subscription', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+        }).then(jsonOf);
+    }
+    // Registering the worker and re-posting whatever subscription this browser already has, on
+    // every launch. That re-post is the only mechanism that works everywhere: iOS Safari never
+    // fires pushsubscriptionchange, and Chrome only got it right in 138.
+    function pushInit() {
+        if (!REMOTE || !pushSupported()) { pushRender(); return; }
+        navigator.serviceWorker.register('sw.js', { scope: './' }).then(function(reg) {
+            pushReg = reg;
+            return reg.pushManager.getSubscription();
+        }).then(function(sub) {
+            pushSub = sub || null;
+            pushRender();
+            if (sub) return pushPost(sub).catch(function() {});
+        }).catch(function(e) { pushNote = 'Notifications could not start: ' + (e.message || e); pushRender(); });
+    }
+    // Must run from a real tap: both Notification.requestPermission() and subscribe() require a
+    // user gesture on iOS, and Chrome refuses a permission prompt without one.
+    function pushEnable() {
+        if (pushBusy || !pushReg) return;
+        pushBusy = true; pushNote = ''; pushRender();
+        Notification.requestPermission().then(function(perm) {
+            if (perm !== 'granted') throw new Error(perm === 'denied'
+                ? 'Notifications are blocked for this site in the browser settings.'
+                : 'Notifications were not allowed.');
+            return fetch(REMOTE + 'push/key').then(jsonOf);
+        }).then(function(j) {
+            if (!j.key) throw new Error('The PC has no notification key yet.');
+            // userVisibleOnly is required by Chrome and matches what the worker does anyway: every
+            // push shows a notification, which is also what keeps the permission alive on iOS.
+            return pushReg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: pushKeyBytes(j.key) });
+        }).then(function(sub) {
+            pushSub = sub;
+            return pushPost(sub);
+        }).then(function() {
+            pushNote = 'This phone will now be told when a print starts, finishes or needs you.';
+        }).catch(function(e) {
+            pushNote = e.message || String(e);
+        }).then(function() { pushBusy = false; pushRender(); });
+    }
+    function pushDisable() {
+        if (pushBusy || !pushSub) return;
+        pushBusy = true; pushRender();
+        var endpoint = pushSub.endpoint;
+        pushSub.unsubscribe().catch(function() {}).then(function() {
+            return fetch(REMOTE + 'push/subscription', {
+                method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ endpoint: endpoint })
+            }).catch(function() {});
+        }).then(function() {
+            pushSub = null; pushNote = ''; pushBusy = false; pushRender();
+        });
+    }
+    function pushRender() {
+        var page = document.getElementById('devices');
+        if (!page || !REMOTE) return;
+        var box = page.querySelector('.pushbox');
+        // On the Wi-Fi link there is nothing to offer: no secure context, so no service worker and
+        // no push. Say nothing rather than showing a button that cannot work.
+        if (!pushSupported() && !(pushIos() && !pushStandalone())) { if (box) box.remove(); return; }
+        if (!box) { box = el('div', 'pushbox'); page.insertBefore(box, page.firstChild); }
+        box.className = 'pushbox' + (pushSub ? ' on' : '');
+        box.innerHTML = '';
+        box.appendChild(el('div', 'dot'));
+        var txt = el('div', 'txt');
+        // iOS only has Notification and PushManager inside a home-screen web app - never in a
+        // Safari tab, in any browser on the phone, because they are all WebKit.
+        if (!pushSupported() && pushIos()) {
+            txt.appendChild(el('b', '', 'Notifications need this page on your Home Screen'));
+            txt.appendChild(el('div', '', 'Tap Share, then Add to Home Screen, and open it from the new icon. This link is the one that gets installed.'));
+            box.appendChild(txt);
+            return;
+        }
+        if (pushSub) {
+            txt.appendChild(el('b', '', 'Notifications are on for this phone'));
+            txt.appendChild(el('div', '', pushNote || 'Prints starting, finishing and going wrong are pushed here, even with this page closed.'));
+            box.appendChild(txt);
+            var off = el('span', 'btn dim small', pushBusy ? 'Working...' : 'Turn off');
+            off.onclick = pushDisable;
+            box.appendChild(off);
+            return;
+        }
+        txt.appendChild(el('b', '', 'Notifications are off'));
+        txt.appendChild(el('div', '', pushNote || 'Be told when a print starts, finishes or needs you - even with this page closed.'));
+        box.appendChild(txt);
+        var on = el('span', 'btn', pushBusy ? 'Working...' : 'Enable notifications');
+        on.onclick = pushEnable;
+        box.appendChild(on);
     }
     function fail(e) { document.getElementById('note').textContent = e.message || String(e); }
     function startSlice(plate) {
@@ -2741,9 +2868,10 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
     function refreshDevices() {
         var root = document.getElementById('devices');
+        pushRender(); // the Enable-notifications control survives every redraw of the tab
         // No slicer, no printer cards - but the hub keeps the events after every instance is
         // closed, so they stay on the tab.
-        if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); evRender(); return; }
+        if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); evRender(); pushRender(); return; }
         // One request per card source: the printers (every card) and the Snapmaker devices call for
         // the optional PC-side connect. A failing devices call only costs the connect button.
         Promise.all([api('/printers'), api('/snapmaker/devices').catch(function() { return {}; })]).then(function(res) {
@@ -2867,6 +2995,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         // page's own cadence too, not only while the Devices tab is showing.
         refreshEvents();
         setInterval(refreshEvents, 15000);
+        pushInit();
         var v = 'streams';
         try { v = localStorage.getItem('snorca_remote_view') || 'streams'; } catch (e) {}
         if (v === 'prepare' || v === 'devices' || v === 'plates') setView(v === 'plates' ? 'prepare' : v);

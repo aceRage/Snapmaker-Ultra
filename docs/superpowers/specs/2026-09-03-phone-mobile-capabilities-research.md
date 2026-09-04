@@ -751,6 +751,182 @@ saving the hub will not show it again.
 **Gate.** `snorca_hubtest\test_phone_notify.py` with `mock_relay.py`: an isolated data dir, a hub
 of its own, a loopback mock recording every header and body. It never contacts a real relay.
 
+### 2.8 Update (P7): Web Push, as built
+
+Branch `feat/phone-webpush`. N3 above, shipped: `src/slic3r/GUI/WebPush.{hpp,cpp}` (hub process
+only), the `/r/<token>/push/*` and `/hub/push*` routes in `RemoteHub.cpp`,
+`resources/web/orca/sw.js`, the Enable-notifications control on the phone's Devices tab and the
+*Phones (Web Push)* card on the hub page. It carries the parts of P2 it cannot work without - the
+per-token manifest, the icon routes and a 512 px icon - and nothing else of P2: **the Install chip
+and the iOS instruction sheet of §1.5 are still to do.** What the page does have is the one line
+iOS needs at the point of failure: on an iPhone in a Safari tab (where `Notification` and
+`PushManager` do not exist at all) the Devices tab says *"Notifications need this page on your
+Home Screen"* instead of offering a button that cannot work.
+
+**The shape, in one paragraph.** The hub owns a P-256 VAPID key pair, generated once and kept in
+`<datadir>/hub/settings.json`. The page asks for its public half, hands it to
+`PushManager.subscribe()`, and POSTs the resulting subscription back. When an event arrives, the
+hub encrypts a small JSON payload to that subscription's own keys (RFC 8291, `aes128gcm`) and
+POSTs it to the opaque endpoint with a VAPID `Authorization` header (RFC 8292). The push service
+sees an origin, a size and a token that proves who sent it - never the content. The phone's
+service worker wakes, decrypts (the browser does that part) and calls `showNotification`.
+
+**Routes.** All of the phone-facing ones are under `/r/<token>/`, so the existing constant-time
+token gate covers them and nothing new was added to the LAN listener's surface. None of them is an
+*instance* route, so `instance_api_allowed` and `test_hardening.py` are untouched.
+
+| Route | Listener | Answer |
+|---|---|---|
+| `GET /r/<token>/manifest.webmanifest` | main | `application/manifest+json`, built per token: `id: "/r/<token>/"`, `start_url: "./"`, `scope: "./"`, `display: standalone`, name/short_name, `theme_color`/`background_color` `#1f1f1f`, icons 192, 512 and a `maskable` 512 |
+| `GET /r/<token>/icon-192.png`, `icon-512.png`, `icon-512-maskable.png` | main | `image/png` from `resources/images` |
+| `GET /r/<token>/apple-touch-icon.png` | main | `image/png`, 180x180, opaque (iOS ignores the alpha channel) |
+| `GET /r/<token>/sw.js` | main | the service worker. Served **under the token** so its scope is exactly this phone link |
+| `GET /r/<token>/push/key` | main | `{"key": "<base64url 65-byte point>"}` - the `applicationServerKey` |
+| `POST /r/<token>/push/subscription` | main | the browser's `PushSubscription` JSON (`{endpoint, keys:{p256dh, auth}}`, plus an optional `ua`). Idempotent on the endpoint |
+| `DELETE /r/<token>/push/subscription` | main | body `{endpoint}` - the page unsubscribed. Answers `{"ok":true}` whether or not it was there, so it cannot be used to test whether some endpoint is subscribed here |
+| `GET /hub/push` | admin | the masked list, the public key, the count, the minimum severity |
+| `DELETE /hub/push?id=` | admin | forget one phone |
+| `POST /hub/push/options` | admin | `{enabled, min_severity, subject}` |
+| `POST /hub/push/test` | admin | one synthetic push to every phone, on the request thread, no retries; `{ok, results:[{id, endpoint, ok, status, error}]}` |
+| `POST /hub/push/debug` | admin | **only with `SNORCA_DEBUG_ROUTES=1`** (as P4 did): `{op:"encrypt"\|"jwt"\|"topic", ...}`, so the gate can compare this hub's primitives against an independent implementation instead of against themselves. A shipped hub answers 404 |
+
+The `/hub/*` ones keep the whole existing gate: loopback peer, loopback `Host`, no
+`Sec-Fetch-Site: cross-site`, `X-Hub-Secret`, and the admin listener only.
+
+**Settings.** `<datadir>/hub/settings.json`, under a `webpush` key next to `notify` and the phone
+token - that file, not `hub.json`, because `shutdown()` deletes `hub.json` and a new VAPID pair
+would silently break every phone that ever subscribed:
+
+```json
+"webpush": {
+  "enabled": true,
+  "min_severity": "info",
+  "subject": "mailto:hub@snapmaker-orca.invalid",
+  "vapid": {"private": "<base64url 32-byte scalar>", "public": "<base64url 65-byte point>"},
+  "subscriptions": [
+    {"id": "3f7a...", "endpoint": "https://web.push.apple.com/...", "p256dh": "<65 bytes>",
+     "auth": "<16 bytes>", "ua": "Mozilla/5.0 ...", "added": 1757000000000,
+     "last_sent": 1757000100000, "last_status": 201, "last_error": "", "failures": 0}
+  ]
+}
+```
+
+The sender runs on another thread than the one that owns that file, so it never writes it: it sets
+a flag and the hub's own two-second loop calls `write_hub_json()` (`WebPush::consume_dirty()`).
+
+**On the wire.** One `POST` to the endpoint:
+
+```
+TTL: 86400
+Urgency: high            (warning and error; normal otherwise)
+Topic: <24 base64url chars>   = base64url(SHA-256(printer id | kind))[:24]
+Content-Encoding: aes128gcm
+Content-Type: application/octet-stream
+Authorization: vapid t=<ES256 JWT>, k=<base64url 65-byte public key>
+
+salt(16) | record size(4, = 4096) | key id length(1, = 65) | ephemeral public key(65) | AES-128-GCM(payload || 0x02)
+```
+
+The payload is `{title, body, tag, url, kind, severity, printer, id, time}` - about 200 bytes,
+against RFC 8291's 3993-byte ceiling, and clipped to 3000 before encryption so it can never get
+near it. `url` is the Tailscale link when remote access is on, the Wi-Fi link otherwise, and is
+omitted while phone access is off. `tag` is `<printer id>:<kind>`, so a second *paused* for the
+same printer replaces the first on the lock screen instead of stacking.
+
+**Crypto choices, and why.**
+
+- **OpenSSL 1.1.1w only, no new dependency** - the abandoned C libraries of §2.3(b) stay
+  unbundled. `EC_KEY` for key generation and for importing a raw 32-byte scalar or a 65-byte
+  point, `ECDH_compute_key` with a null KDF for `ecdh_secret`, plain `HMAC-SHA-256` for the whole
+  RFC 8291 key schedule (every expand step is at most 32 bytes, i.e. exactly one HMAC block, so
+  no HKDF API is needed), `EVP_aes_128_gcm` with OpenSSL's default 12-byte GCM IV (hence no
+  `SET_IVLEN`), and `EVP_DigestSign*` + `d2i_ECDSA_SIG` + `BN_bn2binpad` for the ES256 signature's
+  DER-to-raw-`r||s` conversion.
+- **A fresh ephemeral key pair and a fresh 16-byte salt per message.** The same sentence to the
+  same phone twice never produces the same bytes; the gate checks exactly that.
+- **One record, delimiter `0x02`, no padding.** Padding hides a payload's length; there is nothing
+  to hide here, and a shorter body is a body a rate limit is happier with.
+- **`aud` is the endpoint's origin, not the endpoint.** This is the commonest cause of a 403 from
+  FCM. `exp` is 12 h and the token is cached per push origin and reused until it is within an hour
+  of expiring, because Apple asks that it not be minted more often than hourly. `sub` must be a
+  `mailto:` or `https:` URI and the hub refuses anything else.
+- **`https` only, except to `127.0.0.1`** - the same rule as the relay senders, and the same
+  reason the gate's mock service can exist at all.
+
+**iOS caveats, all of which are the platform's and none of which we can work around.**
+
+1. **The page must be added to the Home Screen.** `Notification` and `PushManager` do not exist in
+   a Safari tab on iOS, in *any* browser on the phone, because they are all WebKit. Web Push has
+   worked in a home-screen web app since iOS 16.4 (March 2023) and needs no Apple Developer
+   Program membership - it is standards-based VAPID.
+2. **A secure origin.** That means the Tailscale link, never the plain-`http` Wi-Fi one. The page
+   hides the whole control on the Wi-Fi origin rather than offering something that cannot work.
+3. **The permission must be asked for from a user gesture.** Hence a button, and hence
+   `pushEnable()` runs `Notification.requestPermission()` synchronously inside the tap handler.
+4. **Every push must show a notification.** *"If you don't, Safari revokes the push notification
+   permission for your site."* The service worker therefore calls `showNotification` first and
+   `waitUntil`s nothing else - in particular it never makes a request back to this PC, which would
+   reject when the phone is off the LAN and settle the promise with no notification shown.
+   Chrome's version of the same rule is `userVisibleOnly: true`, which the page passes.
+5. **`pushsubscriptionchange` never fires on iOS**, and only became spec-conformant in Chrome 138.
+   The mechanism that works everywhere is the page re-POSTing `getSubscription()` on every launch,
+   which it does; the worker also handles the event where it exists, as a belt.
+6. **Two origins are two apps.** A phone that installed the Wi-Fi link and one that installed the
+   Tailscale link are separate installs with separate permissions and separate subscriptions.
+
+**Pruning and retries.** `404` and `410` are terminal: the subscription is deleted, never retried,
+and `settings.json` is rewritten. A transport error, a `429` or a `5xx` is retried three times,
+1 s then 3 s apart, exactly like the relay senders. Any other `4xx` is the push service saying the
+request itself is wrong, and repeating it only burns the rate limit.
+
+**What is verified, and what still needs a phone.**
+
+Verified by `snorca_hubtest\test_phone_webpush.py` (with `mock_push.py`, an *independent* RFC 8291
+and RFC 8292 implementation written on Python's `cryptography`, so the hub is compared against
+something that is not itself):
+
+- the manifest, `sw.js` and all four icons are served under the token and 404 under a wrong one;
+  the manifest is token-scoped and relative;
+- `/r/<token>/push/key` is a 65-byte uncompressed point, the same one the hub page shows, and the
+  private half appears on neither the phone origin nor the hub page;
+- subscribe, re-subscribe (idempotent on the endpoint), a rejected `p256dh`, a rejected `auth`, a
+  rejected non-`https` endpoint, and remove;
+- **the encryption is byte-identical to Python's** given the same salt and ephemeral key, and with
+  fresh randomness still decrypts to the same plaintext with different bytes;
+- the JWT verifies against its own `k=`, with `aud` = the endpoint's origin, a `mailto:` `sub` and
+  an `exp` inside 24 h;
+- the full send shape: `TTL`, `Urgency`, `Topic` (<= 32 base64url characters), `Content-Encoding`,
+  `Content-Type`, and a payload that decrypts to the expected title, sentence, tag and link;
+- `Urgency: high` for an error, the minimum-severity filter, the disable switch;
+- a `503` is retried and the push still lands; a `410` and a `404` each prune the subscription and
+  it disappears from `settings.json`;
+- masking on the hub page, the `/hub/*` gate on every new route (no secret, non-loopback `Host`,
+  cross-site, the phone-facing listener, the LAN address), and that nothing under `/r/<token>/`
+  leaks the private key;
+- the VAPID pair and the subscriptions survive a hub restart, and `/hub/push/debug` is a 404
+  without `SNORCA_DEBUG_ROUTES=1`.
+
+Not verified here, because it needs a real device and a real push service:
+
+- a subscription minted by an installed iOS web app, and a push arriving on it (open question 7
+  of §5);
+- that iOS's permission survives normal use - i.e. that rule 4 above is honoured in practice;
+- Android Chrome's WebAPK install and its own `Urgency`/`Topic` handling;
+- what a push service does with our `Topic` coalescing over a slow mobile connection.
+
+**Phone checklist** (iPhone, once the hub is running with remote access on):
+
+1. Open `https://<pc>.<tailnet>.ts.net/r/<token>/` in Safari.
+2. Share -> Add to Home Screen. Open it from the new icon, not from Safari.
+3. Devices tab -> *Enable notifications* -> Allow.
+4. On the PC: hub page -> Phones (Web Push) -> *Test*. The notification should arrive with the
+   page closed.
+
+**Still to do.** The Install chip and the iOS instruction sheet from §1.5 (P2 proper);
+`screenshots` and `description` in the manifest for Chrome's richer install prompt; and a decision
+on whether the hub should say out loud that it now needs outbound HTTPS to
+`*.push.apple.com` / `fcm.googleapis.com`, and what it should show when that is blocked.
+
 ---
 
 ## 3. Start / pause / stop on the Devices tab
@@ -890,7 +1066,7 @@ exist and only need joining up. Add the U1 alongside the state work in topic 2. 
 | **P4** | **The event watcher**: `RemoteEvents` in the instance, `GET /api/events`, the hub tray balloon, the Devices-tab badge | P3's `/api/printers` extensions (shares the polling code) | **1 day** |
 | **P5** | **Relay notifications**: `POST /hub/event`, hub-side destinations in `settings.json`, the generic POST sender, ntfy and Pushover presets with a QR, the hub-page UI, a test button | P4 | **1–1½ days** |
 | **P6** | **In-page notifications**: service worker on the https origin, `showNotification()` from the events feed | P2, P4 | **½ day** |
-| **P7** | **Web Push**: VAPID keypair, `WebPush.{hpp,cpp}` (JWT + RFC 8291 on OpenSSL), subscription routes, the SW `push`/`notificationclick` handlers, re-sync on launch, 404/410 pruning | P6 | **4–6 days** |
+| **P7** | **Web Push**: VAPID keypair, `WebPush.{hpp,cpp}` (JWT + RFC 8291 on OpenSSL), subscription routes, the SW `push`/`notificationclick` handlers, re-sync on launch, 404/410 pruning | P6 | **4–6 days** · **done** on `feat/phone-webpush` (§2.8), carrying the manifest/icon/service-worker part of P2 with it; the Install chip and the iOS sheet are still P2's |
 | **P8** *(opt.)* | **U1 without a slicer**: hub polls Moonraker over LAN HTTP from its own loop; U1 events and controls with no instance open | `feat/phone-snapmaker-lan` | **1–2 days** |
 | **P9** *(opt.)* | ntfy `Actions: http` buttons that pause a print straight from the notification | P3, P5 | **½ day** |
 
@@ -948,6 +1124,13 @@ Ordering notes:
 7. **Web Push on the Tailscale origin (if P7 happens).** The certificate chain is public, so it should
    behave like any HTTPS site — but verify a subscription is minted on both an installed iOS web app
    and Android Chrome before writing the sender.
+   **Update (P7, `feat/phone-webpush`): the sender was written anyway, and everything below the
+   device is proven** — the request the hub puts on the wire is checked byte for byte against an
+   independent RFC 8291 / RFC 8292 implementation and against a mock push service (§2.8). What a
+   real device does is still open, and is the one thing the gate cannot answer: whether an
+   installed iOS web app mints a subscription against this VAPID key, whether the notification
+   arrives with the app closed, and whether the permission survives (Apple revokes it if a push
+   ever shows nothing). The phone checklist at the end of §2.8 is the test.
 
 ---
 

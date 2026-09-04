@@ -54,6 +54,9 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
   <div class="card" id="slicers"><h2>Slicer windows</h2><div id="slicerbody">Loading…</div>
     <div class="note">A hidden slicer runs without a window and serves the phone; Show puts its window on the desktop, Hide takes it away again (it keeps working). "Needs attention" means it hit something only a person at this PC can answer - a file dialog, first-run setup, a mandatory update - so its window has been shown; Dismiss clears the flag once handled.</div>
   </div>
+  <div class="card" id="push"><h2>Phones (Web Push)</h2><div id="pushbody">Loading…</div>
+    <div class="note">The other way round from the relays below: the phone subscribes to its own browser's push service, and this PC posts each event straight there, encrypted so only that phone can read it. No account anywhere. It needs the Tailscale link (a secure origin), and on an iPhone the page has to be added to the Home Screen first - open the link, Devices tab, Enable notifications. The key below is the public half of this hub's identity; the private half stays in the data folder and is never shown or sent.</div>
+  </div>
   <div class="card" id="notify"><h2>Notifications</h2><div id="notifybody">Loading…</div>
     <div class="note">The hub sends printer events - print finished, paused, filament runout, an error - to a push service you pick, so your phone is told with the page closed. The PC makes the call, so this works on plain Wi-Fi with no Tailscale and no home-screen install. Topics, keys and tokens are treated as passwords: this page shows only their last four characters once saved, and they never reach the phone link.</div>
   </div>
@@ -335,6 +338,65 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         return fetch('/hub/notify', { headers: hdrs() }).then(function(r) { return r.json(); })
             .then(function(j) { notify = j; renderNotify(); }).catch(function() {});
     }
+    // ---- Phones (Web Push) --------------------------------------------------------------
+    // /hub/push on the same loopback control plane. The hub masks each subscription to the push
+    // service it belongs to plus the tail of its endpoint - enough to tell two phones apart,
+    // never enough to push to one from anywhere else.
+    var push = null, lastPush = null, pushNote = '';
+    function renderPush() {
+        var body = document.getElementById('pushbody');
+        if (!push) return;
+        var key = JSON.stringify(push) + '|' + pushNote;
+        if (key === lastPush) return;
+        lastPush = key;
+        body.innerHTML = '';
+        var subs = push.subscriptions || [];
+        if (!subs.length) {
+            body.appendChild(el('div', 'note', 'No phone has subscribed yet. Open the phone link on the phone, go to the Devices tab and tap "Enable notifications".'));
+        }
+        subs.forEach(function(d) {
+            var row = el('div', 'dest' + (d.status === 'failing' ? ' bad' : ''));
+            var head = el('div', 't', d.host || 'push service');
+            head.appendChild(el('span', 'badge' + (d.status === 'failing' ? ' bad' : (d.status === 'ok' ? ' ok' : '')),
+                                d.status === 'failing' ? 'failing' : (d.status === 'new' ? 'new' : (d.status === 'retrying' ? 'retrying' : 'on'))));
+            row.appendChild(head);
+            row.appendChild(el('div', 'm', d.endpoint + (d.last_status ? '  \u00b7  last answer ' + d.last_status : '')));
+            if (d.ua) row.appendChild(el('div', 'm', d.ua));
+            if (d.last_error) row.appendChild(el('div', 'err', 'Last error: ' + d.last_error + (d.failures > 1 ? ' (' + d.failures + ' in a row)' : '')));
+            var del = el('span', 'btn warn small', 'Remove');
+            del.onclick = function() {
+                if (!confirm('Stop pushing to this phone? It can subscribe again from the phone link.')) return;
+                jfetch('/hub/push?id=' + encodeURIComponent(d.id), 'DELETE').then(function(r) { push = r.j; lastPush = null; renderPush(); });
+            };
+            row.appendChild(del);
+            body.appendChild(row);
+        });
+        var sev = severitySelect(push.min_severity);
+        sev.onchange = function() { jfetch('/hub/push/options', 'POST', { min_severity: sev.value }).then(function(r) { push = r.j; lastPush = null; renderPush(); }); };
+        body.appendChild(sev);
+        var tog = el('span', 'btn dim small', push.enabled ? 'Disable' : 'Enable');
+        tog.onclick = function() { jfetch('/hub/push/options', 'POST', { enabled: !push.enabled }).then(function(r) { push = r.j; lastPush = null; renderPush(); }); };
+        body.appendChild(tog);
+        if (subs.length) {
+            var test = el('span', 'btn dim small', 'Test');
+            test.onclick = function() {
+                test.textContent = 'Sending\u2026';
+                jfetch('/hub/push/test', 'POST', {}).then(function(r) {
+                    var res = r.j.results || [];
+                    pushNote = r.j.ok ? ('Test sent to ' + res.length + ' phone(s).')
+                                      : ('Test failed: ' + ((res[0] && (res[0].error || ('HTTP ' + res[0].status))) || r.j.error || 'no answer') + '.');
+                    lastPush = null; refreshPush();
+                });
+            };
+            body.appendChild(test);
+        }
+        if (pushNote) body.appendChild(el('div', 'note', pushNote));
+        body.appendChild(el('div', 'm', 'Public key: ' + (push.public_key || '(none yet)')));
+    }
+    function refreshPush() {
+        return fetch('/hub/push', { headers: hdrs() }).then(function(r) { return r.json(); })
+            .then(function(j) { push = j; renderPush(); }).catch(function() {});
+    }
     function renderSlicers(list) {
         var body = document.getElementById('slicerbody');
         body.innerHTML = '';
@@ -365,6 +427,7 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         fetch('/hub/info', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { info = j; renderPhone(); renderRemote(); document.getElementById('status').textContent = 'Hub pid ' + j.pid + ', port ' + j.port + ', version ' + j.version; }).catch(function() {});
         fetch('/hub/instances', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { renderSlicers(j.instances || []); }).catch(function() {});
         if (!openForm) refreshNotify(); // never while a form is half typed
+        refreshPush();
     }
     document.getElementById('new').onclick = function() { post('/hub/new').then(function() { setTimeout(refresh, 3000); }); };
     document.getElementById('newhidden').onclick = function() { post('/hub/new?hidden=1').then(function() { setTimeout(refresh, 3000); }); };
