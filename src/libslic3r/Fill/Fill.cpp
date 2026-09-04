@@ -10,7 +10,7 @@
 #include "../Surface.hpp"
 
 #include "ExtrusionEntity.hpp"
-#include "FillBase.hpp"
+#include "Fill.hpp"
 #include "FillRectilinear.hpp"
 #include "FillLightning.hpp"
 #include "FillConcentricInternal.hpp"
@@ -1474,6 +1474,10 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
         params.lateral_lattice_angle_2   = surface_fill.params.lateral_lattice_angle_2;
         params.infill_overhang_angle   = surface_fill.params.infill_overhang_angle;
         params.multiline         = surface_fill.params.multiline;
+        // Orca: Match make_fills() when choosing the origin of plane-path patterns.
+        // Without the sparse extrusion role, the filler uses each surface's bounds
+        // instead of the object's bounds, so bridge anchors shift away from printed infill.
+        params.extrusion_role            = surface_fill.params.extrusion_role;
 
         for (ExPolygon &expoly : surface_fill.expolygons) {
             // Spacing is modified by the filler to indicate adjustments. Reset it for each expolygon.

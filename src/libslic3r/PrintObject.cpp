@@ -17,6 +17,7 @@
 #include "TriangleMeshSlicer.hpp"
 #include "Utils.hpp"
 #include "Fill/FillAdaptive.hpp"
+#include "Fill/Fill.hpp"
 #include "Fill/FillLightning.hpp"
 #include "Format/STL.hpp"
 #include "format.hpp"
@@ -2547,17 +2548,11 @@ void PrintObject::bridge_over_infill()
         return diff(layers_sparse_infill, not_sparse_infill);
     };
 
-    // LAMBDA do determine optimal bridging angle
-    auto determine_bridging_angle = [](const Polygons &bridged_area, const Lines &anchors, InfillPattern dominant_pattern, double infill_direction) {
+    // Orca: Derive the fallback bridge direction from the supplied anchor geometry.
+    // Pattern-specific angle selection belongs at the call site, where the supporting
+    // layer and region are known; this helper must not override it with a base config angle.
+    auto determine_bridging_angle = [](const Polygons &bridged_area, const Lines &anchors) {
         AABBTreeLines::LinesDistancer<Line> lines_tree(anchors);
-
-        // Check it the infill that require a fixed infill angle.
-        switch (dominant_pattern) {
-        case ip3DHoneycomb:
-        case ipCrossHatch:
-            return (infill_direction + 45.0) * 2.0 * M_PI / 360.;
-        default: break;
-        }
 
         std::map<double, int> counted_directions;
         for (const Polygon &p : bridged_area) {
@@ -2624,18 +2619,14 @@ void PrintObject::bridge_over_infill()
         if (bridging_angle == 0) {
             bridging_angle = 0.001;
         }
-        switch (dominant_pattern) {
-        case ipHilbertCurve: bridging_angle += 0.25 * PI; break;
-        case ipOctagramSpiral: bridging_angle += (1.0 / 16.0) * PI; break;
-        default: break;
-        }
 
         return bridging_angle;
     };
 
-    // LAMBDA that will fill given polygons with lines, exapand the lines to the nearest anchor, and reconstruct polygons from the newly
-    // generated lines
-    auto construct_anchored_polygon = [](Polygons bridged_area, Lines anchors, const Flow &bridging_flow, double bridging_angle) {
+    // Orca: Extend scan sections to the nearest anchors and reconstruct the bridge area.
+    // scan_spacing controls boundary sampling independently of the extrusion spacing;
+    // anchoring overlap and smoothing thresholds still use the physical bridging flow.
+    auto construct_anchored_polygon = [](Polygons bridged_area, Lines anchors, const Flow &bridging_flow, double bridging_angle, coord_t scan_spacing) {
         auto lines_rotate = [](Lines &lines, double cos_angle, double sin_angle) {
             for (Line &l : lines) {
                 double ax = double(l.a.x());
@@ -2662,12 +2653,12 @@ void PrintObject::bridge_over_infill()
             BoundingBox bb_x = get_extents(bridged_area);
             BoundingBox bb_y = get_extents(anchors);
 
-            const size_t n_vlines = (bb_x.max.x() - bb_x.min.x() + bridging_flow.scaled_spacing() - 1) / bridging_flow.scaled_spacing();
+            const size_t n_vlines = (bb_x.max.x() - bb_x.min.x() + scan_spacing - 1) / scan_spacing;
             std::vector<Line> vertical_lines(n_vlines);
             for (size_t i = 0; i < n_vlines; i++) {
-                // Orca: Make sure the line is placed in the middle of the extrusion
-                // coord_t x           = bb_x.min.x() + i * bridging_flow.scaled_spacing();
-                coord_t x           = bb_x.min.x() + (i + 0.5) * bridging_flow.scaled_spacing();
+                // Orca: Sample the center of each reconstructed strip. Its edges lie
+                // half a scan step away, even when the sampling is finer than extrusion.
+                coord_t x           = bb_x.min.x() + (i + 0.5) * scan_spacing;
                 coord_t y_min       = bb_y.min.y() - bridging_flow.scaled_spacing();
                 coord_t y_max       = bb_y.max.y() + bridging_flow.scaled_spacing();
                 vertical_lines[i].a = Point{x, y_min};
@@ -2729,7 +2720,9 @@ void PrintObject::bridge_over_infill()
                           });
             }
 
-            // reconstruct polygon from polygon sections
+            // Orca: Reconstruct the polygon from scan sections. At discontinuities and
+            // strip starts/ends, use half the scan step for the X offsets; using half an
+            // extrusion spacing would overlap the finer strips and distort curved anchors.
             struct TracedPoly
             {
                 Points lows;
@@ -2755,8 +2748,8 @@ void PrintObject::bridge_over_infill()
                             36.0 * double(bridging_flow.scaled_spacing()) * bridging_flow.scaled_spacing()) {
                             traced_poly.lows.push_back(candidate->a);
                         } else {
-                            traced_poly.lows.push_back(traced_poly.lows.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
-                            traced_poly.lows.push_back(candidate->a - Point{bridging_flow.scaled_spacing() / 2, 0});
+                            traced_poly.lows.push_back(traced_poly.lows.back() + Point{scan_spacing / 2, 0});
+                            traced_poly.lows.push_back(candidate->a - Point{scan_spacing / 2, 0});
                             traced_poly.lows.push_back(candidate->a);
                         }
 
@@ -2764,8 +2757,8 @@ void PrintObject::bridge_over_infill()
                             36.0 * double(bridging_flow.scaled_spacing()) * bridging_flow.scaled_spacing()) {
                             traced_poly.highs.push_back(candidate->b);
                         } else {
-                            traced_poly.highs.push_back(traced_poly.highs.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
-                            traced_poly.highs.push_back(candidate->b - Point{bridging_flow.scaled_spacing() / 2, 0});
+                            traced_poly.highs.push_back(traced_poly.highs.back() + Point{scan_spacing / 2, 0});
+                            traced_poly.highs.push_back(candidate->b - Point{scan_spacing / 2, 0});
                             traced_poly.highs.push_back(candidate->b);
                         }
                         segment_added = true;
@@ -2773,9 +2766,9 @@ void PrintObject::bridge_over_infill()
                     }
 
                     if (!segment_added) {
-                        // Zero overlapping segments, we just close this polygon
-                        traced_poly.lows.push_back(traced_poly.lows.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
-                        traced_poly.highs.push_back(traced_poly.highs.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
+                        // Orca: No section continues this strip; close at its right edge.
+                        traced_poly.lows.push_back(traced_poly.lows.back() + Point{scan_spacing / 2, 0});
+                        traced_poly.highs.push_back(traced_poly.highs.back() + Point{scan_spacing / 2, 0});
                         Polygon &new_poly = expanded_bridged_area.emplace_back(std::move(traced_poly.lows));
                         new_poly.points.insert(new_poly.points.end(), traced_poly.highs.rbegin(), traced_poly.highs.rend());
                         traced_poly.lows.clear();
@@ -2790,9 +2783,9 @@ void PrintObject::bridge_over_infill()
                 for (const auto &segment : polygon_slice) {
                     if (used_segments.find(&segment) == used_segments.end()) {
                         TracedPoly &new_tp = current_traced_polys.emplace_back();
-                        new_tp.lows.push_back(segment.a - Point{bridging_flow.scaled_spacing() / 2, 0});
+                        new_tp.lows.push_back(segment.a - Point{scan_spacing / 2, 0});
                         new_tp.lows.push_back(segment.a);
-                        new_tp.highs.push_back(segment.b - Point{bridging_flow.scaled_spacing() / 2, 0});
+                        new_tp.highs.push_back(segment.b - Point{scan_spacing / 2, 0});
                         new_tp.highs.push_back(segment.b);
                     }
                 }
@@ -2899,7 +2892,10 @@ void PrintObject::bridge_over_infill()
                 total_fill_area   = closing(total_fill_area, float(SCALED_EPSILON));
                 expansion_area    = closing(expansion_area, float(SCALED_EPSILON));
                 expansion_area    = intersection(expansion_area, deep_infill_area);
-                Polylines anchors = intersection_pl(infill_lines[lidx - 1], shrink(expansion_area, spacing));
+                // Orca: Preserve the real lower-layer anchors for every candidate in this
+                // layer. Replacing this shared set for one pattern also changes later regions,
+                // and synthetic straight lines can claim support where no infill is printed.
+                const Polylines anchors = intersection_pl(infill_lines[lidx - 1], shrink(expansion_area, spacing));
                 Polygons internal_unsupported_area = shrink(deep_infill_area, spacing * 4.5);
 
 #ifdef DEBUG_BRIDGE_OVER_INFILL
@@ -2910,6 +2906,9 @@ void PrintObject::bridge_over_infill()
                 std::vector<CandidateSurface> expanded_surfaces;
                 expanded_surfaces.reserve(surfaces_by_layer[lidx].size());
                 for (const CandidateSurface &candidate : surfaces_by_layer[lidx]) {
+                    const auto &region_config = candidate.region->region().config();
+                    const bool turning_pattern = region_config.sparse_infill_pattern == ipHilbertCurve ||
+                                                 region_config.sparse_infill_pattern == ipOctagramSpiral;
                     const Flow &flow              = candidate.region->bridging_flow(frSolidInfill, true);
                     Polygons    area_to_be_bridge = expand(candidate.new_polys, flow.scaled_spacing());
                     area_to_be_bridge             = intersection(area_to_be_bridge, deep_infill_area);
@@ -2938,26 +2937,67 @@ void PrintObject::bridge_over_infill()
                                to_lines(area_to_be_bridge), to_lines(boundary_plines), to_lines(anchors), to_lines(expansion_area));
 #endif
 
-                    double bridging_angle = 0;
-                    if (!anchors.empty()) {
-                        bridging_angle = determine_bridging_angle(area_to_be_bridge, to_lines(anchors),
-                                                                  candidate.region->region().config().sparse_infill_pattern.value,
-                                                                  candidate.region->region().config().infill_direction.value);
-                    } else {
-                        // use expansion boundaries as anchors.
-                        // Also, use Infill pattern that is neutral for angle determination, since there are no infill lines.
-                        bridging_angle = determine_bridging_angle(area_to_be_bridge, to_lines(boundary_plines), InfillPattern::ipLine, 0);
+                    double bridging_angle = -1.;
+                    if (!anchors.empty() && turning_pattern) {
+                        // Orca: Keep adjacent bridges over Hilbert/Octagram aligned despite
+                        // their many local turning directions. Use the lower layer's rotation,
+                        // since that is the infill supporting the bridge, not the current layer's.
+                        for (const LayerRegion *lower_region : layer->lower_layer->regions()) {
+                            // Orca: Apply the configured direction only if the same region has
+                            // sparse infill below this bridge. A height modifier may put another
+                            // pattern underneath, requiring the geometry-based fallback below.
+                            if (&lower_region->region() != &candidate.region->region() ||
+                                intersection(area_to_be_bridge, to_polygons(lower_region->fill_surfaces.filter_by_type(stInternal))).empty())
+                                continue;
+                            bridging_angle = calculate_infill_rotation_angle(po, layer->lower_layer->id(), region_config.infill_direction.value,
+                                                                            region_config.sparse_infill_rotate_template.value) + 0.5 * PI;
+                            // Orca: Apply model alignment as infill generation does, then normalize
+                            // the undirected bridge angle to [0, PI), including negative rotations.
+                            if (region_config.align_infill_direction_to_model) {
+                                const auto &m = po->trafo().matrix();
+                                bridging_angle += std::atan2(double(m(1, 0)), double(m(0, 0)));
+                            }
+                            bridging_angle = std::fmod(bridging_angle, PI);
+                            if (bridging_angle < 0.)
+                                bridging_angle += PI;
+                            break;
+                        }
                     }
-                    
-                    // ORCA: Internal bridge angle override
-                    if (candidate.region->region().config().internal_bridge_angle > 0)
-                        bridging_angle = candidate.region->region().config().internal_bridge_angle.value * PI / 180.0; // Convert degrees to radians
+                    // Orca: A different region below (e.g. a height modifier) needs the actual anchor
+                    // directions. When there are no sparse anchors, use the expansion boundaries.
+                    // Ultra: keep the existing 3D Honeycomb / Cross Hatch fixed-angle fallback;
+                    // Orca already removed that from the helper, but Ultra still relies on it.
+                    if (bridging_angle < 0.) {
+                        const InfillPattern pattern = region_config.sparse_infill_pattern.value;
+                        if (!anchors.empty() && (pattern == ip3DHoneycomb || pattern == ipCrossHatch))
+                            bridging_angle = (region_config.infill_direction.value + 45.0) * 2.0 * M_PI / 360.;
+                        else
+                            bridging_angle = determine_bridging_angle(area_to_be_bridge, to_lines(anchors.empty() ? boundary_plines : anchors));
+                    }
 
+                    // Orca: Preserve the user's internal bridge angle override after automatic
+                    // direction selection. Ultra has no relative_bridge_angle setting.
+                    if (candidate.region->region().config().internal_bridge_angle.value > 0) {
+                        bridging_angle = Geometry::deg2rad(region_config.internal_bridge_angle.value);
+                        if (region_config.align_infill_direction_to_model) {
+                            const auto &m = po->trafo().matrix();
+                            bridging_angle += std::atan2(double(m(1, 0)), double(m(0, 0)));
+                        }
+                    }
+
+                    // Orca: Changing the bridge direction must not change its physical supports.
+                    // Extend to actual sparse infill or the existing boundary anchors, never to
+                    // a synthetic grid that merely has the same nominal angle and spacing.
                     boundary_plines.insert(boundary_plines.end(), anchors.begin(), anchors.end());
                     if (!lightning_area.empty() && !intersection(area_to_be_bridge, lightning_area).empty()) {
                         boundary_plines = intersection_pl(boundary_plines, expand(area_to_be_bridge, scale_(10)));
                     }
-                    Polygons bridging_area = construct_anchored_polygon(area_to_be_bridge, to_lines(boundary_plines), flow, bridging_angle);
+                    // Orca: Use four samples per extrusion spacing for Hilbert/Octagram so the
+                    // reconstructed boundary follows rounded anchors instead of cutting corners.
+                    // Keep the original step for other patterns and at least one coordinate unit
+                    // after integer division. This changes boundary accuracy, not infill density.
+                    const coord_t scan_spacing = std::max(coord_t(1), flow.scaled_spacing() / (turning_pattern ? 4 : 1));
+                    Polygons bridging_area = construct_anchored_polygon(area_to_be_bridge, to_lines(boundary_plines), flow, bridging_angle, scan_spacing);
 
                     // Check collision with other expanded surfaces
                     {
@@ -2971,7 +3011,9 @@ void PrintObject::bridge_over_infill()
                             }
                         }
                         if (reconstruct) {
-                            bridging_area = construct_anchored_polygon(area_to_be_bridge, to_lines(boundary_plines), flow, bridging_angle);
+                            // Orca: Retain the same sampling accuracy when matching a nearby
+                            // bridge's direction; rebuilding must not lose the curved supports.
+                            bridging_area = construct_anchored_polygon(area_to_be_bridge, to_lines(boundary_plines), flow, bridging_angle, scan_spacing);
                         }
                     }
 
