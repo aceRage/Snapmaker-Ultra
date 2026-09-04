@@ -661,6 +661,8 @@ find_package(PNG REQUIRED)
 set(OpenGL_GL_PREFERENCE "LEGACY")
 find_package(OpenGL REQUIRED)
 
+# GUI OpenGL loading is now GLAD (src/glad). GLEW remains for optional
+# sandboxes/OpenCSG and is still discovered here so those targets can link it.
 set(GLEW_ROOT "${CMAKE_PREFIX_PATH}")
 message("GLEW_ROOT: ${GLEW_ROOT}")
 # Find glew or use bundled version

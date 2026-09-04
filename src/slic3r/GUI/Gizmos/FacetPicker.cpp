@@ -7,7 +7,7 @@
 #include "slic3r/GUI/Selection.hpp"
 #include "libslic3r/Model.hpp"
 
-#include <GL/glew.h>
+#include <glad/gl.h>
 
 #include <limits>
 
