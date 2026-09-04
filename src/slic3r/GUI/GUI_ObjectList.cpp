@@ -25,6 +25,7 @@
 #include "SingleChoiceDialog.hpp"
 #include "StepMeshDialog.hpp"
 
+#include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <wx/progdlg.h>
 #include <wx/listbook.h>
@@ -74,7 +75,8 @@ static size_t total_filaments_count(size_t physical_count)
     if (wxGetApp().preset_bundle == nullptr)
         return physical_count;
 
-    return wxGetApp().preset_bundle->mixed_filaments.total_filaments(physical_count);
+    size_t total = wxGetApp().preset_bundle->mixed_filaments.total_filaments(physical_count);
+    return std::max(total, wxGetApp().preset_bundle->texture_mapping_zones.total_filaments(physical_count));
 }
 
 static int filaments_count()
@@ -863,6 +865,10 @@ void ObjectList::selected_object(ObjectDataViewModelNode* item)
 void ObjectList::update_filament_values_for_items_when_delete_filament(const size_t filament_id, const int replace_id)
 {
     int replace_filament_id = replace_id == -1 ? 1 : (replace_id + 1);
+    auto is_texture_mapping_zone = [](int filament) {
+        return wxGetApp().preset_bundle != nullptr &&
+               wxGetApp().preset_bundle->texture_mapping_zones.is_texture_mapping_zone_id(unsigned(std::max(filament, 0)));
+    };
     for (size_t i = 0; i < m_objects->size(); ++i) {
         wxDataViewItem item = m_objects_model->GetItemById(i);
         if (!item)
@@ -880,6 +886,8 @@ void ObjectList::update_filament_values_for_items_when_delete_filament(const siz
             // default icon (see UpdateExtruderAndColorIcon), not the
             // parent's color.
             extruder = "0";
+        } else if (is_texture_mapping_zone(object->config.extruder())) {
+            extruder = wxString::Format("%d", object->config.extruder());
         } else if (size_t(object->config.extruder()) == filament_id + 1) {
             extruder = std::to_string(replace_filament_id);
             object->config.set_key_value("extruder", new ConfigOptionInt(replace_filament_id));
@@ -894,6 +902,8 @@ void ObjectList::update_filament_values_for_items_when_delete_filament(const siz
                                      "support_filament", "support_interface_filament"};
         for (auto key : keys) {
             if (object->config.has(key)) {
+                if (is_texture_mapping_zone(object->config.opt_int(key)))
+                    continue;
                 if (object->config.opt_int(key) == filament_id + 1)
                     object->config.erase(key);
                 else {

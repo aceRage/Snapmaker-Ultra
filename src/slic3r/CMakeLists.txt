@@ -161,6 +161,10 @@ set(SLIC3R_GUI_SOURCES
     GUI/Gizmos/GLGizmoMeshBoolean.hpp
     GUI/Gizmos/GLGizmoMmuSegmentation.cpp
     GUI/Gizmos/GLGizmoMmuSegmentation.hpp
+    GUI/Gizmos/GLGizmoTextureMappingTools.cpp
+    GUI/Gizmos/GLGizmoTextureMappingTools.hpp
+    GUI/Gizmos/GLGizmoTextureGradientPointPicker.cpp
+    GUI/Gizmos/GLGizmoTextureGradientPointPicker.hpp
     GUI/Gizmos/GLGizmoAlignment.cpp
     GUI/Gizmos/GLGizmoAlignment.hpp
     GUI/Gizmos/GLGizmoMove.cpp
@@ -374,6 +378,12 @@ set(SLIC3R_GUI_SOURCES
     GUI/PhysicalPrinterDialog.hpp
     GUI/Plater.cpp
     GUI/Plater.hpp
+    GUI/TextureMappingPlaterHooks.cpp
+    GUI/TextureMappingPlaterHooks.hpp
+    GUI/TextureMappingSidebarPanel.cpp
+    GUI/TextureMappingSidebarPanel.hpp
+    GUI/MMUPaintedTexturePreview.cpp
+    GUI/MMUPaintedTexturePreview.hpp
     GUI/PlateSettingsDialog.cpp
     GUI/PlateSettingsDialog.hpp
     GUI/Preferences.cpp

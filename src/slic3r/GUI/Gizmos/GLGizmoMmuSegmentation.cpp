@@ -10,6 +10,7 @@
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoTextureMappingTools.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Model.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
@@ -908,6 +909,11 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     if (m_show_filament_remap_ui) {
         ImGui::Separator();
         render_filament_remap_ui(window_width, max_tooltip_width);
+    }
+    ImGui::Separator();
+    if (m_imgui->button(_L("Manage Color Data"))) {
+        ModelObject *object = m_c->selection_info() != nullptr ? m_c->selection_info()->model_object() : nullptr;
+        open_color_data_management_dialog(wxGetApp().plater(), m_parent, object);
     }
     ImGui::Separator();
 

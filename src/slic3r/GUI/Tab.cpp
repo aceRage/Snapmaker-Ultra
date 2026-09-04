@@ -1904,6 +1904,13 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
     const bool refresh_mixed_filament_panel =
         (m_type == Preset::TYPE_PRINT && opt_key == "mixed_filament_component_bias_enabled") ||
         (m_type == Preset::TYPE_FILAMENT && opt_key == "filament_type");
+    const bool refresh_texture_mapping_panel =
+        m_type == Preset::TYPE_PRINT &&
+        (opt_key == "texture_mapping_definitions" ||
+         opt_key == "texture_mapping_global_settings" ||
+         opt_key == "texture_mapping_outer_wall_gradient_global_strength" ||
+         opt_key == "texture_mapping_outer_wall_gradient_max_line_width" ||
+         opt_key == "texture_mapping_outer_wall_gradient_min_line_width");
 
     // Keep Mixed Filaments global settings in sync with project_config. In
     // full_fff_config(), project_config is applied last and would otherwise
@@ -1926,7 +1933,12 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
          opt_key == "dithering_local_z_infill" ||
          opt_key == "dithering_local_z_direct_multicolor" ||
          opt_key == "dithering_step_painted_zones_only" ||
-         opt_key == "mixed_filament_definitions")) {
+         opt_key == "mixed_filament_definitions" ||
+         opt_key == "texture_mapping_definitions" ||
+         opt_key == "texture_mapping_global_settings" ||
+         opt_key == "texture_mapping_outer_wall_gradient_global_strength" ||
+         opt_key == "texture_mapping_outer_wall_gradient_max_line_width" ||
+         opt_key == "texture_mapping_outer_wall_gradient_min_line_width")) {
         DynamicPrintConfig &project_cfg = wxGetApp().preset_bundle->project_config;
         if (const ConfigOption *opt = m_config->option(opt_key))
             project_cfg.set_key_value(opt_key, opt->clone());
@@ -1941,6 +1953,8 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         wxGetApp().sidebar().update_mixed_filament_panel(false);
         wxGetApp().sidebar().update_color_mix_panel();
     }
+    if (refresh_texture_mapping_panel && wxGetApp().plater() != nullptr)
+        wxGetApp().sidebar().update_texture_mapping_panel(true);
 }
 
 void Tab::show_timelapse_warning_dialog() {
@@ -2646,6 +2660,11 @@ void TabPrint::build()
         optgroup->append_single_option_line("interlocking_beam_layer_count", "multimaterial_settings_advanced#interlocking-beam-layers");
         optgroup->append_single_option_line("interlocking_depth", "multimaterial_settings_advanced#interlocking-depth");
         optgroup->append_single_option_line("interlocking_boundary_avoidance", "multimaterial_settings_advanced#interlocking-boundary-avoidance");
+
+        optgroup = page->new_optgroup(L("Texture Mapping"), L"param_texture_mapping");
+        optgroup->append_single_option_line("texture_mapping_outer_wall_gradient_global_strength");
+        optgroup->append_single_option_line("texture_mapping_outer_wall_gradient_max_line_width");
+        optgroup->append_single_option_line("texture_mapping_outer_wall_gradient_min_line_width");
 
         optgroup = page->new_optgroup(L("Color Mixing (Experimental)"), L"param_mixed_color");
         optgroup->append_single_option_line("dithering_local_z_mode");

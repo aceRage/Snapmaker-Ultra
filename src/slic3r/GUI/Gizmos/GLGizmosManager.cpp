@@ -22,6 +22,8 @@
 //#include "slic3r/GUI/Gizmos/GLGizmoHollow.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSeam.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoMmuSegmentation.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoTextureMappingTools.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoTextureGradientPointPicker.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSimplify.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoEmboss.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSVG.hpp"
@@ -177,6 +179,12 @@ void GLGizmosManager::switch_gizmos_icon_filename()
         case (EType::BrimEars):
             gizmo->set_icon_filename(m_is_dark ? "toolbar_brimears_dark.svg" : "toolbar_brimears.svg");
             break;
+        case (EType::TrueColorPainting):
+            gizmo->set_icon_filename(m_is_dark ? "true_color_painting_dark.svg" : "true_color_painting.svg");
+            break;
+        case (EType::ImageProjection):
+            gizmo->set_icon_filename(m_is_dark ? "image_projection_dark.svg" : "image_projection.svg");
+            break;
         }
 
     }
@@ -219,6 +227,9 @@ bool GLGizmosManager::init()
     m_gizmos.emplace_back(new GLGizmoAssembly(m_parent, m_is_dark ? "toolbar_assembly_dark.svg" : "toolbar_assembly.svg", EType::Assembly));
     m_gizmos.emplace_back(new GLGizmoSimplify(m_parent, "reduce_triangles.svg", EType::Simplify));
     m_gizmos.emplace_back(new GLGizmoBrimEars(m_parent, m_is_dark ? "toolbar_brimears_dark.svg" : "toolbar_brimears.svg", EType::BrimEars));
+    m_gizmos.emplace_back(new GLGizmoTrueColorPainting(m_parent, m_is_dark ? "true_color_painting_dark.svg" : "true_color_painting.svg", EType::TrueColorPainting));
+    m_gizmos.emplace_back(new GLGizmoImageProjection(m_parent, m_is_dark ? "image_projection_dark.svg" : "image_projection.svg", EType::ImageProjection));
+    m_gizmos.emplace_back(new GLGizmoTextureGradientPointPicker(m_parent, "true_color_painting.svg", EType::TextureGradientPointPicker));
     //m_gizmos.emplace_back(new GLGizmoSlaSupports(m_parent, "sla_supports.svg", sprite_id++));
     //m_gizmos.emplace_back(new GLGizmoFaceDetector(m_parent, "face recognition.svg", sprite_id++));
     //m_gizmos.emplace_back(new GLGizmoHollow(m_parent, "hollow.svg", sprite_id++));
@@ -546,6 +557,8 @@ bool GLGizmosManager::gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_p
         return dynamic_cast<GLGizmoMeshBoolean*>(m_gizmos[MeshBoolean].get())->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
     else if (m_current == BrimEars)
         return dynamic_cast<GLGizmoBrimEars*>(m_gizmos[BrimEars].get())->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
+    else if (m_current == TrueColorPainting)
+        return dynamic_cast<GLGizmoTrueColorPainting*>(m_gizmos[TrueColorPainting].get())->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
     else
         return false;
 }
@@ -554,6 +567,7 @@ bool GLGizmosManager::is_paint_gizmo()
 {
     return m_current == EType::FdmSupports ||
            m_current == EType::MmSegmentation ||
+           m_current == EType::TrueColorPainting ||
            m_current == EType::FuzzySkin ||
            m_current == EType::Seam;
 }
@@ -653,7 +667,7 @@ bool GLGizmosManager::on_mouse_wheel(const wxMouseEvent &evt)
 {
     bool processed = false;
 
-    if (/*m_current == SlaSupports || m_current == Hollow ||*/ m_current == FdmSupports || m_current == Seam || m_current == MmSegmentation || m_current == FuzzySkin || m_current == BrimEars) {
+    if (/*m_current == SlaSupports || m_current == Hollow ||*/ m_current == FdmSupports || m_current == Seam || m_current == MmSegmentation || m_current == TrueColorPainting || m_current == FuzzySkin || m_current == BrimEars) {
         float rot = (float)evt.GetWheelRotation() / (float)evt.GetWheelDelta();
         if (gizmo_event((rot > 0.f ? SLAGizmoEventType::MouseWheelUp : SLAGizmoEventType::MouseWheelDown), Vec2d::Zero(), evt.ShiftDown(), evt.AltDown()
             // BBS
@@ -1489,6 +1503,12 @@ std::string get_name_from_gizmo_etype(GLGizmosManager::EType type)
         return "Color Painting";
     case GLGizmosManager::EType::FuzzySkin:
         return "Fuzzy Skin Painting";
+    case GLGizmosManager::EType::TrueColorPainting:
+        return "RGB Color Painting";
+    case GLGizmosManager::EType::ImageProjection:
+        return "Project image…";
+    case GLGizmosManager::EType::TextureGradientPointPicker:
+        return "Set linear gradient point";
     default:
         return "";
     }

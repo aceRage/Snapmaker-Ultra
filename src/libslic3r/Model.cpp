@@ -411,6 +411,8 @@ Model& Model::assign_copy(const Model &rhs)
     this->mk_version = rhs.mk_version;
     this->md_name = rhs.md_name;
     this->md_value = rhs.md_value;
+    this->texture_mapping_definitions = rhs.texture_mapping_definitions;
+    this->texture_mapping_definitions_valid = rhs.texture_mapping_definitions_valid;
 
     return *this;
 }
@@ -455,6 +457,9 @@ Model& Model::assign_copy(Model &&rhs)
     rhs.model_info.reset();
     this->profile_info = rhs.profile_info;
     rhs.profile_info.reset();
+    this->texture_mapping_definitions = std::move(rhs.texture_mapping_definitions);
+    this->texture_mapping_definitions_valid = rhs.texture_mapping_definitions_valid;
+    rhs.texture_mapping_definitions_valid = false;
     return *this;
 }
 

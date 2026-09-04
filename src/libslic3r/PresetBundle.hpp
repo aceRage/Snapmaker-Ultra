@@ -6,6 +6,7 @@
 #include "FilamentColorLibrary.hpp"
 #include "enum_bitmask.hpp"
 #include "MixedFilament.hpp"
+#include "TextureMapping.hpp"
 
 #include <memory>
 #include <unordered_map>
@@ -175,6 +176,10 @@ public:
 
     // Mixed (virtual) filaments for layer-based colour mixing.
     MixedFilamentManager        mixed_filaments;
+
+    // Texture mapping zones (virtual filament IDs) + global TM settings.
+    TextureMappingManager       texture_mapping_zones;
+    TextureMappingGlobalSettings texture_mapping_global_settings;
 
     // Snapmaker
     std::map<int, std::pair<std::string, std::string>> machine_filaments;
