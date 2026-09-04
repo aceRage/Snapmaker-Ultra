@@ -414,6 +414,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/RemoteHub.hpp
     GUI/RemoteNotify.cpp
     GUI/RemoteNotify.hpp
+    GUI/WebPush.cpp
+    GUI/WebPush.hpp
     GUI/PrintHostDialogs.cpp
     GUI/PrintHostDialogs.hpp
     GUI/PrintOptionsDialog.cpp
