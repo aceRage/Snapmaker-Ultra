@@ -19,11 +19,13 @@
 #include "libslic3r/Geometry/ConvexHull.hpp"
 
 #include <float.h>
+#include <cctype>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <iterator>
 #include <limits>
+#include <unordered_map>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -39,6 +41,7 @@
 // BBS: for segment
 #include "MeshBoolean.hpp"
 #include "Format/3mf.hpp"
+#include "Format/ImportedTexture.hpp"
 
 // Transtltion
 #include "I18N.hpp"
@@ -57,6 +60,309 @@ const std::vector<std::string> CONST_FILAMENTS = {
     // BBS initialization of static variables
     std::map<size_t, ExtruderParams> Model::extruderParamsMap = { {0,{"",0,0}}};
     GlobalSpeedMap Model::printSpeedMap{};
+namespace {
+
+static std::vector<std::string> split_obj_mtl_tokens(const std::string &line)
+{
+    std::vector<std::string> tokens;
+    std::string              current;
+    char                     quote_char = '\0';
+    for (const char c : line) {
+        if ((c == '"' || c == '\'') && (quote_char == '\0' || quote_char == c)) {
+            quote_char = quote_char == '\0' ? c : '\0';
+            continue;
+        }
+        if (quote_char == '\0' && std::isspace(static_cast<unsigned char>(c))) {
+            if (!current.empty()) {
+                tokens.emplace_back(std::move(current));
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty())
+        tokens.emplace_back(std::move(current));
+    return tokens;
+}
+
+static std::string extract_obj_texture_reference(const std::string &map_kd_value)
+{
+    const std::vector<std::string> tokens = split_obj_mtl_tokens(map_kd_value);
+    if (tokens.empty())
+        return {};
+    return tokens.back();
+}
+
+static std::vector<std::string> resolve_obj_texture_path_candidates(const std::string &obj_path, const std::string &texture_reference)
+{
+    std::vector<std::string> candidates;
+    if (texture_reference.empty())
+        return candidates;
+
+    auto push_unique = [&candidates](const boost::filesystem::path &path) {
+        if (path.empty())
+            return;
+        const std::string normalized = path.lexically_normal().string();
+        if (normalized.empty())
+            return;
+        if (std::find(candidates.begin(), candidates.end(), normalized) == candidates.end())
+            candidates.emplace_back(normalized);
+    };
+
+    const boost::filesystem::path texture_path(texture_reference);
+    const boost::filesystem::path obj_dir = boost::filesystem::path(obj_path).parent_path();
+
+    if (texture_path.is_absolute()) {
+        push_unique(texture_path);
+        if (!texture_path.filename().empty())
+            push_unique(obj_dir / texture_path.filename());
+    } else {
+        push_unique(obj_dir / texture_path);
+        if (!texture_path.filename().empty())
+            push_unique(obj_dir / texture_path.filename());
+    }
+
+    return candidates;
+}
+
+struct ObjTextureImage
+{
+    std::string          resolved_path;
+    std::vector<uint8_t> rgba;
+    uint32_t             width{0};
+    uint32_t             height{0};
+};
+
+struct ObjTextureImportData
+{
+    std::vector<ObjTextureImage>              textures;
+    std::unordered_map<std::string, size_t>   map_kd_to_texture_idx;
+};
+
+static std::vector<std::string> obj_texture_map_references(const ObjInfo &obj_info)
+{
+    std::vector<std::string> references;
+
+    auto push_unique = [&references](const std::string &reference) {
+        if (reference.empty())
+            return;
+        if (std::find(references.begin(), references.end(), reference) == references.end())
+            references.emplace_back(reference);
+    };
+
+    for (const auto &face_to_map : obj_info.uv_map_pngs)
+        push_unique(face_to_map.second);
+
+    if (references.empty())
+        push_unique(obj_info.single_texture_image);
+
+    return references;
+}
+
+static size_t count_resolved_obj_albedo_texture_references(const std::string &obj_path, const ObjInfo &obj_info)
+{
+    std::vector<std::string> resolved_paths;
+
+    for (const std::string &map_kd_raw : obj_texture_map_references(obj_info)) {
+        const std::string texture_ref = extract_obj_texture_reference(map_kd_raw);
+        const auto        candidates  = resolve_obj_texture_path_candidates(obj_path, texture_ref);
+        for (const std::string &candidate : candidates) {
+            if (!is_supported_image_texture_path(candidate) || !boost::filesystem::exists(candidate))
+                continue;
+
+            const std::string normalized = boost::filesystem::path(candidate).lexically_normal().string();
+            if (std::find(resolved_paths.begin(), resolved_paths.end(), normalized) == resolved_paths.end())
+                resolved_paths.emplace_back(normalized);
+            break;
+        }
+    }
+
+    return resolved_paths.size();
+}
+
+static ObjTextureImportData load_obj_albedo_textures(const std::string &obj_path, const ObjInfo &obj_info)
+{
+    ObjTextureImportData result;
+    std::unordered_map<std::string, size_t> loaded_texture_path_to_idx;
+
+    auto register_map = [&](const std::string &map_kd_raw) {
+        if (map_kd_raw.empty())
+            return;
+        if (result.map_kd_to_texture_idx.find(map_kd_raw) != result.map_kd_to_texture_idx.end())
+            return;
+
+        const std::string texture_ref = extract_obj_texture_reference(map_kd_raw);
+        const auto        candidates  = resolve_obj_texture_path_candidates(obj_path, texture_ref);
+
+        bool had_decode_failure = false;
+        std::string last_failed_path;
+        for (const std::string &candidate : candidates) {
+            if (!boost::filesystem::exists(candidate))
+                continue;
+
+            if (const auto existing = loaded_texture_path_to_idx.find(candidate);
+                existing != loaded_texture_path_to_idx.end()) {
+                result.map_kd_to_texture_idx[map_kd_raw] = existing->second;
+                return;
+            }
+
+            ObjTextureImage image;
+            image.resolved_path = candidate;
+            if (!decode_image_texture_rgba_from_file(candidate, image.rgba, image.width, image.height)) {
+                had_decode_failure = true;
+                last_failed_path = candidate;
+                continue;
+            }
+
+            const size_t texture_idx = result.textures.size();
+            loaded_texture_path_to_idx[candidate] = texture_idx;
+            result.textures.emplace_back(std::move(image));
+            result.map_kd_to_texture_idx[map_kd_raw] = texture_idx;
+            return;
+        }
+
+        if (had_decode_failure) {
+            BOOST_LOG_TRIVIAL(error) << "OBJ albedo texture map found but failed to decode image"
+                                     << " map_Kd='" << map_kd_raw
+                                     << "' last_path='" << last_failed_path
+                                     << "' (supported: PNG, JPEG).";
+        } else if (!candidates.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "OBJ albedo texture map file not found"
+                                     << " map_Kd='" << map_kd_raw
+                                     << "' (checked OBJ-relative and filename fallback paths).";
+        } else {
+            BOOST_LOG_TRIVIAL(error) << "OBJ albedo texture map reference is empty or invalid"
+                                     << " map_Kd='" << map_kd_raw << "'.";
+        }
+    };
+
+    for (const std::string &map_kd_raw : obj_texture_map_references(obj_info))
+        register_map(map_kd_raw);
+
+    return result;
+}
+
+struct ObjTextureAtlasEntry
+{
+    uint32_t x_offset{0};
+    uint32_t width{0};
+    uint32_t height{0};
+};
+
+static bool build_obj_texture_atlas(const ObjInfo &obj_info,
+                                    const ObjTextureImportData &texture_data,
+                                    std::vector<std::array<Vec2f, 3>> &triangle_uvs,
+                                    std::vector<uint8_t> &triangle_uv_valid,
+                                    std::vector<uint8_t> &atlas_rgba,
+                                    uint32_t &atlas_width,
+                                    uint32_t &atlas_height)
+{
+    atlas_rgba.clear();
+    atlas_width  = 0;
+    atlas_height = 0;
+
+    if (texture_data.textures.empty())
+        return false;
+    if (triangle_uvs.size() != obj_info.triangle_uvs.size() || triangle_uv_valid.size() != obj_info.triangle_uvs_valid.size())
+        return false;
+
+    std::vector<ObjTextureAtlasEntry> placements(texture_data.textures.size());
+    for (size_t i = 0; i < texture_data.textures.size(); ++i) {
+        const ObjTextureImage &texture = texture_data.textures[i];
+        if (texture.width == 0 || texture.height == 0 || texture.rgba.empty())
+            return false;
+        size_t texture_rgba_size = 0;
+        if (!checked_rgba_buffer_size(texture.width, texture.height, texture_rgba_size) ||
+            texture.rgba.size() < texture_rgba_size ||
+            texture.width > std::numeric_limits<uint32_t>::max() - atlas_width)
+            return false;
+
+        placements[i].x_offset = atlas_width;
+        placements[i].width    = texture.width;
+        placements[i].height   = texture.height;
+        atlas_width += texture.width;
+        atlas_height = std::max(atlas_height, texture.height);
+    }
+
+    if (atlas_width == 0 || atlas_height == 0)
+        return false;
+
+    size_t atlas_rgba_size = 0;
+    if (!checked_rgba_buffer_size(atlas_width, atlas_height, atlas_rgba_size))
+        return false;
+
+    atlas_rgba.assign(atlas_rgba_size, uint8_t(0));
+    for (size_t i = 0; i < texture_data.textures.size(); ++i) {
+        const ObjTextureImage      &texture = texture_data.textures[i];
+        const ObjTextureAtlasEntry &entry   = placements[i];
+        for (uint32_t y = 0; y < texture.height; ++y) {
+            const size_t src_off = size_t(y) * size_t(texture.width) * 4;
+            const size_t dst_off = (size_t(y) * size_t(atlas_width) + size_t(entry.x_offset)) * 4;
+            std::copy(texture.rgba.begin() + src_off,
+                      texture.rgba.begin() + src_off + size_t(texture.width) * 4,
+                      atlas_rgba.begin() + dst_off);
+        }
+    }
+
+    auto wrap_uv = [](float value) {
+        if (!std::isfinite(value))
+            return 0.f;
+
+        constexpr float k_uv_epsilon = 1e-6f;
+        if (value >= -k_uv_epsilon && value <= 1.f + k_uv_epsilon)
+            return std::clamp(value, 0.f, 1.f);
+
+        const float wrapped = value - std::floor(value);
+        return wrapped < 0.f ? wrapped + 1.f : wrapped;
+    };
+
+    auto remap_uv = [&wrap_uv, &atlas_width, &atlas_height](const Vec2f &uv, const ObjTextureAtlasEntry &entry) {
+        const float u = wrap_uv(uv.x());
+        const float v = wrap_uv(uv.y());
+        return Vec2f((float(entry.x_offset) + u * float(entry.width)) / float(atlas_width),
+                     v * float(entry.height) / float(atlas_height));
+    };
+
+    bool has_any_textured_triangle = false;
+    for (size_t tri_idx = 0; tri_idx < triangle_uvs.size(); ++tri_idx) {
+        triangle_uv_valid[tri_idx] = 0;
+        if (obj_info.triangle_uvs_valid[tri_idx] == 0)
+            continue;
+
+        size_t texture_idx = size_t(-1);
+        const auto face_to_texture = obj_info.uv_map_pngs.find(int(tri_idx));
+        if (face_to_texture != obj_info.uv_map_pngs.end() && !face_to_texture->second.empty()) {
+            const auto texture_it = texture_data.map_kd_to_texture_idx.find(face_to_texture->second);
+            if (texture_it != texture_data.map_kd_to_texture_idx.end())
+                texture_idx = texture_it->second;
+        }
+
+        if (texture_idx == size_t(-1) && texture_data.textures.size() == 1)
+            texture_idx = 0;
+        if (texture_idx == size_t(-1))
+            continue;
+
+        const ObjTextureAtlasEntry &entry = placements[texture_idx];
+        triangle_uvs[tri_idx][0]          = remap_uv(triangle_uvs[tri_idx][0], entry);
+        triangle_uvs[tri_idx][1]          = remap_uv(triangle_uvs[tri_idx][1], entry);
+        triangle_uvs[tri_idx][2]          = remap_uv(triangle_uvs[tri_idx][2], entry);
+        triangle_uv_valid[tri_idx]        = 1;
+        has_any_textured_triangle         = true;
+    }
+
+    if (!has_any_textured_triangle) {
+        atlas_rgba.clear();
+        atlas_width  = 0;
+        atlas_height = 0;
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
+
 Model& Model::assign_copy(const Model &rhs)
 {
     this->copy_id(rhs);
@@ -277,6 +583,47 @@ Model Model::read_from_file(const std::string&                                  
         result = load_obj(input_file.c_str(), &model, obj_info, message);
         if (result){
             unsigned char first_extruder_id;
+            const bool has_valid_texture_uvs = std::any_of(obj_info.triangle_uvs_valid.begin(), obj_info.triangle_uvs_valid.end(),
+                                                           [](uint8_t uv_valid) { return uv_valid != 0; });
+            if (!model.objects.empty() && model.objects.front() != nullptr && model.objects.front()->volumes.size() == 1) {
+                ModelVolume *volume = model.objects.front()->volumes.front();
+                const size_t triangle_count = volume->mesh().its.indices.size();
+                if (has_valid_texture_uvs && triangle_count == obj_info.triangle_uvs.size() &&
+                    triangle_count == obj_info.triangle_uvs_valid.size()) {
+                    std::vector<std::array<Vec2f, 3>> triangle_uvs = obj_info.triangle_uvs;
+                    std::vector<uint8_t>              triangle_uv_valid = obj_info.triangle_uvs_valid;
+                    const ObjTextureImportData        texture_import_data = load_obj_albedo_textures(input_file, obj_info);
+                    std::vector<uint8_t>              atlas_rgba;
+                    uint32_t                          atlas_width = 0;
+                    uint32_t                          atlas_height = 0;
+                    if (build_obj_texture_atlas(obj_info, texture_import_data, triangle_uvs, triangle_uv_valid, atlas_rgba, atlas_width,
+                                                atlas_height)) {
+                        volume->imported_texture_uvs_per_face.clear();
+                        volume->imported_texture_uv_valid.clear();
+                        volume->imported_texture_uvs_per_face.reserve(triangle_count * 6);
+                        volume->imported_texture_uv_valid.reserve(triangle_count);
+                        for (size_t face_idx = 0; face_idx < triangle_count; ++face_idx) {
+                            const std::array<Vec2f, 3> &uv = triangle_uvs[face_idx];
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[0].x());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[0].y());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[1].x());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[1].y());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[2].x());
+                            volume->imported_texture_uvs_per_face.emplace_back(uv[2].y());
+                            volume->imported_texture_uv_valid.emplace_back(triangle_uv_valid[face_idx]);
+                        }
+                        volume->imported_texture_width = atlas_width;
+                        volume->imported_texture_height = atlas_height;
+                        volume->imported_texture_rgba = std::move(atlas_rgba);
+                        volume->imported_texture_raw_filament_offsets.clear();
+                        volume->imported_texture_raw_top_surface_filament_slots.clear();
+                        volume->imported_texture_raw_top_surface_depths.clear();
+                        volume->imported_texture_raw_channels = 0;
+                        volume->imported_texture_raw_metadata_json.clear();
+                        volume->uv_map_generator_version = 0;
+                    }
+                }
+            }
             if (obj_info.vertex_colors.size() > 0) {
                 std::vector<unsigned char> vertex_filament_ids;
                 if (objFn) { // 1.result is ok and pop up a dialog
@@ -293,14 +640,12 @@ Model Model::read_from_file(const std::string&                                  
                         result = obj_import_face_color_deal(face_filament_ids, first_extruder_id, &model);
                     }
                 }
-            } /*else if (obj_info.has_uv_png && obj_info.uvs.size() > 0) {
-                boost::filesystem::path full_path(input_file);
-                std::string             obj_directory = full_path.parent_path().string();
-                obj_info.obj_dircetory = obj_directory;
-                result = false;
-                message = _L("Importing obj with png function is developing.");
-            }*/
+            }
         }
+    }
+    else if (boost::algorithm::iends_with(input_file, ".gltf") || boost::algorithm::iends_with(input_file, ".glb")) {
+        result = false;
+        message = _L("GLTF/GLB import is not supported.");
     }
     else if (boost::algorithm::iends_with(input_file, ".svg"))
         result = load_svg(input_file.c_str(), &model, message);
@@ -328,7 +673,7 @@ Model Model::read_from_file(const std::string&                                  
     }
 #endif
     else
-        throw Slic3r::RuntimeError(_L("Unknown file format. Input file must have .stl, .obj, .amf(.xml) extension."));
+        throw Slic3r::RuntimeError(_L("Unknown file format. Input file must have .stl, .obj, .amf(.xml), .3mf, .gltf or .glb extension."));
 
     if (is_cb_cancel) {
         Model empty_model;

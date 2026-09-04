@@ -2,6 +2,9 @@
 #include "../Exception.hpp"
 #include "../Model.hpp"
 #include "../MixedFilament.hpp"
+#include "../TextureMapping.hpp"
+#include "../ImageMapRawFilamentOffsetAtlas.hpp"
+#include "ImportedTexture.hpp"
 #include "../Preset.hpp"
 #include "../Utils.hpp"
 #include "../LocalesUtils.hpp"
@@ -27,6 +30,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/format.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/nowide/fstream.hpp>
 #include <boost/nowide/cstdio.hpp>
@@ -279,6 +283,8 @@ static constexpr const char* CUSTOM_FUZZY_SKIN_ATTR      = "paint_fuzzy_skin";
 static constexpr const char* CUSTOM_FUZZY_SKIN_ATTR_OLD  = "paint_fuzzy";
 static constexpr const char* CUSTOM_SEAM_ATTR = "paint_seam";
 static constexpr const char* MMU_SEGMENTATION_ATTR = "paint_color";
+static constexpr const char* TEXTURE_MAPPING_COLOR_ATTR = "texture_mapping_color";
+static const std::string IMPORTED_TEXTURE_DIR = "Metadata/imported_texture/";
 // BBS
 static constexpr const char* FACE_PROPERTY_ATTR = "face_property";
 
@@ -638,6 +644,120 @@ static int max_supported_filament_id_from_project_config(const DynamicPrintConfi
     return max_filament_id >= size_t(std::numeric_limits<int>::max()) ? std::numeric_limits<int>::max() : int(max_filament_id);
 }
 
+
+static bool is_texture_mapping_virtual_filament_id(const Slic3r::DynamicPrintConfig &config, int filament_id, size_t physical_count)
+{
+    if (filament_id < 99 || filament_id > 255)
+        return false;
+
+    const auto *texture_defs_opt = config.option<Slic3r::ConfigOptionString>("texture_mapping_definitions");
+    if (texture_defs_opt == nullptr || texture_defs_opt->value.empty())
+        return false;
+
+    std::vector<std::string> physical_colors;
+    if (const auto *colors_opt = config.option<Slic3r::ConfigOptionStrings>("filament_colour");
+        colors_opt != nullptr && !colors_opt->values.empty())
+        physical_colors = colors_opt->values;
+    else
+        physical_colors.assign(std::max<size_t>(physical_count, 1), "#FFFFFF");
+    physical_colors.resize(std::max<size_t>(physical_colors.size(), 2), physical_colors.empty() ? "#FFFFFF" : physical_colors.front());
+
+    Slic3r::TextureMappingManager texture_mgr;
+    texture_mgr.load_entries(texture_defs_opt->value, physical_colors);
+    return texture_mgr.is_texture_mapping_zone_id(unsigned(filament_id));
+}
+
+static bool has_imported_obj_texture_payload(const ModelVolume &volume)
+{
+    const size_t triangle_count = volume.mesh().its.indices.size();
+    return volume.imported_texture_width > 0 &&
+           volume.imported_texture_height > 0 &&
+           !volume.imported_texture_rgba.empty() &&
+           volume.imported_texture_rgba.size() >=
+               size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height) * 4 &&
+           volume.imported_texture_uv_valid.size() == triangle_count &&
+           volume.imported_texture_uvs_per_face.size() >= triangle_count * 6;
+}
+
+static bool has_imported_raw_atlas_texture_payload(const ModelVolume &volume)
+{
+    if (volume.imported_texture_width == 0 || volume.imported_texture_height == 0)
+        return false;
+    const size_t pixel_count = size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height);
+    const bool has_offsets =
+        volume.imported_texture_raw_channels > 0 &&
+        volume.imported_texture_raw_filament_offsets.size() >= pixel_count * size_t(volume.imported_texture_raw_channels);
+    const bool has_top_surface =
+        !volume.imported_texture_raw_top_surface_depths.empty() &&
+        volume.imported_texture_raw_top_surface_filament_slots.size() >=
+            pixel_count * volume.imported_texture_raw_top_surface_depths.size();
+    return has_offsets || has_top_surface;
+}
+
+static std::vector<ImageMapRawFilament> raw_atlas_filaments_from_metadata(const std::string &metadata_json, uint32_t channels)
+{
+    std::vector<ImageMapRawFilament> filaments;
+    try {
+        const nlohmann::json root = nlohmann::json::parse(metadata_json);
+        const nlohmann::json entries = root.value("filaments", nlohmann::json::array());
+        if (entries.is_array()) {
+            for (const nlohmann::json &entry : entries) {
+                if (!entry.is_object())
+                    continue;
+                ImageMapRawFilament filament;
+                filament.slot = unsigned(std::max(0, entry.value("slot", 0)));
+                filament.color = entry.value("color", std::string());
+                filament.hex = entry.value("hex", std::string());
+                filaments.emplace_back(std::move(filament));
+            }
+        }
+    } catch (...) {
+        filaments.clear();
+    }
+
+    if (filaments.empty()) {
+        filaments.reserve(channels);
+        for (uint32_t channel = 0; channel < channels; ++channel) {
+            ImageMapRawFilament filament;
+            filament.slot = channel + 1;
+            filament.color = "custom";
+            filament.hex = "#FFFFFF";
+            filaments.emplace_back(std::move(filament));
+        }
+    }
+    return filaments;
+}
+
+static ImageMapRawFilamentOffsetAtlas raw_atlas_from_model_volume(const ModelVolume &volume)
+{
+    ImageMapRawFilamentOffsetAtlas atlas;
+    atlas.width = volume.imported_texture_width;
+    atlas.height = volume.imported_texture_height;
+    atlas.channels = volume.imported_texture_raw_channels;
+    atlas.offsets.assign(volume.imported_texture_raw_filament_offsets.begin(), volume.imported_texture_raw_filament_offsets.end());
+    atlas.metadata_json = volume.imported_texture_raw_metadata_json;
+    atlas.filaments = raw_atlas_filaments_from_metadata(volume.imported_texture_raw_metadata_json, atlas.channels);
+    const size_t pixel_count = size_t(atlas.width) * size_t(atlas.height);
+    const size_t depth_count = volume.imported_texture_raw_top_surface_depths.size();
+    if (depth_count > 0 &&
+        volume.imported_texture_raw_top_surface_filament_slots.size() >= pixel_count * depth_count) {
+        for (size_t depth_idx = 0; depth_idx < depth_count; ++depth_idx) {
+            ImageMapRawTopSurfaceLayer layer;
+            layer.depth = volume.imported_texture_raw_top_surface_depths[depth_idx];
+            const auto begin = volume.imported_texture_raw_top_surface_filament_slots.begin() + depth_idx * pixel_count;
+            layer.filament_slots.assign(begin, begin + pixel_count);
+            atlas.top_surface_layers.emplace_back(std::move(layer));
+        }
+    }
+    return atlas;
+}
+
+static std::string imported_texture_part_stem(size_t object_index, size_t volume_index)
+{
+    return (boost::format("o%1%_v%2%") % object_index % volume_index).str();
+}
+
+
 void PlateData::parse_filament_info(GCodeProcessorResult *result)
 {
     if (!result) return;
@@ -726,6 +846,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             std::vector<std::string> custom_supports;
             std::vector<std::string> custom_seam;
             std::vector<std::string> mmu_segmentation;
+            std::vector<std::string> texture_mapping_color;
             std::vector<std::string> fuzzy_skin;
             // BBS
             std::vector<std::string> face_properties;
@@ -738,6 +859,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 std::swap(triangles, o.triangles);
                 std::swap(custom_supports, o.custom_supports);
                 std::swap(custom_seam, o.custom_seam);
+                std::swap(mmu_segmentation, o.mmu_segmentation);
+                std::swap(texture_mapping_color, o.texture_mapping_color);
+                std::swap(fuzzy_skin, o.fuzzy_skin);
             }
 
             void reset() {
@@ -746,6 +870,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 custom_supports.clear();
                 custom_seam.clear();
                 mmu_segmentation.clear();
+                texture_mapping_color.clear();
                 fuzzy_skin.clear();
             }
         };
@@ -1036,6 +1161,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         bool m_load_restore = false;
         std::string m_backup_path;
         std::string m_origin_file;
+        std::map<std::string, std::vector<uint8_t>> m_imported_texture_files;
         // Semantic version of Orca Slicer, that generated this 3MF.
         boost::optional<Semver> m_bambuslicer_generator_version;
         unsigned int m_fdm_supports_painting_version = 0;
@@ -1148,6 +1274,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         void _extract_print_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, DynamicPrintConfig& config, ConfigSubstitutionContext& subs_context, const std::string& archive_filename);
         //BBS: add project config file logic
         void _extract_project_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, DynamicPrintConfig& config, ConfigSubstitutionContext& subs_context, Model& model);
+        void _extract_imported_texture_file_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, const std::string& name);
+        void _restore_imported_textures_from_archive();
         //BBS: extract project embedded presets
         void _extract_project_embedded_presets_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, std::vector<Preset*>&project_presets, Model& model, Preset::Type type, bool use_json = true);
 
@@ -1511,6 +1639,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     // extract slic3r print config file
                     ConfigSubstitutionContext config_substitutions(ForwardCompatibilitySubstitutionRule::Disable);
                     _extract_project_config_from_archive(archive, stat, config, config_substitutions, model);
+                }
+                else if (boost::algorithm::istarts_with(name, IMPORTED_TEXTURE_DIR)) {
+                    _extract_imported_texture_file_from_archive(archive, stat, name);
                 }
                 else if (boost::algorithm::iequals(name, BBS_MODEL_CONFIG_FILE)) {
                     // extract slic3r model config file
@@ -1896,6 +2027,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     _extract_xml_from_archive(archive, stat, _handle_start_config_xml_element, _handle_end_config_xml_element);
                     m_parsing_slice_info = false;
                 }
+                else if (boost::algorithm::istarts_with(name, IMPORTED_TEXTURE_DIR)) {
+                    _extract_imported_texture_file_from_archive(archive, stat, name);
+                }
                 else if (boost::algorithm::istarts_with(name, AUXILIARY_DIR)) {
                     // extract auxiliary directory to temp directory, do nothing for restore
                     if (m_load_aux && !m_load_restore)
@@ -2163,7 +2297,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             if (extruder_opt != nullptr)
                 extruder_id = extruder_opt->getInt();
 
-            if (extruder_id == 0 || extruder_id > max_filament_id)
+            if (extruder_id == 0 ||
+                (extruder_id > max_filament_id &&
+                 !is_texture_mapping_virtual_filament_id(config, extruder_id, size_t(max_filament_id))))
                 mo->config.set_key_value("extruder", new ConfigOptionInt(0));
 
             if (mo->volumes.size() == 1) {
@@ -2177,11 +2313,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
                     if (vol_extruder_opt->getInt() == 0)
                         mv->config.erase("extruder");
-                    else if (vol_extruder_opt->getInt() > max_filament_id)
+                    else if (vol_extruder_opt->getInt() > max_filament_id &&
+                             !is_texture_mapping_virtual_filament_id(config, vol_extruder_opt->getInt(), size_t(max_filament_id)))
                         mv->config.set_key_value("extruder", new ConfigOptionInt(0));
                 }
             }
         }
+
+        _restore_imported_textures_from_archive();
 
 //        // fixes the min z of the model if negative
 //        model.adjust_min_z();
@@ -2572,6 +2711,112 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 return;
             }
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", load project config file successfully from %1%\n") %dest_file;
+        }
+    }
+
+    void _BBS_3MF_Importer::_extract_imported_texture_file_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, const std::string& name)
+    {
+        if (stat.m_uncomp_size == 0)
+            return;
+        std::vector<uint8_t> buffer(size_t(stat.m_uncomp_size), 0);
+        mz_bool res = mz_zip_reader_extract_to_mem(&archive, stat.m_file_index, buffer.data(), buffer.size(), 0);
+        if (res == 0) {
+            BOOST_LOG_TRIVIAL(warning) << "Failed to extract imported texture file " << name;
+            return;
+        }
+        m_imported_texture_files[name] = std::move(buffer);
+    }
+
+    void _BBS_3MF_Importer::_restore_imported_textures_from_archive()
+    {
+        if (m_model == nullptr || m_imported_texture_files.empty())
+            return;
+
+        for (size_t object_index = 0; object_index < m_model->objects.size(); ++object_index) {
+            ModelObject *object = m_model->objects[object_index];
+            if (object == nullptr)
+                continue;
+            for (size_t volume_index = 0; volume_index < object->volumes.size(); ++volume_index) {
+                ModelVolume *volume = object->volumes[volume_index];
+                if (volume == nullptr)
+                    continue;
+                const std::string stem = imported_texture_part_stem(object_index, volume_index);
+                const std::string json_name = IMPORTED_TEXTURE_DIR + stem + ".json";
+                const std::string png_name = IMPORTED_TEXTURE_DIR + stem + ".png";
+                const auto json_it = m_imported_texture_files.find(json_name);
+                const auto png_it = m_imported_texture_files.find(png_name);
+                if (json_it == m_imported_texture_files.end() || png_it == m_imported_texture_files.end())
+                    continue;
+
+                nlohmann::json root;
+                try {
+                    root = nlohmann::json::parse(std::string(json_it->second.begin(), json_it->second.end()));
+                } catch (const std::exception &e) {
+                    BOOST_LOG_TRIVIAL(warning) << "Imported texture JSON parse failed for " << json_name << ": " << e.what();
+                    continue;
+                }
+
+                std::vector<uint8_t> imported_rgba;
+                uint32_t imported_width = 0;
+                uint32_t imported_height = 0;
+                if (!decode_image_texture_rgba_from_memory(png_it->second.data(), png_it->second.size(), "image/png",
+                                                           imported_rgba, imported_width, imported_height)) {
+                    BOOST_LOG_TRIVIAL(warning) << "Imported texture PNG decode failed for " << png_name;
+                    continue;
+                }
+
+                const size_t triangle_count = volume->mesh().its.indices.size();
+                std::vector<uint8_t> uv_valid;
+                std::vector<float> uvs_per_face;
+                if (root.contains("uv_valid") && root["uv_valid"].is_array()) {
+                    uv_valid.reserve(root["uv_valid"].size());
+                    for (const auto &entry : root["uv_valid"])
+                        uv_valid.emplace_back(uint8_t(entry.get<int>() != 0));
+                }
+                if (root.contains("uvs_per_face") && root["uvs_per_face"].is_array()) {
+                    uvs_per_face.reserve(root["uvs_per_face"].size());
+                    for (const auto &entry : root["uvs_per_face"])
+                        uvs_per_face.emplace_back(entry.get<float>());
+                }
+                if (uv_valid.size() != triangle_count || uvs_per_face.size() < triangle_count * 6) {
+                    BOOST_LOG_TRIVIAL(warning) << "Imported texture UV triangle mismatch for " << json_name;
+                    continue;
+                }
+
+                volume->imported_texture_uv_valid.assign(uv_valid.begin(), uv_valid.end());
+                volume->imported_texture_uvs_per_face.assign(uvs_per_face.begin(), uvs_per_face.begin() + triangle_count * 6);
+
+                ImageMapRawFilamentOffsetAtlas raw_atlas;
+                if (decode_image_map_raw_filament_offset_atlas(imported_rgba, imported_width, imported_height, raw_atlas, nullptr)) {
+                    volume->imported_texture_rgba = image_map_raw_filament_offset_preview_rgba(raw_atlas);
+                    volume->imported_texture_width = raw_atlas.width;
+                    volume->imported_texture_height = raw_atlas.height;
+                    volume->imported_texture_raw_channels = raw_atlas.channels;
+                    volume->imported_texture_raw_filament_offsets = std::move(raw_atlas.offsets);
+                    volume->imported_texture_raw_top_surface_filament_slots.clear();
+                    volume->imported_texture_raw_top_surface_depths.clear();
+                    const size_t pixel_count = size_t(raw_atlas.width) * size_t(raw_atlas.height);
+                    for (const ImageMapRawTopSurfaceLayer &layer : raw_atlas.top_surface_layers) {
+                        if (layer.filament_slots.size() < pixel_count)
+                            continue;
+                        volume->imported_texture_raw_top_surface_depths.emplace_back(layer.depth);
+                        volume->imported_texture_raw_top_surface_filament_slots.insert(
+                            volume->imported_texture_raw_top_surface_filament_slots.end(),
+                            layer.filament_slots.begin(),
+                            layer.filament_slots.begin() + pixel_count);
+                    }
+                    volume->imported_texture_raw_metadata_json = std::move(raw_atlas.metadata_json);
+                } else {
+                    volume->imported_texture_rgba = std::move(imported_rgba);
+                    volume->imported_texture_width = imported_width;
+                    volume->imported_texture_height = imported_height;
+                    volume->imported_texture_raw_filament_offsets.clear();
+                    volume->imported_texture_raw_top_surface_filament_slots.clear();
+                    volume->imported_texture_raw_top_surface_depths.clear();
+                    volume->imported_texture_raw_channels = 0;
+                    volume->imported_texture_raw_metadata_json.clear();
+                }
+            }
         }
     }
 
@@ -3675,6 +3920,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             m_curr_object->geometry.custom_supports.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
             m_curr_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             m_curr_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
+            m_curr_object->geometry.texture_mapping_color.push_back(
+                bbs_get_attribute_value_string(attributes, num_attributes, TEXTURE_MAPPING_COLOR_ATTR));
             m_curr_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, {CUSTOM_FUZZY_SKIN_ATTR, CUSTOM_FUZZY_SKIN_ATTR_OLD}));
             // BBS
             m_curr_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
@@ -4838,11 +5085,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 volume->supported_facets.reserve(triangles_count);
                 volume->seam_facets.reserve(triangles_count);
                 volume->mmu_segmentation_facets.reserve(triangles_count);
+                volume->texture_mapping_color_facets.reserve(triangles_count);
                 volume->fuzzy_skin_facets.reserve(triangles_count);
                 for (size_t i=0; i<triangles_count; ++i) {
                     assert(i < sub_object->geometry.custom_supports.size());
                     assert(i < sub_object->geometry.custom_seam.size());
                     assert(i < sub_object->geometry.mmu_segmentation.size());
+                    assert(i < sub_object->geometry.texture_mapping_color.size());
                     assert(i < sub_object->geometry.fuzzy_skin.size());
                     if (! sub_object->geometry.custom_supports[i].empty())
                         volume->supported_facets.set_triangle_from_string(i, sub_object->geometry.custom_supports[i]);
@@ -4850,6 +5099,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                         volume->seam_facets.set_triangle_from_string(i, sub_object->geometry.custom_seam[i]);
                     if (! sub_object->geometry.mmu_segmentation[i].empty())
                         volume->mmu_segmentation_facets.set_triangle_from_string(i, sub_object->geometry.mmu_segmentation[i]);
+                    if (!sub_object->geometry.texture_mapping_color[i].empty())
+                        volume->texture_mapping_color_facets.set_triangle_from_string(i, sub_object->geometry.texture_mapping_color[i]);
                     if (!sub_object->geometry.fuzzy_skin[i].empty())
                         volume->fuzzy_skin_facets.set_triangle_from_string(i, sub_object->geometry.fuzzy_skin[i]);
                 }
@@ -4857,6 +5108,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 volume->seam_facets.shrink_to_fit();
                 volume->mmu_segmentation_facets.shrink_to_fit();
                 volume->mmu_segmentation_facets.touch();
+                volume->texture_mapping_color_facets.shrink_to_fit();
+                volume->texture_mapping_color_facets.touch();
                 volume->fuzzy_skin_facets.shrink_to_fit();
                 volume->fuzzy_skin_facets.touch();
             }
@@ -5000,17 +5253,21 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             volume->supported_facets.reserve(triangles_count);
             volume->seam_facets.reserve(triangles_count);
             volume->mmu_segmentation_facets.reserve(triangles_count);
+            volume->texture_mapping_color_facets.reserve(triangles_count);
             for (size_t i=0; i<triangles_count; ++i) {
                 size_t index = volume_data.first_triangle_id + i;
                 assert(index < geometry.custom_supports.size());
                 assert(index < geometry.custom_seam.size());
                 assert(index < geometry.mmu_segmentation.size());
+                assert(index < geometry.texture_mapping_color.size());
                 if (! geometry.custom_supports[index].empty())
                     volume->supported_facets.set_triangle_from_string(i, geometry.custom_supports[index]);
                 if (! geometry.custom_seam[index].empty())
                     volume->seam_facets.set_triangle_from_string(i, geometry.custom_seam[index]);
                 if (! geometry.mmu_segmentation[index].empty())
                     volume->mmu_segmentation_facets.set_triangle_from_string(i, geometry.mmu_segmentation[index]);
+                if (! geometry.texture_mapping_color[index].empty())
+                    volume->texture_mapping_color_facets.set_triangle_from_string(i, geometry.texture_mapping_color[index]);
             }
             volume->supported_facets.shrink_to_fit();
             volume->seam_facets.shrink_to_fit();
@@ -5317,6 +5574,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             current_object->geometry.custom_supports.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
             current_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             current_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
+            current_object->geometry.texture_mapping_color.push_back(
+                bbs_get_attribute_value_string(attributes, num_attributes, TEXTURE_MAPPING_COLOR_ATTR));
             current_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, {CUSTOM_FUZZY_SKIN_ATTR, CUSTOM_FUZZY_SKIN_ATTR_OLD}));
             // BBS
             current_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
@@ -5679,6 +5938,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         bool _add_print_config_file_to_archive(mz_zip_archive& archive, const DynamicPrintConfig &config);
         //BBS: add project config file logic for json format
         bool _add_project_config_file_to_archive(mz_zip_archive& archive, const DynamicPrintConfig &config, Model& model);
+        bool _add_imported_texture_files_to_archive(mz_zip_archive& archive, const Model& model);
         //BBS: add project embedded preset files
         bool _add_project_embedded_presets_to_archive(mz_zip_archive& archive, Model& model, std::vector<Preset*> project_presets);
         bool _add_model_config_file_to_archive(mz_zip_archive& archive, const Model& model, PlateDataPtrs& plate_data_list, const ObjectToObjectDataMap &objects_data, const DynamicPrintConfig& config, int export_plate_idx = -1, bool save_gcode = true, bool use_loaded_id = false);
@@ -6130,6 +6390,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 // BBS: change to json format
                 // if (!_add_print_config_file_to_archive(archive, *config)) {
                 if (!_add_project_config_file_to_archive(archive, *config, model)) { return false; }
+                if (!_add_imported_texture_files_to_archive(archive, model)) { return false; }
             }
 
             // BBS progress point
@@ -6698,6 +6959,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                                 if ((shared_volume->supported_facets.equals(volume->supported_facets))
                                     && (shared_volume->seam_facets.equals(volume->seam_facets))
                                     && (shared_volume->mmu_segmentation_facets.equals(volume->mmu_segmentation_facets))
+                                    && (shared_volume->texture_mapping_color_facets.equals(volume->texture_mapping_color_facets))
                                     && (shared_volume->fuzzy_skin_facets.equals(volume->fuzzy_skin_facets)))
                                 {
                                     auto data = iter->second.first;
@@ -7104,6 +7366,15 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     output_buffer += "\"";
                 }
 
+                std::string texture_mapping_color_data_string = volume->texture_mapping_color_facets.get_triangle_as_string(i);
+                if (! texture_mapping_color_data_string.empty()) {
+                    output_buffer += " ";
+                    output_buffer += TEXTURE_MAPPING_COLOR_ATTR;
+                    output_buffer += "=\"";
+                    output_buffer += texture_mapping_color_data_string;
+                    output_buffer += "\"";
+                }
+
                 std::string fuzzy_skin_painting_data_string = volume->fuzzy_skin_facets.get_triangle_as_string(i);
                 if (!fuzzy_skin_painting_data_string.empty()) {
                     output_buffer += " ";
@@ -7492,6 +7763,82 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         std::string temp_file = temp_path + std::string("/") + "_temp_1.config";
         config.save_to_json(temp_file, std::string("project_settings"), std::string("project"), std::string(Snapmaker_VERSION));
         return _add_file_to_archive(archive, BBS_PROJECT_CONFIG_FILE, temp_file);
+    }
+
+    bool _BBS_3MF_Exporter::_add_imported_texture_files_to_archive(mz_zip_archive& archive, const Model& model)
+    {
+        for (size_t object_index = 0; object_index < model.objects.size(); ++object_index) {
+            const ModelObject *object = model.objects[object_index];
+            if (object == nullptr)
+                continue;
+            for (size_t volume_index = 0; volume_index < object->volumes.size(); ++volume_index) {
+                const ModelVolume *volume = object->volumes[volume_index];
+                if (volume == nullptr ||
+                    (!has_imported_obj_texture_payload(*volume) && !has_imported_raw_atlas_texture_payload(*volume)))
+                    continue;
+
+                std::vector<uint8_t> png_source_rgba;
+                uint32_t png_width = volume->imported_texture_width;
+                uint32_t png_height = volume->imported_texture_height;
+                if (has_imported_raw_atlas_texture_payload(*volume)) {
+                    const ImageMapRawFilamentOffsetAtlas raw_atlas = raw_atlas_from_model_volume(*volume);
+                    std::string encode_error;
+                    if (!encode_image_map_raw_filament_offset_atlas(raw_atlas, png_source_rgba, png_width, png_height, &encode_error)) {
+                        add_error(encode_error.empty() ? "Unable to encode ImageMap raw filament offset atlas texture image" : encode_error);
+                        return false;
+                    }
+                } else {
+                    png_source_rgba.assign(volume->imported_texture_rgba.begin(), volume->imported_texture_rgba.end());
+                }
+
+                size_t png_size = 0;
+                void *png_data = tdefl_write_image_to_png_file_in_memory_ex(
+                    static_cast<const void *>(png_source_rgba.data()),
+                    int(png_width),
+                    int(png_height),
+                    4,
+                    &png_size,
+                    MZ_DEFAULT_COMPRESSION,
+                    1);
+                if (png_data == nullptr || png_size == 0) {
+                    add_error("Unable to encode imported texture PNG");
+                    if (png_data != nullptr)
+                        mz_free(png_data);
+                    return false;
+                }
+
+                const std::string stem = imported_texture_part_stem(object_index, volume_index);
+                const std::string png_name = IMPORTED_TEXTURE_DIR + stem + ".png";
+                const bool png_ok = mz_zip_writer_add_mem(&archive, png_name.c_str(), png_data, png_size, MZ_DEFAULT_COMPRESSION);
+                mz_free(png_data);
+                if (!png_ok) {
+                    add_error("Unable to add imported texture PNG to archive");
+                    return false;
+                }
+
+                nlohmann::json root;
+                root["width"] = png_width;
+                root["height"] = png_height;
+                root["raw_channels"] = volume->imported_texture_raw_channels;
+                root["raw_metadata_json"] = volume->imported_texture_raw_metadata_json;
+                root["is_raw_atlas"] = has_imported_raw_atlas_texture_payload(*volume);
+                nlohmann::json uv_valid = nlohmann::json::array();
+                for (uint8_t valid : volume->imported_texture_uv_valid)
+                    uv_valid.push_back(int(valid));
+                root["uv_valid"] = std::move(uv_valid);
+                nlohmann::json uvs = nlohmann::json::array();
+                for (float value : volume->imported_texture_uvs_per_face)
+                    uvs.push_back(value);
+                root["uvs_per_face"] = std::move(uvs);
+                const std::string json_body = root.dump();
+                const std::string json_name = IMPORTED_TEXTURE_DIR + stem + ".json";
+                if (!mz_zip_writer_add_mem(&archive, json_name.c_str(), json_body.data(), json_body.size(), MZ_DEFAULT_COMPRESSION)) {
+                    add_error("Unable to add imported texture JSON to archive");
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     //BBS: add project embedded preset files

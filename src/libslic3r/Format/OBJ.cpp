@@ -6,6 +6,7 @@
 #include "objparser.hpp"
 
 #include <string>
+#include <set>
 
 #include <boost/log/trivial.hpp>
 
@@ -100,6 +101,26 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
         obj_info.is_single_mtl = data.usemtls.size() == 1 && mtl_data.new_mtl_unmap.size() == 1;
         obj_info.face_colors.reserve(num_faces + num_quads);
     }
+    obj_info.triangle_uvs.reserve(num_faces + num_quads);
+    obj_info.triangle_uvs_valid.reserve(num_faces + num_quads);
+    auto read_uv = [&data](int uv_idx, Vec2f &out_uv) {
+        if (uv_idx < 0)
+            return false;
+        const size_t off = size_t(uv_idx) * 2;
+        if (off + 1 >= data.textureCoordinates.size())
+            return false;
+        out_uv = Vec2f(data.textureCoordinates[off], data.textureCoordinates[off + 1]);
+        return true;
+    };
+    auto append_triangle_uv = [&obj_info, &read_uv](int uv0_idx, int uv1_idx, int uv2_idx) {
+        std::array<Vec2f, 3> triangle_uv{Vec2f::Zero(), Vec2f::Zero(), Vec2f::Zero()};
+        const bool has_all_uv =
+            read_uv(uv0_idx, triangle_uv[0]) &&
+            read_uv(uv1_idx, triangle_uv[1]) &&
+            read_uv(uv2_idx, triangle_uv[2]);
+        obj_info.triangle_uvs.emplace_back(triangle_uv);
+        obj_info.triangle_uvs_valid.emplace_back(uint8_t(has_all_uv ? 1 : 0));
+    };
     bool has_color = data.has_vertex_color;
     for (size_t i = 0; i < num_vertices; ++ i) {
         size_t j = i * OBJ_VERTEX_LENGTH;
@@ -135,6 +156,7 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                 assert(cnt == 3 || cnt == 4);
                 // Insert one or two faces (triangulate a quad).
                 its.indices.emplace_back(indices[0], indices[1], indices[2]);
+                append_triangle_uv(uvs[0], uvs[1], uvs[2]);
                 int  face_index =its.indices.size() - 1;
                 RGBA face_color;
                 auto set_face_color = [&uvs, &data, &mtl_data, &obj_info, &face_color](int face_index, const std::string mtl_name) {
@@ -189,6 +211,7 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                 }
                 if (cnt == 4) {
                     its.indices.emplace_back(indices[0], indices[2], indices[3]);
+                    append_triangle_uv(uvs[0], uvs[2], uvs[3]);
                     int face_index = its.indices.size() - 1;
                     if (exist_mtl) {
                         set_face_color_by_mtl(face_index);
@@ -203,8 +226,19 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
         message = _L("This OBJ file couldn't be read because it's empty.");
         return false;
     }
-    if (meshptr->volume() < 0)
+    if (meshptr->volume() < 0) {
         meshptr->flip_triangles();
+        for (std::array<Vec2f, 3> &triangle_uv : obj_info.triangle_uvs)
+            std::swap(triangle_uv[1], triangle_uv[2]);
+    }
+    if (obj_info.has_uv_png && !obj_info.uv_map_pngs.empty()) {
+        std::set<std::string> unique_textures;
+        for (const auto &face_to_png : obj_info.uv_map_pngs)
+            if (!face_to_png.second.empty())
+                unique_textures.insert(face_to_png.second);
+        if (unique_textures.size() == 1)
+            obj_info.single_texture_image = *unique_textures.begin();
+    }
     return true;
 }
 

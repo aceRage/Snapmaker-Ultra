@@ -1,16 +1,24 @@
 #include <catch2/catch.hpp>
 
 #include <array>
+#include <stdexcept>
 
+#include "libslic3r/Exception.hpp"
 #include "libslic3r/Format/ImportedTexture.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/GCode/ToolOrdering.hpp"
 #include "libslic3r/ImageMapRawFilamentOffsetAtlas.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/ModelTextureDataRemap.hpp"
+#include "libslic3r/PaintDepth.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/Semver.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/TextureMappingContoning.hpp"
 #include "libslic3r/TextureMappingOffset.hpp"
+#include "libslic3r/TriangleMesh.hpp"
+
+#include <boost/filesystem.hpp>
 
 using namespace Slic3r;
 
@@ -162,4 +170,112 @@ TEST_CASE("LayerTools resolve_filament_id is a no-op without a TextureMapping ma
     CHECK(tools.texture_mapping_manager == nullptr);
     CHECK(tools.resolve_filament_id(0) == 0);
     CHECK(tools.resolve_filament_id(4) == 4);
+}
+
+TEST_CASE("C5: legacy mmu_segmented_region_max_width still migrates to paint_depth_*", "[texturemapping][pr3][paintdepth]")
+{
+    DynamicPrintConfig loaded;
+    loaded.load_from_ini_string("mmu_segmented_region_max_width = 0.8\n", ForwardCompatibilitySubstitutionRule::Disable);
+
+    REQUIRE(loaded.has("paint_depth_mode"));
+    REQUIRE(loaded.option<ConfigOptionEnum<PaintDepthMode>>("paint_depth_mode")->value == pdmMillimeters);
+    REQUIRE(loaded.has("paint_depth_mm"));
+    CHECK(std::abs(loaded.option<ConfigOptionFloat>("paint_depth_mm")->value - 0.8) < 1e-6);
+}
+
+TEST_CASE("C6: bbs_3mf round-trips texture_mapping_* and paint_depth_* together", "[texturemapping][pr3]")
+{
+    DynamicPrintConfig src = DynamicPrintConfig::full_print_config();
+    src.set_key_value("texture_mapping_definitions", new ConfigOptionString("zones-v1"));
+    src.set_key_value("texture_mapping_global_settings", new ConfigOptionString("{\"enabled\":true}"));
+    src.set_key_value("texture_mapping_background_color", new ConfigOptionString("#AABBCCDD"));
+    src.set_key_value("texture_mapping_outer_wall_gradient_global_strength", new ConfigOptionFloat(42.0));
+    src.set_key_value("texture_mapping_outer_wall_gradient_max_line_width", new ConfigOptionFloat(0.88));
+    src.set_key_value("texture_mapping_outer_wall_gradient_min_line_width", new ConfigOptionFloat(0.22));
+    src.set_key_value("paint_depth_mode", new ConfigOptionEnum<PaintDepthMode>(pdmMillimeters));
+    src.set_key_value("paint_depth_mm", new ConfigOptionFloat(1.25));
+    src.set_key_value("paint_depth_walls", new ConfigOptionInt(4));
+
+    Model model;
+    ModelObject *object = model.add_object();
+    REQUIRE(object != nullptr);
+    object->add_volume(make_cube(10., 10., 10.));
+    model.add_default_instances();
+
+    const boost::filesystem::path tmp_path = boost::filesystem::temp_directory_path() / "imagemap_full_pr3_c6.3mf";
+    const std::string tmp = tmp_path.string();
+    StoreParams store;
+    store.path = tmp.c_str();
+    store.model = &model;
+    store.config = &src;
+    store.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+    REQUIRE(store_bbs_3mf(store));
+
+    DynamicPrintConfig dst;
+    Model dst_model;
+    ConfigSubstitutionContext ctx{ForwardCompatibilitySubstitutionRule::Disable};
+    PlateDataPtrs plates;
+    std::vector<Preset *> presets;
+    bool is_bbl = false;
+    Semver file_version;
+    const bool loaded = load_bbs_3mf(tmp.c_str(), &dst, &ctx, &dst_model, &plates, &presets, &is_bbl, &file_version, nullptr,
+                                     LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
+    boost::filesystem::remove(tmp_path);
+    release_PlateData_list(plates);
+
+    REQUIRE(loaded);
+    REQUIRE(dst.has("texture_mapping_definitions"));
+    CHECK(dst.option<ConfigOptionString>("texture_mapping_definitions")->value == "zones-v1");
+    CHECK(dst.option<ConfigOptionString>("texture_mapping_global_settings")->value == "{\"enabled\":true}");
+    CHECK(dst.option<ConfigOptionString>("texture_mapping_background_color")->value == "#AABBCCDD");
+    CHECK(dst.option<ConfigOptionFloat>("texture_mapping_outer_wall_gradient_global_strength")->value == 42.0);
+    CHECK(dst.option<ConfigOptionFloat>("texture_mapping_outer_wall_gradient_max_line_width")->value == 0.88);
+    CHECK(dst.option<ConfigOptionFloat>("texture_mapping_outer_wall_gradient_min_line_width")->value == 0.22);
+    REQUIRE(dst.has("paint_depth_mode"));
+    CHECK(dst.option<ConfigOptionEnum<PaintDepthMode>>("paint_depth_mode")->value == pdmMillimeters);
+    CHECK(std::abs(dst.option<ConfigOptionFloat>("paint_depth_mm")->value - 1.25) < 1e-6);
+    CHECK(dst.option<ConfigOptionInt>("paint_depth_walls")->value == 4);
+}
+
+TEST_CASE("C7: Remap snapshot/apply is wired for ImageTexture and region paint", "[texturemapping][pr3][remap]")
+{
+    Model model;
+    ModelObject *object = model.add_object();
+    ModelVolume *volume = object->add_volume(make_cube(20., 20., 10.));
+    REQUIRE(volume != nullptr);
+
+    const size_t tri_count = volume->mesh().its.indices.size();
+    REQUIRE(tri_count > 0);
+    volume->imported_texture_width = 2;
+    volume->imported_texture_height = 2;
+    volume->imported_texture_rgba.assign(16, uint8_t(255));
+    volume->imported_texture_uv_valid.assign(tri_count, uint8_t(1));
+    volume->imported_texture_uvs_per_face.assign(tri_count * 6, 0.5f);
+
+    const SimplifyTextureDataSnapshot snapshot = snapshot_simplify_texture_data(*volume);
+    CHECK(snapshot.source == SimplifyColorSource::ImageTexture);
+
+    SimplifyTextureDataResult result = remap_simplify_texture_data(snapshot, volume->mesh().its);
+    apply_simplify_texture_data_result(*volume, std::move(result));
+    CHECK(volume->imported_texture_uv_valid.size() == tri_count);
+    CHECK(volume->imported_texture_uvs_per_face.size() >= tri_count * 6);
+
+    volume->mmu_segmentation_facets.reserve(int(tri_count));
+    volume->mmu_segmentation_facets.set_triangle_from_string(0, "4");
+    const SimplifyTextureDataSnapshot region_snapshot = snapshot_simplify_texture_data(*volume);
+    SimplifyTextureDataResult region_result = remap_simplify_texture_data(region_snapshot, volume->mesh().its);
+    apply_simplify_texture_data_result(*volume, std::move(region_result));
+}
+
+TEST_CASE("load_gltf unsupported path does not crash", "[texturemapping][pr3]")
+{
+    CHECK_THROWS_AS(Model::read_from_file("missing.gltf"), Slic3r::RuntimeError);
+    CHECK_THROWS_AS(Model::read_from_file("missing.glb"), Slic3r::RuntimeError);
+    try {
+        Model::read_from_file("missing.glb");
+        FAIL("GLB import should throw");
+    } catch (const std::runtime_error &err) {
+        const std::string msg = err.what();
+        CHECK(msg.find("GLTF") != std::string::npos);
+    }
 }

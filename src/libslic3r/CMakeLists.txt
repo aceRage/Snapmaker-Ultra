@@ -232,6 +232,8 @@ set(lisbslic3r_sources
     GCode/CoolingBuffer.cpp
     GCode/CoolingBuffer.hpp
     GCode.cpp
+    GCodeTextureMapping.cpp
+    GCodeTextureMapping.hpp
     GCode/ExtrusionProcessor.hpp
     GCode/FanMover.cpp
     GCode/FanMover.hpp
