@@ -1827,7 +1827,7 @@ void PartPlate::clear(bool clear_sliced_result)
 		m_ready_for_slice = true;
 		update_slice_result_valid_state(false);
 	}
-	m_name_texture.reset();
+	invalidate_plate_name_texture();
 	return;
 }
 
@@ -1917,6 +1917,10 @@ Vec3d PartPlate::get_center_origin()
 
 void PartPlate::generate_plate_name_texture()
 {
+	auto canvas = (m_partplate_list != nullptr && m_partplate_list->m_plater != nullptr) ? m_partplate_list->m_plater->get_view3D_canvas3D() : nullptr;
+	if (canvas == nullptr)
+		return;
+
     m_plate_name_icon.reset();
 
 	// generate m_name_texture texture from m_name with generate_from_text_string
@@ -1954,11 +1958,25 @@ void PartPlate::generate_plate_name_texture()
     if (!init_model_from_poly(m_plate_name_icon, poly, GROUND_Z))
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "Unable to generate geometry buffers for icons\n";
 
-	auto canvas = this->m_partplate_list->m_plater->get_view3D_canvas3D();
     canvas->remove_raycasters_for_picking(SceneRaycaster::EType::Bed, picking_id_component(6));
     calc_vertex_for_plate_name_edit_icon(&m_name_texture, 0, m_plate_name_edit_icon);
     register_model_for_picking(*canvas, m_plate_name_edit_icon, picking_id_component(6));
 }
+
+void PartPlate::invalidate_plate_name_texture()
+{
+	// Ultra: encapsulate the existing clear() texture reset so set_plate_name
+	// still lazy-regenerates via render_plate_name_texture (get_id() == 0).
+	m_name_texture.reset();
+	m_plate_name_edit_icon.mesh_raycaster.reset();
+
+	auto canvas = (m_plater != nullptr) ? m_plater->get_view3D_canvas3D() : nullptr;
+	if (canvas != nullptr) {
+		canvas->remove_raycasters_for_picking(SceneRaycaster::EType::Bed, picking_id_component(6));
+		canvas->set_as_dirty();
+	}
+}
+
 void PartPlate::set_plate_name(const std::string& name) 
 { 
 	// compare if name equal to m_name, case sensitive
@@ -1969,7 +1987,7 @@ void PartPlate::set_plate_name(const std::string& name)
     if (m_print != nullptr)
         m_print->set_plate_name(name);
 
-	generate_plate_name_texture();
+	invalidate_plate_name_texture();
 }
 
 //get the print's object, result and index
