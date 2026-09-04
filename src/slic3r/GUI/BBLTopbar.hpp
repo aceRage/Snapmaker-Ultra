@@ -25,6 +25,7 @@ public:
     void OnDropdownToolItem(wxAuiToolBarEvent& evt);
     void OnCalibToolItem(wxAuiToolBarEvent &evt);
     void OnAccountToolItem(wxAuiToolBarEvent &evt);   // Ultra: contextual account login/logout
+    void OnMobileHubToolItem(wxAuiToolBarEvent &evt); // Ultra: opens the hub page in the browser
     void OnMouseLeftDClock(wxMouseEvent& mouse);
     void OnMouseLeftDown(wxMouseEvent& event);
     void OnMouseLeftUp(wxMouseEvent& event);
@@ -75,6 +76,7 @@ private:
     wxAuiToolBarItem* m_undo_item;
     wxAuiToolBarItem* m_redo_item;
     wxAuiToolBarItem* m_calib_item;
+    wxAuiToolBarItem* m_hub_item;
     wxAuiToolBarItem* maximize_btn;
 
     wxBitmap m_publish_bitmap;

@@ -2613,6 +2613,7 @@ static Info parse_info(const std::string& body)
         i.alive       = j.value("alive", false);
         i.pid         = j.value("pid", 0L);
         i.port        = j.value("port", 0);
+        i.admin_port  = j.value("admin_port", 0);
         i.phone       = j.value("phone", false);
         i.token       = j.value("token", "");
         i.go2rtc_port = j.value("go2rtc_port", 0);
