@@ -32,8 +32,6 @@ void remember_credentials(const std::string& sn, const nlohmann::json& connect_p
 // GUI thread. The paired devices as the Device page lists them (no credentials), which one is the
 // connected host, and what the current printer preset is.
 void list(nlohmann::json& out);
-// Request thread, on what list() returned: adds `online` per device (its MQTT port answers).
-void probe_online(nlohmann::json& out);
 
 // Request thread (never the GUI thread): blocks on the MQTT connect and the printer's first
 // answer, a few seconds normally and up to ~30 s for a printer that is off. {200, ""} or an HTTP

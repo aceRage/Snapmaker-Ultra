@@ -12,6 +12,7 @@
 #include "RemoteHub.hpp"
 #include "RemoteSend.hpp"
 #include "RemoteSnapmaker.hpp"
+#include "SnapmakerLan.hpp"
 #include "Selection.hpp"
 #include "Tab.hpp"
 #include "IMSlider.hpp"
@@ -1076,6 +1077,7 @@ RemoteAccess::ApiResponse RemoteAccess::api_send(int plate, const std::string& f
     req.timelapse      = tri("timelapse");
     req.use_ams        = tri("use_ams");
     req.name           = get("name");
+    req.mapping        = get("mapping");
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_send_running) { r.status = 409; r.body = json_error("a send is already running; wait for it to finish"); return r; }
@@ -1140,17 +1142,60 @@ RemoteAccess::ApiResponse RemoteAccess::api_send(int plate, const std::string& f
 
 // ------------------------------------------------------- Snapmaker connect ----
 
-// The paired Snapmaker printers ("My Devices" on the PC's Device page) and which one, if any, the
-// slicer is connected to. The port probe runs off the GUI thread: a printer that is off must not
-// hold up the answer.
+// The Snapmaker printers on the LAN, with what each is doing right now. They are found four ways:
+// the printers this PC has paired on its Device tab, an mDNS pass, the Stream tab's cameras, and
+// what someone typed in on the phone. Nothing here needs the PC to be connected to a printer - the
+// connect the Device tab makes is reported alongside, for the phone's secondary control.
 RemoteAccess::ApiResponse RemoteAccess::api_snapmaker_devices()
 {
-    auto out = std::make_shared<nlohmann::json>();
-    bool ok  = run_on_main([out]() { RemoteSnapmaker::list(*out); });
+    // The app's own device list lives on the GUI thread; everything else is network work.
+    auto connect = std::make_shared<nlohmann::json>();
+    bool ok      = run_on_main([connect]() {
+        try { SnapmakerLan::merge_app_devices(); } catch (...) {}
+        RemoteSnapmaker::list(*connect);
+    });
     ApiResponse r;
     if (!ok) { r.status = 503; r.body = json_error("the slicer is busy"); return r; }
-    RemoteSnapmaker::probe_online(*out);
-    r.body = out->dump();
+    try { SnapmakerLan::start_discovery(); } catch (...) {}      // mDNS, at most once a minute
+    try { SnapmakerLan::merge_stream_devices(); } catch (...) {} // the Stream tab's cameras
+    nlohmann::json out;
+    SnapmakerLan::list_json(out);
+    // The PC-side MQTT connect: optional, and only interesting for the printers it knows.
+    nlohmann::json c;
+    c["connected"]      = (*connect)["connected"];
+    c["host"]           = (*connect)["host"];
+    c["devices"]        = (*connect)["devices"];
+    out["connect"]        = c;
+    out["printer_preset"] = (*connect)["printer_preset"];
+    out["is_snapmaker"]   = (*connect)["is_snapmaker"];
+    r.body = out.dump();
+    return r;
+}
+
+// Add a printer by address: it has to answer as a Snapmaker before it is remembered.
+RemoteAccess::ApiResponse RemoteAccess::api_snapmaker_add(const std::string& ip, int port)
+{
+    ApiResponse r;
+    if (ip.empty()) { r.status = 400; r.body = json_error("ip is required"); return r; }
+    SnapmakerLan::Device d;
+    std::string          error;
+    if (!SnapmakerLan::add(ip, port, d, error)) { r.status = 404; r.body = json_error(error); return r; }
+    nlohmann::json j;
+    j["ok"]     = true;
+    j["id"]     = d.id;
+    j["name"]   = d.name;
+    j["model"]  = d.model;
+    j["ip"]     = d.ip;
+    r.body      = j.dump();
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_snapmaker_remove(const std::string& id)
+{
+    ApiResponse r;
+    if (id.empty()) { r.status = 400; r.body = json_error("id is required"); return r; }
+    if (!SnapmakerLan::remove(id)) { r.status = 404; r.body = json_error("no such printer: " + id); return r; }
+    r.body = "{\"ok\":true}";
     return r;
 }
 
@@ -1865,12 +1910,14 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "POST"}, {"path", "/api/objects/transform"},       {"description", "form obj=&inst=[&x=&y=][&rz=][&scale=][&center=1]: move / rotate / scale one instance like the sidebar (undoable)"} },
             { {"method", "GET"},  {"path", "/api/printers"},               {"description", "known printers with live status and what a send needs: kind bambu|printhost|connect, online, lan_mode, access_code_set, sdcard, has_ams, model_matches, can_upload, can_print, options (the desktop's remembered defaults)"} },
             { {"method", "POST"}, {"path", "/api/slice?plate={index}|all"}, {"description", "start slicing one plate (selects it) or all; returns a job id; 409 while slicing"} },
-            { {"method", "POST"}, {"path", "/api/plates/{index}/send"},    {"description", "form printer={id}&mode=upload|print[&confirm=1][&force=1][&dry_run=1][&bed_leveling=0|1&flow_cali=0|1&timelapse=0|1&vibration_cali=0|1&use_ams=0|1][&name=]: send the sliced plate to a printer exactly like the desktop's Send / Print dialogs (upload = to the printer's storage, print = start it; print needs confirm=1); returns a job id; 409 unless the plate is sliced and no other send is running"} },
+            { {"method", "POST"}, {"path", "/api/plates/{index}/send"},    {"description", "form printer={id}&mode=upload|print[&confirm=1][&force=1][&dry_run=1][&bed_leveling=0|1&flow_cali=0|1&timelapse=0|1&vibration_cali=0|1&use_ams=0|1][&name=][&mapping=0:1,1:2]: send the sliced plate to a printer exactly like the desktop's Send / Print dialogs (upload = to the printer's storage, print = start it; print needs confirm=1). A Snapmaker over the LAN (printer sm:{id}) takes `mapping` = which toolhead prints each of the file's filaments, defaulting to the colour match its own app makes; returns a job id; 409 unless the plate is sliced and no other send is running"} },
             { {"method", "GET"},  {"path", "/api/jobs"},                   {"description", "recent jobs"} },
             { {"method", "GET"},  {"path", "/api/jobs/{id}"},              {"description", "job state: kind slice|send, running | done | error | cancelled, percent, text; send jobs add printer, mode and result (what was sent, or the composed parameters of a dry run)"} },
-            { {"method", "GET"},  {"path", "/api/snapmaker/devices"},      {"description", "the Snapmaker printers paired on this PC (Device page \"My Devices\"): id, name, model, ip, nozzles, connected, online; plus which one is the connected host and whether the printer preset is a Snapmaker"} },
-            { {"method", "POST"}, {"path", "/api/snapmaker/connect?id={device}"}, {"description", "connect that paired Snapmaker the way picking it on the PC's Device page does (MQTT, no pairing / PIN); the PC's Device tab follows"} },
-            { {"method", "POST"}, {"path", "/api/snapmaker/disconnect"},     {"description", "disconnect the connected Snapmaker"} },
+            { {"method", "GET"},  {"path", "/api/snapmaker/devices"},      {"description", "the Snapmaker printers on the LAN (from this PC's paired devices, an mDNS pass, the Stream tab's cameras and what was added by hand) with live state, temperatures and what each toolhead holds; plus `connect`, the optional MQTT connection the PC's Device tab makes"} },
+            { {"method", "POST"}, {"path", "/api/snapmaker/add?ip={address}"}, {"description", "remember a printer at that address (it has to answer as a Snapmaker first)"} },
+            { {"method", "POST"}, {"path", "/api/snapmaker/remove?id={device}"}, {"description", "forget a printer from the list"} },
+            { {"method", "POST"}, {"path", "/api/snapmaker/connect?id={device}"}, {"description", "optional: connect that paired Snapmaker over MQTT the way picking it on the PC's Device page does; sending does not need it"} },
+            { {"method", "POST"}, {"path", "/api/snapmaker/disconnect"},     {"description", "disconnect the MQTT-connected Snapmaker"} },
             { {"method", "GET"},  {"path", "/api/presets"},                {"description", "printer / process choices as the sidebar shows them, the nozzle choices of the printer model, filament choices and the current filament slots with colours"} },
             { {"method", "POST"}, {"path", "/api/presets/select?type=printer|nozzle|process|filament&name={value}[&index={slot}]"}, {"description", "select a preset the way the sidebar does (nozzle = the same printer with another nozzle variant); 409 when that preset has unsaved changes on the PC"} },
             { {"method", "POST"}, {"path", "/api/presets/filament_color?index={slot}&color=%23RRGGBB"}, {"description", "set a filament slot colour"} },
@@ -1953,6 +2000,15 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
         return api_printers();
     if (path == "/snapmaker/devices" && method == "GET")
         return api_snapmaker_devices();
+    if (path == "/snapmaker/add" && method == "POST") {
+        auto get = [&](const char* k) { std::string v = query_param(query, k); return v.empty() ? query_param(body, k) : v; };
+        return api_snapmaker_add(get("ip"), num(get("port"), 80));
+    }
+    if (path == "/snapmaker/remove" && method == "POST") {
+        std::string id = query_param(query, "id");
+        if (id.empty()) id = query_param(body, "id");
+        return api_snapmaker_remove(id);
+    }
     if (path == "/snapmaker/connect" && method == "POST") {
         std::string id = query_param(query, "id");
         if (id.empty()) id = query_param(body, "id");
