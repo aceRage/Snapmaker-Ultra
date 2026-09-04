@@ -87,10 +87,16 @@ std::pair<int, std::string> prepare(const Request& req, std::shared_ptr<Prepared
 // ends with sink.done.
 void run(std::shared_ptr<Prepared> p, Sink sink);
 
+// GUI thread. The file name the desktop's own export gives a plate ("<project>_plate_2.gcode"),
+// for any plate, without making it the current one on the PC. `plate` out of range = the current
+// plate; an empty extension gives the bare name.
+std::string export_name_for(int plate, const std::string& extension);
+
 // GUI thread. What /api/printers adds for the send UI: a Bambu machine's send capabilities and
-// option defaults, and the print-host / connected-Snapmaker entries.
+// option defaults, and the print-host / connected-Snapmaker entries. `plate` says which plate the
+// `upload_name` defaults are for (-1 = the current one).
 void describe_bambu(MachineObject* m, nlohmann::json& p);
-void list_hosts(nlohmann::json& printers);
+void list_hosts(nlohmann::json& printers, int plate = -1);
 
 } // namespace RemoteSend
 } // namespace GUI

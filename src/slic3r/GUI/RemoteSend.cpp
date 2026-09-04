@@ -4,6 +4,7 @@
 #include "DeviceManager.hpp"
 #include "GUI_App.hpp"
 #include "HMS.hpp"
+#include "I18N.hpp"
 #include "PartPlate.hpp"
 #include "Plater.hpp"
 #include "SelectMachine.hpp" // CloudTaskNozzleId
@@ -946,15 +947,43 @@ void describe_bambu(MachineObject* m, json& p)
                              { "use_ams", m->has_ams() } };
 }
 
-void list_hosts(json& printers)
+// Plater::priv::get_export_gcode_filename (Plater.cpp:16778) for a plate that is not the current
+// one: that helper reads partplate_list.get_curr_plate(), and merely listing printers must not move
+// the plate the PC shows. Same rule - the project name (or the first object's, for a project that
+// was never named or saved), then the plate's own name, or "_plate_<n>" when there is more than one.
+std::string export_name_for(int plate, const std::string& extension)
+{
+    Plater* plater = wxGetApp().plater();
+    if (!plater) return {};
+    PartPlateList& plates = plater->get_partplate_list();
+    if (plate < 0 || plate >= plates.get_plate_count()) plate = plates.get_curr_plate_index();
+    if (plate < 0 || plate >= plates.get_plate_count()) return {};
+    std::string       suffix;
+    const std::string plate_name = plates.get_plate(plate)->get_plate_name();
+    if (!plate_name.empty())
+        suffix = "_" + plate_name;
+    else if (plates.get_plate_count() > 1)
+        suffix = "_plate_" + std::to_string(plate + 1);
+    wxString base = plater->get_project_name();
+    // An unsaved, unnamed project is named after its first object, as the export does.
+    if (plater->get_project_filename().empty() && base == _L("Untitled") && !plater->model().objects.empty())
+        base = wxString(fs::path(plater->model().objects.front()->name).replace_extension().c_str());
+    return std::string(base.ToUTF8().data()) + suffix + extension;
+}
+
+void list_hosts(json& printers, int plate)
 {
     // Every Snapmaker on the LAN is a printer the phone can send to, with no connect step.
     try { SnapmakerLan::list_printers(printers); } catch (...) {}
-    Plater*             plater = wxGetApp().plater();
     PresetBundle*       bundle = wxGetApp().preset_bundle;
     DynamicPrintConfig& cfg    = bundle->printers.get_edited_preset().config;
     const bool          use_3mf = bundle->is_bbl_vendor();
-    const std::string   upload_name = plater ? std::string(plater->get_export_gcode_filename(use_3mf ? ".gcode.3mf" : ".gcode", true).ToUTF8().data()) : std::string();
+    const std::string   upload_name = export_name_for(plate, use_3mf ? ".gcode.3mf" : ".gcode");
+    // A Snapmaker over the LAN always takes the plate's G-code (prepare_snapmaker), whatever the
+    // preset's vendor: the phone shows that name in the Send sheet and can still change it.
+    const std::string   lan_name = export_name_for(plate, ".gcode");
+    for (json& p : printers)
+        if (p.value("kind", std::string()) == "snapmaker") p["upload_name"] = lan_name;
     const std::string   url         = cfg.opt_string("print_host");
     if (!url.empty() && !bundle->use_bbl_network()) {
         std::unique_ptr<PrintHost> host(PrintHost::get_print_host(&cfg, false));

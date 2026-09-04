@@ -107,12 +107,19 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 .printer .heads .head.empty { opacity: .45; }
 .view .addrow { display: flex; gap: 8px; margin: 8px 0 4px; }
 .view .addrow input { flex: 1; min-width: 0; background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 8px 10px; font-size: 14px; }
-#send .maprow { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+#send .maprow { display: flex; align-items: center; gap: 8px; margin: 12px 0 6px; }
 #send .maprow .sw { width: 22px; height: 22px; border-radius: 4px; border: 1px solid #666; flex: none; }
 #send .maprow .who { flex: 1; min-width: 0; font-size: 13px; }
 #send .maprow .who .sub { display: block; color: #8a8a8a; font-size: 11px; }
-#send .maprow select { flex: 1.2; min-width: 0; background: #222; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 8px 10px; font-size: 14px; }
-.view .smsec .lbl { color: #9a9a9a; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: 0 0 6px; }
+/* The toolhead chooser: one tappable chip per toolhead, radio-like. A select cannot show a
+   colour, and the colour is what the choice is about. */
+#send .heads { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+#send .heads .head { display: flex; align-items: center; gap: 6px; min-height: 40px; padding: 6px 10px; border-radius: 8px; background: #303030; border: 1px solid #454545; color: #ccc; font-size: 12px; cursor: pointer; user-select: none; -webkit-user-select: none; }
+#send .heads .head .sw { width: 16px; height: 16px; border-radius: 4px; border: 1px solid #666; flex: none; }
+#send .heads .head .n { color: #fff; font-weight: 600; }
+#send .heads .head.sel { background: #234a33; border-color: #0a9e50; color: #fff; }
+#send .heads .head.empty { opacity: .5; font-style: italic; }
+#send .heads .head.empty.sel { opacity: .85; border-color: #b26a00; background: #3a2f1f; }
 .setup .filerow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .setup .filerow label.btn { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .setup .note { color: #9ed; font-size: 12px; margin-top: 8px; }
@@ -2103,7 +2110,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         document.getElementById('send').style.display = 'flex';
         sendRender();
         var s = sendState;
-        api('/printers').then(function(res) {
+        // ?plate= so every printer's upload_name is the name the desktop's own export would give
+        // *this* plate ("<project>_plate_2.gcode"), not whichever plate the PC happens to show.
+        api('/printers?plate=' + plateInfo.index).then(function(res) {
             if (sendState !== s) return;
             var list = (res.printers || []).slice();
             list.sort(function(a, b) { return (b.online ? 1 : 0) - (a.online ? 1 : 0); }); // online first, otherwise the slicer's order
@@ -2225,16 +2234,29 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                     var who = el('div', 'who', 'Filament ' + (f.index + 1) + (f.type ? ' · ' + f.type : ''));
                     who.appendChild(el('span', 'sub', (f.used_g ? Math.round(f.used_g) + ' g' : '') ));
                     row.appendChild(who);
-                    var pick = el('select');
-                    heads.forEach(function(t) {
-                        var o = el('option', '', 'Toolhead ' + (t.index + 1) + ' · ' + (t.loaded ? ((t.type || '?') + (t.color ? ' ' + t.color : '')) : 'empty'));
-                        o.value = String(t.index);
-                        if (String(t.index) === String(s.map[f.index])) o.selected = true;
-                        pick.appendChild(o);
-                    });
-                    pick.onchange = function() { s.map[f.index] = parseInt(pick.value); sendRender(); };
-                    row.appendChild(pick);
                     body.appendChild(row);
+                    // One chip per toolhead: its colour, its number and what is loaded in it. A
+                    // <select> shows neither the colour nor which toolheads are empty.
+                    var picks = el('div', 'heads');
+                    picks.setAttribute('role', 'radiogroup');
+                    picks.setAttribute('aria-label', 'Toolhead for filament ' + (f.index + 1));
+                    if (!heads.length) picks.appendChild(el('div', 'info', 'This printer did not report its toolheads.'));
+                    heads.forEach(function(t) {
+                        var on = String(t.index) === String(s.map[f.index]);
+                        var mat = t.loaded ? ((t.type || '?') + (t.sub_type && t.sub_type !== 'NONE' ? ' ' + t.sub_type : '')) : 'empty';
+                        var chip = el('div', 'head' + (t.loaded ? '' : ' empty') + (on ? ' sel' : ''));
+                        chip.setAttribute('role', 'radio');
+                        chip.setAttribute('aria-checked', on ? 'true' : 'false');
+                        chip.title = 'Print filament ' + (f.index + 1) + ' with toolhead ' + (t.index + 1) + ' (' + mat + ')';
+                        var csw = el('span', 'sw');
+                        csw.style.background = t.loaded && /^#[0-9a-fA-F]{6}$/.test(t.color || '') ? t.color : '#444';
+                        chip.appendChild(csw);
+                        chip.appendChild(el('span', 'n', String(t.index + 1)));
+                        chip.appendChild(el('span', 'mat', mat));
+                        chip.onclick = function() { s.map[f.index] = t.index; sendRender(); };
+                        picks.appendChild(chip);
+                    });
+                    body.appendChild(picks);
                     var head = heads.filter(function(t) { return t.index === s.map[f.index]; })[0];
                     if (head && head.loaded && f.type && head.type && f.type.toUpperCase() !== head.type.toUpperCase())
                         body.appendChild(el('div', 'info warn', 'Filament ' + (f.index + 1) + ' was sliced as ' + f.type + ' but toolhead ' + (head.index + 1) + ' holds ' + head.type + '.'));
@@ -2452,6 +2474,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     }
     // The Snapmaker printers on the LAN. Everything here is plain HTTP to the printer itself, so a
     // printer shows its state - and takes a file - whether or not the PC is connected to it.
+    //
+    // One card per printer, and /api/printers is where a card comes from: it already carries the
+    // state, the job, the temperatures, the toolheads and the control predicates for a Snapmaker
+    // (kind "snapmaker") as it does for a Bambu one. /api/snapmaker/devices is asked only for what
+    // it alone knows - the optional PC-side MQTT connect - and for adding a printer by address.
     var smBusy = '', smAddIp = '', smAddNote = '', smAddErr = false;
     function smHead(t) {
         var h = el('div', 'head' + (t.loaded ? '' : ' empty'));
@@ -2461,92 +2488,65 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         h.appendChild(el('span', '', (t.index + 1) + ' · ' + (t.loaded ? ((t.type || '?') + (t.sub_type && t.sub_type !== 'NONE' ? ' ' + t.sub_type : '')) : 'empty')));
         return h;
     }
-    function refreshSnapmaker() {
-        var root = document.getElementById('devices');
-        api('/snapmaker/devices').then(function(d) {
-            var sec = root.querySelector('.smsec');
-            var devs = d.devices || [];
-            var conn = d.connect || {};
-            if (!devs.length && !d.is_snapmaker) { if (sec) sec.remove(); return; }
-            if (!sec) { sec = el('div', 'smsec'); root.insertBefore(sec, root.firstChild); }
-            sec.innerHTML = '';
-            sec.appendChild(el('div', 'lbl', 'Snapmaker'));
-            if (!devs.length)
-                sec.appendChild(el('div', 'empty', 'No Snapmaker found yet. Add one by its address below - the PC does not have to be connected to it.'));
-            devs.forEach(function(p) {
-                var card = el('div', 'printer' + (p.online ? ' online' : ''));
-                card.appendChild(el('div', 'name', (p.name || p.ip) + (p.model ? '  ·  ' + p.model : '')));
-                var meta = p.online ? (p.state || 'idle') : 'offline';
-                if (p.printing) meta += ' · ' + p.percent + '%' + (p.total_layers ? ' · layer ' + p.layer + '/' + p.total_layers : '') + (p.left_time_s ? ' · ' + fmtTime(p.left_time_s) + ' left' : '');
-                if (p.task) meta += ' · ' + p.task;
-                meta += ' · ' + p.ip;
-                if (p.login_required) meta += ' · asks for a login';
-                card.appendChild(el('div', 'meta', meta));
-                if (p.online) {
-                    var temps = el('div', 'temps');
-                    var bed = el('div'); bed.appendChild(el('div', 'v', Math.round(p.bed_temp) + '° / ' + Math.round(p.bed_target) + '°')); bed.appendChild(el('div', 'k', 'bed'));
-                    temps.appendChild(bed);
-                    var noz = el('div'); noz.appendChild(el('div', 'v', Math.round(p.nozzle_temp) + '° / ' + Math.round(p.nozzle_target) + '°')); noz.appendChild(el('div', 'k', 'nozzle'));
-                    temps.appendChild(noz);
-                    card.appendChild(temps);
-                    if ((p.toolheads || []).length) {
-                        var heads = el('div', 'heads');
-                        p.toolheads.forEach(function(t) { heads.appendChild(smHead(t)); });
-                        card.appendChild(heads);
-                    }
-                }
-                var acts = el('div', 'acts');
-                if (p.added_by === 'manual') {
-                    var rm = el('span', 'btn small dim', 'Remove');
-                    rm.title = 'Forget this printer (it was added by hand)';
-                    rm.onclick = function() {
-                        api('/snapmaker/remove?id=' + encodeURIComponent(p.id), { method: 'POST' })
-                            .then(function() { refreshSnapmaker(); }).catch(fail);
-                    };
-                    acts.appendChild(rm);
-                }
-                // The PC-side MQTT connection: only the Device tab needs it, and only for its own page.
-                var known = (conn.devices || []).filter(function(c) { return c.id === p.id || c.ip === p.ip; })[0];
-                if (known) {
-                    var here = known.connected && known.is_host;
-                    var busy = smBusy === known.id;
-                    var b = el('span', 'btn small dim', busy ? (here ? 'Disconnecting…' : 'Connecting…') : (here ? 'Disconnect on PC' : 'Connect on PC'));
-                    b.title = here ? 'Disconnect this printer on the PC\'s Device tab'
-                                   : 'Optional: connect this printer on the PC\'s Device tab, as picking it there would. Sending from the phone does not need it.';
-                    b.onclick = function() {
-                        if (smBusy) return;
-                        smBusy = known.id;
-                        b.textContent = here ? 'Disconnecting…' : 'Connecting…';
-                        api(here ? '/snapmaker/disconnect' : '/snapmaker/connect?id=' + encodeURIComponent(known.id), { method: 'POST' })
-                            .then(function() { smBusy = ''; refreshSnapmaker(); })
-                            .catch(function(e) { smBusy = ''; fail(e); refreshSnapmaker(); });
-                    };
-                    acts.appendChild(b);
-                }
-                if (acts.childNodes.length) card.appendChild(acts);
-                sec.appendChild(card);
-            });
-            // Add by address: what the phone needs when mDNS is quiet.
-            var row = el('div', 'addrow');
-            var ipin = el('input');
-            ipin.type = 'text'; ipin.placeholder = 'Add a printer by IP (10.0.0.x)'; ipin.value = smAddIp;
-            ipin.oninput = function() { smAddIp = ipin.value; };
-            ipin.onkeydown = function(e) { if (e.key === 'Enter') add.onclick(); };
-            row.appendChild(ipin);
-            var add = el('span', 'btn small', 'Add');
-            add.onclick = function() {
-                var ip = (smAddIp || '').trim();
-                if (!ip) return;
-                add.textContent = 'Adding…';
-                api('/snapmaker/add?ip=' + encodeURIComponent(ip), { method: 'POST' }).then(function(j) {
-                    smAddIp = ''; smAddErr = false; smAddNote = 'Added ' + (j.name || ip) + '.';
-                    refreshSnapmaker();
-                }).catch(function(e) { smAddErr = true; smAddNote = e.message; refreshSnapmaker(); });
-            };
-            row.appendChild(add);
-            sec.appendChild(row);
-            if (smAddNote) sec.appendChild(el('div', 'note' + (smAddErr ? ' err' : ''), smAddNote));
-        }).catch(function() {});
+    function smDeviceId(p) { return String(p.id || '').indexOf('sm:') === 0 ? p.id.slice(3) : p.id; }
+    function smHost(u) { return String(u || '').replace(/^\w+:\/\//, '').split(':')[0]; }
+    // Forget a printer somebody typed in (the discovered ones come back on the next pass).
+    function smRemoveBtn(p) {
+        var rm = el('span', 'btn small dim', 'Remove');
+        rm.title = 'Forget this printer (it was added by hand)';
+        rm.onclick = function() {
+            api('/snapmaker/remove?id=' + encodeURIComponent(smDeviceId(p)), { method: 'POST' })
+                .then(function() { refreshDevices(); }).catch(fail);
+        };
+        return rm;
+    }
+    // The PC-side MQTT connection: only the PC's Device tab needs it, and only for its own page.
+    function smConnectBtn(p, conn) {
+        var id = smDeviceId(p);
+        var known = ((conn && conn.devices) || []).filter(function(c) { return c.id === id || c.ip === p.ip; })[0];
+        if (!known) return null;
+        var here = known.connected && known.is_host;
+        var busy = smBusy === known.id;
+        var b = el('span', 'btn small dim', busy ? (here ? 'Disconnecting…' : 'Connecting…') : (here ? 'Disconnect on PC' : 'Connect on PC'));
+        b.title = here ? 'Disconnect this printer on the PC\'s Device tab'
+                       : 'Optional: connect this printer on the PC\'s Device tab, as picking it there would. Sending from the phone does not need it.';
+        b.onclick = function() {
+            if (smBusy) return;
+            smBusy = known.id;
+            b.textContent = here ? 'Disconnecting…' : 'Connecting…';
+            api(here ? '/snapmaker/disconnect' : '/snapmaker/connect?id=' + encodeURIComponent(known.id), { method: 'POST' })
+                .then(function() { smBusy = ''; refreshDevices(); })
+                .catch(function(e) { smBusy = ''; fail(e); refreshDevices(); });
+        };
+        return b;
+    }
+    // Add by address: what the phone needs when mDNS is quiet. `typing` = the address field had the
+    // cursor before this refresh rebuilt it.
+    function smAddRow(root, typing) {
+        var sec = el('div', 'smsec');
+        var row = el('div', 'addrow');
+        var ipin = el('input');
+        ipin.className = 'smip';
+        ipin.type = 'text'; ipin.placeholder = 'Add a printer by IP (10.0.0.x)'; ipin.value = smAddIp;
+        ipin.oninput = function() { smAddIp = ipin.value; };
+        ipin.onkeydown = function(e) { if (e.key === 'Enter') add.onclick(); };
+        row.appendChild(ipin);
+        var add = el('span', 'btn small', 'Add');
+        add.onclick = function() {
+            var ip = (smAddIp || '').trim();
+            if (!ip) return;
+            add.textContent = 'Adding…';
+            api('/snapmaker/add?ip=' + encodeURIComponent(ip), { method: 'POST' }).then(function(j) {
+                smAddIp = ''; smAddErr = false; smAddNote = 'Added ' + (j.name || ip) + '.';
+                refreshDevices();
+            }).catch(function(e) { smAddErr = true; smAddNote = e.message; refreshDevices(); });
+        };
+        row.appendChild(add);
+        sec.appendChild(row);
+        if (smAddNote) sec.appendChild(el('div', 'note' + (smAddErr ? ' err' : ''), smAddNote));
+        root.appendChild(sec);
+        // The 5 s poll rebuilds this row: give the address back its cursor if it had it.
+        if (typing) { ipin.focus(); try { ipin.setSelectionRange(ipin.value.length, ipin.value.length); } catch (e) {} }
     }
     // ---- Pause / Resume / Stop on a printer card (POST /api/printers/{id}/control, followed
     // through /api/jobs at 1 s like a send). Stop asks first in the Send sheet's style because it
@@ -2639,21 +2639,37 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     function refreshDevices() {
         var root = document.getElementById('devices');
         if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); return; }
-        refreshSnapmaker();
-        api('/printers').then(function(res) {
-            var printers = res.printers || [];
+        // One request per card source: the printers (every card) and the Snapmaker devices call for
+        // the optional PC-side connect. A failing devices call only costs the connect button.
+        Promise.all([api('/printers'), api('/snapmaker/devices').catch(function() { return {}; })]).then(function(res) {
+            var printers = res[0].printers || [], sm = res[1] || {}, conn = sm.connect || {};
+            var lanHosts = {};
+            printers.forEach(function(p) { if (p.kind === 'snapmaker' && p.ip) lanHosts[p.ip] = true; });
+            // The Snapmakers keep the top of the tab, where their own section used to be; the
+            // slicer's order (Bambu, then the print host) is otherwise untouched.
+            printers = printers.filter(function(p) { return p.kind === 'snapmaker'; })
+                               .concat(printers.filter(function(p) { return p.kind !== 'snapmaker'; }));
             var root2 = root.querySelector('.plist');
             if (!root2) { root2 = el('div', 'plist'); root.appendChild(root2); }
+            var page = root;
             root = root2;
             root.innerHTML = '';
-            if (!printers.length) { root.appendChild(el('div', 'row', 'No printers known to the slicer yet')); return; }
+            var typing = !!(document.activeElement && document.activeElement.className === 'smip');
+            var sec = page.querySelector('.smsec');
+            if (sec) sec.remove();
+            if (!printers.length) { root.appendChild(el('div', 'row', 'No printers known to the slicer yet')); }
             printers.forEach(function(p) {
+                // The Snapmaker the PC is connected to over MQTT is the same machine as its LAN
+                // card: one card, and that card's Disconnect covers the connection.
+                if (p.kind === 'connect' && lanHosts[smHost(p.url)]) return;
                 var card = el('div', 'printer' + (p.online ? ' online' : ''));
                 card.appendChild(el('div', 'name', p.name + (p.selected ? ' ★' : '') + (p.model ? '  ·  ' + p.model : '')));
                 var meta = p.online ? (p.print_status || p.status || 'idle') : 'offline';
                 if (p.printing) meta += ' · ' + p.percent + '% · ' + fmtTime(p.left_time_s) + ' left' + (p.total_layers ? ' · layer ' + p.layer + '/' + p.total_layers : '');
                 if (p.task) meta += ' · ' + p.task;
                 if (p.stage) meta += ' · ' + p.stage; // "Paused due to filament runout" rather than a bare PAUSE
+                if (p.ip) meta += ' · ' + p.ip;
+                if (p.login_required) meta += ' · asks for a login';
                 card.appendChild(el('div', 'meta', meta));
                 if (p.online) {
                     var temps = el('div', 'temps');
@@ -2664,6 +2680,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                         temps.appendChild(d);
                     });
                     card.appendChild(temps);
+                    // What each toolhead holds (a Snapmaker's print_task_config).
+                    if ((p.toolheads || []).length) {
+                        var heads = el('div', 'heads');
+                        p.toolheads.forEach(function(t) { heads.appendChild(smHead(t)); });
+                        card.appendChild(heads);
+                    }
                 }
                 // Why the printer stopped, in its own words (HMS for a Bambu one).
                 if (p.print_error && (p.print_error.message || p.print_error.code))
@@ -2672,8 +2694,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 // place, dimmed, with the reason in its tooltip.
                 var st = ctlJobs[p.id];
                 var busy = !!(st && st.phase === 'running');
+                var acts = null;
                 if (p.can_pause !== undefined || p.can_stop !== undefined) {
-                    var acts = el('div', 'acts');
+                    acts = el('div', 'acts');
                     [['pause', 'Pause', p.can_pause], ['resume', 'Resume', p.can_resume], ['stop', 'Stop', p.can_stop]].forEach(function(a) {
                         var on = a[2] === true && !busy;
                         var b = el('span', 'btn small' + (a[0] === 'stop' ? ' stop' : '') + (on ? '' : ' dim'), a[1]);
@@ -2683,6 +2706,14 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                         acts.appendChild(b);
                     });
                     card.appendChild(acts);
+                }
+                // A Snapmaker over the LAN carries the two things only its own list knows about:
+                // forgetting a printer that was typed in, and the optional connect on the PC.
+                if (p.kind === 'snapmaker') {
+                    if (!acts) { acts = el('div', 'acts'); card.appendChild(acts); }
+                    if (p.added_by === 'manual') acts.appendChild(smRemoveBtn(p));
+                    var cb = smConnectBtn(p, conn);
+                    if (cb) acts.appendChild(cb);
                 }
                 if (st) {
                     var line = el('div', 'ctlline' + (st.phase === 'error' ? ' err' : st.phase === 'done' ? ' ok' : ''),
@@ -2696,6 +2727,13 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 }
                 root.appendChild(card);
             });
+            // Adding a Snapmaker by hand belongs to the page, not to a card: below the list, and
+            // only where a Snapmaker is in play (one is listed, or the PC's printer preset is one).
+            var anySm = printers.some(function(p) { return p.kind === 'snapmaker'; });
+            if (anySm || sm.is_snapmaker) {
+                if (!anySm) root.appendChild(el('div', 'empty', 'No Snapmaker found yet. Add one by its address below - the PC does not have to be connected to it.'));
+                smAddRow(page, typing);
+            }
         }).catch(function(e) {
             var list = root.querySelector('.plist');
             if (!list) { list = el('div', 'plist'); root.appendChild(list); }
