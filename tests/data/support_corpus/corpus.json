@@ -47,7 +47,26 @@
     "ModelObject PER component, and per-part settings keyed on either the assembly object id or the",
     "component object id were both ignored by the importer. Until a fixture is produced BY the",
     "slicer itself, the group round trip is covered only by the unit tests, which build multi-volume",
-    "objects with add_volume. See the Stage 2 status section."
+    "objects with add_volume. See the Stage 2 status section.",
+    "",
+    "Stage 4 (2026-09-05) added the tree cases. tree_classic came back: it was dropped in Stage 2",
+    "because classic tree support was not self-reproducible at all (6.6 % matching segments,",
+    "baseline against baseline), and fix/tree-support-determinism - merged into",
+    "feat/ultra-preferences before this stage - fixed exactly that. Re-measure with the same",
+    "executable on both sides before trusting a classic-tree result; the three styles are here",
+    "because they take three different paths through draw_circles().",
+    "",
+    "The ON-mode cases now carry a per-case \"baseline_has_groups\". It has to be per case from",
+    "Stage 4 on: against a feat/ultra-preferences baseline the NORMAL-support group cases already",
+    "act on both sides (so the geometry must be IDENTICAL and only the absolute criteria say",
+    "anything), while the TREE group cases act only in the candidate (so they must DIFFER). One",
+    "global flag cannot express both. The command-line --baseline-has-groups remains the default",
+    "for cases that do not say.",
+    "",
+    "The handy models came back too. Stage 2 recorded that every .3mf under resources/handy_models/",
+    "segfaulted the CLI on --slice; on this tree all five slice cleanly with tree support, so the",
+    "three below are in the corpus as real-geometry off-mode cases. They are the only cases here",
+    "that are not synthetic boxes, which is the whole reason to keep them."
   ],
   "presets": {
     "printer": "Snapmaker U1 (0.4 nozzle)",
@@ -146,7 +165,8 @@
         "feature": "Support interface",
         "axis": "x",
         "min_share": 0.95
-      }
+      },
+      "baseline_has_groups": true
     },
     {
       "name": "group_parts_matching",
@@ -171,7 +191,8 @@
       "filaments": [
         "Generic PLA",
         "Generic PLA"
-      ]
+      ],
+      "baseline_has_groups": true
     },
     {
       "name": "group_parts_geom",
@@ -184,7 +205,8 @@
         "--enable-support=1",
         "--support-type=normal(auto)",
         "--support-style=grid"
-      ]
+      ],
+      "baseline_has_groups": true
     },
     {
       "name": "group_single_part",
@@ -197,7 +219,8 @@
         "--enable-support=1",
         "--support-type=normal(auto)",
         "--support-style=grid"
-      ]
+      ],
+      "baseline_has_groups": true
     },
     {
       "name": "tree_organic",
@@ -208,6 +231,78 @@
         "--enable-support=1",
         "--support-type=tree(auto)",
         "--support-style=organic"
+      ]
+    },
+    {
+      "name": "tree_classic_slim",
+      "comment": "OFF MODE. No part carries support_group, so K == 1 and the whole Stage 4 code path is behind an early return - this case is the measurement of that.",
+      "models": [
+        "tests/data/support_corpus/twopart_bridge.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=tree_slim"
+      ]
+    },
+    {
+      "name": "tree_classic_strong",
+      "comment": "OFF MODE. No part carries support_group, so K == 1 and the whole Stage 4 code path is behind an early return - this case is the measurement of that.",
+      "models": [
+        "tests/data/support_corpus/twopart_bridge.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=tree_strong"
+      ]
+    },
+    {
+      "name": "tree_classic_hybrid",
+      "comment": "OFF MODE. No part carries support_group, so K == 1 and the whole Stage 4 code path is behind an early return - this case is the measurement of that.",
+      "models": [
+        "tests/data/support_corpus/twopart_bridge.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=tree_hybrid"
+      ]
+    },
+    {
+      "name": "tree_organic_ledge",
+      "comment": "OFF MODE. No part carries support_group, so K == 1 and the whole Stage 4 code path is behind an early return - this case is the measurement of that.",
+      "models": [
+        "tests/data/support_corpus/overhang_ledge.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=organic"
+      ]
+    },
+    {
+      "name": "tree_organic_onepart",
+      "comment": "OFF MODE. No part carries support_group, so K == 1 and the whole Stage 4 code path is behind an early return - this case is the measurement of that.",
+      "models": [
+        "tests/data/support_corpus/onepart_ledge.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=organic"
+      ]
+    },
+    {
+      "name": "tree_classic_onepart",
+      "comment": "OFF MODE. No part carries support_group, so K == 1 and the whole Stage 4 code path is behind an early return - this case is the measurement of that.",
+      "models": [
+        "tests/data/support_corpus/onepart_ledge.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=tree_slim"
       ]
     },
     {
@@ -228,6 +323,134 @@
       ],
       "args": [
         "--enable-support=0"
+      ]
+    },
+    {
+      "name": "handy_benchy_tree_organic",
+      "comment": "OFF MODE on real geometry. Stage 2 could not use the handy models at all - they segfaulted the CLI - and they slice cleanly here. No part carries a group, so this measures that the Stage 4 code path is genuinely behind an early return on a model with thousands of overhang islands rather than four boxes.",
+      "models": [
+        "resources/handy_models/3DBenchy.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=organic"
+      ]
+    },
+    {
+      "name": "handy_bunny_tree_organic",
+      "comment": "OFF MODE on real geometry. Stage 2 could not use the handy models at all - they segfaulted the CLI - and they slice cleanly here. No part carries a group, so this measures that the Stage 4 code path is genuinely behind an early return on a model with thousands of overhang islands rather than four boxes.",
+      "models": [
+        "resources/handy_models/Stanford_Bunny.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=organic"
+      ]
+    },
+    {
+      "name": "handy_benchy_tree_classic",
+      "comment": "OFF MODE on real geometry. Stage 2 could not use the handy models at all - they segfaulted the CLI - and they slice cleanly here. No part carries a group, so this measures that the Stage 4 code path is genuinely behind an early return on a model with thousands of overhang islands rather than four boxes.",
+      "models": [
+        "resources/handy_models/3DBenchy.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=tree_slim"
+      ]
+    },
+    {
+      "name": "group_parts_tree_organic",
+      "groups": true,
+      "baseline_has_groups": false,
+      "comment": "ON MODE, organic tree, one filament. The group asks for five dense roof layers where the object asks for two. An organic tree decides its roof DEPTH when it places the tips (sample_overhang_area), so this is the case that fails if that call is left object-wide.",
+      "models": [
+        "tests/data/support_corpus/twopart_groups_geom.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=organic"
+      ]
+    },
+    {
+      "name": "group_single_part_tree_organic",
+      "groups": true,
+      "baseline_has_groups": false,
+      "comment": "ON MODE, organic tree, ONE part. The default group owns no parts, so nothing in the output shows a claim that failed to reach the contacts - the single-part shape of the bug 2c records, on the tree path.",
+      "models": [
+        "tests/data/support_corpus/onepart_group.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=organic"
+      ]
+    },
+    {
+      "name": "group_parts_tree_classic",
+      "groups": true,
+      "baseline_has_groups": false,
+      "comment": "ON MODE, classic tree. Only the roof FILL follows the group here - its interface spacing and pattern - because the roof layer count is decided object-wide in draw_circles(). The case must still differ from a baseline that fills the whole roof with the object's spacing.",
+      "models": [
+        "tests/data/support_corpus/twopart_groups_geom.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=tree_slim"
+      ]
+    },
+    {
+      "name": "group_parts_tree_organic_filament",
+      "groups": true,
+      "baseline_has_groups": false,
+      "comment": "ON MODE, organic tree, TWO filaments. The group pins its own interface filament: the tool change has to be scheduled and the second filament has to draw the group's own part's interface and essentially none of the other part's.",
+      "models": [
+        "tests/data/support_corpus/twopart_groups.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=organic"
+      ],
+      "expect_tool": "T1",
+      "expect_tool_part": {
+        "tool": "T1",
+        "feature": "Support interface",
+        "axis": "x",
+        "min_share": 0.95
+      },
+      "filaments": [
+        "Generic PLA",
+        "Generic PLA"
+      ]
+    },
+    {
+      "name": "group_parts_tree_classic_filament",
+      "groups": true,
+      "baseline_has_groups": false,
+      "comment": "ON MODE, classic tree, TWO filaments. Same claim as the organic case above, through the other generator: TreeSupport::generate_toolpaths() writes the group's roof straight into SupportLayer::interface_by_extruder.",
+      "models": [
+        "tests/data/support_corpus/twopart_groups.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=tree(auto)",
+        "--support-style=tree_slim"
+      ],
+      "expect_tool": "T1",
+      "expect_tool_part": {
+        "tool": "T1",
+        "feature": "Support interface",
+        "axis": "x",
+        "min_share": 0.95
+      },
+      "filaments": [
+        "Generic PLA",
+        "Generic PLA"
       ]
     }
   ],

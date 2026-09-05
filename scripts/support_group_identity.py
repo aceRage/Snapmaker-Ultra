@@ -346,6 +346,10 @@ def groups_ok(verdict, case, baseline_path, candidate_path, segment_tolerance=99
     """
     if "error" in verdict:
         return False, verdict["error"]
+    # Stage 4: a case may say for itself whether the baseline honours ITS kind of group. Against a
+    # feat/ultra-preferences baseline the normal-support cases already act on both sides while the
+    # tree cases act only in the candidate, so one command-line flag cannot describe the corpus.
+    baseline_has_groups = bool(case.get("baseline_has_groups", baseline_has_groups))
     if verdict.get("config_rows", 0) != 0:
         return False, ("%s config row(s) changed - a group must move geometry, not settings"
                        % verdict.get("config_rows"))
@@ -441,7 +445,10 @@ def main(argv=None):
                     help="--gate groups only: the BASELINE already implements support groups "
                          "(any pairing from Stage 3 on). Requirement 1 flips from 'must differ' "
                          "to 'the support geometry must be identical', and expect_tool no longer "
-                         "has to be absent from the baseline. See groups_ok.")
+                         "has to be absent from the baseline. See groups_ok. A corpus case may "
+                         "override this with its own \"baseline_has_groups\", which is how the "
+                         "Stage 4 corpus keeps the normal-support and the tree group cases in one "
+                         "run against one baseline.")
     ap.add_argument("--segment-tolerance", type=float, default=99.0,
                     help="minimum per cent of matching segments (default 99.0); see the "
                          "module docstring for why this is not 100")
@@ -529,7 +536,10 @@ def main(argv=None):
                 if a.gate == "groups":
                     ok, why = groups_ok(verdict, case, bf, cf, a.segment_tolerance,
                                         a.baseline_has_groups)
-                    detail = "          " + describe(verdict)
+                    mode = ("baseline acts too: geometry must MATCH"
+                            if bool(case.get("baseline_has_groups", a.baseline_has_groups))
+                            else "baseline is blind: geometry must DIFFER")
+                    detail = "          [" + mode + "]" + chr(10) + "          " + describe(verdict)
                     if ok and why:
                         # groups_ok returns the per-part tool evidence on success; it is the
                         # whole point of the ON-mode gate, so print it next to the numbers.
