@@ -318,6 +318,14 @@ endif()
 # we don't want to load a "wrong" openssl when loading curl
 # so, just don't even bother 
 # ...i think this is how it works? change if wrong
+# HTTP/2 for libcurl, which APNs requires and nothing else in the tree provides. Built before
+# curl because curl's own configure has to find it: see deps/NGHTTP2/NGHTTP2.cmake.
+set(NGHTTP2_PKG "")
+if (NOT NGHTTP2_FOUND)
+    include(NGHTTP2/NGHTTP2.cmake)
+    set(NGHTTP2_PKG dep_NGHTTP2)
+endif ()
+
 set(CURL_PKG "")
 if (NOT OPENSSL_FOUND OR NOT CURL_FOUND)
     include(CURL/CURL.cmake)

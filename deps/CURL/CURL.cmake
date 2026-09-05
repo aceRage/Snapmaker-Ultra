@@ -20,7 +20,15 @@ set(_curl_platform_flags
   -DCMAKE_USE_GSSAPI:BOOL=OFF
   -DCMAKE_USE_LIBSSH2:BOOL=OFF
   -DUSE_RTMP:BOOL=OFF
-  -DUSE_NGHTTP2:BOOL=OFF
+  # APNs speaks HTTP/2 and nothing else, and in curl 7.75 HTTP/2 means nghttp2 - there is no
+  # other provider. On all three platforms, deliberately: a hub on a Mac should be able to push
+  # too, and scoping this to Windows would ship an APNs feature that silently does not exist
+  # elsewhere. See docs/superpowers/specs/2026-09-04-ultra1-phase0-spike.md section 1.4.
+  -DUSE_NGHTTP2:BOOL=ON
+  # nghttp2.h declares every symbol __declspec(dllimport) unless NGHTTP2_STATICLIB is defined, so
+  # without this http2.c compiles against import stubs that a static build never generates. The
+  # flag is harmless where it means nothing.
+  -DCMAKE_C_FLAGS:STRING=-DNGHTTP2_STATICLIB
   -DUSE_MBEDTLS:BOOL=OFF
 )
 
@@ -61,7 +69,7 @@ Snapmaker_Orca_add_cmake_project(CURL
   # GIT_TAG             curl-7_75_0
   URL                 https://github.com/curl/curl/archive/refs/tags/curl-7_75_0.zip
   URL_HASH            SHA256=a63ae025bb0a14f119e73250f2c923f4bf89aa93b8d4fafa4a9f5353a96a765a
-  DEPENDS             ${ZLIB_PKG}
+  DEPENDS             ${ZLIB_PKG} ${NGHTTP2_PKG}
   # PATCH_COMMAND       ${GIT_EXECUTABLE} checkout -f -- . && git clean -df && 
   #                     ${GIT_EXECUTABLE} apply --whitespace=fix ${CMAKE_CURRENT_LIST_DIR}/curl-mods.patch
   CMAKE_ARGS

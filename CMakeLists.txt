@@ -572,6 +572,21 @@ find_package(Freetype REQUIRED)
 add_library(libcurl INTERFACE)
 target_link_libraries(libcurl INTERFACE CURL::libcurl)
 
+# HTTP/2, which APNs requires (see AppPush.cpp and the phase 0 spike). A static libcurl carries
+# no link interface of its own, so the transitive library has to be named here or every nghttp2
+# symbol http2.c references comes out unresolved at link time. NGHTTP2::nghttp2 also carries the
+# NGHTTP2_STATICLIB definition the header needs. Optional on purpose: a deps tree built before
+# this change still links, it just has no HTTP/2 - and AppPush says so on the hub page rather
+# than failing every push with a transport error.
+find_package(NGHTTP2 QUIET)
+if (NGHTTP2_FOUND)
+    target_link_libraries(libcurl INTERFACE NGHTTP2::nghttp2)
+    message(STATUS "Found nghttp2 at ${NGHTTP2_LIBRARY}: libcurl will have HTTP/2")
+else ()
+    message(WARNING "nghttp2 not found: this build of libcurl will have no HTTP/2, so APNs push "
+                    "will be unavailable. Rebuild the deps to pick it up.")
+endif ()
+
 find_package(ZLIB REQUIRED)
 target_link_libraries(libcurl INTERFACE ZLIB::ZLIB)
 
