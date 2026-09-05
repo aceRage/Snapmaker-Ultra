@@ -189,15 +189,15 @@ void SupportGroupsDialog::build_ui()
     m_table = new wxDataViewListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxDV_ROW_LINES | wxDV_SINGLE);
     // Only the name is editable, and in place: renaming a group must not raise a modal text
     // prompt (see the header).
-    m_table->AppendTextColumn(_L("Group"),              wxDATAVIEW_CELL_EDITABLE, 14 * em);
-    m_table->AppendTextColumn(_L("Parts"),              wxDATAVIEW_CELL_INERT,     4 * em);
-    m_table->AppendTextColumn(_L("Interface filament"), wxDATAVIEW_CELL_INERT,     9 * em);
-    m_table->AppendTextColumn(_L("Top Z distance"),     wxDATAVIEW_CELL_INERT,     7 * em);
-    m_table->AppendTextColumn(_L("Interface layers"),   wxDATAVIEW_CELL_INERT,     7 * em);
-    m_table->AppendTextColumn(_L("Interface pattern"),  wxDATAVIEW_CELL_INERT,     9 * em);
-    m_table->AppendTextColumn(_L("Interface spacing"),  wxDATAVIEW_CELL_INERT,     8 * em);
-    m_table->AppendTextColumn(_L("Support set"),        wxDATAVIEW_CELL_INERT,    12 * em);
-    m_table->SetMinSize(wxSize(76 * em, 16 * em));
+    m_table->AppendTextColumn(_L("Group"),              wxDATAVIEW_CELL_EDITABLE, 16 * em);
+    m_table->AppendTextColumn(_L("Parts"),              wxDATAVIEW_CELL_INERT,     5 * em);
+    m_table->AppendTextColumn(_L("Interface filament"), wxDATAVIEW_CELL_INERT,    12 * em);
+    m_table->AppendTextColumn(_L("Top Z distance"),     wxDATAVIEW_CELL_INERT,    10 * em);
+    m_table->AppendTextColumn(_L("Interface layers"),   wxDATAVIEW_CELL_INERT,    10 * em);
+    m_table->AppendTextColumn(_L("Interface pattern"),  wxDATAVIEW_CELL_INERT,    13 * em);
+    m_table->AppendTextColumn(_L("Interface spacing"),  wxDATAVIEW_CELL_INERT,    11 * em);
+    m_table->AppendTextColumn(_L("Support set"),        wxDATAVIEW_CELL_INERT,    14 * em);
+    m_table->SetMinSize(wxSize(96 * em, 16 * em)); // the Body_14 header needs the room (hardware pass 2)
     m_table->SetFont(Label::Body_14);
     m_hint->SetFont(Label::Body_14);
     // The header is themed at the end of the constructor, after UpdateDlgDarkUI - see there.
