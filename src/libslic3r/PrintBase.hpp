@@ -71,7 +71,11 @@ public:
         // moves. Having an id of its own is not decoration: a warning left on the default id is
         // dropped by the CLI's own result.json filter (Snapmaker_Orca.cpp), so it could not be
         // asserted by a gate - and this one went unnoticed for a release because of that.
-        SlicingSupportGroupChameleonOff
+        SlicingSupportGroupChameleonOff,
+        // Ultra (support groups, Stage 4b): a classic tree support object carries a group asking
+        // for its own interface layer count, which that generator cannot give per part. Appended,
+        // so no existing value moves; its own id for the same reason as the one above.
+        SlicingSupportGroupTreeInterfaceLayers
     };
 
     typedef size_t TimeStamp;

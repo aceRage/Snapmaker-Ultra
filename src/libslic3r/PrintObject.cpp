@@ -686,6 +686,23 @@ void PrintObject::generate_support_material()
             this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
                 _u8L("Support filament matching is off for this object because one of its support groups picks its own interface filament."),
                 PrintStateBase::SlicingSupportGroupChameleonOff);
+        // Ultra (support groups, plan Stage 4b): a classic tree decides how many roof layers it
+        // builds while it propagates influence areas (TreeSupport::draw_circles), object-wide - the
+        // roof geometry exists before anything knows about groups. A group's interface pattern,
+        // spacing, density and filament DO follow the group there; its interface layer COUNT
+        // cannot. Say so, once, where the user can see it. Organic trees and normal supports
+        // honour the count, so neither ever raises this.
+        // The style resolution SupportParameters performs: a tree object is built by the CLASSIC
+        // generator only when it explicitly asks for one of the three classic styles; anything
+        // else - smsDefault, or a normal-support style that does not apply to a tree - resolves
+        // to organic (SupportParameters.hpp, and TreeSupport::generate() branches on it).
+        const auto tree_style = m_config.support_style.value;
+        const bool classic_tree = is_tree(m_config.support_type.value) &&
+            (tree_style == smsTreeSlim || tree_style == smsTreeStrong || tree_style == smsTreeHybrid);
+        if (classic_tree && this->has_support_group_interface_layer_override())
+            this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                _u8L("Interface layer count is object-wide for classic tree supports; use organic trees or normal supports for per-group interface layers."),
+                PrintStateBase::SlicingSupportGroupTreeInterfaceLayers);
         this->set_done(posSupportMaterial);
     }
 }
@@ -3368,6 +3385,30 @@ void PrintObject::support_group_masks(std::vector<SupportGroup> &groups) const
 bool PrintObject::has_support_group_interface_filament() const
 {
     return ! this->support_group_interface_extruders().empty();
+}
+
+bool PrintObject::has_support_group_interface_layer_override() const
+{
+    const ModelObject *object = this->model_object();
+    if (object == nullptr)
+        return false;
+    // -1 in support_interface_bottom_layers means "same as top", so resolve before comparing.
+    auto resolved_bottom = [](int bottom, int top) { return bottom < 0 ? std::max(0, top) : bottom; };
+    const int object_top    = m_config.support_interface_top_layers.value;
+    const int object_bottom = resolved_bottom(m_config.support_interface_bottom_layers.value, object_top);
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || ! volume->is_model_part())
+            continue;
+        int top = object_top;
+        if (const ConfigOption *opt = volume->config.option("support_interface_top_layers"); opt != nullptr)
+            top = opt->getInt();
+        int bottom = m_config.support_interface_bottom_layers.value;
+        if (const ConfigOption *opt = volume->config.option("support_interface_bottom_layers"); opt != nullptr)
+            bottom = opt->getInt();
+        if (top != object_top || resolved_bottom(bottom, top) != object_bottom)
+            return true;
+    }
+    return false;
 }
 
 std::vector<unsigned int> PrintObject::support_group_interface_extruders() const

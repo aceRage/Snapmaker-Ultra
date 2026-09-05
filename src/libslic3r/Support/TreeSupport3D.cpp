@@ -130,9 +130,31 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
     for (size_t object_id : print_object_ids) {
         const PrintObject       &print_object  = *print.get_object(object_id);
         const PrintObjectConfig &object_config = print_object.config();
-        if (object_config.support_top_z_distance < EPSILON)
+        if (object_config.support_top_z_distance < EPSILON) {
             // || min_feature_size < scaled<coord_t>(0.1) that is the minimum line width
+            //
+            // Ultra (support groups, plan 3.6): the config read here is ALREADY group-aware.
+            // PrintObject::object_config_from_model_object() forces support_top_z_distance to 0
+            // when any support group on the object asks for a soluble interface, because that
+            // value is object-wide behaviour (SlicingParameters::soluble_interface, bottom-surface
+            // classification, and this very static). Do NOT "fix" this to look at the volumes.
+            //
+            // R4.2: the static is process-global and is never reset, so one soluble object makes
+            // every other object on the plate behave as if it were soluble too. Groups do not make
+            // that worse, but they make it easier to reach - say so in the log.
+            if (! TreeSupportSettings::soluble)
+                for (const PrintObject *other : print.objects())
+                    if (other != &print_object && other->has_support() &&
+                        other->config().support_top_z_distance >= EPSILON) {
+                        BOOST_LOG_TRIVIAL(warning)
+                            << "Tree support: object \"" << print_object.model_object()->name
+                            << "\" asks for a soluble interface, and TreeSupportSettings::soluble is a"
+                               " process-global static - object \"" << other->model_object()->name
+                            << "\" has a non-zero top Z distance and will be built as if it were soluble too.";
+                        break;
+                    }
             TreeSupportSettings::soluble = true;
+        }
     }
 
     size_t largest_printed_mesh_idx = 0;
@@ -1253,7 +1275,15 @@ static void generate_initial_areas(
     const std::vector<Polygons>     &overhangs,
     std::vector<SupportElements>    &move_bounds,
     InterfacePlacer                 &interface_placer,
-    std::function<void()>            throw_on_cancel)
+    std::function<void()>            throw_on_cancel,
+    // Ultra (support groups, plan 2026-09-02 Stage 4a): the object's support groups and their
+    // per-object-layer claims. THIS is where an organic tree's roof DEPTH is decided - not in
+    // generate_interface_layers, which only converts intermediate layers near a contact. The tips
+    // are placed per overhang island by sample_overhang_area(), which takes the roof layer count as
+    // an argument, so a per-group count is a matter of splitting the island first. Both pointers
+    // are null for a single-group object and every line below that reads them is then dead.
+    const std::vector<PrintObject::SupportGroup> *support_groups = nullptr,
+    const std::vector<std::vector<Polygons>>     *group_claims   = nullptr)
 {
     using                           AvoidanceType = TreeModelVolumes::AvoidanceType;
     TreeSupportMeshGroupSettings    mesh_group_settings(print_object);
@@ -1284,7 +1314,13 @@ static void generate_initial_areas(
         //FIXME this is a heuristic value for support enforcers to work.
 //        + 10 * config.support_line_width;
         ;
-    const size_t  num_support_roof_layers = mesh_group_settings.support_roof_layers;
+    // Ultra (support groups, Stage 4a): with groups the count is the SHARED maximum, so the roof
+    // the greediest group asks for can exist at all - including when the OBJECT asks for none.
+    // interface_placer.support_parameters was built from support_shared_config() for exactly this,
+    // and equals the object's own whenever there is a single group.
+    const bool    group_mode = group_claims != nullptr && ! group_claims->empty() && support_groups != nullptr;
+    const size_t  num_support_roof_layers = group_mode ?
+        size_t(interface_placer.support_parameters.num_top_interface_layers) : mesh_group_settings.support_roof_layers;
     const bool    roof_enabled        = num_support_roof_layers > 0;
     const bool    force_tip_to_roof   = roof_enabled && (interface_placer.support_parameters.soluble_interface || sqr<double>(config.min_radius) * M_PI > mesh_group_settings.minimum_roof_area);
     // cap for how much layer below the overhang a new support point may be added, as other than with regular support every new inserted point
@@ -1310,6 +1346,9 @@ static void generate_initial_areas(
     // Layers with their overhang regions.
     std::vector<std::pair<size_t, const Polygons*>>  raw_overhangs;
 
+    // Ultra (support groups): overhangs[] is indexed by OBJECT layer + raft layers, and the claims
+    // are indexed by object layer, so this is the offset between the two.
+    const size_t num_raft_layers_for_claims = config.raft_layers.size();
     {
         const size_t num_raft_layers     = config.raft_layers.size();
         const size_t first_support_layer = std::max(int(num_raft_layers) - int(z_distance_delta), 1);
@@ -1327,10 +1366,45 @@ static void generate_initial_areas(
     tbb::parallel_for(tbb::blocked_range<size_t>(0, raw_overhangs.size()),
         [&volumes, &config, &raw_overhangs, &mesh_group_settings,
          min_xy_dist, roof_enabled, num_support_roof_layers, extra_outset, circle_length_to_half_linewidth_change, connect_length,
-         &rich_interface_placer, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
+         &rich_interface_placer, &throw_on_cancel, group_mode, support_groups, group_claims,
+         num_raft_layers_for_claims, z_distance_delta](const tbb::blocked_range<size_t> &range) {
         for (size_t raw_overhang_idx = range.begin(); raw_overhang_idx < range.end(); ++ raw_overhang_idx) {
             size_t           layer_idx    = raw_overhangs[raw_overhang_idx].first;
             const Polygons  &overhang_raw = *raw_overhangs[raw_overhang_idx].second;
+
+            // Ultra (support groups, Stage 4a): the OBJECT layer this overhang came off. overhangs[]
+            // is filled at [object layer + raft layers] and read at [layer_idx + z_distance_delta],
+            // so the object layer - the index space the claims live in - is exact here; no nearest-
+            // print_z guessing is needed on this path.
+            const size_t idx_object_layer = group_mode ?
+                (layer_idx + z_distance_delta >= num_raft_layers_for_claims ?
+                    layer_idx + z_distance_delta - num_raft_layers_for_claims : size_t(-1)) : size_t(-1);
+            // Split one overhang island between the groups and place each piece's tips with its own
+            // group's roof layer count. Returns false when there is nothing group-specific to do,
+            // in which case the caller runs today's single-count code unchanged.
+            auto sample_grouped = [&](Polygons &&island, bool large_horizontal_roof) -> bool {
+                if (! group_mode || idx_object_layer == size_t(-1) || island.empty())
+                    return false;
+                bool handled = false;
+                for (size_t g = 0; g < support_groups->size(); ++ g) {
+                    Polygons piece = support_group_piece(island, &(*group_claims)[g], idx_object_layer, g);
+                    if (piece.empty())
+                        continue;
+                    handled = true;
+                    // A group asking for FEWER roof layers than the shared maximum gets fewer; one
+                    // asking for none gets plain tips, which is what sample_overhang_area does with
+                    // large_horizontal_roof == false. Clamped to the shared maximum because
+                    // InterfacePlacer::add_roof_unguarded asserts against exactly that bound.
+                    const size_t roof_g = std::min(num_support_roof_layers,
+                        size_t(std::max(0, (*support_groups)[g].config.support_interface_top_layers.value)));
+                    for (ExPolygon &part : union_ex(piece)) {
+                        sample_overhang_area(to_polygons(std::move(part)), large_horizontal_roof && roof_g > 0,
+                            layer_idx, roof_g, connect_length, mesh_group_settings, rich_interface_placer);
+                        throw_on_cancel();
+                    }
+                }
+                return handled;
+            };
 
             // take the least restrictive avoidance possible
             Polygons relevant_forbidden;
@@ -1436,6 +1510,8 @@ static void generate_initial_areas(
                 overhang_regular = diff(overhang_regular, overhang_roofs, ApplySafetyOffset::Yes);
                 //check_self_intersections(overhang_regular, "overhang_regular3");
                 for (ExPolygon &roof_part : union_ex(overhang_roofs)) {
+                    if (sample_grouped(to_polygons(roof_part), true))
+                        continue;
                     sample_overhang_area(to_polygons(std::move(roof_part)), true, layer_idx, num_support_roof_layers, connect_length,
                         mesh_group_settings, rich_interface_placer);
                     throw_on_cancel();
@@ -1447,6 +1523,8 @@ static void generate_initial_areas(
                 remove_small(overhang_regular, mesh_group_settings.minimum_support_area);
 
             for (ExPolygon &support_part : union_ex(overhang_regular)) {
+                if (sample_grouped(to_polygons(support_part), false))
+                    continue;
                 sample_overhang_area(to_polygons(std::move(support_part)),
                     false, layer_idx, num_support_roof_layers, connect_length,
                     mesh_group_settings, rich_interface_placer);
@@ -3430,8 +3508,30 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
         if (num_support_layers == 0)
             continue;
 
-        SupportParameters            support_params(print_object);
+        // Ultra (support groups, plan 2026-09-02 Stage 4a): the object's support groups. The
+        // organic-tree generator calls the very same two functions Stage 3 made group-aware, so
+        // parity here is (a) the SHARED SupportParameters, (b) the per-group generate_interface_
+        // layers loop and (c) handing the groups to generate_support_toolpaths. Every one of them
+        // is a no-op at K == 1 - which is every project that carries no support_group data - and
+        // that is the whole of the off-mode guarantee.
+        std::vector<PrintObject::SupportGroup> support_groups = print_object.support_groups();
+        const PrintObjectConfig      shared_config = support_shared_config(print_object, support_groups);
+        SupportParameters            support_params(print_object, shared_config);
         support_params.with_sheath = true;
+        // The claims are built from the SHARED parameters, so the reach is the same whichever
+        // group asked for the most interface layers. Empty vector at K == 1.
+        const std::vector<coordf_t>  object_layer_zs = object_layer_print_zs(print_object);
+        std::vector<std::vector<Polygons>> group_claims = support_group_claims(print_object, support_groups, support_params);
+        std::vector<SupportParameters>     group_params;
+        if (! group_claims.empty()) {
+            group_params.reserve(support_groups.size());
+            for (const PrintObject::SupportGroup &group : support_groups) {
+                group_params.emplace_back(print_object, group.config);
+                // with_sheath follows the shared parameters: it is a BASE property of a tree, not
+                // an interface one, and the base geometry is shared (R4.3).
+                group_params.back().with_sheath = true;
+            }
+        }
 // Don't override the support density of tree supports, as the support density is used for raft.
 // The trees will have the density zeroed in tree_supports_generate_paths()
 //        support_params.support_density = 0;
@@ -3477,7 +3577,9 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             // ### Place tips of the support tree
             for (size_t mesh_idx : processing.second)
                 generate_initial_areas(*print.get_object(mesh_idx), volumes, config, overhangs, 
-                    move_bounds, interface_placer, throw_on_cancel);
+                    move_bounds, interface_placer, throw_on_cancel,
+                    group_claims.empty() ? nullptr : &support_groups,
+                    group_claims.empty() ? nullptr : &group_claims);
             auto t_gen = std::chrono::high_resolution_clock::now();
 
 #ifdef TREESUPPORT_DEBUG_SVG
@@ -3513,8 +3615,52 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 
             remove_undefined_layers();
 
-            std::tie(interface_layers, base_interface_layers) = generate_interface_layers(print_object.config(), support_params,
-                bottom_contacts, top_contacts, interface_layers, base_interface_layers, intermediate_layers, layer_storage);
+            if (group_claims.empty()) {
+                // Off mode - one group, i.e. every project that carries no support_group data.
+                // Literally the call this branch replaced.
+                std::tie(interface_layers, base_interface_layers) = generate_interface_layers(print_object.config(), support_params,
+                    bottom_contacts, top_contacts, interface_layers, base_interface_layers, intermediate_layers, layer_storage);
+            } else {
+                // Ultra (support groups, Stage 4a): the same per-group loop Stage 3 built for the
+                // normal generator. The branches, their tips and the roof organic_draw_branches
+                // precomputed all ran ONCE, under the shared parameters; only the interface stage
+                // is per group. Note that the precomputed top interface layers are cloned per
+                // group too: generate_interface_layers CONSUMES them (it moves their polygons out
+                // and clears them), so handing the same vector to K calls would give the whole
+                // organic roof to whichever group ran first.
+                SupportGeneratorLayersPtr out_interface, out_base_interface;
+                for (size_t g = 0; g < support_groups.size(); ++ g) {
+                    const SupportParameters &params_g = group_params[g];
+                    if (! params_g.has_interfaces())
+                        continue;
+                    SupportGeneratorLayersPtr top_g       = clone_contacts_masked(top_contacts,          g, group_claims[g], object_layer_zs, layer_storage, true);
+                    SupportGeneratorLayersPtr bottom_g    = clone_contacts_masked(bottom_contacts,       g, group_claims[g], object_layer_zs, layer_storage, false);
+                    SupportGeneratorLayersPtr top_iface_g = clone_contacts_masked(interface_layers,      g, group_claims[g], object_layer_zs, layer_storage, true);
+                    SupportGeneratorLayersPtr top_base_g  = clone_contacts_masked(base_interface_layers, g, group_claims[g], object_layer_zs, layer_storage, true);
+                    auto [iface_g, base_iface_g] = generate_interface_layers(
+                        support_groups[g].config, params_g, bottom_g, top_g, top_iface_g, top_base_g,
+                        intermediate_layers, layer_storage);
+                    BOOST_LOG_TRIVIAL(info) << "Organic tree support - group " << g << " (\"" << support_groups[g].name
+                        << "\", " << support_groups[g].volumes.size() << " parts, "
+                        << support_groups[g].config.support_interface_top_layers.value << " top interface layers) claimed "
+                        << top_g.size() << " of " << top_contacts.size() << " top contact layers and "
+                        << top_iface_g.size() << " of " << interface_layers.size() << " precomputed roof layers, produced "
+                        << iface_g.size() << " interface layers";
+                    for (SupportGeneratorLayer *l : iface_g)      l->support_group = uint16_t(g);
+                    for (SupportGeneratorLayer *l : base_iface_g) l->support_group = uint16_t(g);
+                    append(out_interface,      iface_g);
+                    append(out_base_interface, base_iface_g);
+                }
+                // stable_sort, not sort: at one print_z the groups must stay in GROUP order, which
+                // is what makes the output reproducible (R3.6) and what the layer cache in
+                // generate_support_toolpaths relies on.
+                std::stable_sort(out_interface.begin(), out_interface.end(),
+                                 [](const SupportGeneratorLayer *l, const SupportGeneratorLayer *r) { return *l < *r; });
+                std::stable_sort(out_base_interface.begin(), out_base_interface.end(),
+                                 [](const SupportGeneratorLayer *l, const SupportGeneratorLayer *r) { return *l < *r; });
+                interface_layers      = std::move(out_interface);
+                base_interface_layers = std::move(out_base_interface);
+            }
 
             auto t_draw = std::chrono::high_resolution_clock::now();
             auto dur_pre_gen = 0.001 * std::chrono::duration_cast<std::chrono::microseconds>(t_precalc - t_start).count();
@@ -3551,8 +3697,25 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 
         // Don't fill in the tree supports, make them hollow with just a single sheath line.
         print.set_status(69, _L("Generating support"));
+        // Ultra (support groups, Stage 4a): an empty `group_toolpaths` - which is what a
+        // single-group object produces - makes generate_support_toolpaths take exactly the path it
+        // always took.
+        std::vector<SupportGroupToolpaths> group_toolpaths;
+        if (! group_claims.empty()) {
+            group_toolpaths.reserve(support_groups.size());
+            for (size_t g = 0; g < support_groups.size(); ++ g) {
+                SupportGroupToolpaths gt;
+                gt.config             = &support_groups[g].config;
+                gt.params             = &group_params[g];
+                gt.claim              = &group_claims[g];
+                gt.interface_filament = support_groups[g].config.support_interface_filament.value;
+                group_toolpaths.emplace_back(gt);
+            }
+        }
         generate_support_toolpaths(print_object.support_layers(), print_object.config(), support_params, print_object.slicing_parameters(),
-            raft_layers, bottom_contacts, top_contacts, intermediate_layers, interface_layers, base_interface_layers);
+            raft_layers, bottom_contacts, top_contacts, intermediate_layers, interface_layers, base_interface_layers,
+            group_toolpaths.empty() ? nullptr : &group_toolpaths,
+            group_toolpaths.empty() ? nullptr : &object_layer_zs);
         
         auto t_end = std::chrono::high_resolution_clock::now();
         BOOST_LOG_TRIVIAL(info) << "Total time of organic tree support: " << 0.001 * std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count() << " ms";

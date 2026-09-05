@@ -58,13 +58,24 @@ void add_box(ModelObject *object, double x0, double y0, double z0, double dx, do
 //
 // Everything is one connected solid resting on the bed, so each layer has one island and the print
 // order of the objects cannot vary.
-void add_bridge(Model &model)
+// `grouped` puts the short side of the deck into a support group of its own, asking for five dense
+// interface layers where the object asks for the default. That is the Stage 4 code path: per-group
+// masks, per-group claims, a per-group roof count at tip placement (organic) and a per-group roof
+// fill (classic). The group deliberately pins no interface filament - this case is about geometry,
+// and support_digest() reads coordinates.
+void add_bridge(Model &model, bool grouped = false)
 {
     ModelObject *object = model.add_object();
     object->name = "twopart_bridge";
     add_box(object, -5., -15., 0., 10., 30., 16.);   // pillar
     add_box(object, -40., -25., 16., 45., 50., 2.);  // deck, long side
     add_box(object, 5., -25., 16., 35., 50., 2.);    // deck, short side
+    if (grouped) {
+        ModelVolume *part = object->volumes.back();
+        part->config.set_key_value("support_group", new ConfigOptionString("B"));
+        part->config.set_key_value("support_interface_top_layers", new ConfigOptionInt(5));
+        part->config.set_key_value("support_interface_spacing", new ConfigOptionFloat(0.));
+    }
     object->add_instance();
     object->ensure_on_bed();
 }
@@ -97,14 +108,31 @@ SupportDigest support_digest(const Print &print)
                     out << ' ' << pt.x() << ',' << pt.y();
                 out << "\n";
             }
+            // Ultra (support groups): a group that pins its own interface filament leaves
+            // support_fills for this map, so the digest has to read it too or a grouped case could
+            // agree on nothing. Empty for every ungrouped object, so the cases above are unchanged.
+            for (const auto &by_extruder : layer->interface_by_extruder) {
+                out << " e " << by_extruder.first << "\n";
+                for (const Polyline &pl : by_extruder.second.as_polylines()) {
+                    digest.points += pl.points.size();
+                    out << " q";
+                    for (const Point &pt : pl.points)
+                        out << ' ' << pt.x() << ',' << pt.y();
+                    out << "\n";
+                }
+            }
         }
     }
     digest.text = out.str();
     return digest;
 }
 
-// One slice of the bridge with classic tree support, under a TBB parallelism cap.
-SupportDigest slice_with_threads(size_t max_threads)
+// One slice of the bridge with tree support, under a TBB parallelism cap.
+//
+// `style` picks the generator - "tree_slim" is the classic one this file was written for, "organic"
+// is the default the Stage 4a code path runs in. `grouped` puts a support group on the short side of
+// the deck; the whole of Stage 4 is behind K > 1, so a grouped model is the only way to exercise it.
+SupportDigest slice_with_threads(size_t max_threads, const char *style = "tree_slim", bool grouped = false)
 {
     tbb::global_control gc(tbb::global_control::max_allowed_parallelism, max_threads);
 
@@ -112,25 +140,32 @@ SupportDigest slice_with_threads(size_t max_threads)
     Model model;
     print.set_status_silent();
 
+    const bool classic = std::string(style) == "tree_slim";
     DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
     config.set_deserialize_strict({
         {"enable_support", "1"},
         {"support_type", "tree(auto)"},
-        {"support_style", "tree_slim"},
-        // Half the default 5 mm, so this deck carries roughly a thousand contact nodes per layer -
-        // enough for the workers to really share them. See add_bridge().
-        {"tree_support_branch_distance", "2"},
+        {"support_style", style},
+        // Half the default 5 mm for the classic tree, so this deck carries roughly a thousand
+        // contact nodes per layer - enough for the workers to really share them. See add_bridge().
+        // The organic generator does not need it and is much slower with it.
+        {"tree_support_branch_distance", classic ? "2" : "5"},
         // Classic Arachne-free walls, so a difference here can only come from the support path.
         {"wall_generator", "classic"},
         {"layer_height", "0.2"},
         {"initial_layer_print_height", "0.2"},
     });
 
-    add_bridge(model);
+    add_bridge(model, grouped);
     print.auto_assign_extruders(model.objects.front());
     print.apply(model, config);
     print.process();
 
+    if (grouped) {
+        // Or the case would be asserting determinism of the code it is not testing.
+        REQUIRE(! print.objects().empty());
+        REQUIRE(print.objects().front()->support_groups().size() == 2);
+    }
     return support_digest(print);
 }
 
@@ -163,5 +198,53 @@ TEST_CASE("classic tree support is identical across several thread counts", "[Tr
     for (size_t threads : {size_t(2), size_t(4), size_t(20)}) {
         INFO("max_allowed_parallelism = " << threads);
         CHECK(slice_with_threads(threads) == reference);
+    }
+}
+
+
+// ============================================================================================
+// Ultra (support groups) - Stage 4: the group code paths must be as deterministic as the rest.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2d.
+//
+// Everything Stage 4 added runs under TBB: support_group_claims() builds the per-layer claims in a
+// parallel_for, the organic tip placement splits each overhang island inside its own parallel_for,
+// and the classic roof fill splits inside generate_toolpaths()' parallel_for. None of it may depend
+// on how the work was divided. The claims are built per layer with no cross-layer state and every
+// split is a pure function of (island, claim, group index), so this should hold by construction -
+// which is exactly the kind of claim worth measuring rather than asserting.
+// ============================================================================================
+
+TEST_CASE("a grouped classic tree support is identical across several thread counts", "[TreeSupportDeterminism][support_groups]")
+{
+    const SupportDigest reference = slice_with_threads(1, "tree_slim", true);
+    require_real_support(reference);
+
+    for (size_t threads : {size_t(2), size_t(4), size_t(20)}) {
+        INFO("max_allowed_parallelism = " << threads);
+        CHECK(slice_with_threads(threads, "tree_slim", true) == reference);
+    }
+}
+
+TEST_CASE("a grouped organic tree support is identical across several thread counts", "[TreeSupportDeterminism][support_groups]")
+{
+    const SupportDigest reference = slice_with_threads(1, "organic", true);
+    require_real_support(reference);
+
+    for (size_t threads : {size_t(2), size_t(4), size_t(20)}) {
+        INFO("max_allowed_parallelism = " << threads);
+        CHECK(slice_with_threads(threads, "organic", true) == reference);
+    }
+}
+
+TEST_CASE("an ungrouped organic tree support is identical across several thread counts", "[TreeSupportDeterminism]")
+{
+    // The control for the two above: whatever the group code does, the path every existing project
+    // takes has to stay where it is.
+    const SupportDigest reference = slice_with_threads(1, "organic", false);
+    require_real_support(reference);
+
+    for (size_t threads : {size_t(2), size_t(4), size_t(20)}) {
+        INFO("max_allowed_parallelism = " << threads);
+        CHECK(slice_with_threads(threads, "organic", false) == reference);
     }
 }

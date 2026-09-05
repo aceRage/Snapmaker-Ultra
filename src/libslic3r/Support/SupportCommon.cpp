@@ -1491,17 +1491,40 @@ size_t support_group_object_layer_index(const SupportGeneratorLayer &layer, bool
         return idx;
     // merge_contact_layers (SupportMaterial.cpp) merges contacts closer than support_layer_height_min
     // and SupportGeneratorLayer::merge does not merge the object layer indices, so a merged layer can
-    // arrive here with none. Fall back to the nearest object layer by print_z - a contact layer sits
-    // against the object either way, so this is never far off.
+    // arrive here with none; the organic tree's precomputed roof layers never carry one at all. Fall
+    // back to the object layer the contact is there FOR - above for a top contact, below for a bottom
+    // one. Stage 4 changed this from "the nearest": see support_group_object_layer_index_at().
+    return support_group_object_layer_index_at(use_above ? layer.print_z : layer.bottom_z, object_layer_zs, use_above);
+}
+
+size_t support_group_object_layer_index_at(coordf_t z, const std::vector<coordf_t> &object_layer_zs, bool above)
+{
     if (object_layer_zs.empty())
         return size_t(-1);
-    const coordf_t z = use_above ? layer.print_z : layer.bottom_z;
-    auto it = std::lower_bound(object_layer_zs.begin(), object_layer_zs.end(), z);
-    if (it == object_layer_zs.end())
-        return object_layer_zs.size() - 1;
-    if (it != object_layer_zs.begin() && (*it - z) > (z - *(it - 1)))
+    // Round TOWARDS the object the surface is there for, never to the nearest layer. A part
+    // floating 10 mm above the bed has no footprint at all at the layers where its own support roof
+    // is printed, so the nearest layer below is empty and the group's claim there is empty with it -
+    // support_group_piece() then gives the whole roof to the default group and the group appears to
+    // do nothing. Measured on the two-part organic-tree fixture: 61 % of the object-wide yardstick
+    // with nearest, and the classic-tree roof came out bit-identical to the ungrouped control.
+    auto it = std::lower_bound(object_layer_zs.begin(), object_layer_zs.end(), z - EPSILON);
+    if (above) {
+        if (it == object_layer_zs.end())
+            return object_layer_zs.size() - 1;
+        return size_t(it - object_layer_zs.begin());
+    }
+    if (it == object_layer_zs.end() || (it != object_layer_zs.begin() && *it > z + EPSILON))
         -- it;
     return size_t(it - object_layer_zs.begin());
+}
+
+std::vector<coordf_t> object_layer_print_zs(const PrintObject &object)
+{
+    std::vector<coordf_t> zs;
+    zs.reserve(object.layers().size());
+    for (const Layer *layer : object.layers())
+        zs.emplace_back(layer->print_z);
+    return zs;
 }
 
 Polygons support_group_piece(const Polygons &src, const std::vector<Polygons> *claim,
@@ -1515,6 +1538,209 @@ Polygons support_group_piece(const Polygons &src, const std::vector<Polygons> *c
     if (g == 0)
         return c.empty() ? src : diff(src, c);
     return c.empty() ? Polygons() : intersection(src, c);
+}
+
+// Ultra (support groups, plan 2026-09-02 Stage 3 3.5): the config the SHARED SupportParameters is
+// built from. It is the object's own, with the interface layer counts raised to the max over all
+// groups. Reason: SupportParameters collapses support_material_interface_flow into
+// support_material_flow when support_interface_top_layers == 0, and
+// support_material_bottom_interface_flow - which decides the bottom-contact layer HEIGHTS, i.e.
+// shared geometry - is derived from it. Taking the max keeps the interface flow alive whenever ANY
+// group wants interfaces, and equals the object's own value when there is a single group, which is
+// what keeps the off-mode output where it is. support_interface_filament deliberately stays the
+// OBJECT's, so a group's filament choice can never move a bottom-contact layer height.
+// Stage 4a: the organic-tree generator reads the same config to size its roof, so it uses this too.
+PrintObjectConfig support_shared_config(const PrintObject &object,
+                                        const std::vector<PrintObject::SupportGroup> &groups)
+{
+    PrintObjectConfig config = object.config();
+    if (groups.size() <= 1)
+        return config;
+    // -1 in support_interface_bottom_layers means "same as top"; resolve it before taking a max.
+    auto resolved_bottom = [](const PrintObjectConfig &c) {
+        return c.support_interface_bottom_layers.value < 0 ? std::max(0, c.support_interface_top_layers.value)
+                                                           : c.support_interface_bottom_layers.value;
+    };
+    int top    = config.support_interface_top_layers.value;
+    int bottom = resolved_bottom(config);
+    for (const PrintObject::SupportGroup &group : groups) {
+        top    = std::max(top,    group.config.support_interface_top_layers.value);
+        bottom = std::max(bottom, resolved_bottom(group.config));
+    }
+    config.support_interface_top_layers.value    = top;
+    config.support_interface_bottom_layers.value = bottom;
+    return config;
+}
+
+// Ultra (support groups, plan Stage 3 3.5 / R3.1): fill the per-group masks and turn them into
+// DISJOINT per-object-layer claims. Every group's footprint is expanded by `reach` - how far a
+// contact layer can sit outside the outline of the part it supports - and the result is then cut
+// against (a) every OTHER group's own part, so a wide claim can never reach across a neighbour and
+// take the contacts that belong to it, and (b) every LOWER group's claim, so the claims stay
+// disjoint and the split is a hard clip along that boundary. claims[0] holds the union of all of
+// them: group 0 takes what is left of any shared polygon, so the K pieces cover it exactly.
+// `reach` and the group order are the two knobs behind the seam R3.1 describes.
+std::vector<std::vector<Polygons>> support_group_claims(const PrintObject &object,
+                                                        std::vector<PrintObject::SupportGroup> &groups,
+                                                        const SupportParameters &shared_params)
+{
+    std::vector<std::vector<Polygons>> claims;
+    if (groups.size() <= 1)
+        // Off mode - every project that carries no support_group data. Not one extra mesh slice,
+        // not one extra boolean; the whole of the off-mode guarantee is this early return.
+        return claims;
+
+    object.support_group_masks(groups);
+
+    // Ultra (support groups, Stage 4): a TREE's roof carries no object-layer index of its own, and
+    // it is not printed at the part's own layers either - it sits under the part, from the Z gap
+    // down through however many roof layers there are. A part floating above the bed therefore has
+    // an EMPTY footprint at every layer its own roof is printed at, so a claim built layer by layer
+    // is empty exactly where the tree needs it and support_group_piece() hands the whole roof to the
+    // default group. Measured before this projection: the classic-tree two-part fixture came out
+    // BIT-IDENTICAL to the ungrouped control, and the organic single-part fixture delivered 61 % of
+    // what the same value set object-wide delivers.
+    //
+    // So project each group's footprint DOWNWARD over the layers its roof can occupy before the
+    // claims are cut. The claims stay disjoint by construction, because everything below - the
+    // other-group block and the cut against lower groups - is computed from the projected masks too.
+    // The normal generator projects nothing: its contacts carry idx_object_layer_above and land on
+    // the right layer exactly, so Stage 3's output is untouched.
+    if (is_tree(object.config().support_type.value) && ! object.layers().empty()) {
+        const double layer_height = std::max(EPSILON, object.config().layer_height.value);
+        const size_t project_down = size_t(shared_params.num_top_interface_layers) +
+            size_t(std::ceil(object.config().support_top_z_distance.value / layer_height)) + 2;
+        for (PrintObject::SupportGroup &group : groups) {
+            if (group.mask.empty())
+                continue;
+            std::vector<Polygons> projected(group.mask.size());
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, group.mask.size()),
+                [&group, &projected, project_down](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++ i) {
+                        Polygons acc;
+                        for (size_t j = i; j <= i + project_down && j < group.mask.size(); ++ j)
+                            append(acc, group.mask[j]);
+                        projected[i] = acc.empty() ? Polygons() : union_(acc);
+                    }
+                });
+            group.mask = std::move(projected);
+        }
+    }
+
+    // How far a contact layer can sit OUTSIDE the outline of the part it supports. Three terms, and
+    // the second one is the whole reason a group used to barely change anything:
+    //
+    //  - the XY gap plus one interface extrusion width, the margin the contact is inflated by;
+    //  - for grid supports, one grid cell. fill_contact_layer() runs every contact through
+    //    SupportGridPattern, which STRETCHES each island onto a grid of
+    //    support_base_pattern_spacing + support_material_flow.spacing() (SupportGridParams,
+    //    SupportMaterial.cpp - 5.4 mm with the stock 5 mm spacing) before it is sliced. A narrow
+    //    overhang - the crescent a slanted wall sheds on each layer - therefore becomes a band of
+    //    grid cells straddling the part outline, most of it well beyond the part's own footprint.
+    //    Claiming only footprint + 0.6 mm left the rest to the default group: measured on the
+    //    user's two slanted cylinders, the group claimed 814 mm2 of 7506 mm2 of contact area
+    //    (11 %) and its five interface layers changed that part's interface by 1 %, where the
+    //    same value set object-wide changed it by 34 %. See the plan's 2c.
+    //  - for TREE supports (Stage 4), one branch radius. A tree's roof is not the overhang either:
+    //    it is drawn on top of branches whose tips are placed inside the overhang but whose circles
+    //    reach tree_support_branch_diameter/2 beyond it, and organic trees additionally smooth the
+    //    roof outward. The same lesson as the grid cell, with the generator's own dimension.
+    //
+    // Reaching this far is only safe because of the second cut below: no claim may take area
+    // sitting over ANOTHER group's part - `block`, the part outline plus the gap no support may
+    // enter anyway.
+    // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2c, Stage 4.
+    const PrintObjectConfig &object_config = object.config();
+    const float block = float(scale_(shared_params.gap_xy));
+    float       reach = block + float(shared_params.support_material_interface_flow.scaled_width());
+    if (shared_params.support_style == smsGrid)
+        reach += float(scale_(object_config.support_base_pattern_spacing.value +
+                              shared_params.support_material_flow.spacing()));
+    else if (is_tree(object_config.support_type.value))
+        reach += float(scale_(0.5 * object_config.tree_support_branch_diameter.value));
+
+    const size_t num_layers = object.layers().size();
+    claims.assign(groups.size(), std::vector<Polygons>(num_layers));
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers),
+        [&groups, &claims, reach, block](const tbb::blocked_range<size_t> &range) {
+            for (size_t i = range.begin(); i < range.end(); ++ i) {
+                Polygons taken;
+                for (size_t g = 1; g < groups.size(); ++ g) {
+                    Polygons c;
+                    if (i < groups[g].mask.size() && ! groups[g].mask[i].empty())
+                        c = expand(groups[g].mask[i], reach);
+                    if (! c.empty()) {
+                        // Another group's part, plus the gap no support may enter: off limits.
+                        Polygons blocked;
+                        for (size_t h = 0; h < groups.size(); ++ h)
+                            if (h != g && i < groups[h].mask.size() && ! groups[h].mask[i].empty())
+                                append(blocked, expand(groups[h].mask[i], block));
+                        if (! blocked.empty()) {
+                            // ... except over this group's OWN part. Two parts that touch would
+                            // otherwise let the neighbour's gap eat a strip of the group's own
+                            // footprint, which is never the right answer.
+                            blocked = union_(blocked);
+                            if (! groups[g].mask[i].empty())
+                                blocked = diff(blocked, groups[g].mask[i]);
+                            if (! blocked.empty())
+                                c = diff(c, blocked);
+                        }
+                    }
+                    if (! c.empty() && ! taken.empty())
+                        c = diff(c, taken);
+                    if (! c.empty())
+                        append(taken, c);
+                    claims[g][i] = std::move(c);
+                }
+                claims[0][i] = taken.empty() ? Polygons() : union_(taken);
+            }
+        });
+    BOOST_LOG_TRIVIAL(info) << "Support generator - " << groups.size() << " support groups";
+    return claims;
+}
+
+// Ultra (support groups, plan Stage 3 3.5): a sibling of every contact layer holding only the part
+// of it group `g` owns. The clones are input to generate_interface_layers and are NEVER added to
+// the layer graph, so generate_support_layers' assert(num_top_contacts <= 1) is untouched - which
+// is exactly why the plan splits contacts at extrusion time and not here.
+SupportGeneratorLayersPtr clone_contacts_masked(
+    const SupportGeneratorLayersPtr &contacts,
+    size_t                           g,
+    const std::vector<Polygons>     &claim,
+    const std::vector<coordf_t>     &object_layer_zs,
+    SupportGeneratorLayerStorage    &layer_storage,
+    bool                             use_above)
+{
+    SupportGeneratorLayersPtr out;
+    out.reserve(contacts.size());
+    for (SupportGeneratorLayer *src : contacts) {
+        if (src == nullptr)
+            continue;
+        const size_t idx = support_group_object_layer_index(*src, use_above, object_layer_zs);
+        Polygons polygons = support_group_piece(src->polygons, &claim, idx, g);
+        if (polygons.empty())
+            continue;
+        SupportGeneratorLayer &dst = layer_storage.allocate(src->layer_type);
+        dst.print_z                = src->print_z;
+        dst.bottom_z               = src->bottom_z;
+        dst.height                 = src->height;
+        dst.bridging               = src->bridging;
+        dst.idx_object_layer_above = src->idx_object_layer_above;
+        dst.idx_object_layer_below = src->idx_object_layer_below;
+        dst.support_group          = uint16_t(g);
+        dst.polygons               = std::move(polygons);
+        // Snug supports project *overhang_polygons rather than polygons, and dereference it
+        // unconditionally, so every optional polygon set travels with the clone.
+        auto mask_ptr = [&claim, idx, g](const std::unique_ptr<Polygons> &s, std::unique_ptr<Polygons> &d) {
+            if (s)
+                d = std::make_unique<Polygons>(support_group_piece(*s, &claim, idx, g));
+        };
+        mask_ptr(src->contact_polygons,  dst.contact_polygons);
+        mask_ptr(src->overhang_polygons, dst.overhang_polygons);
+        mask_ptr(src->enforcer_polygons, dst.enforcer_polygons);
+        out.emplace_back(&dst);
+    }
+    return out;
 }
 
 void generate_support_toolpaths(

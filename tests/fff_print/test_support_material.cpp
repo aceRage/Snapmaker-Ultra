@@ -650,3 +650,354 @@ TEST_CASE("SupportMaterial: a group on a single-part object acts like the object
     // cell out from the part.
     CHECK(grouped > global * 0.90);
 }
+
+
+// ============================================================================================
+// Ultra (support groups) - Stage 4 gate: TREE supports.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md, Stage 4 "Gate".
+//
+// 4a - organic trees. Where an organic tree's interface comes from is NOT where the plan assumed.
+// generate_interface_layers() only converts intermediate layers that sit near a contact; the roof
+// itself is drawn by the tip placement pass, one island at a time, in sample_overhang_area(), which
+// takes the roof layer count as an argument. That argument is what Stage 4a made per group, so the
+// magnitude test below - "a group delivers what the same value set object-wide delivers" - is the
+// assertion that matters, exactly as it was for the normal generator after the hardware pass.
+//
+// 4b - classic trees. Their roof GEOMETRY is decided during influence-area propagation
+// (draw_circles), object-wide, and Stage 4b deliberately does not touch it: only the FILL follows
+// the group. So the classic-tree cases assert the opposite pair - the fill really changed, and the
+// number of roof layers did NOT - plus the notice that says so.
+// ============================================================================================
+
+namespace {
+
+DynamicPrintConfig tree_fixture_config(const char *style)
+{
+    DynamicPrintConfig config = group_fixture_config();
+    config.set_deserialize_strict({
+        { "support_type",  "tree(auto)" },
+        { "support_style", style },
+    });
+    return config;
+}
+
+// Interface extrusion length under part A (left) and part B (right), counting the interface a group
+// routed to its own filament as well - support_fills is not the only place it can land.
+void sum_interface_length_all(const SupportLayer &support_layer, double split_x, double &left, double &right)
+{
+    sum_interface_length(support_layer.support_fills, split_x, left, right);
+    for (const auto &kv : support_layer.interface_by_extruder)
+        sum_interface_length(kv.second, split_x, left, right);
+}
+
+std::pair<double, double> interface_lengths_all(const PrintObject &object)
+{
+    const double split_x = split_x_between_parts(object);
+    double left = 0., right = 0.;
+    for (const SupportLayer *support_layer : object.support_layers())
+        sum_interface_length_all(*support_layer, split_x, left, right);
+    return std::make_pair(left, right);
+}
+
+// How many support layers carry interface on each side. This is the ROOF DEPTH - the quantity a
+// classic tree decides object-wide and an organic tree now decides per group.
+std::pair<size_t, size_t> interface_layer_counts(const PrintObject &object)
+{
+    const double split_x = split_x_between_parts(object);
+    size_t left = 0, right = 0;
+    for (const SupportLayer *support_layer : object.support_layers()) {
+        double l = 0., r = 0.;
+        sum_interface_length_all(*support_layer, split_x, l, r);
+        if (l > 0.)
+            ++ left;
+        if (r > 0.)
+            ++ right;
+    }
+    return std::make_pair(left, right);
+}
+
+double total_interface_length_all(const PrintObject &object)
+{
+    double all = 0., unused = 0.;
+    for (const SupportLayer *support_layer : object.support_layers())
+        sum_interface_length_all(*support_layer, std::numeric_limits<double>::max(), all, unused);
+    return all;
+}
+
+bool has_warning_containing(const PrintObject &object, const std::string &needle)
+{
+    for (const auto &warning : object.step_state_with_warnings(posSupportMaterial).warnings)
+        if (warning.message.find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+
+} // namespace
+
+TEST_CASE("SupportMaterial: per-group interface, organic tree", "[SupportMaterial][support_groups][tree]")
+{
+    // Control: no part carries an override, so support_groups() collapses to a single group and the
+    // organic generator takes exactly today's path.
+    double control_a = 0., control_b = 0.;
+    {
+        Slic3r::Print print;
+        Slic3r::Model model;
+        make_floating_two_part_print(print, model, tree_fixture_config("organic"), nullptr);
+        REQUIRE(! print.objects().empty());
+        const PrintObject &object = *print.objects().front();
+        REQUIRE(object.support_groups().size() == 1);
+        REQUIRE(! object.support_layers().empty());
+        std::tie(control_a, control_b) = interface_lengths_all(object);
+        REQUIRE(control_a > 1.);
+        REQUIRE(control_b > 1.);
+    }
+
+    double grouped_a = 0., grouped_b = 0.;
+    {
+        Slic3r::Print print;
+        Slic3r::Model model;
+        make_floating_two_part_print(print, model, tree_fixture_config("organic"), [](ModelObject &object) {
+            ModelVolume *part_b = object.volumes.back();
+            part_b->config.set_key_value("support_group", new ConfigOptionString("B"));
+            part_b->config.set_key_value("support_interface_top_layers", new ConfigOptionInt(5));
+            part_b->config.set_key_value("support_interface_spacing", new ConfigOptionFloat(0.));
+        });
+        REQUIRE(! print.objects().empty());
+        const PrintObject &object = *print.objects().front();
+        REQUIRE(object.support_groups().size() == 2);
+        REQUIRE(object.support_groups()[1].name == "B");
+        std::tie(grouped_a, grouped_b) = interface_lengths_all(object);
+    }
+
+    // B's roof got denser and deeper.
+    CHECK(grouped_b > control_b * 1.30);
+    // A's did not. Not the normal generator's 1 %: an organic tree's branches are drawn from
+    // influence areas that propagate down the whole object, so raising the roof count over B moves
+    // a little material under A too. 10 % is comfortably below the change a per-group roof makes,
+    // and the two-part fixture's parts are 20 mm apart so their branch systems are separate.
+    CHECK(std::abs(grouped_a - control_a) <= control_a * 0.10);
+}
+
+TEST_CASE("SupportMaterial: a group on a single-part organic tree acts like the object's own settings",
+          "[SupportMaterial][support_groups][tree]")
+{
+    auto interface_of = [](const DynamicPrintConfig                 &config,
+                           const std::function<void(ModelObject &)> &tweak,
+                           size_t                                    expect_groups) {
+        Slic3r::Print print;
+        Slic3r::Model model;
+        make_floating_one_part_print(print, model, config, tweak);
+        REQUIRE(! print.objects().empty());
+        const PrintObject &object = *print.objects().front();
+        REQUIRE(object.support_groups().size() == expect_groups);
+        REQUIRE(! object.support_layers().empty());
+        return total_interface_length_all(object);
+    };
+
+    const double control = interface_of(tree_fixture_config("organic"), nullptr, 1);
+    REQUIRE(control > 1.);
+
+    // The yardstick: the same five dense roof layers, set OBJECT-WIDE.
+    DynamicPrintConfig global_config = tree_fixture_config("organic");
+    global_config.set_deserialize_strict({
+        { "support_interface_top_layers", "5" },
+        { "support_interface_spacing",    "0" },
+    });
+    const double global = interface_of(global_config, nullptr, 1);
+    REQUIRE(global > control * 1.30);
+
+    // The same five layers, asked for by a GROUP on the object's only part. This is the assertion
+    // that fails when the roof count is left object-wide: the tips over this part would still carry
+    // the object's two layers and the group would deliver barely more than the control.
+    const double grouped = interface_of(tree_fixture_config("organic"), [](ModelObject &object) {
+        ModelVolume *part = object.volumes.front();
+        part->config.set_key_value("support_group", new ConfigOptionString("B"));
+        part->config.set_key_value("support_interface_top_layers", new ConfigOptionInt(5));
+        part->config.set_key_value("support_interface_spacing", new ConfigOptionFloat(0.));
+    }, 2);
+
+    CHECK(grouped > control * 1.30);
+    CHECK(grouped > global * 0.90);
+}
+
+TEST_CASE("SupportMaterial: per-group roof fill, classic tree", "[SupportMaterial][support_groups][tree]")
+{
+    // A classic tree's roof geometry is object-wide, so a group that changes only the interface
+    // SPACING must change how much material is laid into its own roof and nothing else at all -
+    // not the other part's roof, and not the number of roof layers on either side.
+    double control_a = 0., control_b = 0.;
+    std::pair<size_t, size_t> control_layers;
+    {
+        Slic3r::Print print;
+        Slic3r::Model model;
+        make_floating_two_part_print(print, model, tree_fixture_config("tree_slim"), nullptr);
+        REQUIRE(! print.objects().empty());
+        const PrintObject &object = *print.objects().front();
+        REQUIRE(object.support_groups().size() == 1);
+        REQUIRE(! object.support_layers().empty());
+        std::tie(control_a, control_b) = interface_lengths_all(object);
+        control_layers = interface_layer_counts(object);
+        REQUIRE(control_a > 1.);
+        REQUIRE(control_b > 1.);
+        REQUIRE(control_layers.first > 0);
+        REQUIRE(control_layers.second > 0);
+    }
+
+    double grouped_a = 0., grouped_b = 0.;
+    std::pair<size_t, size_t> grouped_layers;
+    {
+        Slic3r::Print print;
+        Slic3r::Model model;
+        make_floating_two_part_print(print, model, tree_fixture_config("tree_slim"), [](ModelObject &object) {
+            ModelVolume *part_b = object.volumes.back();
+            part_b->config.set_key_value("support_group", new ConfigOptionString("B"));
+            part_b->config.set_key_value("support_interface_spacing", new ConfigOptionFloat(0.));
+        });
+        REQUIRE(! print.objects().empty());
+        const PrintObject &object = *print.objects().front();
+        REQUIRE(object.support_groups().size() == 2);
+        // A group that changes no interface LAYER COUNT raises no classic-tree notice.
+        CHECK(! object.has_support_group_interface_layer_override());
+        std::tie(grouped_a, grouped_b) = interface_lengths_all(object);
+        grouped_layers = interface_layer_counts(object);
+    }
+
+    // B's roof is solid where the object's is spaced.
+    CHECK(grouped_b > control_b * 1.20);
+    // A's roof did not move at all: the geometry is shared and untouched, and A is still filled with
+    // the object's own interface parameters.
+    CHECK(std::abs(grouped_a - control_a) <= control_a * 0.01);
+    // And the roof DEPTH is identical on both sides - the documented 4b limit, asserted rather than
+    // asserted-about.
+    CHECK(grouped_layers.first  == control_layers.first);
+    CHECK(grouped_layers.second == control_layers.second);
+}
+
+TEST_CASE("SupportMaterial: classic tree says its interface layer count is object-wide",
+          "[SupportMaterial][support_groups][tree]")
+{
+    // The plan's 4b limit, made visible. A group asking for its own interface layer count on a
+    // classic tree gets the object's count - the roof layers were decided in draw_circles() before
+    // anything knew about groups - and the user is told, non-fatally, instead of being left to
+    // wonder why nothing changed.
+    std::pair<size_t, size_t> control_layers;
+    {
+        Slic3r::Print print;
+        Slic3r::Model model;
+        make_floating_two_part_print(print, model, tree_fixture_config("tree_slim"), nullptr);
+        REQUIRE(! print.objects().empty());
+        control_layers = interface_layer_counts(*print.objects().front());
+        REQUIRE(control_layers.second > 0);
+    }
+
+    Slic3r::Print print;
+    Slic3r::Model model;
+    make_floating_two_part_print(print, model, tree_fixture_config("tree_slim"), [](ModelObject &object) {
+        ModelVolume *part_b = object.volumes.back();
+        part_b->config.set_key_value("support_group", new ConfigOptionString("B"));
+        part_b->config.set_key_value("support_interface_top_layers", new ConfigOptionInt(5));
+    });
+    REQUIRE(! print.objects().empty());
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.support_groups().size() == 2);
+    CHECK(object.has_support_group_interface_layer_override());
+    CHECK(has_warning_containing(object, "object-wide for classic tree supports"));
+    // The count really is unchanged - this is the limit, not a bug report.
+    const std::pair<size_t, size_t> grouped_layers = interface_layer_counts(object);
+    CHECK(grouped_layers.second == control_layers.second);
+
+    // The same override on an ORGANIC tree raises no notice, because organic trees do honour it.
+    Slic3r::Print organic_print;
+    Slic3r::Model organic_model;
+    make_floating_two_part_print(organic_print, organic_model, tree_fixture_config("organic"), [](ModelObject &object) {
+        ModelVolume *part_b = object.volumes.back();
+        part_b->config.set_key_value("support_group", new ConfigOptionString("B"));
+        part_b->config.set_key_value("support_interface_top_layers", new ConfigOptionInt(5));
+    });
+    REQUIRE(! organic_print.objects().empty());
+    CHECK(! has_warning_containing(*organic_print.objects().front(), "object-wide for classic tree supports"));
+}
+
+TEST_CASE("SupportMaterial: per-group interface filament, organic tree", "[SupportMaterial][support_groups][tree]")
+{
+    DynamicPrintConfig config = tree_fixture_config("organic");
+    config.set_deserialize_strict({
+        { "nozzle_diameter",   "0.4,0.4" },
+        { "filament_diameter", "1.75,1.75" },
+        { "filament_type",     "PLA;PLA" },
+        { "filament_soluble",  "0,0" },
+    });
+
+    Slic3r::Print print;
+    Slic3r::Model model;
+    make_floating_two_part_print(print, model, config, [](ModelObject &object) {
+        ModelVolume *part_b = object.volumes.back();
+        part_b->config.set_key_value("support_group", new ConfigOptionString("B"));
+        part_b->config.set_key_value("support_interface_filament", new ConfigOptionInt(2));
+    });
+    REQUIRE(! print.objects().empty());
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.support_groups().size() == 2);
+    CHECK(object.has_support_group_interface_filament());
+
+    size_t layers_with_second_extruder = 0;
+    double moved_length = 0.;
+    for (const SupportLayer *support_layer : object.support_layers()) {
+        auto it = support_layer->interface_by_extruder.find(1); // 0-based key: filament 2
+        if (it == support_layer->interface_by_extruder.end() || it->second.entities.empty())
+            continue;
+        ++ layers_with_second_extruder;
+        for (const ExtrusionEntity *ee : it->second.entities) {
+            moved_length += unscale<double>(ee->length());
+            CHECK(ee->role() == erSupportMaterialInterface);
+        }
+        for (const auto &kv : support_layer->interface_by_extruder)
+            CHECK(kv.first == 1u);
+    }
+    CHECK(layers_with_second_extruder > 0);
+    CHECK(moved_length > 1.);
+}
+
+TEST_CASE("SupportMaterial: per-group interface filament, classic tree", "[SupportMaterial][support_groups][tree]")
+{
+    DynamicPrintConfig config = tree_fixture_config("tree_slim");
+    config.set_deserialize_strict({
+        { "nozzle_diameter",   "0.4,0.4" },
+        { "filament_diameter", "1.75,1.75" },
+        { "filament_type",     "PLA;PLA" },
+        { "filament_soluble",  "0,0" },
+    });
+
+    Slic3r::Print print;
+    Slic3r::Model model;
+    make_floating_two_part_print(print, model, config, [](ModelObject &object) {
+        ModelVolume *part_b = object.volumes.back();
+        part_b->config.set_key_value("support_group", new ConfigOptionString("B"));
+        part_b->config.set_key_value("support_interface_filament", new ConfigOptionInt(2));
+    });
+    REQUIRE(! print.objects().empty());
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.support_groups().size() == 2);
+    CHECK(object.has_support_group_interface_filament());
+
+    // The classic tree writes the group's roof straight into interface_by_extruder: it does no
+    // height modulation, so there is nothing to do afterwards.
+    const double split_x = split_x_between_parts(object);
+    size_t layers_with_second_extruder = 0;
+    double own_part = 0., other_part = 0.;
+    for (const SupportLayer *support_layer : object.support_layers()) {
+        auto it = support_layer->interface_by_extruder.find(1);
+        if (it == support_layer->interface_by_extruder.end() || it->second.entities.empty())
+            continue;
+        ++ layers_with_second_extruder;
+        sum_interface_length(it->second, split_x, other_part, own_part);
+        for (const ExtrusionEntity *ee : it->second.entities)
+            CHECK(ee->role() == erSupportMaterialInterface);
+        for (const auto &kv : support_layer->interface_by_extruder)
+            CHECK(kv.first == 1u);
+    }
+    CHECK(layers_with_second_extruder > 0);
+    CHECK(own_part > 1.);
+    // It stays on its own part: the corpus gate's expect_tool_part criterion, in miniature.
+    CHECK(other_part <= own_part * 0.05);
+}

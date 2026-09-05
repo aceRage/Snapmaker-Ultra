@@ -329,127 +329,11 @@ static Polygons contours_simplified(const Vec2i32 &grid_size, const double pixel
 }
 #endif // SUPPORT_USE_AGG_RASTERIZER
 
-// Ultra (support groups, plan 2026-09-02 Stage 3 3.5): the config the SHARED SupportParameters is
-// built from. It is the object's own, with the interface layer counts raised to the max over all
-// groups. Reason: SupportParameters collapses support_material_interface_flow into
-// support_material_flow when support_interface_top_layers == 0, and
-// support_material_bottom_interface_flow - which decides the bottom-contact layer HEIGHTS, i.e.
-// shared geometry - is derived from it. Taking the max keeps the interface flow alive whenever ANY
-// group wants interfaces, and equals the object's own value when there is a single group, which is
-// what keeps the off-mode output where it is. support_interface_filament deliberately stays the
-// OBJECT's, so a group's filament choice can never move a bottom-contact layer height.
-static PrintObjectConfig support_shared_config(const PrintObject &object,
-                                               const std::vector<PrintObject::SupportGroup> &groups)
-{
-    PrintObjectConfig config = object.config();
-    if (groups.size() <= 1)
-        return config;
-    // -1 in support_interface_bottom_layers means "same as top"; resolve it before taking a max.
-    auto resolved_bottom = [](const PrintObjectConfig &c) {
-        return c.support_interface_bottom_layers.value < 0 ? std::max(0, c.support_interface_top_layers.value)
-                                                           : c.support_interface_bottom_layers.value;
-    };
-    int top    = config.support_interface_top_layers.value;
-    int bottom = resolved_bottom(config);
-    for (const PrintObject::SupportGroup &group : groups) {
-        top    = std::max(top,    group.config.support_interface_top_layers.value);
-        bottom = std::max(bottom, resolved_bottom(group.config));
-    }
-    config.support_interface_top_layers.value    = top;
-    config.support_interface_bottom_layers.value = bottom;
-    return config;
-}
-
-// Ultra (support groups, plan Stage 3 3.5 / R3.1): turn the raw per-group masks into DISJOINT
-// per-object-layer claims. Every group's footprint is expanded by `reach` - how far a top contact
-// layer can sit outside the outline of the part it supports - and the result is then cut against
-// (a) every OTHER group's own part, so a wide claim can never reach across a neighbour and take the
-// contacts that belong to it, and (b) every LOWER group's claim, so the claims stay disjoint and the
-// split is a hard clip along that boundary. claims[0] holds the union of all of them: group 0 takes
-// what is left of any shared polygon, so the K pieces cover it exactly.
-// `reach` and the group order are the two knobs behind the seam R3.1 describes.
-static std::vector<std::vector<Polygons>> support_group_claims(
-    const std::vector<PrintObject::SupportGroup> &groups, float reach, float block, size_t num_layers)
-{
-    std::vector<std::vector<Polygons>> claims(groups.size(), std::vector<Polygons>(num_layers));
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers),
-        [&groups, &claims, reach, block](const tbb::blocked_range<size_t> &range) {
-            for (size_t i = range.begin(); i < range.end(); ++ i) {
-                Polygons taken;
-                for (size_t g = 1; g < groups.size(); ++ g) {
-                    Polygons c;
-                    if (i < groups[g].mask.size() && ! groups[g].mask[i].empty())
-                        c = expand(groups[g].mask[i], reach);
-                    if (! c.empty()) {
-                        // Another group's part, plus the gap no support may enter: off limits.
-                        Polygons blocked;
-                        for (size_t h = 0; h < groups.size(); ++ h)
-                            if (h != g && i < groups[h].mask.size() && ! groups[h].mask[i].empty())
-                                append(blocked, expand(groups[h].mask[i], block));
-                        if (! blocked.empty()) {
-                            // ... except over this group's OWN part. Two parts that touch would
-                            // otherwise let the neighbour's gap eat a strip of the group's own
-                            // footprint, which is never the right answer.
-                            blocked = union_(blocked);
-                            if (! groups[g].mask[i].empty())
-                                blocked = diff(blocked, groups[g].mask[i]);
-                            if (! blocked.empty())
-                                c = diff(c, blocked);
-                        }
-                    }
-                    if (! c.empty() && ! taken.empty())
-                        c = diff(c, taken);
-                    if (! c.empty())
-                        append(taken, c);
-                    claims[g][i] = std::move(c);
-                }
-                claims[0][i] = taken.empty() ? Polygons() : union_(taken);
-            }
-        });
-    return claims;
-}
-
-// Ultra (support groups, plan Stage 3 3.5): a sibling of every contact layer holding only the part
-// of it group `g` owns. The clones are input to generate_interface_layers and are NEVER added to
-// the layer graph, so generate_support_layers' assert(num_top_contacts <= 1) is untouched - which
-// is exactly why the plan splits contacts at extrusion time and not here.
-static SupportGeneratorLayersPtr clone_contacts_masked(
-    const SupportGeneratorLayersPtr &contacts,
-    size_t                           g,
-    const std::vector<Polygons>     &claim,
-    const std::vector<coordf_t>     &object_layer_zs,
-    SupportGeneratorLayerStorage    &layer_storage,
-    bool                             use_above)
-{
-    SupportGeneratorLayersPtr out;
-    out.reserve(contacts.size());
-    for (SupportGeneratorLayer *src : contacts) {
-        const size_t idx = support_group_object_layer_index(*src, use_above, object_layer_zs);
-        Polygons polygons = support_group_piece(src->polygons, &claim, idx, g);
-        if (polygons.empty())
-            continue;
-        SupportGeneratorLayer &dst = layer_storage.allocate(src->layer_type);
-        dst.print_z                = src->print_z;
-        dst.bottom_z               = src->bottom_z;
-        dst.height                 = src->height;
-        dst.bridging               = src->bridging;
-        dst.idx_object_layer_above = src->idx_object_layer_above;
-        dst.idx_object_layer_below = src->idx_object_layer_below;
-        dst.support_group          = uint16_t(g);
-        dst.polygons               = std::move(polygons);
-        // Snug supports project *overhang_polygons rather than polygons, and dereference it
-        // unconditionally, so every optional polygon set travels with the clone.
-        auto mask_ptr = [&claim, idx, g](const std::unique_ptr<Polygons> &s, std::unique_ptr<Polygons> &d) {
-            if (s)
-                d = std::make_unique<Polygons>(support_group_piece(*s, &claim, idx, g));
-        };
-        mask_ptr(src->contact_polygons,  dst.contact_polygons);
-        mask_ptr(src->overhang_polygons, dst.overhang_polygons);
-        mask_ptr(src->enforcer_polygons, dst.enforcer_polygons);
-        out.emplace_back(&dst);
-    }
-    return out;
-}
+// Ultra (support groups): support_shared_config(), support_group_claims() and
+// clone_contacts_masked() used to be three statics right here. Stage 4a needs exactly the same
+// three in the organic-tree generator, so they moved to SupportCommon.cpp verbatim - one copy
+// is the only way the two generators can stay the same.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2d.
 
 PrintObjectSupportMaterial::PrintObjectSupportMaterial(const PrintObject *object, const SlicingParameters &slicing_params) :
     m_print_config          (&object->print()->config()),
@@ -516,39 +400,8 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     // claims derived from them. support_group_masks() returns immediately when there is a single
     // group, so a project that carries no support_group data pays nothing here - not one extra
     // mesh slice, not one extra boolean.
-    std::vector<coordf_t> object_layer_zs;
-    object_layer_zs.reserve(object.layers().size());
-    for (const Layer *layer : object.layers())
-        object_layer_zs.emplace_back(layer->print_z);
-    if (m_groups.size() > 1) {
-        object.support_group_masks(m_groups);
-        // How far a top contact layer can sit OUTSIDE the outline of the part it supports. Two
-        // terms, and the second one is the whole reason a group used to barely change anything:
-        //
-        //  - the XY gap plus one interface extrusion width, the margin the contact is inflated by;
-        //  - for grid supports, one grid cell. fill_contact_layer() runs every contact through
-        //    SupportGridPattern, which STRETCHES each island onto a grid of
-        //    support_base_pattern_spacing + support_material_flow.spacing() (SupportGridParams
-        //    above - 5.4 mm with the stock 5 mm spacing) before it is sliced. A narrow overhang -
-        //    the crescent a slanted wall sheds on each layer - therefore becomes a band of grid
-        //    cells straddling the part outline, most of it well beyond the part's own footprint.
-        //    Claiming only footprint + 0.6 mm left the rest to the default group: measured on the
-        //    user's two slanted cylinders, the group claimed 814 mm2 of 7506 mm2 of contact area
-        //    (11 %) and its five interface layers changed that part's interface by 1 %, where the
-        //    same value set object-wide changed it by 34 %.
-        //
-        // Reaching this far is only safe because support_group_claims() then refuses any area
-        // sitting over ANOTHER group's part - `block` below, the part outline plus the gap no
-        // support may enter.
-        // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2c.
-        const float block = float(scale_(m_support_params.gap_xy));
-        float       reach = block + float(m_support_params.support_material_interface_flow.scaled_width());
-        if (m_support_params.support_style == smsGrid)
-            reach += float(scale_(m_object_config->support_base_pattern_spacing.value +
-                                  m_support_params.support_material_flow.spacing()));
-        m_group_claims = support_group_claims(m_groups, reach, block, object.layers().size());
-        BOOST_LOG_TRIVIAL(info) << "Support generator - " << m_groups.size() << " support groups";
-    }
+    const std::vector<coordf_t> object_layer_zs = object_layer_print_zs(object);
+    m_group_claims = support_group_claims(object, m_groups, m_support_params);
 
     BOOST_LOG_TRIVIAL(info) << "Support generator - Creating top contacts";
 
