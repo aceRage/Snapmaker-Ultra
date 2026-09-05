@@ -24,11 +24,9 @@ set(_curl_platform_flags
   # other provider. On all three platforms, deliberately: a hub on a Mac should be able to push
   # too, and scoping this to Windows would ship an APNs feature that silently does not exist
   # elsewhere. See docs/superpowers/specs/2026-09-04-ultra1-phase0-spike.md section 1.4.
+  # (NGHTTP2_STATICLIB, which nghttp2.h needs against a static build, is applied by
+  # cmake/modules/FindNGHTTP2.cmake - curl's configure finds that module first.)
   -DUSE_NGHTTP2:BOOL=ON
-  # nghttp2.h declares every symbol __declspec(dllimport) unless NGHTTP2_STATICLIB is defined, so
-  # without this http2.c compiles against import stubs that a static build never generates. The
-  # flag is harmless where it means nothing.
-  -DCMAKE_C_FLAGS:STRING=-DNGHTTP2_STATICLIB
   -DUSE_MBEDTLS:BOOL=OFF
 )
 

@@ -29,6 +29,15 @@ find_package_handle_standard_args(NGHTTP2
 if (NGHTTP2_FOUND)
     set(NGHTTP2_INCLUDE_DIRS ${NGHTTP2_INCLUDE_DIR})
     set(NGHTTP2_LIBRARIES    ${NGHTTP2_LIBRARY})
+    # nghttp2.h declares every symbol __declspec(dllimport) unless NGHTTP2_STATICLIB is defined, so
+    # anything that includes it against this static build - curl's own http2.c above all - has to
+    # carry the macro or it links against import stubs that were never generated.
+    #
+    # It goes here rather than into a -DCMAKE_C_FLAGS on curl's configure line because that would
+    # *replace* the flags CMake sets for the platform (on MSVC, /DWIN32 /D_WINDOWS) rather than add
+    # to them. curl consumes this module's plain variables, not the imported target below, so the
+    # definition has to be applied to the directory that found us.
+    add_compile_definitions(NGHTTP2_STATICLIB)
     if (NOT TARGET NGHTTP2::nghttp2)
         add_library(NGHTTP2::nghttp2 UNKNOWN IMPORTED)
         set_target_properties(NGHTTP2::nghttp2 PROPERTIES
