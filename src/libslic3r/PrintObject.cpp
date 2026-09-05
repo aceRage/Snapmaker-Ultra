@@ -676,6 +676,16 @@ void PrintObject::generate_support_material()
             this->_generate_support_material();
             m_print->throw_if_canceled();
         }
+        // Ultra (support groups, plan 2026-09-02 3.7): both this feature and support filament
+        // matching (Chameleon) write SupportLayer::interface_by_extruder, so running both would
+        // make the result depend on which ran last. The group wins and Chameleon stands down for
+        // the object (chameleon_assign_support_interfaces, Print.cpp) - say so where the user can
+        // see it. This is the only place it CAN be said: that pass runs after every object step
+        // has finished, and active_step_add_warning needs a started step.
+        if (this->config().support_filament_matching.value && this->has_support_group_interface_filament())
+            this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                _u8L("Support filament matching is off for this object because one of its support groups picks its own interface filament."),
+                PrintStateBase::SlicingSupportGroupChameleonOff);
         this->set_done(posSupportMaterial);
     }
 }
@@ -3355,25 +3365,27 @@ void PrintObject::support_group_masks(std::vector<SupportGroup> &groups) const
     }
 }
 
-void PrintObject::add_support_group_chameleon_warning(const std::string &message)
-{
-    this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, message);
-}
-
 bool PrintObject::has_support_group_interface_filament() const
 {
+    return ! this->support_group_interface_extruders().empty();
+}
+
+std::vector<unsigned int> PrintObject::support_group_interface_extruders() const
+{
+    std::vector<unsigned int> out;
     const ModelObject *object = this->model_object();
     if (object == nullptr)
-        return false;
+        return out;
     const int object_filament = m_config.support_interface_filament.value;
     for (const ModelVolume *volume : object->volumes) {
         if (volume == nullptr || ! volume->is_model_part())
             continue;
         if (const ConfigOption *opt = volume->config.option("support_interface_filament"); opt != nullptr)
             if (int slot = opt->getInt(); slot != 0 && slot != object_filament)
-                return true;
+                out.push_back(unsigned(slot - 1));
     }
-    return false;
+    sort_remove_duplicates(out);
+    return out;
 }
 
 const std::string                                                    key_extruder { "extruder" };

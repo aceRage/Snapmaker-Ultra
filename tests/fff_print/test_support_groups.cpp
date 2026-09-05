@@ -9,6 +9,7 @@
 #include <catch2/catch.hpp>
 
 #include <algorithm>
+#include <vector>
 
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Preset.hpp"
@@ -106,6 +107,59 @@ TEST_CASE("support_groups: one part overriding an interface key makes a second g
     REQUIRE(groups[1].volumes.size() == 1);
     CHECK(groups[1].volumes[0] == first_object(print).model_object()->volumes[1]);
     CHECK(groups[1].config.support_interface_top_layers.value == 5);
+}
+
+// Ultra (support groups, plan 2c): the extruder list GCode.cpp keeps away from every other
+// group's support. It is what makes the fix for the filament leak - a group's own interface
+// filament ending up under the neighbouring part and in the support base - a statement about
+// data rather than about whichever tool happened to be active on a layer.
+TEST_CASE("support_groups: a group's pinned interface filament is reported as an extruder to keep clear",
+          "[SupportGroups]")
+{
+    Slic3r::Print print;
+    Slic3r::Model model;
+    // A second filament has to exist for a group to be able to pick one, and PrintObject clamps
+    // an out-of-range support filament slot to 1 - which would silently turn this into the
+    // "repeats the object's own slot" case below.
+    make_two_part_print(print, model,
+                        {{"enable_support", "1"}, {"support_interface_filament", "0"},
+                         {"nozzle_diameter", "0.4,0.4"}, {"filament_diameter", "1.75,1.75"},
+                         {"filament_type", "PLA;PLA"}, {"filament_soluble", "0,0"}},
+                        [](ModelObject &object) {
+                            object.volumes[1]->config.set_key_value("support_interface_filament",
+                                                                    new ConfigOptionInt(2));
+                            object.volumes[1]->config.set_key_value("support_group",
+                                                                    new ConfigOptionString("B"));
+                        });
+
+    const PrintObject &obj = first_object(print);
+    CHECK(obj.has_support_group_interface_filament());
+    // 1-based slot 2 -> 0-based extruder 1, and nothing else.
+    REQUIRE(obj.support_group_interface_extruders() == std::vector<unsigned int>{ 1u });
+}
+
+TEST_CASE("support_groups: a group repeating the object's own interface filament pins nothing",
+          "[SupportGroups]")
+{
+    Slic3r::Print print;
+    Slic3r::Model model;
+    make_two_part_print(print, model,
+                        {{"enable_support", "1"}, {"support_interface_filament", "2"},
+                         {"nozzle_diameter", "0.4,0.4"}, {"filament_diameter", "1.75,1.75"},
+                         {"filament_type", "PLA;PLA"}, {"filament_soluble", "0,0"}},
+                        [](ModelObject &object) {
+                            // The same slot the object already uses: there is nothing to keep
+                            // clear of, and nothing must stand down - which is why the predicate
+                            // compares against the object's value rather than against zero.
+                            object.volumes[1]->config.set_key_value("support_interface_filament",
+                                                                    new ConfigOptionInt(2));
+                            object.volumes[1]->config.set_key_value("support_group",
+                                                                    new ConfigOptionString("B"));
+                        });
+
+    const PrintObject &obj = first_object(print);
+    CHECK(! obj.has_support_group_interface_filament());
+    CHECK(obj.support_group_interface_extruders().empty());
 }
 
 TEST_CASE("support_groups: an override equal to the object's value collapses into the default group",

@@ -5531,6 +5531,20 @@ LayerResult GCode::process_layer(const Print& print,
                 // Shall the support interface be printed with the active extruder, preferably with non-soluble, to avoid tool changes?
                 bool interface_dontcare = object.config().support_interface_filament.value == 0;
 
+                // Ultra (support groups, plan 2026-09-02 2c): the extruders a support group pins
+                // for ITS OWN part's interface. They live in SupportLayer::interface_by_extruder
+                // and are emitted from there; everything still in support_fills belongs to the
+                // other groups and must never borrow them. Without this, an object whose support
+                // filament is "don't care" resolved both the base and the neighbouring part's
+                // interface to whatever extruder happened to be first/active on the layer - which,
+                // once a group had forced its own filament onto that layer, was the group's. That
+                // is what put the group's colour under every part. Empty for every object with no
+                // such group, so nothing below this line can move for them.
+                const std::vector<unsigned int> group_interface_extruders = object.support_group_interface_extruders();
+                auto is_group_pinned = [&group_interface_extruders](unsigned int extruder_id) {
+                    return std::binary_search(group_interface_extruders.begin(), group_interface_extruders.end(), extruder_id);
+                };
+
                 // BBS: apply wiping overridden extruders
                 WipingExtrusions& wiping_extrusions = const_cast<LayerTools&>(layer_tools).wiping_extrusions();
                 if (support_dontcare) {
@@ -5587,7 +5601,18 @@ LayerResult GCode::process_layer(const Print& print,
                 // a documented, now much smaller, remaining gap (see this task's own
                 // report: still deterministic per run, but layer-varying, same as
                 // before this fix).
+                //
+                // Ultra (support groups, plan 2026-09-02 2c): the pin reads interface_by_extruder
+                // as "what Chameleon matched on this layer", but since Stage 3 a support group's
+                // own interface filament writes that very same map (SupportCommon.cpp) - and for
+                // such an object the Chameleon pass itself has already stood down (Print.cpp), so
+                // every bucket there is a GROUP's, not a match. Pinning to it handed the layer's
+                // whole don't-care support - base and the other parts' interface alike - to the
+                // group's filament, which is exactly the "the group's colour is under both parts"
+                // report. The interlock is the same one the Chameleon pass, WipingExtrusions and
+                // is_support_overriddable already use.
                 if (object.config().support_filament_matching.value
+                    && group_interface_extruders.empty()
                     && (support_dontcare || interface_dontcare)) {
                     // chameleon_dominant_matched_extruder (BrimFilament.hpp/.cpp) is
                     // the pure/testable core of this pin: largest total_path_length_mm
@@ -5617,6 +5642,10 @@ LayerResult GCode::process_layer(const Print& print,
                         // BBS: now we don't consider interface filament used in other object
                         if (extruder_id == interface_extruder)
                             continue;
+                        // Ultra (support groups): a group's own interface filament is not a
+                        // candidate for anybody else's support base.
+                        if (is_group_pinned(extruder_id))
+                            continue;
 
                         dontcare_extruder = extruder_id;
                         break;
@@ -5636,11 +5665,14 @@ LayerResult GCode::process_layer(const Print& print,
                     // Some support will be printed with "don't care" material, preferably non-soluble.
                     // Is the current extruder assigned a soluble filament?
                     unsigned int dontcare_extruder = first_extruder_id;
-                    if (print.config().filament_soluble.get_at(dontcare_extruder)) {
+                    // Ultra (support groups): ... or the first/active extruder is one a support
+                    // group pinned for its own interface, in which case falling through to it
+                    // would paint this object's other support with the group's filament.
+                    if (print.config().filament_soluble.get_at(dontcare_extruder) || is_group_pinned(dontcare_extruder)) {
                         // The last extruder printed on the previous layer extrudes soluble filament.
                         // Try to find a non-soluble extruder on the same layer.
                         for (unsigned int extruder_id : layer_tools.extruders)
-                            if (!print.config().filament_soluble.get_at(extruder_id)) {
+                            if (!print.config().filament_soluble.get_at(extruder_id) && !is_group_pinned(extruder_id)) {
                                 dontcare_extruder = extruder_id;
                                 break;
                             }

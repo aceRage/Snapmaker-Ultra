@@ -557,10 +557,11 @@ public:
     // and WipingExtrusions write / repaint the same SupportLayer::interface_by_extruder map this
     // feature owns, so both stand down for such an object.
     bool                        has_support_group_interface_filament() const;
-    // Ultra (support groups): raise the non-critical warning that says Chameleon stood down for
-    // this object. active_step_add_warning is protected on PrintObjectBaseWithState, and the
-    // Chameleon pass is a static free function in Print.cpp, so it needs a public door.
-    void                        add_support_group_chameleon_warning(const std::string &message);
+    // Ultra (support groups): the 0-based extruders a support group pins for its own interface -
+    // sorted, unique, and empty for every object without such a group. Those extruders belong to
+    // one part's interface and to nothing else, so nobody else's "don't care" support may resolve
+    // to them; GCode.cpp's support-extruder resolution excludes them for that reason.
+    std::vector<unsigned int>   support_group_interface_extruders() const;
 
     // Ultra (support groups, plan Stage 3 3.1): slice an explicit set of volumes at this object's
     // layer Zs and union them per layer. This is the body slice_support_volumes() always had; that
