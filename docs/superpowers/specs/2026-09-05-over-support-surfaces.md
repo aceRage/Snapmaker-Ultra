@@ -151,6 +151,40 @@ but the object-wide value acts.
   with the switch left at its default, compared against a baseline build that does not have the
   feature at all. It must stay within the tolerance gate along with every other off-mode case.
 
+### 7.0 What the gate showed
+
+`tests/data/support_corpus/onepart_ledge.3mf`, real presets (Snapmaker U1 0.4 nozzle, 0.20 Standard,
+Generic PLA), normal(auto) supports at a 0.2 mm top Z distance, sliced by the shipped CLI. Per feature
+type: extruding segments, extruded path length, extrusion per millimetre and the feedrates seen.
+
+Switch **off**:
+
+```
+Bottom surface               segments=23    mm=79.1     E/mm=0.04855  F=[6300]
+Bridge                       segments=26    mm=618.3    E/mm=0.02419  F=[3000]
+Internal Bridge              segments=68    mm=697.6    E/mm=0.03935  F=[4500]
+```
+
+Switch **on**, `over_support_speed = 25`, `over_support_flow = 0.9`:
+
+```
+Bottom surface               segments=23    mm=79.1     E/mm=0.04855  F=[6300]
+Bottom surface over support  segments=62    mm=629.3    E/mm=0.02697  F=[1500]
+Internal Bridge              segments=68    mm=697.6    E/mm=0.03935  F=[4500]
+```
+
+The face moved out of `Bridge` and into the new role: `F=1500` is 25 mm/s, exactly
+`over_support_speed`, where the bridge was printed at the profile's 50 mm/s bridge speed. The segment
+count rises because the surface is now filled with the bottom-surface pattern at solid density rather
+than at bridge density, and `E/mm` changes with it because the line is a normal solid line of the
+layer height rather than a round bridging line. Every other feature type - the first-layer bottom
+surface, the walls, the internal bridges over sparse infill, the support itself - is untouched, to the
+segment.
+
+Tolerance gate, candidate against a `feat/ultra-preferences` baseline that does not have the feature:
+**within tolerance on all 9 off-mode cases** (including the new `over_support_off`), and the Stage 3/4
+`--gate groups` cases still act, with `config_rows=0`.
+
 ### 7.1 One deviation the gate needed
 
 The support-sets plan §3.7 could say "the only new config key never reaches `full_print_config`",
