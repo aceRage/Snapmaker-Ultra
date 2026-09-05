@@ -3066,7 +3066,7 @@ wxSizer* TabPrint::support_set_create_widget(wxWindow* parent)
     add_text_button(&m_support_set_apply, _L("Apply"),
                     _L("Copy this set's values into the current process settings"),
                     ButtonStyle::Confirm, &TabPrint::on_support_set_apply);
-    hsizer->Add(m_support_set_apply, 0, wxRIGHT | wxTOP, em / 2);
+    hsizer->Add(m_support_set_apply, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT | wxTOP, em / 2);
 
     add_icon_button(&m_support_set_edit, "edit",
                     _L("Edit the selected support set. The current project is not changed."),
@@ -3083,8 +3083,8 @@ wxSizer* TabPrint::support_set_create_widget(wxWindow* parent)
     hsizer->AddStretchSpacer(1);
     add_text_button(&m_support_set_groups, _L("Groups"),
                     _L("Open the Support groups window for the selected object"),
-                    ButtonStyle::Regular, &TabPrint::on_support_set_groups);
-    hsizer->Add(m_support_set_groups, 0, wxTOP, em / 2);
+                    ButtonStyle::Confirm, &TabPrint::on_support_set_groups); // green like Apply, the user's call
+    hsizer->Add(m_support_set_groups, 0, wxALIGN_CENTER_VERTICAL | wxTOP, em / 2);
 
     m_support_set_note = new wxStaticText(parent, wxID_ANY, wxEmptyString);
     m_support_set_note->SetFont(wxGetApp().normal_font());
