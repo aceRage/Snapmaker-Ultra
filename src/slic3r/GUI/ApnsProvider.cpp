@@ -224,7 +224,7 @@ private:
     // the cache even when the host has not changed.
     bool provider_token(const std::string& host, std::string& out, std::string& err)
     {
-        std::string kid, iss;
+        std::string kid, iss, key_error;
         void*       key = nullptr;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -234,11 +234,12 @@ private:
                 out = m_jwt;
                 return true;
             }
-            kid = m_key_id;
-            iss = m_team_id;
-            key = m_key;
+            kid       = m_key_id;
+            iss       = m_team_id;
+            key       = m_key;
+            key_error = m_key_error;
         }
-        if (!key) { err = m_key_error.empty() ? "no APNs signing key is configured" : m_key_error; return false; }
+        if (!key) { err = key_error.empty() ? "no APNs signing key is configured" : key_error; return false; }
         if (kid.empty() || iss.empty()) { err = "the APNs key id or team id is not set"; return false; }
 
         // Exactly these two header fields and exactly these two claims. No `typ`, and above all

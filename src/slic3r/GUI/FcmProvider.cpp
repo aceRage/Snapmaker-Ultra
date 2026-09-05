@@ -19,6 +19,7 @@
 #include <boost/log/trivial.hpp>
 #include <nlohmann/json.hpp>
 
+#include <cctype>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -207,7 +208,7 @@ private:
     // is nearly expired. One exchange an hour, not one per notification.
     bool access_token(std::string& out, std::string& err)
     {
-        std::string uri, email, project;
+        std::string uri, email, project, key_error;
         void*       key = nullptr;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -216,12 +217,13 @@ private:
                 out = m_access_token;
                 return true;
             }
-            uri     = m_token_uri;
-            email   = m_client_email;
-            project = m_project_id;
-            key     = m_key;
+            uri      = m_token_uri;
+            email    = m_client_email;
+            project  = m_project_id;
+            key      = m_key;
+            key_error = m_key_error;
         }
-        if (!key) { err = m_key_error.empty() ? "no FCM service account is configured" : m_key_error; return false; }
+        if (!key) { err = key_error.empty() ? "no FCM service account is configured" : key_error; return false; }
         if (email.empty() || project.empty()) { err = "the FCM service account is incomplete"; return false; }
 
         const long long iat = fcm_now_s();

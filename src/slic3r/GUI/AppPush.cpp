@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include <openssl/bio.h>
+#include <openssl/bn.h>
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
 #include <openssl/evp.h>
@@ -133,11 +134,24 @@ static void take_bool(const json& j, const char* key, bool& out)
 
 // A path is not a secret, but it names a person's home directory and the key's file name, and the
 // hub page has no use for either. The basename alone is enough to say "yes, that is the file".
+static const char* const PATH_ELLIPSIS = "\xE2\x80\xA6";
+
 static std::string mask_path(const std::string& p)
 {
     if (p.empty()) return "";
     const size_t slash = p.find_last_of("/\\");
-    return slash == std::string::npos ? p : ("\xE2\x80\xA6" + p.substr(slash + 1));
+    return slash == std::string::npos ? p : (std::string(PATH_ELLIPSIS) + p.substr(slash + 1));
+}
+
+// A path field posted back. take_secret's rule plus one more: a masked path is shown as its
+// basename behind an ellipsis rather than as ****, so a client that echoed back what it was shown
+// must not be able to overwrite the real path with that display form.
+static void take_path(const json& j, const char* key, std::string& out)
+{
+    if (!j.is_object() || !j.contains(key) || !j[key].is_string()) return;
+    const std::string v = trim(j[key].get<std::string>());
+    if (is_masked(v) || v.compare(0, std::strlen(PATH_ELLIPSIS), PATH_ELLIPSIS) == 0) return;
+    out = v;
 }
 
 static std::string header_safe(const std::string& s, size_t limit = 200)
@@ -154,16 +168,13 @@ static std::string header_safe(const std::string& s, size_t limit = 200)
 
 // libcurl's error text carries the URL it failed on, and for APNs the URL *is* the device token.
 // Nothing that reaches last_error or the log may contain one.
-static std::string scrub(std::string text, const Device& d)
+//
+// Two entry points because most callers are already inside the lock (they are recording a result
+// against a row) and std::mutex is not recursive - taking it twice would deadlock the sender.
+static std::string scrub_locked(std::string text, const Device& d)
 {
-    std::string key_path, sa_path;
-    {
-        // No lock: the caller holds none and these are only read here. A torn read would at worst
-        // fail to redact a path, so take a copy under the lock to be sure.
-        std::lock_guard<std::mutex> lock(g_mutex);
-        key_path = g_apns_cfg.value("key_path", "");
-        sa_path  = g_fcm_cfg.value("service_account_path", "");
-    }
+    const std::string key_path = g_apns_cfg.value("key_path", "");
+    const std::string sa_path  = g_fcm_cfg.value("service_account_path", "");
     for (const std::string& secret : { d.token, d.p256dh, d.auth, d.bundle, key_path, sa_path }) {
         if (secret.size() < 6) continue;
         for (size_t at = text.find(secret); at != std::string::npos; at = text.find(secret, at + 3))
@@ -171,6 +182,12 @@ static std::string scrub(std::string text, const Device& d)
     }
     if (text.size() > 300) text.resize(300);
     return text;
+}
+
+static std::string scrub(std::string text, const Device& d)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return scrub_locked(std::move(text), d);
 }
 
 static int severity_rank(const std::string& s)
@@ -561,7 +578,7 @@ static void record(const Device& sent_to, const PushResult& r)
             g_devices[i].last_error.clear();
         } else {
             ++g_devices[i].failures;
-            g_devices[i].last_error = scrub(r.error, sent_to);
+            g_devices[i].last_error = scrub_locked(r.error, sent_to);
             BOOST_LOG_TRIVIAL(warning) << "AppPush: push to a " << sent_to.platform << " device failed ("
                                        << g_devices[i].failures << " in a row): " << g_devices[i].last_error;
         }
@@ -605,7 +622,7 @@ void deliver(const json& event)
         if (!encrypt_for(d, plaintext, blob, err)) {
             std::lock_guard<std::mutex> lock(g_mutex);
             for (Device& row : g_devices)
-                if (row.id == d.id) { row.last_error = scrub(err, d); ++row.failures; g_dirty = true; }
+                if (row.id == d.id) { row.last_error = scrub_locked(err, d); ++row.failures; g_dirty = true; }
             continue;
         }
         record(d, send_with_retries(p, request_for(d, event, blob), d.platform == "apns" ? apns_cfg : fcm_cfg));
@@ -757,7 +774,7 @@ std::pair<int, std::string> set_options(const std::string& body)
             v = g_apns_cfg.value("bundle", "");   take_string(a, "bundle", v);   g_apns_cfg["bundle"] = header_safe(v, 200);
             v = g_apns_cfg.value("key_id", "");   take_secret(a, "key_id", v);   g_apns_cfg["key_id"] = header_safe(v, 32);
             v = g_apns_cfg.value("team_id", "");  take_secret(a, "team_id", v);  g_apns_cfg["team_id"] = header_safe(v, 32);
-            v = g_apns_cfg.value("key_path", ""); take_secret(a, "key_path", v); g_apns_cfg["key_path"] = v;
+            v = g_apns_cfg.value("key_path", ""); take_path(a, "key_path", v);   g_apns_cfg["key_path"] = v;
             // The PEM itself, for people who would rather paste the key than keep a file. It is a
             // credential in the fullest sense: stored only in settings.json, masked out of every
             // response, and never echoed back even masked.
@@ -780,7 +797,7 @@ std::pair<int, std::string> set_options(const std::string& body)
             g_fcm_cfg["enabled"] = on;
             std::string v;
             v = g_fcm_cfg.value("project_id", "");           take_string(f, "project_id", v); g_fcm_cfg["project_id"] = header_safe(v, 120);
-            v = g_fcm_cfg.value("service_account_path", ""); take_secret(f, "service_account_path", v); g_fcm_cfg["service_account_path"] = v;
+            v = g_fcm_cfg.value("service_account_path", ""); take_path(f, "service_account_path", v); g_fcm_cfg["service_account_path"] = v;
             v = g_fcm_cfg.value("service_account_json", ""); take_secret(f, "service_account_json", v); g_fcm_cfg["service_account_json"] = v;
             if (detail::debug_routes_on()) {
                 v = g_fcm_cfg.value("host_override", "");      take_string(f, "host_override", v);      g_fcm_cfg["host_override"] = v;
