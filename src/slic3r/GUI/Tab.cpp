@@ -2567,6 +2567,15 @@ void TabPrint::build()
         optgroup->append_single_option_line("support_ironing_flow", "support_settings_ironing#flow");
         optgroup->append_single_option_line("support_ironing_spacing", "support_settings_ironing#line-spacing");
 
+        // Ultra (over-support surfaces): its own small group right under the support interface
+        // settings, because that is what it is about - the object face that lands on the
+        // interface, not a bridge.
+        // docs/superpowers/specs/2026-09-05-over-support-surfaces.md
+        optgroup = page->new_optgroup(L("Over-support surfaces"), L"param_advanced");
+        optgroup->append_single_option_line("over_support_surfaces");
+        optgroup->append_single_option_line("over_support_flow");
+        optgroup->append_single_option_line("over_support_speed");
+
         //optgroup = page->new_optgroup(L("Options for support material and raft"));
 
         // Support

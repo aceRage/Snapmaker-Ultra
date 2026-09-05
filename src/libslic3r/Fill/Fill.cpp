@@ -904,6 +904,12 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 } else if (surface.is_solid()) {
                     if (surface.is_top()) {
                         params.extrusion_role = erTopSolidInfill;
+                    } else if (surface.is_bottom_over_support()) {
+                        // Ultra (over-support surfaces): a bottom shell in geometry - the pattern,
+                        // the density and the flow above all came from the bottom-surface branch -
+                        // but its own role, so the preview names it and GCode::_extrude can give it
+                        // over_support_flow / over_support_speed instead of the bridge settings.
+                        params.extrusion_role = erBottomSurfaceOverSupport;
                     } else if (surface.is_bottom()) {
                         params.extrusion_role = erBottomSurface;
                     } else {
@@ -1656,7 +1662,7 @@ void Layer::make_ironing()
 						polygons_append(polys, surface.expolygon);
 				} else {
 					for (const Surface &surface : ironing_params.layerm->slices.surfaces)
-						if ((surface.surface_type == stTop && (region_config.top_shell_layers > 0 || this->object()->print()->config().spiral_mode)) || (iron_everything && surface.surface_type == stBottom && region_config.bottom_shell_layers > 0))
+						if ((surface.surface_type == stTop && (region_config.top_shell_layers > 0 || this->object()->print()->config().spiral_mode)) || (iron_everything && (surface.surface_type == stBottom || surface.surface_type == stBottomOverSupport) && region_config.bottom_shell_layers > 0))
 							// stBottomBridge is not being ironed on purpose, as it would likely destroy the bridges.
 							polygons_append(polys, surface.expolygon);
 				}

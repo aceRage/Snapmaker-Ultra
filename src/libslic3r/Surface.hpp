@@ -28,6 +28,14 @@ enum SurfaceType {
     stInternalVoid,
     // Inner/outer perimeters.
     stPerimeter,
+    // Ultra (over-support surfaces): a bottom surface that sits on support material with a
+    // non-zero top Z distance. Geometrically a bottom shell, not a bridge: it is printed with
+    // the bottom surface pattern and density and its own flow / speed (over_support_flow,
+    // over_support_speed), never with the bridge settings. Appended at the end of the enum on
+    // purpose - inserting it next to stBottomBridge would renumber every later value.
+    // Only ever produced when over_support_surfaces is on.
+    // docs/superpowers/specs/2026-09-05-over-support-surfaces.md
+    stBottomOverSupport,
     // Number of SurfaceType enums.
     stCount,
 };
@@ -104,7 +112,9 @@ public:
 
     // The following methods do not test for stPerimeter.
 	bool   is_top()      const { return this->surface_type == stTop; }
-	bool   is_bottom()   const { return this->surface_type == stBottom || this->surface_type == stBottomBridge; }
+	bool   is_bottom()   const { return this->surface_type == stBottom || this->surface_type == stBottomBridge || this->surface_type == stBottomOverSupport; }
+	// Ultra: a bottom that lands on support, printed like a bottom shell but with its own flow/speed.
+	bool   is_bottom_over_support() const { return this->surface_type == stBottomOverSupport; }
 	bool   is_bridge()   const { return this->surface_type == stBottomBridge || this->surface_type == stInternalBridge; }
     bool   is_internal_bridge() const { return this->surface_type == stInternalBridge; }
 	bool   is_external() const { return this->is_top() || this->is_bottom(); }

@@ -703,6 +703,7 @@ const std::vector<ColorRGBA> GCodeViewer::Extrusion_Role_Colors{ {
     { 0.59f, 0.33f, 0.80f, 1.0f },   // erSolidInfill
     { 0.94f, 0.25f, 0.25f, 1.0f },   // erTopSolidInfill
     { 0.40f, 0.36f, 0.78f, 1.0f },   // erBottomSurface
+    { 0.16f, 0.76f, 0.72f, 1.0f },   // erBottomSurfaceOverSupport
     { 1.00f, 0.55f, 0.41f, 1.0f },   // erIroning
     { 0.30f, 0.40f, 0.63f, 1.0f },   // erBridgeInfill
     { 0.30f, 0.50f, 0.73f, 1.0f },   // erInternalBridgeInfill
@@ -1759,6 +1760,7 @@ void GCodeViewer::render_calibration_thumbnail(ThumbnailData& thumbnail_data, un
     m_extrusions.role_visibility_flags = m_extrusions.role_visibility_flags | (1 << erTopSolidInfill);
     m_extrusions.role_visibility_flags = m_extrusions.role_visibility_flags | (1 << erInternalInfill);
     m_extrusions.role_visibility_flags = m_extrusions.role_visibility_flags | (1 << erBottomSurface);
+    m_extrusions.role_visibility_flags = m_extrusions.role_visibility_flags | (1 << erBottomSurfaceOverSupport);
 
     refresh_render_paths(false, false);
 

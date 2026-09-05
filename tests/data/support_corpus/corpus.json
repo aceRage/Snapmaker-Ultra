@@ -223,6 +223,21 @@
       "baseline_has_groups": true
     },
     {
+      "name": "over_support_off",
+      "comment": "OFF MODE for the over-support surfaces feature (docs/superpowers/specs/2026-09-05-over-support-surfaces.md). It sets exactly the inputs that feature reads - supports on, a NON-ZERO top Z distance, interface layers - so the object's underside is classified stBottomBridge and printed with the bridge settings, and it deliberately does NOT pass over_support_surfaces: the baseline build does not have that key, and the point of the case is that the default (off) leaves the output where it was. If the classifier ever fired without the switch, this is the case that would move.",
+      "models": [
+        "tests/data/support_corpus/onepart_ledge.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=normal(auto)",
+        "--support-style=grid",
+        "--support-top-z-distance=0.2",
+        "--support-interface-top-layers=2",
+        "--support-interface-bottom-layers=2"
+      ]
+    },
+    {
       "name": "tree_organic",
       "models": [
         "tests/data/support_corpus/twopart_bridge.3mf"

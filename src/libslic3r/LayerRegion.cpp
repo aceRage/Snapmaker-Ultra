@@ -665,6 +665,10 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
     expansion_zones.at(0).parameters = RegionExpansionParameters::build(expansion_bottom, expansion_step, max_nr_expansion_steps);
     Surfaces bottoms = expand_merge_surfaces(this->fill_surfaces.surfaces, stBottom, expansion_zones, closing_radius);
 
+    // Ultra (over-support surfaces): a bottom that lands on support expands like any other
+    // bottom shell - same parameters, same order, just its own type so it keeps its own role.
+    Surfaces over_support = expand_merge_surfaces(this->fill_surfaces.surfaces, stBottomOverSupport, expansion_zones, closing_radius);
+
     expansion_zones.at(0).parameters = RegionExpansionParameters::build(expansion_top, expansion_step, max_nr_expansion_steps);
     Surfaces tops = expand_merge_surfaces(this->fill_surfaces.surfaces, stTop, expansion_zones, closing_radius);
 
@@ -691,7 +695,7 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
     unsigned zones_expolygons_count = 0;
     for (const ExpansionZone& zone : expansion_zones)
         zones_expolygons_count += zone.expolygons.size();
-    reserve_more(this->fill_surfaces.surfaces, zones_expolygons_count + bridges.size() + bottoms.size() + tops.size());
+    reserve_more(this->fill_surfaces.surfaces, zones_expolygons_count + bridges.size() + bottoms.size() + over_support.size() + tops.size());
     {
         Surface solid_templ(stInternalSolid, {});
         solid_templ.thickness = layer_thickness;
@@ -704,6 +708,7 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
     }
     this->fill_surfaces.append(std::move(bridges.surfaces));
     this->fill_surfaces.append(std::move(bottoms));
+    this->fill_surfaces.append(std::move(over_support));
     this->fill_surfaces.append(std::move(tops));
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
@@ -766,7 +771,8 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
                     //BBS: Don't need to expand too much in this situation. Expand 3mm to eliminate hole and 1mm for contour
                     surfaces_append(top, intersection_ex(offset(surface.expolygon.contour, margin / 3.0, EXTERNAL_SURFACES_OFFSET_PARAMETERS),
                                                          offset_ex(surface.expolygon, margin, EXTERNAL_SURFACES_OFFSET_PARAMETERS)), surface);
-            } else if (surface.surface_type == stBottom || (surface.surface_type == stBottomBridge && lower_layer == nullptr)) {
+            } else if (surface.surface_type == stBottom || surface.surface_type == stBottomOverSupport ||
+                       (surface.surface_type == stBottomBridge && lower_layer == nullptr)) {
                 // Grown by 3mm.
                 surfaces_append(bottom, offset_ex(surface.expolygon, margin, EXTERNAL_SURFACES_OFFSET_PARAMETERS), surface);
             } else if (surface.surface_type == stBottomBridge) {

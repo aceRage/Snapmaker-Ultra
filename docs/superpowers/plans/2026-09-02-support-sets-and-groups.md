@@ -1371,6 +1371,16 @@ effects, one extra mesh slice per group.
 
 ### 3.5 The part-level support key set
 
+> **Addendum 2026-09-05 (over-support surfaces).** `over_support_surfaces`, `over_support_flow` and
+> `over_support_speed` (`docs/superpowers/specs/2026-09-05-over-support-surfaces.md`) are `Support`-
+> category `PrintObjectConfig` keys, so they join `support_set_keys()` by the derived rule of §2a
+> item 3 with no edit, and they were added to the curated `part_support_keys()` list below by hand.
+> They are **tier B**: set-eligible and part-eligible - a set carries them, a part may carry them, the
+> 3MF round trip and the group resolver handle them - but object-wide in behaviour, because
+> `detect_surfaces_type` reads the object's own `PrintObject::m_config`. **Stage 5 wires the per-part
+> path**; the same promotion `support_style` and `support_threshold_angle` are waiting for.
+
+
 Curated, not mechanical (research open question 7). Three tiers; Stage 2 exposes tier A + B on parts,
 Stage 3 makes tier A act, tier B is display-only until Stage 4/later, tier C is never per-part.
 

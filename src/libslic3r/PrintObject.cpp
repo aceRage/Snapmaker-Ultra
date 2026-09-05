@@ -1044,6 +1044,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "max_bridge_length"
             || opt_key == "support_interface_top_layers"
             || opt_key == "support_critical_regions_only"
+            // Ultra (over-support surfaces): decides the bottom surface type, same as the keys
+            // above it in this group.
+            || opt_key == "over_support_surfaces"
             || opt_key == "hole_to_polyhole"
             || opt_key == "hole_to_polyhole_threshold"
             || opt_key == "hole_to_polyhole_twisted"
@@ -1272,6 +1275,10 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "inner_wall_speed"
             || opt_key == "internal_solid_infill_speed"
             || opt_key == "top_surface_speed"
+            // Ultra (over-support surfaces): flow ratio and speed are applied in GCode::_extrude,
+            // so nothing sliced has to be redone.
+            || opt_key == "over_support_flow"
+            || opt_key == "over_support_speed"
             || opt_key == "bed_mesh_min"
             || opt_key == "bed_mesh_max"
             || opt_key == "adaptive_bed_mesh_margin"
@@ -1349,6 +1356,20 @@ bool PrintObject::invalidate_all_steps()
 // stBottom       - Part of a region, which is not supported by the same region, but it is supported either by another region, or by a soluble interface layer.
 // stInternal     - Part of a region, which is supported by the same region type.
 // If a part of a region is of stBottom and stTop, the stBottom wins.
+void PrintObject::slice_support_annotations(std::vector<Polygons> &enforcers, std::vector<Polygons> &blockers) const
+{
+    // Deliberately the same recipe as SupportAnnotations in Support/SupportMaterial.cpp: the
+    // sliced enforcer / blocker volumes plus the painted facets, and the same blocker expansion,
+    // so "blocked here" means the same thing to the classifier and to the generator.
+    enforcers = this->slice_support_enforcers();
+    blockers  = this->slice_support_blockers();
+    this->project_and_append_custom_facets(false, EnforcerBlockerType::ENFORCER, enforcers);
+    this->project_and_append_custom_facets(false, EnforcerBlockerType::BLOCKER, blockers);
+    for (Polygons &blocker : blockers)
+        if (! blocker.empty())
+            blocker = expand(union_(blocker), float(1000. * SCALED_EPSILON));
+}
+
 void PrintObject::detect_surfaces_type()
 {
     BOOST_LOG_TRIVIAL(info) << "Detecting solid surfaces..." << log_memory_info();
@@ -1370,6 +1391,39 @@ void PrintObject::detect_surfaces_type()
         (this->has_bounded_paint_depth() && m_config.paint_depth_solid_interfaces.value));
     size_t num_layers     = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
 
+    // Ultra (over-support surfaces): decide, once per object, whether a bottom bridge on this
+    // object is really landing on support material rather than hanging over air. The support
+    // generator runs AFTER slicing (Print::process), so its contact areas do not exist yet -
+    // this is a slice-time reconstruction, and the spec says what it can and cannot see.
+    //
+    // The predicate is deliberately the one the soluble path below already uses to decide
+    // "this bottom is fully supported", only at a NON-zero top Z distance: same support types,
+    // same bridge_no_support / tree filters. At a zero gap the surface is stBottom anyway and
+    // there is nothing for this feature to do.
+    // docs/superpowers/specs/2026-09-05-over-support-surfaces.md
+    const bool over_support_on = m_config.over_support_surfaces.value && this->has_support() &&
+                                 m_config.support_top_z_distance.value > 0;
+    // Auto support types put support under every overhang they detect, and a bottom bridge is
+    // an overhang by construction. Manual (painted) types only support what the user enforced.
+    bool over_support_auto = over_support_on && is_auto(m_config.support_type.value);
+    if (over_support_auto) {
+        if (m_config.support_type.value == stNormalAuto)
+            over_support_auto &= ! m_config.bridge_no_support.value;
+        else if (m_config.support_type.value == stTreeAuto)
+            over_support_auto &= (m_config.support_interface_top_layers.value > 0 &&
+                                  m_config.max_bridge_length.value == 0 &&
+                                  m_config.support_critical_regions_only.value == false);
+    }
+    std::vector<Polygons> over_support_enforcers;
+    std::vector<Polygons> over_support_blockers;
+    if (over_support_on)
+        this->slice_support_annotations(over_support_enforcers, over_support_blockers);
+    // With a manual support type and nothing enforced there is no support anywhere, so every
+    // bottom stays a true bridge and the whole pass switches itself off.
+    const bool over_support_active = over_support_on &&
+        (over_support_auto || std::any_of(over_support_enforcers.begin(), over_support_enforcers.end(),
+                                          [](const Polygons &p) { return ! p.empty(); }));
+
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
         BOOST_LOG_TRIVIAL(debug) << "Detecting solid surfaces for region " << region_id << " in parallel - start";
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
@@ -1390,7 +1444,8 @@ void PrintObject::detect_surfaces_type()
             		((num_layers > 1) ? num_layers - 1 : num_layers) :
             		// In non-spiral vase mode, go over all layers.
             		m_layers.size()),
-            [this, region_id, interface_shells, &surfaces_new](const tbb::blocked_range<size_t>& range) {
+            [this, region_id, interface_shells, &surfaces_new, over_support_active, over_support_auto,
+             &over_support_enforcers, &over_support_blockers](const tbb::blocked_range<size_t>& range) {
                 // If we have soluble support material, don't bridge. The overhang will be squished against a soluble layer separating
                 // the support from the print.
                 // BBS: the above logic only applys for normal(auto) support. Complete logic:
@@ -1479,6 +1534,49 @@ void PrintObject::detect_surfaces_type()
                         bottom = layerm->slices.surfaces;
                         for (Surface &surface : bottom)
                             surface.surface_type = stBottom;
+                    }
+
+                    // Ultra (over-support surfaces): retype the part of every bottom bridge that
+                    // lands on support. What is left over - blocked by the user, or outside an
+                    // enforcer under a manual support type - stays a true bridge and keeps the
+                    // bridge settings. The first layer never reaches here (it has no lower layer
+                    // and is already stBottom); it is on the plate, not on support.
+                    if (over_support_active && lower_layer != nullptr && ! bottom.empty()) {
+                        static const Polygons no_polygons;
+                        const Polygons &blockers  = idx_layer < over_support_blockers.size()  ? over_support_blockers[idx_layer]  : no_polygons;
+                        const Polygons &enforcers = idx_layer < over_support_enforcers.size() ? over_support_enforcers[idx_layer] : no_polygons;
+                        if (over_support_auto && blockers.empty()) {
+                            // The common case: everything hanging over air on this layer will get
+                            // support under it. Retype in place so no new polygon boundary and no
+                            // sliver can be introduced by the classification itself.
+                            for (Surface &surface : bottom)
+                                if (surface.surface_type == stBottomBridge)
+                                    surface.surface_type = stBottomOverSupport;
+                        } else if (over_support_auto || ! enforcers.empty()) {
+                            Surfaces retyped;
+                            retyped.reserve(bottom.size());
+                            for (Surface &surface : bottom) {
+                                if (surface.surface_type != stBottomBridge) {
+                                    retyped.emplace_back(std::move(surface));
+                                    continue;
+                                }
+                                ExPolygons over = over_support_auto ? ExPolygons{ surface.expolygon }
+                                                                    : intersection_ex(surface.expolygon, enforcers);
+                                if (! blockers.empty())
+                                    over = diff_ex(over, blockers);
+                                if (over.empty()) {
+                                    retyped.emplace_back(std::move(surface));
+                                    continue;
+                                }
+                                ExPolygons rest = diff_ex(surface.expolygon, over);
+                                Surface templ(surface);
+                                templ.surface_type = stBottomOverSupport;
+                                surfaces_append(retyped, std::move(over), templ);
+                                if (! rest.empty())
+                                    surfaces_append(retyped, std::move(rest), surface);
+                            }
+                            bottom = std::move(retyped);
+                        }
                     }
 
                     // now, if the object contained a thin membrane, we could have overlapping bottom
@@ -1827,7 +1925,7 @@ void PrintObject::discover_vertical_shells()
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, num_layers, grain_size),
             [this, &cache_top_botom_regions](const tbb::blocked_range<size_t>& range) {
-                const std::initializer_list<SurfaceType> surfaces_bottom { stBottom, stBottomBridge };
+                const std::initializer_list<SurfaceType> surfaces_bottom { stBottom, stBottomBridge, stBottomOverSupport };
                 const size_t num_regions = this->num_printing_regions();
                 for (size_t idx_layer = range.begin(); idx_layer < range.end(); ++ idx_layer) {
                     m_print->throw_if_canceled();
@@ -1905,7 +2003,7 @@ void PrintObject::discover_vertical_shells()
             tbb::parallel_for(
                 tbb::blocked_range<size_t>(0, num_layers, grain_size),
                 [this, region_id, &cache_top_botom_regions](const tbb::blocked_range<size_t>& range) {
-                    const std::initializer_list<SurfaceType> surfaces_bottom { stBottom, stBottomBridge };
+                    const std::initializer_list<SurfaceType> surfaces_bottom { stBottom, stBottomBridge, stBottomOverSupport };
                     for (size_t idx_layer = range.begin(); idx_layer < range.end(); ++ idx_layer) {
                         m_print->throw_if_canceled();
                         Layer       &layer                = *m_layers[idx_layer];
@@ -2207,7 +2305,7 @@ void PrintObject::discover_vertical_shells()
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
 
                     // Assign resulting internal surfaces to layer.
-                    layerm->fill_surfaces.keep_types({ stTop, stBottom, stBottomBridge });
+                    layerm->fill_surfaces.keep_types({ stTop, stBottom, stBottomBridge, stBottomOverSupport });
                     layerm->fill_surfaces.append(new_internal,       stInternal);
                     layerm->fill_surfaces.append(new_internal_void,  stInternalVoid);
                     layerm->fill_surfaces.append(new_internal_solid, stInternalSolid);
@@ -4312,9 +4410,14 @@ void PrintObject::discover_horizontal_shells()
 
             coordf_t print_z  = layer->print_z;
             coordf_t bottom_z = layer->bottom_z();
-            for (size_t idx_surface_type = 0; idx_surface_type < 3; ++ idx_surface_type) {
+            // Ultra (over-support surfaces): a 4th type to propagate downwards, and only when the
+            // feature is on - so with the switch off this loop runs exactly the three iterations
+            // it always ran.
+            const size_t num_surface_types = m_config.over_support_surfaces.value ? 4 : 3;
+            for (size_t idx_surface_type = 0; idx_surface_type < num_surface_types; ++ idx_surface_type) {
                 m_print->throw_if_canceled();
-                SurfaceType type = (idx_surface_type == 0) ? stTop : (idx_surface_type == 1) ? stBottom : stBottomBridge;
+                SurfaceType type = (idx_surface_type == 0) ? stTop : (idx_surface_type == 1) ? stBottom :
+                                   (idx_surface_type == 2) ? stBottomBridge : stBottomOverSupport;
                 int num_solid_layers = (type == stTop) ? region_config.top_shell_layers.value : region_config.bottom_shell_layers.value;
                 if (num_solid_layers == 0)
                 	continue;
@@ -4470,7 +4573,7 @@ void PrintObject::discover_horizontal_shells()
                     neighbor_layerm->fill_surfaces.append(internal, stInternal);
                     polygons_append(polygons_internal, to_polygons(std::move(internal)));
                     // assign top and bottom surfaces to layer
-                    backup.keep_types({ stTop, stBottom, stBottomBridge });
+                    backup.keep_types({ stTop, stBottom, stBottomBridge, stBottomOverSupport });
                     std::vector<SurfacesPtr> top_bottom_groups;
                     backup.group(&top_bottom_groups);
                     for (SurfacesPtr &group : top_bottom_groups)
