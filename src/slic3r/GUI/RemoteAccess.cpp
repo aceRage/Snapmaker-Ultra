@@ -1,6 +1,7 @@
 #include "RemoteAccess.hpp"
 
 #include "DeviceManager.hpp"
+#include "GcodeArchive.hpp"
 #include "GLCanvas3D.hpp"
 #include "GLToolbar.hpp"
 #include "GUI_App.hpp"
@@ -1072,6 +1073,54 @@ RemoteAccess::ApiResponse RemoteAccess::api_jobs(int id)
     return r;
 }
 
+// ------------------------------------------------------- the G-code archive ----
+
+// Every file this PC has sent to a printer while the archive was on (Preferences > Ultra >
+// G-Code Archive), newest first. The sidecar is handed out as it is, minus this PC's own paths:
+// the phone gets an id and a file name, never a place on the disk. Stage 2 (Reprints) sends one
+// of these back to a printer; nothing here starts a print.
+RemoteAccess::ApiResponse RemoteAccess::api_archive(const std::string& printer)
+{
+    ApiResponse    r;
+    nlohmann::json j;
+    j["enabled"] = GcodeArchive::enabled();
+    j["max"]     = GcodeArchive::max_records();
+    j["records"] = nlohmann::json::array();
+    for (const GcodeArchive::Record& rec : GcodeArchive::list(printer)) {
+        nlohmann::json o = rec.json;
+        o.erase("path"); // a sidecar never holds one, but never hand one out either
+        o.erase("project_path");
+        o["has_thumbnail"] = rec.has_thumbnail;
+        j["records"].push_back(o);
+    }
+    r.body = j.dump();
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_archive_thumbnail(const std::string& id)
+{
+    ApiResponse                r;
+    const GcodeArchive::Record rec = GcodeArchive::find(id);
+    if (rec.id.empty() || !rec.has_thumbnail) { r.status = 404; r.body = json_error("no thumbnail for this record"); return r; }
+    boost::nowide::ifstream f(rec.thumbnail_path.c_str(), std::ios::binary);
+    if (!f) { r.status = 404; r.body = json_error("no thumbnail for this record"); return r; }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    r.type = "image/png";
+    r.body = ss.str();
+    return r;
+}
+
+RemoteAccess::ApiResponse RemoteAccess::api_archive_delete(const std::string& id)
+{
+    ApiResponse r;
+    if (!GcodeArchive::remove(id)) { r.status = 404; r.body = json_error("no such record"); return r; }
+    nlohmann::json j;
+    j["deleted"] = id;
+    r.body       = j.dump();
+    return r;
+}
+
 // Send the sliced plate to a printer the way the desktop's Print / Send dialogs would, without
 // showing them (RemoteSend). Form: printer=<id>&mode=upload|print[&confirm=1][&force=1][&dry_run=1]
 // [&bed_leveling=&flow_cali=&timelapse=&vibration_cali=&use_ams=][&name=]. Returns a job id; the
@@ -2028,7 +2077,10 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
             { {"method", "GET"},  {"path", "/api/settings/process"},       {"description", "the Process tab: pages > groups > lines > options with definition, current and saved values, dirty flags, app mode"} },
             { {"method", "POST"}, {"path", "/api/settings/process"},       {"description", "form body key=value[&key=value…] (serialized option values); applies like typing into the tab, returns preset/dirty state"} },
             { {"method", "POST"}, {"path", "/api/settings/process/revert"}, {"description", "reset all settings to the last saved preset"} },
-            { {"method", "POST"}, {"path", "/api/settings/process/save"},  {"description", "save modifications under the same name (system presets save to '<name> - Custom')"} }
+            { {"method", "POST"}, {"path", "/api/settings/process/save"},  {"description", "save modifications under the same name (system presets save to '<name> - Custom')"} },
+            { {"method", "GET"},  {"path", "/api/archive[?printer={id}]"}, {"description", "the G-code archive (Preferences > Ultra > Store G-Code Files): every file this PC has sent to a printer while it was on, newest first, as {enabled, max, records}. Each record is {id, time, file, sent_name, size, sha256, printer {id, kind bambu|snapmaker|printhost|connect, name, model}, plate, plate_name, project_title, filaments [{index, type, colour, grams}], estimated_time_s, estimated_weight_g, source desktop|phone, mode upload|print, has_thumbnail} - names and sizes only, never a path on the PC. `printer` filters by the printer id a send used"} },
+            { {"method", "GET"},  {"path", "/api/archive/{id}/thumbnail.png"}, {"description", "the plate preview stored with that record"} },
+            { {"method", "DELETE"}, {"path", "/api/archive/{id}"},        {"description", "delete one stored file with its details and preview"} }
         });
         r.body = j.dump();
         return r;
@@ -2139,6 +2191,18 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
         return api_jobs(-1);
     if (path.compare(0, 6, "/jobs/") == 0 && method == "GET")
         return api_jobs(num(path.substr(6), -1));
+    // The G-code archive. The id is a name this PC made (letters, digits, . - _), so it needs no
+    // decoding; GcodeArchive checks it against that alphabet again before touching the folder.
+    if (path == "/archive" && method == "GET")
+        return api_archive(query_param(query, "printer"));
+    if (path.compare(0, 9, "/archive/") == 0) {
+        const std::string rest  = path.substr(9);
+        const size_t      slash = rest.find('/');
+        if (slash == std::string::npos && method == "DELETE")
+            return api_archive_delete(rest);
+        if (slash != std::string::npos && rest.substr(slash) == "/thumbnail.png" && method == "GET")
+            return api_archive_thumbnail(rest.substr(0, slash));
+    }
     r.status = 404;
     r.body   = json_error("no such route; see /api");
     return r;

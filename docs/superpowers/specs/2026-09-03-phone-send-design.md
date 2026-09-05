@@ -543,3 +543,125 @@ material (type and sub type) or *empty* in italics for a toolhead with nothing i
 colour-matched default is the selected chip, an empty toolhead that is chosen is outlined in the
 warning colour, and the material / empty warnings under the row are as they were. The mapping sent
 is unchanged (`mapping=0:2,1:1,…`).
+
+## 10. The G-code archive (stage 1, 2026-09-04)
+
+Every file this PC uploads to a printer can be kept, with a note of which printer it went to, so
+the phone's *Reprints* tab (stage 2) can send it again without the project being open on the PC.
+Off by default: it copies whole G-code files onto the disk.
+
+### 10.1 The settings
+
+Three keys in `AppConfig` (`src/libslic3r/AppConfig.cpp`, next to the other Ultra defaults), shown
+on **Preferences > Ultra > G-Code Archive**:
+
+| key | default | control |
+| --- | --- | --- |
+| `ultra_gcode_archive` | `false` | checkbox **Store G-Code Files** |
+| `ultra_gcode_archive_dir` | `<datadir>/gcode_archive` | **Storage folder** row: the path, then a **Browse** button (`wxDirDialog`) |
+| `ultra_gcode_archive_max` | `100` | **Maximum Retention** field, digits only, clamped to 1..10000 when the field is left |
+
+The folder row and the retention field are disabled while the checkbox is off, the way the backup
+and auto-save intervals already follow their own switches (`PreferencesDialog::create_item_checkbox`
+holds the same `if (param == ...)` block for all three). The folder is created the first time a
+file is stored, not when it is picked, so a path on a drive that is not plugged in yet is fine.
+
+### 10.2 The module
+
+`src/slic3r/GUI/GcodeArchive.{hpp,cpp}` - GUI-side, called from every send path, desktop and phone:
+
+- `Meta meta_for_plate(plate, mode)` reads the plater and the presets. It marshals to the GUI
+  thread itself, so a hook on a worker thread may call it.
+- `Record archive(sent_file_path, meta)` copies **the exact file that was uploaded** into the
+  archive folder under a collision-free name, writes the sidecar and then trims the folder.
+- `std::vector<Record> list(printer_id_filter = "")` reads the sidecars, newest first.
+- `Record find(id)` / `bool remove(id)` for one record.
+
+Rules it keeps:
+
+- **Archiving never fails a send.** Every entry point catches everything and logs; a caller sees an
+  empty record and carries on.
+- **Atomic writes.** The sidecar and the thumbnail go to `<name>.part` and are renamed; a reader
+  never sees half a file. The G-code copy uses `copy_file(..., fail_if_exists)`, and if the sidecar
+  cannot be written the copy is removed again, so there is never an orphan file.
+- **Several instances share one folder.** The id is `<timestamp>_<printer>_<name>` and, if that is
+  taken, `-<pid>-<n>`; the id is claimed by `copy_file` failing on an existing name, so two slicers
+  writing at the same moment cannot collide. A process-wide mutex only keeps this instance's own
+  threads out of the retention pass.
+- **Names are narrow on purpose.** Ids and file names hold letters, digits, `.`, `-` and `_` only,
+  so an id is safe as a Windows file name, as a URL path segment and against the hub's allow-list
+  pattern whatever the project was called. The name the printer was really given is kept in the
+  sidecar as `sent_name`.
+
+### 10.3 The sidecar
+
+`<id>.json` next to `<id><ext>` (and `<id>.png` when a plate thumbnail was available):
+
+```json
+{
+  "id": "20260904-131502_Mock_U1_plate_1",
+  "time": 1788000902,
+  "file": "20260904-131502_Mock_U1_plate_1.gcode",
+  "sent_name": "my project_plate_1.gcode",
+  "size": 184320,
+  "sha256": "9f86d0...",
+  "has_thumbnail": true,
+  "printer": { "id": "sm:abc", "kind": "snapmaker", "name": "Mock U1", "model": "Snapmaker U1" },
+  "plate": 0,
+  "plate_name": "",
+  "project_title": "my project",
+  "project_path": "C:\Users\...\my project.3mf",
+  "filaments": [ { "index": 0, "type": "PLA", "colour": "#00AE42", "grams": 4.2 } ],
+  "estimated_time_s": 1834,
+  "estimated_weight_g": 4.2,
+  "source": "desktop",
+  "mode": "upload"
+}
+```
+
+`kind` is `bambu | snapmaker | printhost | connect` - the same words `/api/printers` uses, and `id`
+is the id a send takes, so stage 2 can post the record straight back at a printer.
+`estimated_time_s` / `estimated_weight_g` / `filaments` are present when the plate's slice result
+had them. `project_path` is the only field the API strips before answering a phone.
+
+### 10.4 The hooks
+
+One call each, after the transfer has succeeded and before anything deletes the source:
+
+| path | file | what is archived |
+| --- | --- | --- |
+| phone / agent send | `RemoteSend.cpp` `run_bambu`, `run_host`, `run_snapmaker` | the file that branch uploaded; `prepare()` filled `Prepared::archive_meta` on the GUI thread |
+| desktop Bambu print | `Jobs/PrintJob.cpp`, at `send ok` | `params.filename`, the gcode 3mf |
+| desktop Bambu send | `Jobs/SendJob.cpp`, at `send ok` | the same |
+| desktop print host | `Utils/PrintHost.cpp` `perform_job`, on success | `upload_data.source_path`, read **before** `upload()` moves the data: the queue deletes that temporary file as soon as the job returns |
+| desktop Snapmaker (U1) | `SSWCP.cpp` `sw_FinishPreprint`, `status == "success"` | `SSWCP::get_active_filename()`, the plate G-code the preprint page just handed to the printer |
+
+A dry run archives nothing.
+
+### 10.5 The routes
+
+On the instance API (and so, through the hub, at `/r/<token>/i/<pid>/api/...`):
+
+| route | answer |
+| --- | --- |
+| `GET /api/archive[?printer={id}]` | `{enabled, max, records: [...]}`, newest first; each record is its sidecar without `project_path` |
+| `GET /api/archive/{id}/thumbnail.png` | the plate preview stored with that record |
+| `DELETE /api/archive/{id}` | removes the file, the sidecar and the thumbnail |
+
+All three are in the manifest **and** in `instance_api_allowed` (`RemoteHub.cpp`), the pair
+`test_hardening.py` enforces. `DELETE` reaches the allow-list now (it was rejected outright before);
+every other route still answers `GET`/`POST` alone, so `DELETE /api/info` stays unproxied. The id
+segment is checked against the archive's own alphabet in the hub *and* again in `GcodeArchive`
+before a path is built.
+
+Reprinting is **stage 2** and is deliberately not built: no route sends a stored file anywhere. The
+sidecar carries what such a send would need (the printer id and kind, the plate, the filaments).
+
+### 10.6 Verified
+
+`snorca_hubtest	est_gcode_archive.py` against a hidden instance on a copy of `dd_lan`, with
+`mock_printhost.py` standing in for a U1 and `mock_moonraker.py` for a print host: the archived
+bytes are the bytes the mock received, the sidecar fields are right, `GET /api/archive` lists them
+with the printer identity and no local path, the thumbnail and `DELETE` routes work, retention
+drops the oldest when `ultra_gcode_archive_max` is 2 and three files are sent, the manifest and the
+allow-list agree, and nothing is stored while the checkbox is off.

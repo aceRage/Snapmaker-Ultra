@@ -2219,8 +2219,10 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
 // door and is not in the manifest either. test_hardening.py compares the two and fails on drift.
 static bool instance_api_allowed(const std::string& method, const std::string& sub)
 {
-    const bool get = method == "GET", post = method == "POST";
-    if (!get && !post) return false;
+    const bool get = method == "GET", post = method == "POST", del = method == "DELETE";
+    // DELETE is only ever the G-code archive's; every other route below answers get/post alone, so
+    // a DELETE at one of them still falls through to false.
+    if (!get && !post && !del) return false;
     auto is_index = [](const std::string& s) {
         return !s.empty() && s.size() <= 9 && s.find_first_not_of("0123456789") == std::string::npos;
     };
@@ -2250,6 +2252,19 @@ static bool instance_api_allowed(const std::string& method, const std::string& s
         return id.find("%2f") == std::string::npos && id.find("%2F") == std::string::npos;
     }
 
+    // /api/archive/<id> (DELETE) and /api/archive/<id>/thumbnail.png. The id is a name the archive
+    // itself made: letters, digits, dot, dash and underscore, one segment, nothing to decode.
+    if (sub.compare(0, 13, "/api/archive/") == 0) {
+        const std::string rest  = sub.substr(13);
+        const size_t      slash = rest.find('/');
+        const std::string id    = slash == std::string::npos ? rest : rest.substr(0, slash);
+        if (id.empty() || id.size() > 200) return false;
+        if (id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != std::string::npos) return false;
+        if (id == "." || id == "..") return false;
+        if (slash == std::string::npos) return del;
+        return get && rest.substr(slash) == "/thumbnail.png";
+    }
+
     if (sub == "/api" || sub == "/api/")             return get;
     if (sub == "/api/info")                          return get;
     if (sub == "/api/window")                        return get || post;
@@ -2274,6 +2289,7 @@ static bool instance_api_allowed(const std::string& method, const std::string& s
     if (sub == "/api/settings/process")              return get || post;
     if (sub == "/api/settings/process/revert")       return post;
     if (sub == "/api/settings/process/save")         return post;
+    if (sub == "/api/archive")                       return get;
     return false;
 }
 
