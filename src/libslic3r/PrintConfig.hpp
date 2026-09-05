@@ -1013,6 +1013,14 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionEnum<InfillPattern>, support_ironing_pattern))
     ((ConfigOptionPercent,             support_ironing_flow))
     ((ConfigOptionFloat,               support_ironing_spacing))
+    // Ultra (over-support surfaces): bottom surfaces that land on support with a non-zero top Z
+    // distance are classified stBottomOverSupport instead of stBottomBridge and printed with
+    // these, not with the bridge settings. Object-level on purpose, so a part-level support
+    // group can carry them later (Stage 5 of the support-sets plan).
+    // docs/superpowers/specs/2026-09-05-over-support-surfaces.md
+    ((ConfigOptionBool,                over_support_surfaces))
+    ((ConfigOptionFloat,               over_support_flow))
+    ((ConfigOptionFloat,               over_support_speed))
     ((ConfigOptionFloat,               xy_hole_compensation))
     ((ConfigOptionFloat,               xy_contour_compensation))
     ((ConfigOptionBool,                flush_into_objects))

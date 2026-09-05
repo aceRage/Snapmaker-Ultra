@@ -6423,6 +6423,47 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.1));
 
+    // Ultra (over-support surfaces). Category "Support" on purpose: that is what puts the three
+    // keys on the process tab's Support page AND makes them join support_set_keys(), which is
+    // derived from "every PrintObjectConfig key whose category is Support".
+    // docs/superpowers/specs/2026-09-05-over-support-surfaces.md
+    def = this->add("over_support_surfaces", coBool);
+    def->label = L("Over-support surfaces");
+    def->category = L("Support");
+    def->tooltip = L("Print the object's bottom surfaces that rest on support material with their own flow and speed "
+                     "instead of the bridge settings.\n\n"
+                     "With a top Z distance above 0 those surfaces are treated as bridges today, so they take Bridge flow ratio, "
+                     "Bridge speed, bridge density and Thick bridges - the same settings as a real unsupported span. They are not "
+                     "unsupported though, they are lying on the support interface, and they are usually the most visible faces of "
+                     "the print. Turn this on to print them like a bottom shell instead: the normal bottom surface pattern and "
+                     "density, no thick bridges, with Over-support flow and Over-support speed. True bridges over air are not "
+                     "affected.\n\n"
+                     "The affected surfaces show up as \"Bottom surface over support\" in the preview's feature type view.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("over_support_flow", coFloat);
+    def->label = L("Over-support flow");
+    def->category = L("Support");
+    def->tooltip = L("Flow ratio for bottom surfaces that rest on support material, when \"Over-support surfaces\" is on.\n\n"
+                     "1 means the normal flow for a solid layer of this height. Lower it a little if the surface over the support "
+                     "comes out rough or over-extruded; it replaces Bridge flow ratio for these surfaces.");
+    def->min = 0;
+    def->max = 2;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1));
+
+    def = this->add("over_support_speed", coFloat);
+    def->label = L("Over-support speed");
+    def->category = L("Support");
+    def->tooltip = L("Print speed for bottom surfaces that rest on support material, when \"Over-support surfaces\" is on.\n\n"
+                     "0 means follow the outer wall speed of the same layer, so the surface matches the walls around it - which is "
+                     "the point of the feature. Any other value is used as it is. It replaces Bridge speed for these surfaces.");
+    def->sidetext = "mm/s";
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
     def = this->add("activate_chamber_temp_control",coBools);
     def->label = L("Activate temperature control");
     def->tooltip = L("Enable this option for automated chamber temperature control. "
@@ -8136,6 +8177,12 @@ const std::vector<std::string>& part_support_keys()
         "support_ironing_pattern",
         "support_ironing_flow",
         "support_ironing_spacing",
+        // Ultra (over-support surfaces): eligible for a support set / group, object-wide in
+        // behaviour until Stage 5 of the support-sets plan wires the per-part path.
+        // docs/superpowers/specs/2026-09-05-over-support-surfaces.md
+        "over_support_surfaces",
+        "over_support_flow",
+        "over_support_speed",
         // Tier B - stored and resolved, object-wide in behaviour for now.
         "support_top_z_distance",
         "support_style",
