@@ -7,6 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "GcodeArchive.hpp"
 #include "SnapmakerLan.hpp"
 #include "slic3r/Utils/PrintHost.hpp"
 #include "slic3r/Utils/bambu_networking.hpp"
@@ -62,6 +63,9 @@ struct Prepared
     std::vector<SnapmakerLan::FileFilament> file_filaments;
     std::vector<int>                        mapping;      // toolhead per file filament, -1 = unused
     std::vector<SnapmakerLan::Toolhead>     toolheads;
+    // Ultra: what the G-code archive records about this send, gathered on the GUI thread by
+    // prepare() so run() only has to copy the file it uploaded.
+    GcodeArchive::Meta archive_meta;
 };
 
 struct Sink

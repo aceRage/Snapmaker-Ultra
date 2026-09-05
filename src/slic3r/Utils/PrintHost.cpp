@@ -24,6 +24,7 @@
 #include "CrealityPrint.hpp"
 #include "../GUI/PrintHostDialogs.hpp"
 #include "../GUI/MainFrame.hpp"
+#include "../GUI/GcodeArchive.hpp"
 #include "Obico.hpp"
 #include "Flashforge.hpp"
 #include "SimplyPrint.hpp"
@@ -323,6 +324,14 @@ void PrintHostJobQueue::priv::perform_job(PrintHostJob the_job)
 {
     emit_progress(0);   // Indicate the upload is starting
 
+    // Ultra: what went where, read before upload() takes the data - the queue deletes the temporary
+    // source file as soon as this returns, so the archive copy has to happen here.
+    const std::string archive_source = the_job.upload_data.source_path.string();
+    const std::string archive_name   = the_job.upload_data.upload_path.string();
+    const bool        archive_print  = the_job.upload_data.post_action == PrintHostPostUploadAction::StartPrint;
+    const std::string host_name      = the_job.printhost->get_name();
+    const std::string host_url       = the_job.printhost->get_host();
+
     bool success = the_job.printhost->upload(std::move(the_job.upload_data),
         [this](Http::Progress progress, bool &cancel)   { this->progress_fn(std::move(progress), cancel); },
         [this](wxString error)                          { this->error_fn(std::move(error)); },
@@ -331,6 +340,16 @@ void PrintHostJobQueue::priv::perform_job(PrintHostJob the_job)
 
     if (success) {
         emit_progress(100);
+        // Ultra: keep a copy of the file the print host received (Preferences > Ultra > G-Code
+        // Archive). Archiving never fails an upload.
+        if (GUI::GcodeArchive::enabled()) {
+            GUI::GcodeArchive::Meta am = GUI::GcodeArchive::meta_for_plate(-1, archive_print ? "print" : "upload");
+            am.printer_id   = "host";
+            am.printer_kind = "printhost";
+            am.printer_name = host_name + " " + host_url;
+            am.file_name    = archive_name;
+            GUI::GcodeArchive::archive(archive_source, am);
+        }
         if (the_job.switch_to_device_tab) {
             const auto mainframe = GUI::wxGetApp().mainframe;
             mainframe->request_select_tab(MainFrame::TabPosition::tpMonitor);
