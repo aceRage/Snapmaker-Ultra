@@ -88,7 +88,8 @@ struct SupportGroupToolpaths {
 
 // Ultra (support groups): the object layer a SHARED contact layer sits against. The contact
 // generators do set idx_object_layer_above / _below, but merge_contact_layers keeps only the
-// surviving layer's index, so fall back to the nearest object layer print_z. Returns size_t(-1)
+// surviving layer's index, and the organic tree's roof layers never had one, so fall back to
+// support_group_object_layer_index_at() in the direction `use_above` names. Returns size_t(-1)
 // only when there are no object layers at all.
 size_t support_group_object_layer_index(const SupportGeneratorLayer &layer, bool use_above,
                                         const std::vector<coordf_t> &object_layer_zs);
@@ -99,6 +100,48 @@ size_t support_group_object_layer_index(const SupportGeneratorLayer &layer, bool
 // gives group 0 everything, which is the conservative direction: geometry is never dropped.
 Polygons support_group_piece(const Polygons &src, const std::vector<Polygons> *claim,
                              size_t idx_object_layer, size_t g);
+
+// Ultra (support groups, Stage 4): the object layer a support surface at `z` belongs to. `above`
+// picks the direction: a TOP contact or a roof sits BELOW the object layer it supports, so it wants
+// the first object layer at or above z; a BOTTOM contact or a support floor rests ON the object, so
+// it wants the last one at or below. The direction is not cosmetic - a part floating above the bed
+// has an EMPTY footprint at the layers its own roof is printed at, so rounding the wrong way hands
+// that roof to the default group and the group silently stops acting. The classic tree generator
+// owns no SupportGeneratorLayer at all - its roof lives on SupportLayer::roof_areas - so it needs
+// this on its own.
+size_t support_group_object_layer_index_at(coordf_t z, const std::vector<coordf_t> &object_layer_zs, bool above);
+
+// Ultra (support groups): the object's layer print_z values, the index space every claim is in.
+std::vector<coordf_t> object_layer_print_zs(const PrintObject &object);
+
+// Ultra (support groups, plan Stage 3 3.5): the config the SHARED SupportParameters is built from -
+// the object's own, with the interface layer counts raised to the max over all groups. See the
+// implementation for why the max, and note that it equals the object's own config whenever there is
+// a single group, which is what keeps the off-mode output where it is.
+// Stage 4 moved this here verbatim from SupportMaterial.cpp: the organic-tree generator needs the
+// same three helpers, and one copy is the only way they can stay the same.
+PrintObjectConfig support_shared_config(const PrintObject &object,
+                                        const std::vector<PrintObject::SupportGroup> &groups);
+
+// Ultra (support groups, plan Stage 3 3.5 / R3.1): fill the groups' masks and turn them into
+// DISJOINT per-object-layer claims. Returns an EMPTY vector when there is a single group - the
+// off-mode path then pays nothing at all, not one extra mesh slice and not one boolean.
+// `shared_params` supplies the reach: how far a contact layer may sit outside the outline of the
+// part it supports. See the implementation for the measured numbers behind it.
+std::vector<std::vector<Polygons>> support_group_claims(const PrintObject &object,
+                                                        std::vector<PrintObject::SupportGroup> &groups,
+                                                        const SupportParameters &shared_params);
+
+// Ultra (support groups, plan Stage 3 3.5): a sibling of every layer in `contacts` holding only the
+// part of it group `g` owns. The clones are input to generate_interface_layers and are NEVER added
+// to the layer graph, so generate_support_layers' assert(num_top_contacts <= 1) is untouched.
+SupportGeneratorLayersPtr clone_contacts_masked(
+    const SupportGeneratorLayersPtr &contacts,
+    size_t                           g,
+    const std::vector<Polygons>     &claim,
+    const std::vector<coordf_t>     &object_layer_zs,
+    SupportGeneratorLayerStorage    &layer_storage,
+    bool                             use_above);
 
 // Produce the support G-code.
 // Used by both classic and tree supports.
