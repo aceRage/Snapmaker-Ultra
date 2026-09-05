@@ -322,6 +322,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/MsgDialog.hpp
     GUI/SupportGroupsDialog.cpp
     GUI/SupportGroupsDialog.hpp
+    GUI/SupportSetEditDialog.cpp
+    GUI/SupportSetEditDialog.hpp
     GUI/MultiMachine.cpp
     GUI/MultiMachine.hpp
     GUI/MultiMachineManagerPage.cpp
