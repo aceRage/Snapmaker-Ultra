@@ -11,6 +11,9 @@
 #include "OptionsGroup.hpp"
 #include "Widgets/Button.hpp"
 #include "Widgets/ComboBox.hpp"
+#include "Widgets/Label.hpp"
+#include "Widgets/StateColor.hpp"
+#include "Widgets/StaticLine.hpp"
 #include "format.hpp"
 
 namespace Slic3r {
@@ -48,10 +51,35 @@ static const std::vector<std::string>& keys_advanced()
     return s_keys;
 }
 
+// The groups draw themselves the way the process tab's groups do - the OG_CustomCtrl path,
+// which ConfigOptionsGroup only takes when is_tab_opt is true: a Head_14 caption over a rule,
+// Body_14 labels with no trailing colon, painted straight onto the window's own background
+// rather than a static box's lighter one.
+//
+// That flag has one side effect this window must not have. ConfigOptionsGroup::get_option()
+// then registers every key with the settings searcher under THIS group's title, overwriting
+// the entries the real Support page put there and changing what the search box says about
+// them. So the lines are appended here instead: the same Option, and the same opt-map entry
+// the group needs in order to write an edited value back into the config, without the
+// searcher call.
+class SetEditorOptionsGroup : public ConfigOptionsGroup
+{
+public:
+    SetEditorOptionsGroup(wxWindow *parent, const wxString &title, DynamicPrintConfig *config)
+        : ConfigOptionsGroup(parent, title, wxEmptyString, config, true /* is_tab_opt */)
+    {}
+
+    void append_set_option_line(const std::string &opt_key)
+    {
+        m_opt_map.emplace(opt_key, std::make_pair(opt_key, -1));
+        append_single_option_line(Option(*print_config_def.get(opt_key), opt_key));
+    }
+};
+
 SupportSetEditDialog::SupportSetEditDialog(wxWindow                 *parent,
                                            const SupportSet         &set,
                                            const DynamicPrintConfig &filament_config)
-    : wxDialog(parent, wxID_ANY, format_wxstr(_L("Edit support set - %1%"), from_u8(set.name)),
+    : wxDialog(parent, wxID_ANY, format_wxstr(_L("Edit Support Set - %1%"), from_u8(set.name)),
                wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
     , m_set(set)
     , m_filament_config(filament_config)
@@ -77,6 +105,7 @@ SupportSetEditDialog::SupportSetEditDialog(wxWindow                 *parent,
         _L("These values belong to the support set. Changing them here does not change the "
            "current project - use Apply on the Support page, or Re-apply set in the Support "
            "groups window, to put them to work."));
+    head->SetFont(Label::Body_14);
     head->Wrap(52 * em);
     main->Add(head, 0, wxEXPAND | wxALL, em / 2);
 
@@ -88,14 +117,14 @@ SupportSetEditDialog::SupportSetEditDialog(wxWindow                 *parent,
     wxBoxSizer* buttons = new wxBoxSizer(wxHORIZONTAL);
     buttons->AddStretchSpacer();
     Button* save = new Button(this, _L("Save"));
-    save->SetStyle(ButtonStyle::Confirm, ButtonType::Compact);
+    save->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
     save->SetToolTip(_L("Write these values back to this support set"));
     save->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
         collect();
         EndModal(wxID_OK);
     });
     Button* cancel = new Button(this, _L("Cancel"));
-    cancel->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+    cancel->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
     cancel->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { EndModal(wxID_CANCEL); });
     buttons->Add(save, 0, wxRIGHT, em / 2);
     buttons->Add(cancel, 0);
@@ -111,32 +140,54 @@ SupportSetEditDialog::SupportSetEditDialog(wxWindow                 *parent,
 
 void SupportSetEditDialog::add_group(wxSizer *parent_sizer, const wxString &title, const std::vector<std::string> &keys)
 {
-    // is_tab_opt = false, so the group draws itself in a static box with its title - the same
-    // shape PhysicalPrinterDialog's option group has, and it keeps the tab's searcher out of it.
-    auto og = std::make_shared<ConfigOptionsGroup>(this, title, &m_config);
+    // See SetEditorOptionsGroup above: the process tab's own group drawing, minus the searcher.
+    auto og = std::make_shared<SetEditorOptionsGroup>(this, title, &m_config);
     og->m_on_change = [this](t_config_option_key opt_key, boost::any) {
         if (opt_key == "support_ironing")
             toggle_fields();
     };
     for (const std::string& key : keys)
         if (m_config.has(key))
-            og->append_single_option_line(key);
+            og->append_set_option_line(key);
     og->activate();
+    // Both of these are what Tab::Page::activate() does after activate(), and the custom
+    // control needs them: update_visibility() is the only thing that gives it a minimum size
+    // (without it the group collapses to nothing), and reload_config() is what puts the set's
+    // values into the fields - a freshly built field shows the option's default until then.
+    // comDevelop, not the app's mode: a set carries all fourteen keys whatever mode the
+    // window behind this one is in, so every one of them stays on the window.
+    og->update_visibility(comDevelop);
+    og->reload_config();
     m_groups.push_back(og);
-    parent_sizer->Add(og->sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, wxGetApp().em_unit() / 2);
+    parent_sizer->Add(og->sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, wxGetApp().em_unit() / 2);
 }
 
 void SupportSetEditDialog::add_interface_filament_row(wxSizer *parent_sizer)
 {
     const int em = wxGetApp().em_unit();
 
-    wxStaticBoxSizer* box = new wxStaticBoxSizer(wxVERTICAL, this, _L("Filament"));
-    wxBoxSizer*       row = new wxBoxSizer(wxHORIZONTAL);
+    // The caption the option groups get, built by hand because this row is not an option group:
+    // same widget, same font, same colour as OptionsGroup::activate() gives the others.
+    ::StaticLine* caption = new ::StaticLine(this, false, _L("Filament"));
+    caption->SetFont(Label::Head_14);
+    caption->SetForegroundColour("#363636"); // StaticLine maps it for dark mode when it paints
+    parent_sizer->Add(caption, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, em / 2);
+    parent_sizer->AddSpacer(8);
 
-    wxStaticText* label = new wxStaticText(box->GetStaticBox(), wxID_ANY, _L("Support/raft interface") + ":");
-    row->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, em);
+    wxBoxSizer* row = new wxBoxSizer(wxHORIZONTAL);
 
-    m_filament_combo = new ComboBox(box->GetStaticBox(), wxID_ANY, wxEmptyString, wxDefaultPosition,
+    // OG_CustomCtrl starts a row's label 2 em + 4 px in and its control one label width (20 em)
+    // plus a 0.2 em gap from the left edge. Repeating those two numbers is what lines this row
+    // up with the option rows above and below it.
+    const int label_x = 2 * em + 4;
+    const int field_x = 22 * em + em / 5;
+
+    wxStaticText* label = new wxStaticText(this, wxID_ANY, _L("Support/raft interface"));
+    label->SetFont(Label::Body_14);
+    label->SetMinSize(wxSize(field_x - label_x, -1));
+    row->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, label_x);
+
+    m_filament_combo = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition,
                                     wxSize(18 * em, -1), 0, nullptr, wxCB_READONLY);
     m_filament_combo->SetToolTip(_L("A set travels between printers, so it stores the interface filament as a "
                                     "TYPE rather than a slot number. The slot is worked out when the set is "
@@ -171,12 +222,13 @@ void SupportSetEditDialog::add_interface_filament_row(wxSizer *parent_sizer)
     });
     row->Add(m_filament_combo, 0, wxALIGN_CENTER_VERTICAL);
 
-    box->Add(row, 0, wxEXPAND | wxALL, em / 2);
+    parent_sizer->Add(row, 0, wxEXPAND);
 
-    m_filament_note = new wxStaticText(box->GetStaticBox(), wxID_ANY, wxEmptyString);
-    box->Add(m_filament_note, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, em / 2);
+    m_filament_note = new wxStaticText(this, wxID_ANY, wxEmptyString);
+    m_filament_note->SetFont(Label::Body_14);
+    parent_sizer->Add(m_filament_note, 0, wxEXPAND | wxLEFT, label_x);
+    parent_sizer->AddSpacer(em / 2);
 
-    parent_sizer->Add(box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, em / 2);
     update_filament_note();
 }
 
@@ -201,7 +253,7 @@ void SupportSetEditDialog::update_filament_note()
         text = _L("The support interface uses the same filament as the part.");
     m_filament_note->SetLabel(text);
     m_filament_note->SetForegroundColour(is_warning ? wxColour("#ED6B21")
-                                                    : wxSystemSettings::GetColour(wxSYS_COLOUR_GRAYTEXT));
+                                                    : StateColor::darkModeColorFor(wxColour("#8F8F8F")));
     m_filament_note->GetParent()->Layout();
 }
 
