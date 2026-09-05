@@ -937,11 +937,6 @@ void stop()
     if (g_fcm) g_fcm->configure("{}");
 }
 
-// The seam, with nothing behind it yet: FcmProvider lands in the next commit and ApnsProvider in
-// the one after. Everything above already copes with a provider that is not there - the hub page
-// simply reports the platform as unavailable.
-std::unique_ptr<Provider> make_apns_provider() { return nullptr; }
-
 } // namespace AppPush
 } // namespace GUI
 } // namespace Slic3r
