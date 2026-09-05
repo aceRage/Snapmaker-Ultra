@@ -10,6 +10,12 @@ namespace Slic3r {
 
 	void exitSentry();
 
+	// Ultra: mirror the "Join Customer Experience Improvement Program" preference into
+	// sentry's consent flag, which is what gates crashpad's uploads. Opting in has no
+	// effect unless the app config also names a DSN ("ultra_sentry_dsn"); local minidump
+	// capture is unaffected either way.
+	void setSentryUserConsent(bool agreed);
+
     typedef enum SENTRY_LOG_LEVEL {
         SENTRY_LOG_TRACE   = -2,
         SENTRY_LOG_DEBUG   = -1,
