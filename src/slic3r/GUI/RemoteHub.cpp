@@ -6,6 +6,7 @@
 #include "BambuCamRelay.hpp"
 #include "RemoteNotify.hpp"
 #include "WebPush.hpp"
+#include "AppPush.hpp"
 #include "libslic3r/Utils.hpp"
 #include "slic3r/Utils/Http.hpp"
 
@@ -1352,6 +1353,10 @@ void HubServer::write_hub_json()
     // Web Push lives here for the same reason and one more: the VAPID key pair *is* this hub's
     // identity to every phone that ever subscribed, so losing it would silently break all of them.
     st["webpush"] = WebPush::settings_json();
+    // The native app's device rows and the two providers' settings, for the same reason again: a
+    // hub restart must not make every paired phone re-register, and the .p8 path and the service
+    // account path are the person's configuration, not ours to forget.
+    st["apppush"] = AppPush::settings_json();
     write_file(settings_json_path(), st.dump(2));
     update_notify_link();
 }
@@ -2185,6 +2190,37 @@ void HubServer::handle_hub(tcp::socket& client, Request& r)
         if (!read_small_body(client, r, body, 64 * 1024)) { respond_json(client, 413, json_error("that is too large")); return; }
         const auto res = WebPush::debug_op(body);
         respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/apppush" && r.method == "GET") {
+        // The devices the native app registered, each masked to its platform, label and the last
+        // four of its token - plus whether each provider could send right now and, when it could
+        // not, why in a sentence. The .p8 and the service account appear here only as "has_key".
+        respond_json(client, 200, AppPush::masked_json().dump());
+    } else if (r.path == "/hub/apppush" && r.method == "DELETE") {
+        const auto res = AppPush::remove(query_param(r.query, "id"));
+        if (res.first == 200) write_hub_json();
+        respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/apppush/options" && r.method == "POST") {
+        if (r.content_type.compare(0, 16, "application/json") != 0) { respond_json(client, 415, json_error("Content-Type must be application/json")); return; }
+        std::string body;
+        // Larger than the Web Push options cap because a pasted .p8 or service-account JSON can
+        // legitimately be a couple of kilobytes.
+        if (!read_small_body(client, r, body, 64 * 1024)) { respond_json(client, 413, json_error("that is too large")); return; }
+        const auto res = AppPush::set_options(body);
+        if (res.first == 200) write_hub_json();
+        respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/apppush/test" && r.method == "POST") {
+        // Sent on this thread to every registered device, with no retries: somebody is watching
+        // the page for the answer, and each result names the host it reached so an APNs
+        // environment mismatch is diagnosable from here rather than from a debugger.
+        const auto res = AppPush::test();
+        write_hub_json(); // a test can prune a device the platform says is gone
+        respond_json(client, res.first, res.second);
+    } else if (r.path == "/hub/apppush/debug" && r.method == "POST") {
+        // Only answers at all with SNORCA_DEBUG_ROUTES=1 (AppPush::debug_op checks).
+        std::string body;
+        if (!read_small_body(client, r, body, 64 * 1024)) { respond_json(client, 413, json_error("that is too large")); return; }
+        const auto res = AppPush::debug_op(body);
+        respond_json(client, res.first, res.second);
     } else if (r.path == "/hub/quit" && r.method == "POST") {
         respond_json(client, 200, "{\"ok\":true}");
         m_quit = true;
@@ -2382,6 +2418,30 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
         respond_json(client, res.first, res.second);
         return;
     }
+    // ---- native app push (Ultra1 phase 1) ----
+    if (rest == "/push/device" && r.method == "POST") {
+        // The app registering its APNs or FCM token and the public half of the key pair it made.
+        // Same shape and same caps as /push/subscription: this is a subscription, with a device
+        // token where a browser would have an endpoint.
+        if (r.content_type.compare(0, 16, "application/json") != 0) { respond_json(client, 415, json_error("Content-Type must be application/json")); return; }
+        std::string body;
+        if (!read_small_body(client, r, body, 16 * 1024)) { respond_json(client, 413, json_error("that is too large for a device")); return; }
+        const auto res = AppPush::register_device(body);
+        if (res.first == 200) write_hub_json();
+        respond_json(client, res.first, res.second);
+        return;
+    }
+    if (rest == "/push/device" && r.method == "DELETE") {
+        // The app unpairing. It has to name the token in full, which only that device knows, and
+        // the answer is the same either way so this cannot be used to find out whether some
+        // device token is registered here.
+        std::string body;
+        if (!read_small_body(client, r, body, 16 * 1024)) { respond_json(client, 413, json_error("that is too large")); return; }
+        const auto res = AppPush::forget_device(body);
+        write_hub_json();
+        respond_json(client, res.first, res.second);
+        return;
+    }
     // ---- hub-level API (instances, uploads) ----
     if (rest == "/api" || rest == "/api/") {
         json j;
@@ -2396,7 +2456,9 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
             { {"method", "GET"},  {"path", "/events?since={id}"},   {"description", "printer events the slicer instances reported (started / finished / failed / cancelled / paused / resumed / runout / error), newest last: {events, last_id}"} },
             { {"method", "GET"},  {"path", "/push/key"},            {"description", "the hub's VAPID public key, for PushManager.subscribe()"} },
             { {"method", "POST"}, {"path", "/push/subscription"},   {"description", "this browser's PushSubscription JSON; re-post it on every launch"} },
-            { {"method", "DELETE"}, {"path", "/push/subscription"}, {"description", "body {endpoint} - this browser unsubscribed"} }
+            { {"method", "DELETE"}, {"path", "/push/subscription"}, {"description", "body {endpoint} - this browser unsubscribed"} },
+            { {"method", "POST"}, {"path", "/push/device"},        {"description", "the native app's APNs/FCM device token plus its own p256dh/auth; re-post it on every cold launch"} },
+            { {"method", "DELETE"}, {"path", "/push/device"},      {"description", "body {platform, token} - this device unpaired"} }
         });
         respond_json(client, 200, j.dump());
         return;
@@ -2673,7 +2735,7 @@ bool HubServer::start()
     // Remote access settings live in their own file: hub.json is removed on a clean quit (it
     // is how instances find a live hub), which used to lose remote_on and the allow-list and
     // left Tailscale Serve answering 403 until remote access was switched on again.
-    json notify_saved = json::object(), webpush_saved = json::object();
+    json notify_saved = json::object(), webpush_saved = json::object(), apppush_saved = json::object();
     try {
         json j      = json::parse(read_file(settings_json_path()));
         m_remote_on = j.value("remote_on", false);
@@ -2681,6 +2743,7 @@ bool HubServer::start()
         // once must survive every hub restart.
         notify_saved = j.value("notify", json::object());
         webpush_saved = j.value("webpush", json::object());
+        apppush_saved = j.value("apppush", json::object());
         for (const auto& l : j.value("allowed_logins", json::array())) m_allowed_logins.push_back(lower(l.get<std::string>()));
         // ... and so does the phone link, for the same reason: hub.json is gone after a clean
         // quit, and a hub that came back with a new token would break every saved link. The
@@ -2701,6 +2764,7 @@ bool HubServer::start()
     // Web Push before the relay worker: RemoteNotify::deliver() asks it whether any phone is
     // subscribed before deciding there is nothing to queue.
     WebPush::start(webpush_saved); // mints the VAPID key pair the first time this data dir runs
+    AppPush::start(apppush_saved);  // reads the .p8 and the service account, if either is set
     RemoteNotify::start(notify_saved); // the relay worker; deliver() is a no-op until it has one
 
     gc_uploads(); // whatever last time left behind, before anything new lands
@@ -2731,7 +2795,7 @@ void HubServer::loop(bool idle_exit)
         flush_logs(); // the file sink buffers; keep hub.log readable while we run
         // A phone subscribed, or the sender pruned one the push service said was gone. Saving
         // from here means the sender thread never has to reach back into HubServer.
-        if (WebPush::consume_dirty()) write_hub_json();
+        if (WebPush::consume_dirty() || AppPush::consume_dirty()) write_hub_json();
         if (!idle_exit) continue;
         bool phone;
         {
@@ -2763,6 +2827,7 @@ void HubServer::shutdown()
     // WebPush first: it only sets a flag, and it is that flag which lets a push waiting out a
     // retry backoff give up, so the join below does not have to wait for it.
     WebPush::stop();
+    AppPush::stop();      // same reason: sets the flag a backoff checks, and drops the credentials
     RemoteNotify::stop(); // let an in-flight relay send finish, then join the worker
     // On Windows the kill-on-close job object takes go2rtc down with us.
     flush_logs();
