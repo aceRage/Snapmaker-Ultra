@@ -121,6 +121,10 @@ private:
     ApiResponse api_send(int plate, const std::string& form_body);
     ApiResponse api_printer_control(const std::string& printer, const std::string& form_body);
     ApiResponse api_jobs(int id);
+    // Ultra: the G-code archive (GcodeArchive). Local paths never leave the instance.
+    ApiResponse api_archive(const std::string& printer);
+    ApiResponse api_archive_thumbnail(const std::string& id);
+    ApiResponse api_archive_delete(const std::string& id);
     ApiResponse api_presets();
     ApiResponse api_select_preset(const std::string& type, const std::string& name, int index);
     ApiResponse api_filament_color(int index, const std::string& color);

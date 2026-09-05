@@ -6,6 +6,7 @@
 #include "MainFrame.hpp"
 #include "DownloadManager.hpp"
 #include "RemoteSnapmaker.hpp" // Ultra: the phone's own connect reuses this connect's credentials
+#include "GcodeArchive.hpp"    // Ultra: the desktop's Snapmaker send is archived when it finishes
 #include "Timelapse/TimelapseDownloadPopup.hpp"
 #include "nlohmann/json.hpp"
 #include "slic3r/GUI/Tab.hpp"
@@ -2782,6 +2783,19 @@ void SSWCP_MachineOption_Instance::sw_FinishPreprint()
                 if (status != "success") {
                     p_dialog->set_swtich_to_device(false);
                 }
+            }
+
+            // Ultra: the preprint page has just finished handing the plate's G-code to the printer.
+            // Keep a copy of exactly that file (Preferences > Ultra > G-Code Archive).
+            if (status == "success" && GcodeArchive::enabled()) {
+                std::shared_ptr<PrintHost> host = nullptr;
+                wxGetApp().get_connect_host(host);
+                GcodeArchive::Meta am = GcodeArchive::meta_for_plate(-1, (p_dialog && p_dialog->is_send_page()) ? "upload" : "print");
+                am.printer_id   = "connect";
+                am.printer_kind = "connect";
+                am.printer_name = host ? "Snapmaker " + host->get_host() : "Snapmaker";
+                am.file_name    = SSWCP::get_display_filename();
+                GcodeArchive::archive(SSWCP::get_active_filename(), am);
             }
 
             send_to_js();

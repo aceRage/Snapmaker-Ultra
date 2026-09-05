@@ -661,12 +661,45 @@ std::pair<int, std::string> prepare(const Request& req, std::shared_ptr<Prepared
     p->plate      = req.plate;
     p->dry_run    = req.dry_run || env_flag("SNORCA_SEND_DRYRUN");
     p->printer_id = req.printer;
-    if (req.printer.compare(0, 3, "sm:") == 0) return prepare_snapmaker(req, plate, p, out);
-    if (req.printer == "host" || req.printer == "connect") return prepare_host(req, plate, p, out);
-    return prepare_bambu(req, plate, p, out);
+    std::pair<int, std::string> rc;
+    if (req.printer.compare(0, 3, "sm:") == 0)                  rc = prepare_snapmaker(req, plate, p, out);
+    else if (req.printer == "host" || req.printer == "connect") rc = prepare_host(req, plate, p, out);
+    else                                                        rc = prepare_bambu(req, plate, p, out);
+    // Ultra: everything the G-code archive wants about this plate, read here on the GUI thread; the
+    // file name and the printer identity are what the branch above worked out. Never fails a send.
+    if (rc.first == 200 && out) {
+        try {
+            GcodeArchive::Meta m = GcodeArchive::meta_for_plate(req.plate, req.mode);
+            m.printer_id   = p->printer_id;
+            m.printer_kind = p->kind;
+            m.printer_name = p->printer_name;
+            m.source       = "phone";
+            if (p->kind == "snapmaker") {
+                m.file_name = p->lan_filename;
+            } else if (p->kind == "bambu") {
+                // The plugin uploads the gcode 3mf; project_name is the print's name, with the
+                // extension only in the upload branch.
+                m.file_name = p->params.project_name;
+                if (!boost::iends_with(m.file_name, ".3mf")) m.file_name += ".gcode.3mf";
+            } else {
+                m.file_name = p->upload.upload_path.string();
+            }
+            p->archive_meta = std::move(m);
+        } catch (...) {}
+    }
+    return rc;
 }
 
 // -------------------------------------------------------------------- run ----
+
+// Ultra: the file has reached the printer - keep a copy if the user asked for one. Archiving is a
+// side note to a send: it reports into the result and can never turn a good send into a failure.
+static void archive_sent(std::shared_ptr<Prepared> p, const std::string& path, json& result)
+{
+    if (p->dry_run || !GcodeArchive::enabled()) return;
+    const GcodeArchive::Record r = GcodeArchive::archive(path, p->archive_meta);
+    if (!r.id.empty()) result["archived"] = r.id;
+}
 
 static void run_bambu(std::shared_ptr<Prepared> p, Sink& sink)
 {
@@ -732,6 +765,7 @@ static void run_bambu(std::shared_ptr<Prepared> p, Sink& sink)
         sink.done(false, result_text(rc) + (last_error.empty() ? "" : ": " + last_error), result);
         return;
     }
+    archive_sent(p, p->params.filename, result);
     if (upload_only) { sink.done(true, "", result); return; }
 
     // The command left the PC; the printer may still refuse it (an H2-series printer that is not in
@@ -806,6 +840,7 @@ static void run_host(std::shared_ptr<Prepared> p, Sink& sink)
         [&](wxString tag, wxString status) { if (tag == "resolve") result["resolved"] = std::string(status.ToUTF8().data()); });
     if (!ok) { sink.done(false, error.empty() ? "upload failed" : error, result); return; }
     result["uploaded"] = true;
+    archive_sent(p, p->upload.source_path.string(), result);
     if (!p->two_step) { sink.done(true, "", result); return; }
 
     sink.progress(97, "starting the print");
@@ -870,6 +905,7 @@ static void run_snapmaker(std::shared_ptr<Prepared> p, Sink& sink)
         return;
     }
     result["uploaded"] = true;
+    archive_sent(p, p->upload.source_path.string(), result);
     long long size     = 0;
     if (SnapmakerLan::metadata(p->lan, p->lan_filename, size, error))
         result["size"] = size;

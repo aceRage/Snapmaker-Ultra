@@ -17,6 +17,7 @@
 #include "Widgets/TextInput.hpp"
 #include <wx/listimpl.cpp>
 #include <wx/display.h>
+#include <algorithm>
 #include <map>
 #include <memory>
 
@@ -718,6 +719,102 @@ wxBoxSizer *PreferencesDialog::create_item_autosave_input(wxString title, wxWind
     return m_sizer_input;
 }
 
+// Ultra (G-code archive): the folder the copies go to. Same shape as create_item_downloads - the
+// current path, then a Browse button - but with its own label, and it follows the checkbox above.
+wxWindow *PreferencesDialog::create_item_gcode_archive_dir(wxWindow *parent, wxString tooltip)
+{
+    auto item_panel = new wxWindow(parent, wxID_ANY);
+    item_panel->SetBackgroundColour(*wxWHITE);
+    wxBoxSizer *sizer = new wxBoxSizer(wxHORIZONTAL);
+
+    sizer->Add(0, 0, 0, wxEXPAND | wxLEFT, 23);
+    auto label = new wxStaticText(item_panel, wxID_ANY, _L("Storage folder"));
+    label->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    label->SetFont(::Label::Body_13);
+    label->SetToolTip(tooltip);
+    label->Wrap(-1);
+
+    auto path_text = new wxStaticText(item_panel, wxID_ANY, wxString::FromUTF8(app_config->get("ultra_gcode_archive_dir")),
+                                      wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
+    path_text->SetForegroundColour(DESIGN_GRAY600_COLOR);
+    path_text->SetFont(::Label::Body_13);
+    path_text->SetToolTip(tooltip);
+    path_text->Wrap(-1);
+
+    auto browse = new Button(item_panel, _L("Browse"));
+    browse->SetStyle(ButtonStyle::Regular, ButtonType::Window);
+    browse->Bind(wxEVT_BUTTON, [this, path_text, item_panel](wxCommandEvent &e) {
+        wxString    current = wxString::FromUTF8(app_config->get("ultra_gcode_archive_dir"));
+        wxDirDialog dialog(this, _L("Choose the folder for stored G-code files"), current, wxDD_NEW_DIR_BUTTON);
+        if (dialog.ShowModal() == wxID_OK) {
+            wxString picked = dialog.GetPath();
+            app_config->set("ultra_gcode_archive_dir", std::string(picked.ToUTF8().data()));
+            app_config->save();
+            path_text->SetLabelText(picked);
+            item_panel->Layout();
+        }
+        e.Skip();
+    });
+
+    sizer->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    sizer->Add(path_text, 1, wxALIGN_CENTER_VERTICAL | wxALL, FromDIP(5));
+    sizer->Add(browse, 0, wxALL, FromDIP(5));
+
+    item_panel->SetSizer(sizer);
+    item_panel->Layout();
+    item_panel->Enable(app_config->get_bool("ultra_gcode_archive"));
+    m_gcode_archive_dir_item = item_panel;
+    return item_panel;
+}
+
+// Ultra (G-code archive): how many sends to keep. Digits only, and clamped to 1..10000 when the
+// field is left, so a stray value never makes the archive grow without bound or delete everything.
+wxBoxSizer *PreferencesDialog::create_item_gcode_archive_max(wxWindow *parent, wxString tooltip)
+{
+    const std::string param = "ultra_gcode_archive_max";
+    wxBoxSizer *sizer = new wxBoxSizer(wxHORIZONTAL);
+    auto        title = new wxStaticText(parent, wxID_ANY, _L("Maximum Retention"));
+    title->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    title->SetFont(::Label::Body_13);
+    title->SetToolTip(tooltip);
+    title->Wrap(-1);
+
+    auto       input = new ::TextInput(parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, DESIGN_INPUT_SIZE, wxTE_PROCESS_ENTER);
+    StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled), std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
+    input->SetBackgroundColor(input_bg);
+    input->GetTextCtrl()->SetValue(app_config->get(param));
+    wxTextValidator validator(wxFILTER_DIGITS);
+    input->GetTextCtrl()->SetValidator(validator);
+
+    auto second_title = new wxStaticText(parent, wxID_ANY, _L("files"), wxDefaultPosition, DESIGN_TITLE_SIZE, 0);
+    second_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
+    second_title->SetFont(::Label::Body_13);
+    second_title->SetToolTip(tooltip);
+    second_title->Wrap(-1);
+
+    sizer->Add(0, 0, 0, wxEXPAND | wxLEFT, 23);
+    sizer->Add(title, 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+    sizer->Add(input, 0, wxALIGN_CENTER_VERTICAL, 0);
+    sizer->Add(0, 0, 0, wxEXPAND | wxLEFT, 3);
+    sizer->Add(second_title, 0, wxALIGN_CENTER_VERTICAL | wxALL, 3);
+
+    std::function<void()> commit = [this, param, input]() {
+        long value = 100;
+        if (!input->GetTextCtrl()->GetValue().ToLong(&value)) value = 100;
+        value = std::max(1L, std::min(10000L, value));
+        input->GetTextCtrl()->SetValue(wxString::Format("%ld", value));
+        app_config->set(param, std::to_string(value));
+        app_config->save();
+    };
+    input->GetTextCtrl()->Bind(wxEVT_TEXT_ENTER, [commit](wxCommandEvent &e) { commit(); e.Skip(); });
+    input->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [commit](wxFocusEvent &e) { commit(); e.Skip(); });
+
+    input->Enable(app_config->get_bool("ultra_gcode_archive"));
+    input->Refresh();
+    m_gcode_archive_max_textinput = input;
+    return sizer;
+}
+
 
 wxBoxSizer *PreferencesDialog::create_item_switch(wxString title, wxWindow *parent, wxString tooltip ,std::string param)
 {
@@ -876,6 +973,13 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxWindow *pa
             bool pbool = app_config->get("autosave_switch") == "true" ? true : false;
             wxGetApp().mainframe->update_autosave_timer();
             if (m_autosave_interval_textinput != nullptr) { m_autosave_interval_textinput->Enable(pbool); }
+        }
+
+        // Ultra: the archive's folder and retention only mean anything while it is on.
+        if (param == "ultra_gcode_archive") {
+            bool pbool = checkbox->GetValue();
+            if (m_gcode_archive_dir_item != nullptr) { m_gcode_archive_dir_item->Enable(pbool); }
+            if (m_gcode_archive_max_textinput != nullptr) { m_gcode_archive_max_textinput->Enable(pbool); }
         }
 
         if (param == "sync_user_preset") {
@@ -1620,6 +1724,16 @@ wxWindow* PreferencesDialog::create_ultra_page()
     auto item_sm_keys = create_item_checkbox(_L("Remember Snapmaker printer certificates so the phone can connect them"), page,
         _L("After you connect a Snapmaker printer on the Device tab, keep its pairing certificate on this PC (under the data folder's hub\snapmaker_keys.json) so the phone's Devices tab can connect that printer without you at the PC. The certificate never leaves this PC. Off by default because it is a private key stored on disk."), 50, "snapmaker_remember_keys");
 
+    // Ultra (G-code archive): every file this PC uploads is kept, with the printer it went to, so
+    // the phone can send it again later without the project being open.
+    auto title_archive = create_item_title(_L("G-Code Archive"), page, _L("G-Code Archive"));
+    auto item_archive = create_item_checkbox(_L("Store G-Code Files"), page,
+        _L("Keep a copy of every G-code file this PC sends to a printer - from here or from the phone - together with which printer it went to, so it can be sent again later without opening the project."), 50, "ultra_gcode_archive");
+    auto item_archive_dir = create_item_gcode_archive_dir(page,
+        _L("Where the copies are kept. The default is a gcode_archive folder inside the data folder; the folder is created the first time a file is stored."));
+    auto item_archive_max = create_item_gcode_archive_max(page,
+        _L("How many stored files to keep. When a new file takes the count past this, the oldest ones are deleted with their details and previews."));
+
     sizer_page->Add(title_project, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_autosave, 0, wxTOP, FromDIP(3));
     item_autosave->Add(item_autosave_interval, 0, wxLEFT, 0);
@@ -1643,6 +1757,10 @@ wxWindow* PreferencesDialog::create_ultra_page()
     sizer_page->Add(title_phone, 0, wxTOP | wxEXPAND, FromDIP(20));
     sizer_page->Add(item_start_hidden, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_sm_keys, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(title_archive, 0, wxTOP | wxEXPAND, FromDIP(20));
+    sizer_page->Add(item_archive, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_archive_dir, 0, wxTOP | wxEXPAND, FromDIP(3));
+    sizer_page->Add(item_archive_max, 0, wxTOP, FromDIP(3));
 
     page->SetSizer(sizer_page);
     page->Layout();

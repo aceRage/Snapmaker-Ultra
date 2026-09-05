@@ -448,6 +448,20 @@ void AppConfig::set_defaults()
         set_bool("autosave_switch", false);
     }
 
+    // Ultra: the G-code archive. Off by default; the folder is filled in on first use so an empty
+    // value still means "<datadir>/gcode_archive" for a config written by an older build.
+    if (get("ultra_gcode_archive").empty()) {
+        set_bool("ultra_gcode_archive", false);
+    }
+
+    if (get("ultra_gcode_archive_dir").empty()) {
+        set("ultra_gcode_archive_dir", (boost::filesystem::path(Slic3r::data_dir()) / "gcode_archive").string());
+    }
+
+    if (get("ultra_gcode_archive_max").empty()) {
+        set("ultra_gcode_archive_max", "100");
+    }
+
     if (get("autosave_interval").empty()) {
         set("autosave_interval", "300");
     }

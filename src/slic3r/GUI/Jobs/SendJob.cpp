@@ -2,6 +2,7 @@
 #include "libslic3r/MTUtils.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "slic3r/GUI/GcodeArchive.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/GUI.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
@@ -336,6 +337,17 @@ void SendJob::process(Ctl &ctl)
 
     }
     else {
+        // Ultra: keep a copy of the gcode 3mf that went to the printer's storage (Preferences >
+        // Ultra > G-Code Archive). Archiving never fails a send.
+        if (GcodeArchive::enabled()) {
+            GcodeArchive::Meta am = GcodeArchive::meta_for_plate(job_data.plate_idx, "upload");
+            am.printer_id   = m_dev_id;
+            am.printer_kind = "bambu";
+            am.printer_name = GcodeArchive::bambu_printer_name(m_dev_id);
+            am.file_name    = params.project_name;
+            GcodeArchive::archive(params.filename, am);
+        }
+
         BOOST_LOG_TRIVIAL(error) << "send_job: send ok.";
         wxCommandEvent* evt = new wxCommandEvent(m_print_job_completed_id);
         evt->SetString(from_u8(params.project_name));
