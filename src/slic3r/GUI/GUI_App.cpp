@@ -81,6 +81,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/miniz_extension.hpp"
+#include "libslic3r/DataDirMigration.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Color.hpp"
 
@@ -999,6 +1000,10 @@ std::vector<std::string> GUI_App::split_str(std::string src, std::string separat
     return result;
 }
 
+// Set by init_app_config() when the first-start data-dir copy actually ran, and read once by
+// post_init(). A migration happens at most once in the life of an install.
+static Slic3r::DataDirMigrationResult g_datadir_migration;
+
 void GUI_App::post_init()
 {
     assert(initialized());
@@ -1007,6 +1012,22 @@ void GUI_App::post_init()
 
     m_open_method = "double_click";
     bool switch_to_3d = false;
+
+    // The data directory was copied out of the pre-rename one on this start. Say so once, after
+    // the window exists rather than before it - and never on a hidden, hub-managed instance,
+    // which has nobody in front of it to read a dialog.
+    if (g_datadir_migration.ran && !m_hub_managed) {
+        const auto mig = g_datadir_migration;
+        g_datadir_migration = Slic3r::DataDirMigrationResult();
+        wxString msg = wxString::Format(
+            _L("Your settings, presets and phone-hub data were copied over from the previous "
+               "installation.\n\nFrom:\t%s\nTo:\t%s\n\n%llu files were copied. The old folder was "
+               "not changed and is still there, so the previous version keeps working; changes you "
+               "make from now on are not copied back. You can delete the old folder once you are "
+               "happy with this version."),
+            from_u8(mig.old_dir), from_u8(mig.new_dir), (unsigned long long) mig.files_copied);
+        MessageDialog(nullptr, msg, wxString(SLIC3R_APP_NAME), wxOK | wxICON_INFORMATION).ShowModal();
+    }
 
     // Ultra: a hidden (hub-managed) instance gets no WM_PAINT, so GLCanvas3D::render() - the usual
     // trigger for init_opengl() / init() - never runs. Do that work here, before any project loads:
@@ -2231,6 +2252,18 @@ void GUI_App::init_app_config()
                 set_data_dir((dir + "/" + GetAppName()).ToUTF8().data());
                 data_dir_path = boost::filesystem::path(data_dir());
             #endif
+            // Ultra rebrand: the data directory is named after the app key, so it moved when
+            // the key did. Copy the old one across before anything creates the new one - this is
+            // the only moment at which "the new dir does not exist yet" is still true.
+            // Copy, never move: the old install keeps working, which is the real rollback.
+            {
+                const auto mig = Slic3r::migrate_data_dir(data_dir_path.parent_path().string(),
+                                                          data_dir_path.string());
+                if (!mig.error.empty())
+                    BOOST_LOG_TRIVIAL(error) << "data dir migration failed, starting fresh: " << mig.error;
+                else if (mig.ran)
+                    g_datadir_migration = mig; // post_init() tells the user what happened
+            }
             if (!boost::filesystem::exists(data_dir_path)){
                 boost::filesystem::create_directory(data_dir_path);
             }

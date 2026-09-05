@@ -108,6 +108,8 @@ set(lisbslic3r_sources
     Config.hpp
     CustomGCode.cpp
     CustomGCode.hpp
+    DataDirMigration.cpp
+    DataDirMigration.hpp
     CutUtils.cpp
     CutUtils.hpp
     EdgeGrid.cpp

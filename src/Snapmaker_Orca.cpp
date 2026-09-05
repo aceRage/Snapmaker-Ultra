@@ -65,6 +65,7 @@ using namespace nlohmann;
 #include "libslic3r/Format/OBJ.hpp"
 #include "libslic3r/Format/SL1.hpp"
 #include "libslic3r/Utils.hpp"
+#include "libslic3r/DataDirMigration.hpp"
 #include "libslic3r/Time.hpp"
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/BlacklistedLibraryCheck.hpp"
@@ -1275,6 +1276,25 @@ int CLI::run(int argc, char **argv)
     BOOST_LOG_TRIVIAL(info) << "finished setup params, argc="<< argc << std::endl;
     std::string temp_path = wxFileName::GetTempDir().utf8_str().data();
     set_temporary_dir(temp_path);
+
+    // Ultra rebrand: run the first-start data-dir copy against a scratch parent and exit.
+    // Development and test only - see DataDirMigration.hpp and test_rebrand_migration.py.
+    if (const ConfigOptionString* mig_root = m_config.opt<ConfigOptionString>("migrate_datadir_test");
+        mig_root && !mig_root->value.empty()) {
+        const std::string parent = mig_root->value;
+        const auto        r      = Slic3r::migrate_data_dir(parent,
+                                       (boost::filesystem::path(parent) / SLIC3R_APP_KEY).string());
+        boost::nowide::cout << "MIGRATE_RAN=" << (r.ran ? 1 : 0) << std::endl
+                            << "MIGRATE_SKIPPED_NEW_EXISTS=" << (r.skipped_new_exists ? 1 : 0) << std::endl
+                            << "MIGRATE_SKIPPED_NO_OLD=" << (r.skipped_no_old ? 1 : 0) << std::endl
+                            << "MIGRATE_OLD=" << r.old_dir << std::endl
+                            << "MIGRATE_NEW=" << r.new_dir << std::endl
+                            << "MIGRATE_FILES=" << r.files_copied << std::endl
+                            << "MIGRATE_BYTES=" << r.bytes_copied << std::endl
+                            << "MIGRATE_CONF_PATHS=" << r.conf_paths_rewritten << std::endl
+                            << "MIGRATE_ERROR=" << r.error << std::endl;
+        return r.error.empty() ? 0 : CLI_ENVIRONMENT_ERROR;
+    }
 
 #ifdef SLIC3R_GUI
     // Ultra: `--hub` runs the phone-access / camera-relay helper instead of the slicer.

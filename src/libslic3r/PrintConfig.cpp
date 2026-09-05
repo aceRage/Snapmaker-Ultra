@@ -9289,6 +9289,15 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->cli_params = "token";
     def->set_default_value(new ConfigOptionString());
 
+    // Ultra rebrand: exercise the first-start data-dir copy against a scratch root, so the
+    // gate can prove the VAPID pair and the token survive without going anywhere near the
+    // user's real %APPDATA%. Runs the migration and exits; starts no GUI.
+    def = this->add("migrate_datadir_test", coString);
+    def->label = L("Run the data directory migration against a test root");
+    def->tooltip = L("Development and test only: treat the given directory as the parent of both the old and the new data directories, run the first-start migration there, and exit.");
+    def->cli_params = "dir";
+    def->set_default_value(new ConfigOptionString());
+
     def = this->add("hub_phone", coBool);
     def->label = L("Hub phone access on");
     def->tooltip = L("With --hub: start with phone access (the LAN listener) enabled.");
