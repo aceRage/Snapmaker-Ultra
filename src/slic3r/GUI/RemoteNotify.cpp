@@ -3,6 +3,7 @@
 #include "RemoteNotify.hpp"
 
 #include "WebPush.hpp"
+#include "AppPush.hpp"
 #include "slic3r/Utils/Http.hpp"
 
 #include <boost/log/trivial.hpp>
@@ -428,6 +429,11 @@ static void worker()
         // because the reason for the worker is the same: nobody's request thread may wait on a
         // network service half a world away.
         if (g_running) WebPush::deliver(ev);
+        // ... and the same again for the native app (Ultra1 phase 1). A third built-in fan-out,
+        // over whatever devices have registered, with its own minimum severity. It rides this
+        // worker for the reason the worker exists: APNs and FCM are on the other side of the
+        // internet and no request thread may wait on them.
+        if (g_running) AppPush::deliver(ev);
     }
 }
 
@@ -558,7 +564,7 @@ void deliver(const json& event)
 {
     // Nowhere to send it - no relay and no subscribed phone - means there is nothing to queue;
     // the tray balloon and the event ring are the hub's own, and happen either way.
-    const bool phones = WebPush::has_subscriptions();
+    const bool phones = WebPush::has_subscriptions() || AppPush::has_devices();
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_dests.empty() && !phones) return;
     g_queue.push_back(event);

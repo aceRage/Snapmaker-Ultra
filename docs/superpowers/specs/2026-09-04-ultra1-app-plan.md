@@ -949,3 +949,217 @@ All URLs read **2026-09-04** unless a different date is given.
 9. Any iOS 26-specific change to local network privacy.
 10. That Apple explicitly denies native apps the use of Web Push endpoints (the negative is inferred
     from two Apple pages, not stated in one).
+
+---
+
+## Update (phase 1): the hub's push plane, as built
+
+Branch `feat/app-push`, cut from `feat/ultra-preferences` at `48d24205c3`. This section records
+what phase 1 actually shipped, where it differs from §4.2 above, and exactly what the app must
+send. Where this section and §4.2 disagree, **this section is what the code does** - the
+differences all come from [`2026-09-04-ultra1-phase0-spike.md`](2026-09-04-ultra1-phase0-spike.md),
+which found them by compiling and running against the real dependencies.
+
+Phases 2 and up - the app itself - are unchanged and unstarted.
+
+### U1. The dependency change, and what an integrator must do
+
+**The spike's finding stands: the bundled libcurl had no HTTP/2, and APNs speaks nothing else.**
+The fix is `deps/NGHTTP2/NGHTTP2.cmake` (nghttp2 1.64.0, lib-only, static, pinned by hash),
+`-DUSE_NGHTTP2:BOOL=ON` in `deps/CURL/CURL.cmake` with `-DNGHTTP2_STATICLIB` in the C flags, a
+`cmake/modules/FindNGHTTP2.cmake` that knows about MSVC's `nghttp2_static` naming, and one
+`target_link_libraries` line on the top-level `libcurl` interface target.
+
+**On all three platforms, deliberately.** Scoping the flag to Windows would buy a smaller change
+and an APNs feature that silently does not exist on a Mac or Linux hub. The cost is that the next
+clean deps build on any platform inherits one more dependency.
+
+**This does not take effect until the shared deps prefix is rebuilt**, which is a deliberate act
+and not something a slicer build does on its own. Until it is, `Http::has_http2()` is false, the
+hub page says *"This build of libcurl has no HTTP/2, so iOS push cannot work"*, `ApnsProvider`
+reports itself unavailable with the same sentence, and **FCM works normally** - the v1 endpoint is
+plain HTTPS/1.1 and needs none of this.
+
+Two notes for whoever runs it. `nghttp2` 1.64 takes its library targets from `BUILD_STATIC_LIBS`,
+not the `ENABLE_STATIC_LIB` of older releases; with both off it builds no library and then fails
+on its own `nghttp2::nghttp2` alias. And on a *fresh* deps build directory `dep_CURL` pulls
+`dep_OpenSSL` in with it, so a first run from scratch is much longer than the nghttp2 build alone
+suggests; against the existing `deps/build` tree, where OpenSSL is already stamped, it is not.
+
+### U2. Settings: the hub's `settings.json` gains `apppush`
+
+```json
+{ "apppush": {
+    "enabled": true,
+    "min_severity": "info",
+    "apns": { "enabled": true,
+              "bundle": "dev.acerage.ultra1",
+              "key_id": "ABC123DEFG", "team_id": "DEF123GHIJ",
+              "key_path": "C:/Users/ace/keys/AuthKey_ABC123DEFG.p8",
+              "key_pem": "",
+              "env": "production" },
+    "fcm":  { "enabled": true,
+              "project_id": "ultra1-1a2b3",
+              "service_account_path": "C:/Users/ace/keys/ultra1-fcm.json",
+              "service_account_json": "" },
+    "devices": [
+      { "id": "d_7f3a...", "platform": "apns", "env": "production",
+        "token": "<opaque>", "bundle": "dev.acerage.ultra1",
+        "p256dh": "<b64url 65 bytes>", "auth": "<b64url 16 bytes>",
+        "label": "Ace's iPhone", "app": "1.0.3", "os": "iOS 26.1",
+        "added": 1757000000, "last_sent": 0, "last_status": 200,
+        "last_error": "", "last_host": "https://api.push.apple.com", "failures": 0 } ] } }
+```
+
+(Windows paths are stored with whatever separators they were given; the JSON above uses forward
+slashes only to keep this document readable.)
+
+- **Credentials are paths.** `key_path` and `service_account_path` are the source of truth; the
+  file is read at `start()` and whenever the options change, and the parsed key is held in memory
+  so a push at 03:00 does not fail because the file moved. Nothing is copied into the data dir.
+- `key_pem` and `service_account_json` are the inline alternative for someone who would rather
+  paste a key than keep a file. They are credentials in the fullest sense: stored only here, in no
+  `/hub/*` response even masked, and never on the phone plane at all.
+- **`env` is per device**, not per hub (risk **R3**). `apns.env` is only the default for a
+  registration that does not say. `POST /hub/apppush/test`'s per-device result names the host it
+  reached, so a `BadDeviceToken` from an environment mismatch is diagnosable from the hub page.
+- Rows are keyed on **(platform, token)**. Cap: 16 devices, 16 KiB per registration body.
+- Two debug-only keys, `apns.host_override` and `fcm.host_override` / `fcm.token_uri_override`,
+  are read *and written* only when `SNORCA_DEBUG_ROUTES=1`. They exist so the gate can point the
+  sender at its mocks; a shipped hub cannot be talked into sending a device's notifications
+  anywhere but Apple and Google.
+
+### U3. Routes
+
+**Phone plane, `/r/<token>/`** - constant-time token gate, exactly like its neighbours:
+
+| Route | What |
+|---|---|
+| `POST /r/<token>/push/device` | register; idempotent on `(platform, token)`; `Content-Type: application/json`; 16 KiB and 16 rows |
+| `DELETE /r/<token>/push/device` | body `{platform, token}`; answers `{"ok":true}` either way, so it is not an oracle |
+
+**Loopback admin plane, `/hub/*`** - loopback peer + loopback `Host` + no cross-site
+`Sec-Fetch-Site` + `X-Hub-Secret`:
+
+| Route | What |
+|---|---|
+| `GET /hub/apppush` | masked config, per-provider availability with a reason, device list with tokens masked |
+| `DELETE /hub/apppush?id=` | forget one device |
+| `POST /hub/apppush/options` | set everything; `****`-prefixed credential fields mean *keep the stored one* |
+| `POST /hub/apppush/test` | one synchronous push per device, results naming provider, host and status |
+| `POST /hub/apppush/debug` | `{"op":"collapse"｜"plaintext"｜"providers"}`; 404 without `SNORCA_DEBUG_ROUTES=1` |
+
+**`GET /r/<token>/pair` (N1) is not built.** Nothing in phase 1 needs it and the app does not exist
+yet; it belongs with phase 2, where the QR scan that consumes it lives. `AppPush::providers_json()`
+already produces the `push` object it would carry.
+
+### U4. What the app must send
+
+```json
+POST /r/<token>/push/device
+Content-Type: application/json
+
+{ "platform": "apns",
+  "env": "production",
+  "token": "<hex APNs device token, or the FCM registration token>",
+  "bundle": "dev.acerage.ultra1",
+  "p256dh": "<base64url, the 65-byte uncompressed P-256 point>",
+  "auth":   "<base64url, 16 bytes>",
+  "label": "Ace's iPhone", "app": "1.0.3", "os": "iOS 26.1" }
+```
+
+`platform` is `"apns"` or `"fcm"`; `env` is APNs-only and is `"production"` or `"sandbox"`.
+
+- `p256dh` and `auth` are **the app's own**, generated on first launch, private half in the
+  Keychain / Android Keystore. They mean exactly what a browser `PushSubscription`'s do, which is
+  why the hub encrypts with the unchanged `WebPush::encrypt`.
+- **Re-post this on every cold launch.** Push tokens rotate and no platform reliably says when.
+  The row is replaced, not duplicated.
+- A token containing a space, a control character, `/`, `?` or `#` is refused: it lands in a URL
+  path on the APNs side.
+- On iOS, the Keychain item **must be in a shared access group**: the Notification Service
+  Extension is a separate process from the app, and this is the single most common way this design
+  is got wrong.
+
+**What arrives at the device.**
+
+APNs - note the literal alert text, which corrects §4.2 N3's `title-loc-key`:
+
+```json
+{ "aps": { "alert": { "title": "Printer update", "body": "Tap to open" },
+           "mutable-content": 1, "sound": "default", "thread-id": "<printer id>" },
+  "v": 1, "e": "<base64url aes128gcm blob>" }
+```
+
+Headers: `authorization: bearer <ES256 JWT>`, `apns-topic: <bundle>`, `apns-push-type: alert`,
+`apns-priority: 10` for warning and error and `5` otherwise, `apns-expiration: <now + ttl>`,
+`apns-collapse-id: <24 base64url characters>`.
+
+FCM - data-only, with **no `notification` block**, because a message carrying both goes to the
+tray in the background and `onMessageReceived` is never called:
+
+```json
+{ "message": { "token": "<registration token>",
+               "data": { "e": "<base64url blob>", "v": "1", "c": "<collapse id>" },
+               "android": { "priority": "high", "ttl": "1800s", "collapse_key": "<collapse id>" } } }
+```
+
+The decrypted plaintext is the same JSON `WebPush.cpp` already sends to the service worker -
+`title`, `body`, `kind`, `severity`, `printer`, `printer_id`, `tag`, `id`, `time` - so the iOS
+extension, the Android service and the browser's service worker all read one format.
+
+TTL is 1800 s for an alert and 300 s for `started` / `resumed`. The collapse id is a truncated
+SHA-256 of `"<printer id>|<kind>"`, so a second *paused* for one printer replaces the first and
+even the collapse id leaks nothing readable.
+
+### U5. Pruning and retries
+
+| Provider | Prune the row | Retry (3 tries, 1 s then 3 s, in 100 ms slices) | Re-mint and retry **once**, never prune |
+|---|---|---|---|
+| APNs | `410 Unregistered`; `400 BadDeviceToken` / `BadTopic` / `DeviceTokenNotForTopic` | `429`, `5xx`, transport error | `403 ExpiredProviderToken` |
+| FCM | `404 UNREGISTERED` / `NOT_FOUND` | `429`, `5xx`, transport error | `401` |
+
+### U6. Three corrections to §4.2, carried out
+
+1. **Literal `alert` title and body**, not `title-loc-key` (U4). Apple requires alert information
+   for the extension to run at all, and a key naming no `.strings` entry fails silently.
+2. **No `exp` claim** in the APNs JWT. RFC 8292 VAPID has one; Apple does not use one.
+3. **`Http` gained `http_version()` and `has_http2()`.** §4.2 assumed the wrapper could already
+   express this; it could not, and neither could the libcurl underneath it.
+
+### U7. The gate
+
+`snorca_hubtest\test_app_push.py`, with `mock_apns.py` and `mock_fcm.py`. Eleven groups covering
+the `/hub/*` gate on all five new routes, registration and its caps, masking and M11, the FCM
+OAuth2 exchange and data-only message, the APNs header set and provider token, M6 (the cleartext
+appears nowhere in the raw bytes of either conversation), every row of the U5 table, severity and
+the off switch, the collapse id, the test route and a restart.
+
+`mock_apns.py` is a **cleartext HTTP/2 (h2c)** server on loopback. That is only possible because
+the sender is libcurl+nghttp2, which offers `CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE`: no TLS, no
+certificate, nothing added to a trust store, and the gate runs anywhere. It needs Python's `h2`
+package (pure Python, alongside the `cryptography` the existing Web Push gate already uses).
+
+### U8. Still unverified after phase 1
+
+Everything in the plan's own list, plus:
+
+1. **A real APNs or FCM send has not happened.** Both need credentials only the user can create
+   (§U9). Every assertion here is against a mock that implements the documented contract.
+2. **The deps change has not been built on macOS or Linux.** The recipe is portable in principle;
+   only Windows has run it. This is the residual risk the spike named.
+3. Whether a **force-stopped** Android app receives FCM at all.
+
+### U9. What the user must create before any of this reaches a phone
+
+1. Enrol in the **Apple Developer Program** ($99/yr) - the free Personal Team's ability to use
+   Push Notifications is unverified and should not be planned against.
+2. Reserve a **bundle id** and note the 10-character **Team ID**.
+3. Create an **APNs Auth Key**, download the `.p8` *once* (Apple will not offer it again), and
+   note the 10-character **Key ID**.
+4. Create a **Firebase project**, add an Android app, and download a **service-account JSON** with
+   the `firebase.messaging` scope.
+5. Put both files somewhere the hub can read and set `apns.key_path` / `fcm.service_account_path`,
+   with `apns.bundle`, `apns.key_id`, `apns.team_id` and `fcm.project_id` beside them.
+   **Neither file ever belongs in this repository or in a release artifact**: whoever holds a
+   team's `.p8` can push to every app that team signed (risk **R1**).

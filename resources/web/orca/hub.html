@@ -70,6 +70,7 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
   <div class="card" id="notify"><h2>Notifications</h2>
     <div class="tabs" id="notifytabs"></div>
     <div id="pushbody">Loading…</div>
+    <div id="appbody">Loading…</div>
     <div id="notifybody">Loading…</div>
   </div>
 </div>
@@ -176,9 +177,10 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
     // call goes to the loopback control plane with the secret. The hub masks each credential it
     // hands back, so a saved topic or key can never be read off this page again - which is also
     // why the ntfy QR code is drawn while you are typing the topic, not afterwards.
-    var TAB_KEY = 'snorca.hub.notifyTab', TABS = [['mobile', 'Mobile Web'], ['pushover', 'Pushover'], ['webhook', 'Webhook']];
+    var TAB_KEY = 'snorca.hub.notifyTab', TABS = [['mobile', 'Mobile Web'], ['app', 'Native app'], ['pushover', 'Pushover'], ['webhook', 'Webhook']];
+    var TAB_NAMES = TABS.map(function(t) { return t[0]; });
     var tab = 'mobile';
-    try { var saved = window.localStorage.getItem(TAB_KEY); if (saved === 'mobile' || saved === 'pushover' || saved === 'webhook') tab = saved; } catch (e) {}
+    try { var saved = window.localStorage.getItem(TAB_KEY); if (TAB_NAMES.indexOf(saved) >= 0) tab = saved; } catch (e) {}
     function buildTabs() {
         var strip = document.getElementById('notifytabs');
         strip.innerHTML = '';
@@ -187,16 +189,17 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
             b.onclick = function() { setTab(t[0]); };
             strip.appendChild(b);
         });
-        // Only one tab's body is on screen at a time; both keep refreshing underneath.
+        // Only one tab's body is on screen at a time; they all keep refreshing underneath.
         document.getElementById('pushbody').style.display = tab === 'mobile' ? '' : 'none';
-        document.getElementById('notifybody').style.display = tab === 'mobile' ? 'none' : '';
+        document.getElementById('appbody').style.display = tab === 'app' ? '' : 'none';
+        document.getElementById('notifybody').style.display = (tab === 'mobile' || tab === 'app') ? 'none' : '';
     }
     function setTab(t) {
         if (t === tab) return;
         tab = t;
         try { window.localStorage.setItem(TAB_KEY, t); } catch (e) {}
-        openForm = null; lastNotify = null; lastPush = null;
-        buildTabs(); renderPush(); renderNotify();
+        openForm = null; lastNotify = null; lastPush = null; lastApp = null;
+        buildTabs(); renderPush(); renderApp(); renderNotify();
     }
     var notify = null, lastNotify = null, openForm = null, testNote = {};
     function jfetch(path, method, obj) {
@@ -447,6 +450,90 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         return fetch('/hub/push', { headers: hdrs() }).then(function(r) { return r.json(); })
             .then(function(j) { push = j; renderPush(); }).catch(function() {});
     }
+    // ---- Native app (APNs / FCM) -----------------------------------------------------------
+    // /hub/apppush, the same loopback control plane again. A device is a masked token, its
+    // platform and a Remove button; the credentials that reach Apple and Google are configured
+    // here as paths and are never shown back, only ever "set" or "not set". The availability line
+    // matters more than it looks: it is where "this build of libcurl has no HTTP/2" gets said out
+    // loud, instead of every APNs push failing with a transport error nobody can interpret.
+    var app = null, lastApp = null, appNote = '';
+    function renderApp() {
+        var body = document.getElementById('appbody');
+        if (!app) return;
+        if (tab !== 'app') { body.innerHTML = ''; lastApp = null; return; }
+        var key = JSON.stringify(app) + '|' + appNote;
+        if (key === lastApp) return;
+        lastApp = key;
+        body.innerHTML = '';
+        var prov = app.providers || {};
+        [['apns', 'iOS (APNs)'], ['fcm', 'Android (FCM)']].forEach(function(p) {
+            var ok = !!prov[p[0]];
+            var line = el('div', 'note');
+            line.appendChild(el('span', 'badge' + (ok ? ' ok' : ' bad'), ok ? 'ready' : 'not ready'));
+            line.appendChild(document.createTextNode(' ' + p[1] + (ok ? '' : ' - ' + (prov[p[0] + '_reason'] || 'not configured'))));
+            body.appendChild(line);
+        });
+        var devs = app.devices || [];
+        if (!devs.length) body.appendChild(el('div', 'note', 'No app has registered a device yet.'));
+        devs.forEach(function(d) {
+            var row = el('div', 'dest' + (d.status === 'failing' ? ' bad' : ''));
+            var line = el('div', 'phonerow');
+            var left = el('span');
+            var icon = el('span'); icon.innerHTML = PHONE_SVG;
+            icon.title = (d.os || '') + ' ' + (d.app ? 'app ' + d.app : '');
+            left.appendChild(icon);
+            left.appendChild(document.createTextNode(' ' + (d.label || (d.platform === 'apns' ? 'iPhone' : 'Android')) + ' '));
+            left.appendChild(el('span', 'badge', d.platform === 'apns' ? ('APNs / ' + (d.env || 'production')) : 'FCM'));
+            left.appendChild(document.createTextNode(' ' + (d.token || '')));
+            left.appendChild(el('span', 'badge' + (d.status === 'failing' ? ' bad' : (d.status === 'ok' ? ' ok' : '')),
+                                d.status === 'failing' ? 'failing' : (d.status === 'new' ? 'new' : (d.status === 'retrying' ? 'retrying' : 'on'))));
+            line.appendChild(left);
+            var del = el('span', 'btn warn small', 'Remove');
+            del.onclick = function() {
+                if (!confirm('Stop pushing to this device? The app can register again the next time it is opened.')) return;
+                jfetch('/hub/apppush?id=' + encodeURIComponent(d.id), 'DELETE').then(function(r) { app = r.j; lastApp = null; renderApp(); });
+            };
+            line.appendChild(del);
+            row.appendChild(line);
+            if (d.last_error) row.appendChild(el('div', 'err', 'Last error: ' + d.last_error + (d.failures > 1 ? ' (' + d.failures + ' in a row)' : '')));
+            body.appendChild(row);
+        });
+        var acts = el('div', 'acts');
+        var sev = severitySelect(app.min_severity);
+        sev.onchange = function() { jfetch('/hub/apppush/options', 'POST', { min_severity: sev.value }).then(function(r) { app = r.j; lastApp = null; renderApp(); }); };
+        acts.appendChild(sev);
+        var tog = el('span', 'btn dim small', app.enabled ? 'Disable' : 'Enable');
+        tog.style.marginLeft = '6px';
+        tog.onclick = function() { jfetch('/hub/apppush/options', 'POST', { enabled: !app.enabled }).then(function(r) { app = r.j; lastApp = null; renderApp(); }); };
+        acts.appendChild(tog);
+        if (devs.length) {
+            var test = el('span', 'btn dim small', 'Test');
+            test.style.marginLeft = '6px';
+            test.onclick = function() {
+                test.textContent = 'Sending…';
+                jfetch('/hub/apppush/test', 'POST', {}).then(function(r) {
+                    var res = r.j.results || [];
+                    // Naming the host is the point of the per-device result: a BadDeviceToken from
+                    // a sandbox build sent to the production host is otherwise indistinguishable
+                    // from a bug.
+                    appNote = r.j.ok ? ('Test sent to ' + res.length + ' device(s) via ' + (res[0] && res[0].host || 'the push service') + '.')
+                                     : ('Test failed: ' + ((res[0] && (res[0].error || ('HTTP ' + res[0].status))) || r.j.error || 'no answer') + '.');
+                    lastApp = null; refreshApp();
+                });
+            };
+            acts.appendChild(test);
+        }
+        body.appendChild(acts);
+        if (appNote) body.appendChild(el('div', 'note', appNote));
+        if (!app.http2) body.appendChild(el('div', 'err', 'This build of libcurl has no HTTP/2, so iOS push cannot work. Rebuild the dependencies to pick up nghttp2.'));
+        body.appendChild(el('div', 'note', 'Push straight to the companion app, on any network - no Tailscale and no Home Screen install needed. '
+            + 'Set the APNs .p8 path, key id, team id and bundle id (and the Firebase service account for Android) under "apppush" in the hub\'s settings.json; '
+            + 'the keys are read from wherever you keep them and are never copied into the data dir.'));
+    }
+    function refreshApp() {
+        return fetch('/hub/apppush', { headers: hdrs() }).then(function(r) { return r.json(); })
+            .then(function(j) { app = j; renderApp(); }).catch(function() {});
+    }
     function renderSlicers(list) {
         var body = document.getElementById('slicerbody');
         body.innerHTML = '';
@@ -478,6 +565,7 @@ select { background: #222; color: #ddd; border: 1px solid #555; border-radius: 6
         fetch('/hub/instances', { headers: hdrs() }).then(function(r) { return r.json(); }).then(function(j) { renderSlicers(j.instances || []); }).catch(function() {});
         if (!openForm) refreshNotify(); // never while a form is half typed
         refreshPush();
+        refreshApp();
     }
     document.getElementById('new').onclick = function() { post('/hub/new').then(function() { setTimeout(refresh, 3000); }); };
     document.getElementById('newhidden').onclick = function() { post('/hub/new?hidden=1').then(function() { setTimeout(refresh, 3000); }); };

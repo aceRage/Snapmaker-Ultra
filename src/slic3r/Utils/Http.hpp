@@ -102,6 +102,16 @@ public:
 	Http& timeout_connect(long timeout);
     // Sets a maximum total request timeout in seconds
     Http& timeout_max(long timeout);
+	// Ask libcurl for a particular HTTP version - one of the CURL_HTTP_VERSION_* constants.
+	// This exists for APNs, which speaks HTTP/2 and nothing else, so for that caller it is not a
+	// preference but a requirement: on a libcurl built without nghttp2 the option is refused
+	// outright (CURLE_UNSUPPORTED_PROTOCOL) and the request fails loudly instead of silently
+	// falling back to an HTTP/1.1 that Apple will not answer.
+	Http& http_version(long version);
+	// Whether this build of libcurl can speak HTTP/2 at all. Callers that need it should ask
+	// before trying, so they can say why they are unavailable rather than failing every request
+	// with a transport error.
+	static bool has_http2();
 	// Sets a maximum size of the data that can be received.
 	// A value of zero sets the default limit, which is is 5MB.
 	Http& size_limit(size_t sizeLimit);

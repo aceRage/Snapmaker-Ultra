@@ -558,6 +558,18 @@ Http& Http::timeout_max(long timeout)
     return *this;
 }
 
+Http& Http::http_version(long version)
+{
+	if (p) { ::curl_easy_setopt(p->curl, CURLOPT_HTTP_VERSION, version); }
+	return *this;
+}
+
+bool Http::has_http2()
+{
+	const curl_version_info_data *ver = ::curl_version_info(CURLVERSION_NOW);
+	return ver != nullptr && (ver->features & CURL_VERSION_HTTP2) != 0;
+}
+
 Http& Http::size_limit(size_t sizeLimit)
 {
 	if (p) { p->limit = sizeLimit; }
