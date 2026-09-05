@@ -26,6 +26,11 @@ enum ExtrusionRole : uint8_t {
     erSolidInfill,
     erTopSolidInfill,
     erBottomSurface,
+    // Ultra (over-support surfaces): a bottom surface printed on top of support material.
+    // Its own role so the user can see it in the preview and so it can carry its own
+    // flow ratio and speed instead of the shared bridge settings.
+    // docs/superpowers/specs/2026-09-05-over-support-surfaces.md
+    erBottomSurfaceOverSupport,
     erIroning,
     erBridgeInfill,
     erInternalBridgeInfill,
@@ -78,6 +83,7 @@ inline bool is_infill(ExtrusionRole role)
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
+        || role == erBottomSurfaceOverSupport
         || role == erIroning;
 }
 
@@ -93,6 +99,7 @@ inline bool is_solid_infill(ExtrusionRole role)
         || role == erSolidInfill
         || role == erTopSolidInfill
         || role == erBottomSurface
+        || role == erBottomSurfaceOverSupport
         || role == erIroning;
 }
 
