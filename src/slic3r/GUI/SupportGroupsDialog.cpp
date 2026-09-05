@@ -19,6 +19,7 @@
 #include "MsgDialog.hpp"
 #include "Plater.hpp"
 #include "Widgets/Button.hpp"
+#include "Widgets/Label.hpp"
 #include "format.hpp"
 
 namespace Slic3r {
@@ -100,6 +101,10 @@ SupportGroupsDialog::SupportGroupsDialog(wxWindow* parent, ModelObject* object)
 {
     if (object != nullptr)
         m_object_id = object->id();
+    // The rest of the slicer draws in the fork's own body font (Widgets/Label.hpp); this window
+    // was left on the system default, which is both smaller and a different face. Setting it on
+    // the dialog before the children are made means every one of them inherits it.
+    SetFont(Label::Body_14);
     build_ui();
     // The user edits parts in the object list and in the part parameter panel while this window
     // is open; refreshing when it comes back to the front is enough to stay in step, and costs
@@ -111,6 +116,18 @@ SupportGroupsDialog::SupportGroupsDialog(wxWindow* parent, ModelObject* object)
     });
     reload();
     wxGetApp().UpdateDlgDarkUI(this);
+    // The table HEADER is drawn by the native header control behind the generic
+    // wxDataViewListCtrl, and the recursive UpdateDarkUI pass UpdateDlgDarkUI just ran never
+    // reaches it: it recolours the wxWindow, not that HWND, so the header kept whatever text
+    // colour the last theme left on it - which is how it ended up white on white and unreadable.
+    // GUI_App::UpdateDVCDarkUI is the fork's own answer, and every other table in the application
+    // (the object list, Unsaved Changes, Print Host, Slice Compare) calls it: it applies the
+    // mode-aware explorer theme to the header HWND and sets a header wxItemAttr carrying
+    // NppDarkMode::GetTextColor() - 0xF0F0F0 in dark mode, the system window text in light - plus
+    // the application's normal font. It also gives the rows the alternating colour and the border
+    // the other tables have. It has to run AFTER UpdateDlgDarkUI, which would otherwise repaint
+    // over it.
+    wxGetApp().UpdateDVCDarkUI(m_table);
 }
 
 SupportGroupsDialog::~SupportGroupsDialog()
@@ -181,6 +198,9 @@ void SupportGroupsDialog::build_ui()
     m_table->AppendTextColumn(_L("Interface spacing"),  wxDATAVIEW_CELL_INERT,     8 * em);
     m_table->AppendTextColumn(_L("Support set"),        wxDATAVIEW_CELL_INERT,    12 * em);
     m_table->SetMinSize(wxSize(76 * em, 16 * em));
+    m_table->SetFont(Label::Body_14);
+    m_hint->SetFont(Label::Body_14);
+    // The header is themed at the end of the constructor, after UpdateDlgDarkUI - see there.
     main->Add(m_table, 1, wxEXPAND | wxALL, em / 2);
 
     m_table->Bind(wxEVT_DATAVIEW_SELECTION_CHANGED, [this](wxDataViewEvent& evt) {
