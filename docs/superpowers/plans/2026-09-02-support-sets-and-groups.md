@@ -741,6 +741,177 @@ from the baseline. They were just not sensitive to *how much* of the group's own
 group actually got - "differs" is a weak claim. The unit test above is the first one that measures
 the magnitude against a yardstick, and it is the assertion to keep.
 
+### Hardware pass 2 (2026-09-05): the group's filament under both parts
+
+Branch `fix/support-group-filament`, cut from `feat/ultra-preferences` @ `3adbc031c6` (which
+carries Stage 3 and the claim-reach fix above). Two reports from the same print.
+
+**A. The group's interface filament appeared under BOTH parts.** With one part in a group whose
+interface filament is 8 (PVA, cyan), the cyan interface was drawn under the ungrouped part too;
+giving the other part a second group with a PETG interface (red) then mixed red into the PVA
+part's support as well.
+
+**B. The Support-groups window's table header was white on white**, and the window drew in the
+system font rather than the fork's.
+
+**What the project contains.** `tests/supportgroup_test.3mf` is the same object as the first
+hardware pass, re-made: "Assembly" on a Snapmaker U1 with 9 filament slots, object extruder 6, two
+`MODEL_PART` volumes 26 mm apart in Y (both named "front tongue" - two placements of one source
+volume). Two things in it decide everything below:
+
+- the object carries `support_filament_matching = 1` - **Chameleon is on** - while the process
+  leaves `support_filament` and `support_interface_filament` at 0, i.e. *"don't care"*;
+- as saved, **both** volumes carry `support_group = "PVA Interface"` with identical values
+  (`support_interface_filament` 8, 5/2 interface layers, spacing 0, `rectilinear_interlaced`,
+  ironing on, `support_top_z_distance` 0). The file therefore cannot show symptom A by itself -
+  with both parts in the group, cyan under both parts is the correct answer. The measurements
+  below use a variant with the group left on ONE part, which is the situation the report
+  describes, built by rewriting `Metadata/model_settings.config` and nothing else. Whether the
+  user assigned the group to both parts or the GUI did is not answered here: the assignment path
+  (`selected_part_volumes` / `assign_support_group`, `GUI_Factories.cpp:1314,1445`) writes only
+  the volumes the object list actually has selected, and re-reading it turned up no way for one
+  click to reach two parts. Worth one question to the user.
+
+**Root cause of A: `GCode.cpp`, the Chameleon "mechanism B" dominant-bucket pin** (`GCode.cpp`
+:5590-5607 as shipped; `process_layer`'s support-extruder block). It fires for any object with
+`support_filament_matching` on whose support layer has a non-empty
+`SupportLayer::interface_by_extruder`, and pins **both** still-"don't care" slots - the support
+BASE and the support INTERFACE - to that layer's largest bucket's extruder. It was written when
+that map held only Chameleon's own matched partitions. Since Stage 3 a support group's own
+interface filament writes the very same map (`SupportCommon.cpp:2104`) - and for exactly such an
+object the Chameleon pass has already stood down (`Print.cpp:3197`), so every bucket there is a
+GROUP's, not a match. The pin therefore handed the whole layer's don't-care support - the base and
+the *other* parts' interface, everything still in `support_fills` - to the group's filament.
+
+There is a second, smaller path to the same place, and it does not need Chameleon at all: with
+`support_interface_filament = 0` the don't-care resolution falls through to the first/active
+extruder of the layer (`GCode.cpp`:5638 as shipped), and once a group has forced its filament onto a layer
+that extruder is often the group's. Measured with matching off, the ungrouped part's interface
+came out **49 % T7** that way.
+
+**The fix**, three edits, all no-ops for an object with no support group:
+
+1. `src/libslic3r/PrintObject.cpp` - `PrintObject::support_group_interface_extruders()`, the
+   0-based extruders a group pins for its own interface (sorted, unique, empty otherwise).
+   `has_support_group_interface_filament()` is now `! ...empty()`, so the two cannot drift.
+2. `src/libslic3r/GCode.cpp` - the dominant-bucket pin stands down when that list is non-empty,
+   the same interlock the Chameleon pass, `WipingExtrusions` and `is_support_overriddable` already
+   use; and those extruders are excluded from the "don't care" candidate search in both of its
+   branches. A group's filament is for its own part's interface and for nothing else.
+3. `src/libslic3r/PrintObject.cpp` / `Print.cpp` - the Chameleon stand-down **warning now
+   appears**. See below.
+
+**The Chameleon warning: it never fired, and could not have.** `chameleon_assign_support_
+interfaces` posted it through `PrintObject::active_step_add_warning`, but that pass runs at the
+end of `Print::process` (`Print.cpp:4290`), *after* every PrintObject step has finished. There
+`m_step_active` is -1 - `active_step_add_warning`'s own `assert(m_step_active != -1)` says that
+must not happen, and a Release build has no asserts, so the call indexed `m_state[-1]` and the
+warning went nowhere. Measured: **0 occurrences on the baseline, on every variant.** It is now
+raised from `PrintObject::generate_support_material()`, inside the `posSupportMaterial` step,
+under the same condition plus `support_filament_matching`; `add_support_group_chameleon_warning()`
+- the public door that existed only for the old call - is gone. It also has a
+`SlicingNotificationType` of its own (`SlicingSupportGroupChameleonOff`), because the CLI's
+`result.json` filter drops any warning left on the default id - which is precisely why nothing
+automated could have caught its absence. Measured after: the warning appears exactly on the
+variants with Chameleon ON *and* a group interface filament (as-saved, one-part, two-group), and
+not on the matching-off or no-group variants, in both `result.json` and the progress stream.
+
+**Evidence: support-interface extrusion per part, per tool, on the user's project.** Sliced with
+the CLI on an isolated data dir; the two parts separate at y = 121.5. T5 is filament 6 (the
+object's own), T7 is filament 8 (PVA, the group's), T8 is filament 9 (PETG).
+
+*Group on ONE part (the front one), Chameleon on - the reported case:*
+
+| run | grouped part (front) | ungrouped part (back) |
+|---|---|---|
+| control, group stripped | 8 233.4 mm, all T5 | 9 443.2 mm, all T5 |
+| **before** | 10 092.9 mm, **all T7** | 9 504.9 mm, **all T7** |
+| **after** | 9 944.4 mm T7 + 148.5 mm T5 (**98.5 % T7**) | 9 504.9 mm, **all T5** |
+
+The ungrouped part's interface is **9 504.9 mm in 4 909 segments before and after** - identical to
+the last digit. Nothing moved but the tool, which is the whole claim. The support BASE and the
+ironing tell the same story: before, 5 957 mm of base and 4 272 mm of ironing on the ungrouped
+part were drawn in PVA; after, **neither part has a single millimetre of T7 outside the group's own
+interface**.
+
+*Two groups, PVA on the front part and PETG on the back:*
+
+| run | front part interface | back part interface | base support |
+|---|---|---|---|
+| before | 9 990.1 T7 + 109.7 T8 | 10 459.4 T8 + 17.6 T7 | T7 7 015 mm + T8 5 869 mm scattered over both parts |
+| after | 9 920.9 T7 + 178.8 T5 | 10 391.9 T8 + 85.2 T5 | **0 mm of T7 or T8** - all T5 |
+
+*The file as saved (both parts grouped):* both parts keep their PVA interface, correctly, before
+and after; what changes is that 12 623 mm of PVA base support and 8 008 mm of PVA ironing become
+the object's own filament.
+
+The ~1.5 % of the grouped part's interface still drawn in T5 (148.5 mm of 10 092.9) is the R3.1
+claim seam, not a filament bug: it is the same fringe the claim-reach section measures, and it is
+present in the control too.
+
+**Root cause of B, and the fix.** `SupportGroupsDialog` themed itself with `UpdateDlgDarkUI`,
+which walks the child windows and recolours them. The table header is not one: behind the generic
+`wxDataViewListCtrl` it is a native header HWND, so `SetForegroundColour` on the control never
+reaches it and it kept whatever text colour the theme last left there. `GUI_App::UpdateDVCDarkUI`
+(`GUI_App.cpp:3789`) is the fork's own answer and every other table in the application calls it -
+the object list, Unsaved Changes, Print Host, Slice Compare - but this window did not. It applies
+the mode-aware explorer theme to the header HWND and sets a header `wxItemAttr` carrying
+`NppDarkMode::GetTextColor()`, which is `0xF0F0F0` in dark mode and the system window text in
+light, so one call fixes both modes; it also gives the rows the alternating colour and the border
+the other tables have. It has to run *after* `UpdateDlgDarkUI`, which would otherwise paint over
+it. The fonts are the second half: the dialog now sets `Label::Body_14` on itself before its
+children are built, and on the table and the hint line, so the window reads in the same face and
+size as the rest of the slicer instead of the system default.
+
+**Gates.**
+
+- **Off mode, the hard gate** - `scripts/support_group_identity.py`, tolerance, baseline
+  `feat/ultra-preferences` @ `3adbc031c6` installed to a scratch prefix: **green on all 8 cases,
+  three passes**, with exactly the segment counts 2c records (`normal_grid` 4466, `normal_snug`
+  2255, `normal_ledge` 2592, `soluble_interface` 35647, `dense_interface` 4964, `tree_organic`
+  36339, `raft` 4726, `no_support` 1726). Expected by construction: every branch of the fix is
+  behind a non-empty `support_group_interface_extruders()`.
+- **On mode** - `--gate groups --baseline-has-groups`: **green on all 4 cases, three passes.**
+- **Unit** - `fff_print_tests "[SupportGroups]"` 10 cases / 50 assertions, `"[support_groups]"`
+  3 cases / 35 assertions, `libslic3r_tests` 599 cases / 53 725 assertions with the same 2
+  `[!shouldfail]` cases. Build clean: 0 `error C`, 0 `error LNK`.
+
+**The ON-mode gate had to be taught about a baseline that already has groups**, and this is the
+more useful half of the harness change. Its requirements 1 and 3 - "the two G-codes must DIFFER"
+and "the tool change must be ABSENT from the baseline" - only say anything while the baseline
+*predates* the feature. Every branch cut after Stage 3 pairs two builds that both honour groups,
+so both requirements are unsatisfiable by construction; 2c hit this for `group_parts` and called
+it a pairing problem, and this branch would have hit it for all four cases. `--baseline-has-groups`
+flips requirement 1 to "the support GEOMETRY must be IDENTICAL" and drops the second half of
+requirement 3. That is not a weaker gate for a fix like this one, it is the right one: the
+comparison engine reads coordinates, not tools, so `config_rows=0 changed=0 a_only=0 b_only=0
+segments=100.0000%` on all four cases is a *positive* statement that this change moved no support
+geometry at all.
+
+**New regression cover.**
+
+- `corpus.json` - `expect_tool_part` on `group_parts`, and a new ON-mode case
+  `group_parts_matching`: the same fixture and args plus `--support-filament-matching=1`, which is
+  what the user's project had. The criterion splits the named feature's extrusions at the widest
+  gap along an axis and requires the named tool to draw >= 95 % of the group's own part and <= 5 %
+  of the other part's. On `twopart_groups.3mf`, measured across the parts' split at x = 138.4, the
+  baseline gives the neighbouring part **100.0 % T1 with matching on** and **34.0 % T1 with it
+  off**; the candidate gives **1.0 %** in both. `expect_tool` - "a T1 exists somewhere in the
+  file" - is true on every one of those runs, which is exactly why it could not see this.
+- `tests/fff_print/test_support_groups.cpp` - two cases for
+  `support_group_interface_extruders()`: a group pinning slot 2 is reported as extruder 1, and a
+  group merely repeating the object's own slot pins nothing. (They need a two-filament config:
+  `PrintObject` clamps an out-of-range support filament slot to 1, which would otherwise turn the
+  first case into the second.)
+
+**Not fixed here, and worth a decision.** The predicate compares a volume's RAW
+`support_interface_filament` slot against the object's CLAMPED one
+(`object_config_from_model_object` runs `clamp_exturder_to_default`, the volume value does not).
+On a printer with fewer filaments than the group asks for, the group's slot is used unclamped
+through the whole Stage 3 path - `support_groups()` copies it raw as well - so this is
+pre-existing Stage 3 behaviour, consistent within itself, and left alone. Stage 5's "a group whose
+interface filament cannot be resolved raises a warning" is where it belongs.
+
 ### What Stage 4 and Stage 5 inherit
 
 Stage 4a is now a small stage: `TreeSupport3D::generate_support_areas` calls the *same* two functions

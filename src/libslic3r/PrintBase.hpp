@@ -65,7 +65,13 @@ public:
         SlicingReplaceInitEmptyLayers,
         SlicingNeedSupportOn,
         SlicingEmptyGcodeLayers,
-        SlicingGcodeOverlap
+        SlicingGcodeOverlap,
+        // Ultra (support groups): support filament matching stood down for an object because one
+        // of its support groups pins its own interface filament. Appended, so no existing value
+        // moves. Having an id of its own is not decoration: a warning left on the default id is
+        // dropped by the CLI's own result.json filter (Snapmaker_Orca.cpp), so it could not be
+        // asserted by a gate - and this one went unnoticed for a release because of that.
+        SlicingSupportGroupChameleonOff
     };
 
     typedef size_t TimeStamp;

@@ -3194,11 +3194,13 @@ static void chameleon_assign_support_interfaces(Print &print)
         // support-interface filament writes the very same SupportLayer::interface_by_extruder map
         // this pass owns. Letting both run would make the result depend on which ran last, so the
         // explicit per-part assignment wins and Chameleon stands down for this object.
-        if (object->has_support_group_interface_filament()) {
-            object->add_support_group_chameleon_warning(
-                _u8L("Support filament matching is off for this object because one of its support groups picks its own interface filament."));
+        // The user-visible warning that says so is raised from PrintObject::generate_support_
+        // material(), not here: this pass runs after every object step has finished (see the call
+        // site at the end of Print::process), so no PrintObjectStep is active and
+        // active_step_add_warning() would have nowhere to put it - m_step_active is -1 there,
+        // which its own assert says must not happen and which Release builds do not catch.
+        if (object->has_support_group_interface_filament())
             continue;
-        }
 
         const unsigned object_default_extruder = chameleon_object_default_extruder(print, *object);
         // Spec-mandated fallback: the object's resolved interface extruder, mirroring

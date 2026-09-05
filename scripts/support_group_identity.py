@@ -82,6 +82,7 @@ import argparse
 import ctypes
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -199,10 +200,130 @@ def has_tool_change(path, token):
     return False
 
 
-def groups_ok(verdict, case, baseline_path, candidate_path):
+def extrusions_by_side(path, feature, axis):
+    """Split one feature's extrusions into the two PARTS of a two-part fixture, per tool.
+
+    Every corpus fixture that carries a group is one object whose parts sit apart along one axis,
+    so the parts separate at the widest gap in the coordinates the feature is drawn at - read off
+    the data rather than assumed, exactly as the plan's own hardware measurement did. Returns
+    (split, [{tool: mm}, {tool: mm}]), the first dict for the low side.
+    """
+    ai = 0 if axis == "x" else 1
+    tool = None
+    ftype = None
+    pos = [None, None]
+    e_abs = True
+    seg = []       # (mid coordinate on `axis`, tool, length)
+    tool_re = re.compile(r"^T(\d+)\s*(;.*)?$")
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            t = line.strip()
+            if t.startswith(";TYPE:"):
+                ftype = t[6:].strip()
+                continue
+            m = tool_re.match(t)
+            if m:
+                tool = "T" + m.group(1)
+                continue
+            if t.startswith("M82"):
+                e_abs = True
+                continue
+            if t.startswith("M83"):
+                e_abs = False
+                continue
+            if not t[:3] in ("G0 ", "G1 "):
+                continue
+            new = list(pos)
+            e = None
+            for tok in t.split(";")[0].split()[1:]:
+                if tok[:1] == "X":
+                    new[0] = float(tok[1:])
+                elif tok[:1] == "Y":
+                    new[1] = float(tok[1:])
+                elif tok[:1] == "E":
+                    e = float(tok[1:])
+            if (ftype == feature and e is not None and e > 0 and None not in pos and None not in new):
+                d = math.hypot(new[0] - pos[0], new[1] - pos[1])
+                if d > 0:
+                    seg.append((0.5 * (pos[ai] + new[ai]), tool, d))
+            pos = new
+    if not seg:
+        return None, [{}, {}]
+    coords = sorted(s[0] for s in seg)
+    gap, split = 0.0, coords[0]
+    for i in range(1, len(coords)):
+        g = coords[i] - coords[i - 1]
+        if g > gap:
+            gap, split = g, 0.5 * (coords[i] + coords[i - 1])
+    sides = [{}, {}]
+    for c, tl, d in seg:
+        side = sides[0 if c < split else 1]
+        side[tl] = side.get(tl, 0.0) + d
+    return split, sides
+
+
+def tool_part_shares(case, path):
+    """(own-part share, other-part share, split, one-line detail) for expect_tool_part, or None.
+
+    None when the case names no such criterion, or when the feature is missing / drawn on only
+    one side of the split, in which case the assertion would be vacuous.
+    """
+    spec = case.get("expect_tool_part")
+    if not spec:
+        return None
+    tool = spec["tool"]
+    feature = spec.get("feature", "Support interface")
+    axis = spec.get("axis", "x")
+    split, sides = extrusions_by_side(path, feature, axis)
+    if split is None:
+        return None
+    totals = [sum(s.values()) for s in sides]
+    if min(totals) <= 0.0:
+        return None
+    shares = [sides[i].get(tool, 0.0) / totals[i] for i in (0, 1)]
+    owner, other = (0, 1) if shares[0] >= shares[1] else (1, 0)
+    detail = ("%s draws %.1f%% of the %s on its own part and %.1f%% of the other part's "
+              "(%.1f mm of %.1f mm), split at %s=%.2f"
+              % (tool, 100.0 * shares[owner], feature, 100.0 * shares[other],
+                 sides[other].get(tool, 0.0), totals[other], axis, split))
+    return shares[owner], shares[other], split, detail
+
+
+def tool_part_ok(case, candidate_path):
+    """expect_tool_part: the group's interface filament stays inside the group's own part.
+
+    Stage 3 shipped with the geometry split right and the EXTRUDER assignment wrong: an object
+    with support filament matching on handed the whole layer's "don't care" support - the base
+    and the OTHER part's interface alike - to whatever extruder was first on the layer, which
+    once a group had pinned its own filament was the group's (plan 2c). "A tool change exists
+    somewhere in the file" cannot see that; this can. The named tool must draw at least
+    `min_share` of the feature on one part and at most 1 - min_share of it on the other.
+    """
+    spec = case.get("expect_tool_part")
+    if not spec:
+        return True, ""
+    tool = spec["tool"]
+    feature = spec.get("feature", "Support interface")
+    min_share = float(spec.get("min_share", 0.95))
+    got = tool_part_shares(case, candidate_path)
+    if got is None:
+        return False, ("%s is missing from the candidate, or drawn on only one side of the split "
+                       "- the assertion would be vacuous" % feature)
+    own, other, _split, detail = got
+    if own < min_share:
+        return False, ("%s draws only %.1f%% of the %s on its own part (want >= %.0f%%)"
+                       % (tool, 100.0 * own, feature, 100.0 * min_share))
+    if other > 1.0 - min_share:
+        return False, ("%s leaked onto the OTHER part (want <= %.0f%%): %s"
+                       % (tool, 100.0 * (1.0 - min_share), detail))
+    return True, ""
+
+
+def groups_ok(verdict, case, baseline_path, candidate_path, segment_tolerance=99.0,
+              baseline_has_groups=False):
     """The ON-mode criterion: the groups must ACT, and only on the geometry.
 
-    Three requirements, in the order they are worth reading:
+    Four requirements, in the order they are worth reading:
 
       1. the two G-codes must DIFFER - some layer changed, or some segments did not match. A
          baseline that ignores support_group and a candidate that honours it cannot agree;
@@ -210,7 +331,18 @@ def groups_ok(verdict, case, baseline_path, candidate_path):
          group value is a process setting, so the config block must be identical - which is what
          makes requirement 1 a statement about geometry rather than about settings;
       3. where the case names expect_tool, that tool change must appear in the CANDIDATE and not
-         in the baseline: the group's own interface filament being scheduled, end to end.
+         in the baseline: the group's own interface filament being scheduled, end to end;
+      4. where the case names expect_tool_part, that filament must be drawn on the group's OWN
+         part and essentially nowhere else - see tool_part_ok.
+
+    --baseline-has-groups INVERTS requirement 1 and drops the second half of requirement 3.
+    Requirements 1 and 3 only say anything while the baseline PREDATES the feature. Once both
+    sides implement it - which is every branch cut after Stage 3 - they are unsatisfiable by
+    construction, and 2c's hardware pass walked straight into that. With the flag the question
+    becomes the one such a pair can actually answer: the support GEOMETRY must be UNCHANGED (the
+    comparison engine reads coordinates, not tools, so it cannot see an extruder move on its own)
+    and every ABSOLUTE criterion - the tool change exists; it stays on its own part - must hold in
+    the candidate. That is precisely the claim of a fix that reassigns extruders and moves nothing.
     """
     if "error" in verdict:
         return False, verdict["error"]
@@ -221,15 +353,31 @@ def groups_ok(verdict, case, baseline_path, candidate_path):
     seg = verdict.get("segments", {})
     moved = (lay.get("changed", 0) or 0) > 0 or float(seg.get("percent", 100.0)) < 100.0 or \
             (lay.get("a_only", 0) or 0) > 0 or (lay.get("b_only", 0) or 0) > 0
-    if not moved:
+    if baseline_has_groups:
+        if not tolerance_ok(verdict, segment_tolerance):
+            return False, ("the support GEOMETRY moved; with --baseline-has-groups both sides "
+                           "already honour the groups, so nothing but the extruder assignment "
+                           "may differ")
+    elif not moved:
         return False, "identical to the baseline - the support group did NOT act"
     token = case.get("expect_tool")
     if token:
         if not has_tool_change(candidate_path, token):
             return False, "no %s tool change in the candidate - the group's interface filament was not scheduled" % token
-        if has_tool_change(baseline_path, token):
+        if not baseline_has_groups and has_tool_change(baseline_path, token):
             return False, "the baseline already has a %s tool change - the case proves nothing" % token
-    return True, ""
+    ok, why = tool_part_ok(case, candidate_path)
+    if not ok:
+        return False, why
+    # Put the before/after in the gate's own output: a number nobody has to be shown separately.
+    now = tool_part_shares(case, candidate_path)
+    if now is None:
+        return True, ""
+    note = "candidate: " + now[3]
+    was = tool_part_shares(case, baseline_path)
+    if was is not None:
+        note += "  (baseline: %.1f%% own / %.1f%% other)" % (100.0 * was[0], 100.0 * was[1])
+    return True, note
 
 
 def describe(verdict):
@@ -289,6 +437,11 @@ def main(argv=None):
                          "bytes: the original byte comparison, which this tree cannot pass; "
                          "groups: the ON-mode gate over the cases marked \"groups\": true, which "
                          "must DIFFER - see the docstring")
+    ap.add_argument("--baseline-has-groups", action="store_true",
+                    help="--gate groups only: the BASELINE already implements support groups "
+                         "(any pairing from Stage 3 on). Requirement 1 flips from 'must differ' "
+                         "to 'the support geometry must be identical', and expect_tool no longer "
+                         "has to be absent from the baseline. See groups_ok.")
     ap.add_argument("--segment-tolerance", type=float, default=99.0,
                     help="minimum per cent of matching segments (default 99.0); see the "
                          "module docstring for why this is not 100")
@@ -374,8 +527,13 @@ def main(argv=None):
                 _strict, verdict = compare_tolerance(a.compare_exe, bf, cf)
                 total += int(verdict.get("segments", {}).get("both", 0) or 0)
                 if a.gate == "groups":
-                    ok, why = groups_ok(verdict, case, bf, cf)
+                    ok, why = groups_ok(verdict, case, bf, cf, a.segment_tolerance,
+                                        a.baseline_has_groups)
                     detail = "          " + describe(verdict)
+                    if ok and why:
+                        # groups_ok returns the per-part tool evidence on success; it is the
+                        # whole point of the ON-mode gate, so print it next to the numbers.
+                        detail += "\n          " + why
                     if not ok:
                         bad = (os.path.basename(bf), why)
                         break

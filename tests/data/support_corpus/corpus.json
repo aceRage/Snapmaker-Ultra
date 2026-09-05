@@ -140,6 +140,37 @@
       "filaments": [
         "Generic PLA",
         "Generic PLA"
+      ],
+      "expect_tool_part": {
+        "tool": "T1",
+        "feature": "Support interface",
+        "axis": "x",
+        "min_share": 0.95
+      }
+    },
+    {
+      "name": "group_parts_matching",
+      "groups": true,
+      "expect_tool": "T1",
+      "expect_tool_part": {
+        "tool": "T1",
+        "feature": "Support interface",
+        "axis": "x",
+        "min_share": 0.95
+      },
+      "comment": "ON MODE, the regression case for the filament leak of 2c. Same fixture and same args as group_parts plus support filament matching (Chameleon) turned on, which is what the user's own project had. Chameleon and a support group write the same SupportLayer::interface_by_extruder map, so the group makes Chameleon stand down - but GCode.cpp's dominant-bucket pin still read that map as 'what Chameleon matched here' and pinned the layer's whole don't-care support to the group's filament. The result was the group's interface colour under BOTH parts and its filament in the support base as well, with the T1 tool change the plain expect_tool criterion asks for present the whole time. expect_tool_part is what sees it: T1 must draw the support interface on its own part and essentially none of the other part's.",
+      "models": [
+        "tests/data/support_corpus/twopart_groups.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=normal(auto)",
+        "--support-style=grid",
+        "--support-filament-matching=1"
+      ],
+      "filaments": [
+        "Generic PLA",
+        "Generic PLA"
       ]
     },
     {
