@@ -257,12 +257,13 @@ be deterministic and is a two-line change, but it removes the only parallelism `
 
 ## 5. What is still order- or seed-dependent
 
-- **Classic tree support on more than one core** - §4.1. The one corpus case that is not
-  byte-identical and the only one that still needs a CPU pin.
+- ~~**Classic tree support on more than one core**~~ - §4.1. **Fixed on
+  `fix/tree-support-determinism`; see §7.** It no longer needs a CPU pin.
 - **Organic tree support (`TreeSupport3D`) depends on the core count.** It is byte-identical over
   three passes on all cores and over three passes on one CPU, but the two answers differ (52808
   against 52816 lines). Not chased here; it is the same family of question as §4.1 and would need
-  the same kind of look at that generator's parallel sections.
+  the same kind of look at that generator's parallel sections. Still true after §7, and measured
+  there: 58.5 % of segments match between a 1-thread and a 20-thread slice.
 - **Lightning infill's SVG-debug filename helper** still calls `srand(time(NULL))`
   (`Fill/Lightning/Generator.cpp`), reseeding that thread's C-runtime generator from the wall
   clock. The generator's own `rand()` in the tree traversal is fixed (§3.8); the `srand` is left
@@ -302,12 +303,207 @@ be deterministic and is a two-line change, but it removes the only parallelism `
   stage whose file differs between them.
 - `make_twoobj.py` - regenerates `tests/data/support_corpus/two_objects.3mf`.
 
-## 7. Follow-up (decided 2026-09-03)
+## 7. Follow-up: classic tree support across thread counts (done 2026-09-04)
 
-Merged into the integration branch as is. The remaining multi-core case, classic tree support's
-`TreeSupport::drop_nodes()` merging nodes from two `tbb::parallel_for_each` passes in arrival order
-(section 4.1), is deliberately left for a later change of its own: the proposed fix - a parallel
-read-only phase followed by a short sequential apply phase in `nodes_vec` order - changes which node
-wins a merge and therefore tree geometry and timing, so it wants its own tests and a measurement of
-the effect on real tree-supported prints before it lands. Until then classic tree support is
-reproducible on one core only; organic tree support stays self-consistent per core count.
+Branch `fix/tree-support-determinism`, cut from `feat/ultra-preferences` at `eadc7ec8ed`.
+
+§4.1 left one case open. Classic tree support was byte-identical only with the process pinned to
+one CPU, because `TreeSupport::drop_nodes()` merged nodes and appended the next layer's nodes from
+two `tbb::parallel_for_each` passes in whatever order the workers arrived in. The plan recorded
+there - a parallel read-only phase followed by a short sequential apply phase in `nodes_vec` order -
+is what landed, plus one cause the plan had not spotted (the grouping map, §7.1). It costs nothing
+measurable (§7.4).
+
+### 7.1 What was found
+
+Line numbers are on the pre-fix tree, `eadc7ec8ed`.
+
+- `Support/TreeSupport.cpp:2543` - `nodes_per_part` was a
+  `std::vector<std::unordered_map<Point, SupportNode*, PointHash>>`. Its iteration order is the
+  vertex order of the layer's minimum spanning tree, and `prim()` (after §3.4) breaks a tie in the
+  distance by the **lowest vertex index** - so the shape of the tree was a function of the order in
+  which the nodes had been appended to `contact_nodes`, which was thread-arrival order from the
+  layer above. That is what makes the whole thing cascade: every layer's tree depended on the
+  previous layer's push order.
+- `TreeSupport.cpp:2618` and `:2705` - the two `tbb::parallel_for_each` passes, both mutating state
+  shared between the nodes they visit.
+- `TreeSupport.cpp:2642` - pass one's polygon-node branch sets `neighbour_node->valid = false` with
+  **no lock at all**. A plain data race, not merely an ordering question.
+- `TreeSupport.cpp:2685-2695` - pass one's "absorb close neighbours" merge takes
+  `m_ts_data->m_mutex` and then asks `if (p_node->valid)`. Where two neighbouring nodes each want
+  to absorb the other, the winner is whichever worker reached the mutex first.
+- `TreeSupport.cpp:2673` - pass one's pair merge appends the replacement node to
+  `contact_nodes[layer_nr_next]` in arrival order.
+- `TreeSupport.cpp:2725` and `:2875` - pass two appends the next layer's nodes in the order the
+  tasks finish. That vector is the next layer's grouping input **and** the order `smooth_nodes()`
+  walks the branches in.
+- `TreeSupport.cpp:2746` / `:2753` against `:2773` - pass two clears `p_node->valid` from one worker
+  while another worker reads `neighbour_node->valid` to decide whether to move towards that node. A
+  node could be pulled towards a neighbour that was about to be deleted, or not, purely on timing.
+- `TreeSupport.cpp:2629`, `:2647`, `:2660`, `:2685`, `:2772` - `nodes_this_part[neighbour]` is
+  `std::unordered_map::operator[]`, a non-const, potentially-inserting call, made from inside a
+  `parallel_for_each` over that same map. For a key that was not there it also created a null entry
+  that the very next line dereferenced.
+
+### 7.2 What changed
+
+`src/libslic3r/Support/TreeSupport.cpp`, `drop_nodes()`:
+
+- `nodes_per_part` is now a `std::map<Point, SupportNode*>` (a local `NodesByPoint` alias), ordered
+  by `(x, y)`. The MST's vertex order, and so its tie-breaking, is a function of the geometry alone
+  rather than of hashing or of the previous layer's push order - on any standard library.
+- Both passes are split into a **parallel phase that only reads**, recording what each node would
+  do (`TreeMergePlan` / `TreeMovePlan`, in an anonymous namespace above the function), and a
+  **sequential phase applying those decisions in `nodes_vec` order**. Pass two needs three: 2a
+  decides which nodes die and cuts the polygon nodes' overhangs, 2b applies the deaths, 2c computes
+  every survivor's movement, 2d creates the next layer's nodes. The expensive geometry -
+  `projection_onto`, `move_out_expolys`, `diff_clipped`, the line/contour intersections - all stays
+  in the parallel phases; the sequential phases only allocate nodes and push pointers.
+- The two mutex sections and the unlocked `valid` write are gone. Nothing in a parallel phase now
+  writes anything another task reads.
+- Neighbour lookups go through a `node_at()` helper that uses `find()` and returns `nullptr`.
+- One deliberate change beyond ordering: splitting pass two at 2b means every surviving node sees
+  the **same settled** validity picture when it decides where to move, instead of whatever its
+  worker happened to observe mid-flight. That is the only way to make the decision well defined at
+  all, but it is a behaviour change and not just a reordering.
+
+`src/libslic3r/Thread.cpp:222` - not a determinism bug, but it blocked the test.
+`name_tbb_thread_pool_threads_set_locale()`, which `Print::process()` calls once, spawns one task
+per hardware thread and makes each of them wait until **all** of them are running. Under a
+`tbb::global_control` parallelism cap - exactly what a test that wants to slice on one thread
+installs - fewer tasks than that can ever run at once, and the first one waits for ever. The count
+is now clamped to `tbb::global_control::active_value(max_allowed_parallelism)`. Anything that caps
+TBB before the first slice used to deadlock; now it does not.
+
+### 7.3 Determinism evidence
+
+`snorca_hubtest\det_tree_gate.py` slices each case once per thread count and compares the G-code
+byte for byte against the first pass (only the `; generated by` header is dropped). The thread count
+is set by the process affinity mask, which a child inherits and which is what TBB reads for its
+arena concurrency, so 1, 2, 4 and 20 CPUs really are 1, 2, 4 and 20 workers. When bytes differ the
+pair also goes through `tests/slice_compare_cli`, which is what separates the two kinds of failure
+below.
+
+Tree cases, `--threads 1,2,4,20`:
+
+| case | model | before | after |
+|---|---|---|---|
+| `tree_classic_bridge` | `twopart_bridge.3mf` | DIFFER at 1 vs 4 - 14.5 % of segments matching, 49 dirty layers | **identical**, 50317 lines |
+| `tree_classic_ledge` | `overhang_ledge.3mf` | DIFFER at 1 vs 2 - 30.5 %, 29 dirty layers | **identical**, 25662 lines |
+| `tree_classic_strong` | `twopart_bridge.3mf`, `tree_strong` | identical | identical, 51463 lines |
+| `tree_classic_hybrid` | `overhang_ledge.3mf`, `tree_hybrid` | identical | identical, 5729 lines |
+| `tree_organic` | `twopart_bridge.3mf`, `organic` | DIFFER at 1 vs 20 - 58.5 %, 47 dirty layers | **still DIFFER**, unchanged - `TreeSupport3D`, §7.6 |
+| `handy_benchy` | `3DBenchy.3mf` | DIFFER at 1 vs 2 - 50.8 %, 181 dirty layers | **identical**, 350664 lines |
+| `handy_bunny` | `Stanford_Bunny.3mf` | DIFFER at 1 vs 2 - 64.2 %, 488 dirty layers | **identical**, 1088276 lines |
+| `handy_stringhell` | `Orca_stringhell.3mf` | DIFFER at 1 vs 4 | TRAVEL only - §7.6 |
+| `handy_ksr` | `ksr_fdmtest_v4.3mf` | DIFFER at 1 vs 2 - 24.0 %, 249 dirty layers | TRAVEL only - §7.6 |
+| `handy_tolerance` | `OrcaToleranceTest.stl` | identical | identical, 25582 lines |
+
+Every case whose **geometry** used to move now produces identical geometry at all four thread
+counts, and seven of the ten are byte-identical. The remaining geometry difference is organic tree
+support, a different generator; the two "TRAVEL" rows print exactly the same plastic in a different
+visiting order and are not the support generator at all (§7.6).
+
+`det_tree_gate.py --corpus` runs `corpus.json`'s own nine cases at the same four thread counts, as a
+regression check on the paths this change does not touch: **eight of nine byte-identical at 1, 2, 4
+and 20 threads**, the ninth being `tree_organic` again. That is a stronger statement than §4's,
+which only ever compared runs at one thread count.
+
+Two things worth recording. The handy models slice through the CLI perfectly well now - the "every
+.3mf under `resources/handy_models/` segfaults the CLI on `--slice`" note in
+`tests/data/support_corpus/corpus.json` is stale. And `handy_stringhell` used to differ only in the
+I/J of a `G3` Z-lift arc, with the layers already 100 % identical; even a difference the tolerance
+gate passes was downstream of `drop_nodes()`.
+
+### 7.4 Cost
+
+Interleaved A/B on the 20-core machine (`snorca_hubtest\det_tree_ab.py`: 7 runs of each executable,
+alternated case by case so both sides meet the same background load; the figure is the minimum, the
+run that got the least interference). Interleaving is not fussiness - this machine runs other
+people's builds, and a naive "measure A, then measure B" pass reported a spurious 1.6x slowdown that
+vanished entirely once the runs were alternated.
+
+| case | before | after | ratio |
+|---|---|---|---|
+| `tree_classic_bridge` | 3.39 s | 3.22 s | 0.95x |
+| `tree_classic_ledge` | 2.31 s | 2.27 s | 0.98x |
+| `tree_classic_strong` | 2.42 s | 2.55 s | 1.05x |
+| `tree_classic_hybrid` | 2.18 s | 2.27 s | 1.04x |
+| `handy_benchy` | 6.17 s | 5.98 s | 0.97x |
+| `handy_bunny` | 7.03 s | 6.95 s | 0.99x |
+| `handy_stringhell` | 2.77 s | 2.75 s | 0.99x |
+| `handy_ksr` | 6.05 s | 6.13 s | 1.01x |
+| **total** | **32.32 s** | **32.12 s** | **0.99x** |
+
+**The fix costs nothing measurable** - 0.99x overall, every case within ±5 %, which is inside the
+run-to-run noise. That is worth explaining rather than asserting: the sequential phases only
+allocate nodes and push pointers, while every geometric call - all of the actual work - stayed
+inside a `tbb::parallel_for`. The cheaper alternative §4.1 offered (run both passes sequentially, a
+two-line change) was therefore neither needed nor taken; it would have serialised `projection_onto`
+and `move_out_expolys`, which dominate `drop_nodes()`.
+
+The output is the same size, so the comparison is like for like
+(`snorca_hubtest\det_tree_size.py`, all cores): filament used agrees to within 0.3 % on every case
+(bunny 106.19 g against 105.89 g, ksr 48.72 g against 48.96 g) and the G-code line counts to within
+0.5 %. The fix picks different tie-breaks, not a different amount of support.
+
+### 7.5 Tests
+
+`tests/fff_print/test_tree_support_determinism.cpp`, tag `[TreeSupportDeterminism]`:
+
+- *"classic tree support is identical on one thread and on many"* - slices an 80 x 50 mm two-piece
+  deck on an off-centre 10 x 30 mm pillar with `tree(auto)` / `tree_slim` under
+  `tbb::global_control(max_allowed_parallelism, 1)` and then `32`, and compares every support
+  layer's `print_z`, island count and support extrusion points. 1.9 s.
+- *"classic tree support is identical across several thread counts"* - the same digest at 1, 2, 4
+  and 20. 5.2 s.
+- **Negative control**: with `TreeSupport.cpp` reverted to `eadc7ec8ed` and everything else in
+  place, all four comparisons fail. Two properties of the fixture had to be found before it would
+  discriminate, and both are commented in the file: the overhang must be **asymmetric** (a
+  symmetric cap resolves its ties the same way however the work is split), and the deck must be
+  **big** - at the corpus' 34 x 16 mm a layer holds only a few dozen contact nodes, too few for
+  `tbb::parallel_for_each` to split, so the old code ran the passes on one thread whatever the cap
+  said and passed. `require_real_support()` pins the digest size for the same reason: a fixture that
+  quietly stopped producing support would otherwise pass on two identical empty digests.
+- Built on `DynamicPrintConfig::full_print_config()` and `Print::process()`, not on
+  `Slic3r::Test::init_print()`, which still throws on this fork's config key names (§4.0).
+
+Suites, on the fixed build:
+
+- `libslic3r_tests`: 599 cases, 597 passed, 2 failed as expected. No change.
+- `fff_print_tests`: unchanged from before this branch - 9 of 18 cases fail and the run ends in the
+  `test_skirt_brim.cpp:32` SIGSEGV, all of it hanging off the `init_print` fixture described in
+  §4.0. Because that crash aborts the run, `[TreeSupportDeterminism]` and `[SupportGroups]` have to
+  be invoked by tag; both pass.
+
+Helpers, all in `snorca_hubtest` and none committed:
+
+- `det_tree_gate.py` - the gate of §7.3. `--threads`, `--only`, `--corpus`, `--list`. Repeating a
+  thread count (`--threads 20,20,20`) turns it into a same-machine reproducibility check.
+- `det_tree_ab.py` - the interleaved A/B timer of §7.4.
+- `det_tree_size.py` - the like-for-like output size comparison.
+- `det_tree_time.py` - single-executable timing; `det_tree_ab.py` is the one to trust on a loaded
+  machine.
+
+### 7.6 Still open
+
+- **Organic tree support (`TreeSupport3D`) still depends on the core count.** `tree_organic` is the
+  one case that still differs in geometry - 58.5 % matching segments over 47 dirty layers, exactly
+  as before. A separate generator with its own parallel sections; out of scope here. §5's entry
+  stands.
+- **Small islands are visited in a different order from one run to the next** - newly measured here,
+  and *not* a tree support problem. On `ksr_fdmtest_v4.3mf` and `Orca_stringhell.3mf` two runs give
+  identical extrusions on every layer (`slice_compare_cli`: 461 of 461 layers identical, 701228
+  segments both, zero either-only) while ~14 700 lines differ, all of them `G1` travels and the `G3`
+  Z-lift arcs that follow them: the little 0.83 mm pillars of the ksr test grid get printed in a
+  different order. It reproduces **with `--enable-support=0`** and **at a fixed thread count**
+  (`--threads 20,20`), so it is neither the support generator nor thread order - it looks like a tie
+  in whatever chains the islands of a layer together. `det_tree_gate.py` reports these as `TRAVEL`
+  and does not fail on them; the two `*_nosupport` cases in its list exist to prove the point.
+- **`holePropagationInfos`** (`TreeSupport.cpp:2307`) still keys a `std::map` on `const Polygon*`
+  pointing into a `Polygons` vector that is `push_back`-ed to in the same loop. Untouched, same
+  class of bug, still not observed to fire on this corpus.
+- **The two-pass split changes tree geometry.** Every classic tree-support project will slice to
+  different G-code than it did before this branch - the same amount of support in a slightly
+  different arrangement (§7.4). That is unavoidable for any fix here, and it is the thing a reviewer
+  has to accept.

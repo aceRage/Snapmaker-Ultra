@@ -6,10 +6,12 @@
 	#include <pthread.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <tbb/global_control.h>
 #include <tbb/parallel_for.h>
 #include <tbb/task_arena.h>
 
@@ -220,7 +222,12 @@ void name_tbb_thread_pool_threads_set_locale()
 	// TBB will respect the task affinity mask on Linux and spawn less threads than std::thread::hardware_concurrency().
 //	const size_t nthreads_hw = std::thread::hardware_concurrency();
 	const size_t nthreads_hw = tbb::this_task_arena::max_concurrency();
-	size_t       nthreads    = nthreads_hw;
+	// Every task below waits until ALL nthreads of them are running at once. If something has
+	// installed a tbb::global_control capping parallelism - a test slicing on one thread, say -
+	// then fewer than nthreads_hw tasks can ever run together and the first one waits forever.
+	// Ask TBB what it will actually give us rather than what the machine has.
+	const size_t nthreads_allowed = tbb::global_control::active_value(tbb::global_control::max_allowed_parallelism);
+	size_t       nthreads    = std::min(nthreads_hw, std::max<size_t>(1, nthreads_allowed));
 
 #ifdef SLIC3R_PROFILE
 	// Shiny profiler is not thread safe, thus disable parallelization.
