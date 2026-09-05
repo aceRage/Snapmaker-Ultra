@@ -271,15 +271,18 @@ wxWebView* WebView::CreateWebView(wxWindow * parent, wxString const & url, wxStr
     if (webView) {
         webView->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
 #ifdef __WIN32__
-        // Ultra P4: bambulab.com/sign-in version-gates its login flavor on the BBL-Slicer
-        // UA version. Our SLIC3R_VERSION (01.10.x) is below the ticketLogin gate
-        // (02.03.00.01), so the site falls back to its retired legacy /sign-in/callback
-        // (404) instead of the live /sign-in/studio-callback. Report a version >= the gate
-        // for the Bambu login webview ONLY (do not touch SLIC3R_VERSION globally).
-        wxString ua_ver = (brand_tag == "BBL-Slicer") ? wxString("02.03.00.01") : wxString(SLIC3R_VERSION);
-        webView->SetUserAgent(wxString::Format("%s/v%s (%s) Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.52", brand_tag, ua_ver,
-            Slic3r::GUI::wxGetApp().dark_mode() ? "dark" : "light"));
+        // Ultra: every webview reports this build's own name and its own real version. The
+        // Bambu login webview used to override both - it sent "BBL-Slicer" with a made-up
+        // version of 02.03.00.01, which is Bambu Studio 2.3.0.1 - so that bambulab.com's
+        // sign-in would run its in-slicer login flavour. We do not claim to be another
+        // vendor's client any more; see ULTRA_CLIENT_UA_TAG in WebView.hpp for what that
+        // costs and how it was measured. The trailing comment says out loud what this is.
+        wxString ua = wxString::Format("%s/v%s (%s) Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 Edg/107.0.1418.52",
+            brand_tag, wxString(SLIC3R_VERSION), Slic3r::GUI::wxGetApp().dark_mode() ? "dark" : "light");
+        if (brand_tag == ULTRA_CLIENT_UA_TAG)
+            ua += " (OrcaSlicer fork)";
+        webView->SetUserAgent(ua);
         webView->Create(parent, wxID_ANY, url2, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
         // We register the wxfs:// protocol for testing purposes
         webView->RegisterHandler(wxSharedPtr<wxWebViewHandler>(new wxWebViewArchiveHandler("bbl")));

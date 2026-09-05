@@ -92,10 +92,12 @@ ZUserLogin::ZUserLogin() : wxDialog((wxWindow *) (wxGetApp().mainframe), wxID_AN
 
         // set the frame icon
 
-        // Create the webview. Ultra: use the BBL-Slicer UA so bambulab.com/sign-in runs the
-        // slicer login flow and posts the token back via script message (see OnScriptMessage);
-        // the default SM-Slicer UA gets a normal web login that just redirects to the home page.
-        m_browser = WebView::CreateWebView(this, TargetUrl, "BBL-Slicer");
+        // Create the webview. Ultra: identify honestly. This used to pass "BBL-Slicer", which
+        // made the fork introduce itself to bambulab.com as Bambu Studio 2.3.0.1 and got the
+        // site to run its in-slicer login flavour (the one that posts the token back via
+        // script message, see OnScriptMessage). We now send our own name and version, so the
+        // sign-in page treats us as an ordinary browser; the sign-in page itself still loads.
+        m_browser = WebView::CreateWebView(this, TargetUrl, ULTRA_CLIENT_UA_TAG);
         if (m_browser == nullptr) {
             wxLogError("Could not init m_browser");
             return;
