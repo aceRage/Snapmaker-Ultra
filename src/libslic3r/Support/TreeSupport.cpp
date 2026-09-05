@@ -2418,6 +2418,33 @@ void TreeSupport::draw_circles()
 
 double SupportNode::diameter_angle_scale_factor;
 
+namespace {
+// drop_nodes()'s two passes over the nodes of one layer used to be plain tbb::parallel_for_each
+// loops that mutated state shared between the nodes they visited, so which of two neighbouring
+// nodes won a merge - and the order the next layer's nodes were appended in - was decided by
+// whichever worker thread arrived first. Each pass is now a parallel phase that only reads, and
+// records what every node WOULD do, followed by a short sequential phase that applies those
+// decisions in node order. These structs are the records.
+enum class TreeMergeKind { None, PolygonAbsorb, PairMerge, AbsorbClose };
+struct TreeMergePlan
+{
+    TreeMergeKind      kind = TreeMergeKind::None;
+    std::vector<Point> neighbours;           // PolygonAbsorb / AbsorbClose candidates, or PairMerge's partner
+    Point              pair_position{0, 0};  // PairMerge: where the replacement node goes
+    bool               pair_to_buildplate = false;
+};
+
+enum class TreeMoveKind { Skip, Polygon, DropUnsupported, Invalidate, Move };
+struct TreeMovePlan
+{
+    TreeMoveKind kind = TreeMoveKind::Skip;
+    ExPolygons   overhangs_next;        // Polygon: one new node per remaining piece
+    Point        next_vertex{0, 0};     // Move: where this node's child goes
+    bool         to_buildplate = false; // Move
+    double       dist_to_outer = 0.;    // Move: clamps the child's radius
+};
+} // namespace
+
 void TreeSupport::drop_nodes()
 {
     const PrintObjectConfig &config = m_object->config();
@@ -2492,6 +2519,15 @@ void TreeSupport::drop_nodes()
             << ", takes " << duration << " secs.";
     }
 
+    // The nodes of one layer, grouped per part and keyed by their own position. This used to be
+    // a std::unordered_map<Point, SupportNode*, PointHash>. Its iteration order decides the vertex
+    // order of the minimum spanning tree below, and prim() breaks a tie in the distance by the
+    // lower vertex index - so with a hashed map the shape of the tree was a function of the order
+    // the nodes happened to have been appended to contact_nodes, which was the order the worker
+    // threads of the layer above finished in. Ordering by (x, y) makes it a function of the
+    // geometry alone, on any standard library.
+    using NodesByPoint = std::map<Point, SupportNode *>;
+
     m_spanning_trees.resize(contact_nodes.size());
     //m_mst_line_x_layer_contour_caches.resize(contact_nodes.size());
 
@@ -2540,7 +2576,7 @@ void TreeSupport::drop_nodes()
 
         //Group together all nodes for each part.
         const ExPolygons& parts = m_ts_data->m_layer_outlines_below[obj_layer_nr];
-        std::vector<std::unordered_map<Point, SupportNode*, PointHash>> nodes_per_part(1 + parts.size()); //All nodes that aren't inside a part get grouped together in the 0th part.
+        std::vector<NodesByPoint> nodes_per_part(1 + parts.size()); //All nodes that aren't inside a part get grouped together in the 0th part.
         for (SupportNode* p_node : layer_contact_nodes)
         {
             const SupportNode& node = *p_node;
@@ -2593,7 +2629,7 @@ void TreeSupport::drop_nodes()
         profiler.tic();
         //std::vector<MinimumSpanningTree>& spanning_trees = m_spanning_trees[layer_nr];
         std::vector<MinimumSpanningTree> spanning_trees;
-        for (const std::unordered_map<Point, SupportNode*, PointHash>& group : nodes_per_part)
+        for (const NodesByPoint& group : nodes_per_part)
         {
             std::vector<Point> points_to_buildplate;
             for (const std::pair<const Point, SupportNode*>& entry : group)
@@ -2613,38 +2649,53 @@ void TreeSupport::drop_nodes()
         {
             auto& nodes_this_part = nodes_per_part[group_index];
             const MinimumSpanningTree& mst = spanning_trees[group_index];
-            //In the first pass, merge all nodes that are close together.
+
+            // Look a neighbour up without inserting. operator[] on a map that several tasks read
+            // at the same time is a data race, and for a key that is not there it used to create a
+            // null entry that the very next line dereferenced.
+            auto node_at = [&nodes_this_part](const Point &pt) -> SupportNode * {
+                auto it = nodes_this_part.find(pt);
+                return it == nodes_this_part.end() ? nullptr : it->second;
+            };
+
+            // nodes_this_part is ordered by position, so this vector is too. It is the order both
+            // passes below apply their decisions in, and it depends on the geometry alone.
             std::vector<std::pair<const Point, SupportNode*>> nodes_vec(nodes_this_part.begin(), nodes_this_part.end());
-            tbb::parallel_for_each(nodes_vec.begin(), nodes_vec.end(), [&](const std::pair<const Point, SupportNode*>& entry) {
-                SupportNode* p_node = entry.second;
+
+            //In the first pass, merge all nodes that are close together.
+            // Phase 1a, parallel and read-only: what would each node merge?
+            std::vector<TreeMergePlan> merge_plans(nodes_vec.size());
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, nodes_vec.size()), [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t i = range.begin(); i < range.end(); i++) {
+                SupportNode* p_node = nodes_vec[i].second;
                 SupportNode& node = *p_node;
+                TreeMergePlan& plan = merge_plans[i];
                 if (!p_node->valid)
                 {
-                    return; //Delete this node (don't create a new node for it on the next layer).
+                    continue; //Deleted on an earlier layer. The apply phase checks this again.
                 }
                 const std::vector<Point>& neighbours = mst.adjacent_nodes(node.position);
                 if (node.type == ePolygon) {
                     // Remove all circle neighbours that are completely inside the polygon and merge them into this node.
                     for (const Point &neighbour : neighbours) {
-                        SupportNode *    neighbour_node          = nodes_this_part[neighbour];
-                        if (neighbour_node->valid == false) continue;
+                        SupportNode *    neighbour_node          = node_at(neighbour);
+                        if (neighbour_node == nullptr) continue;
                         if (neighbour_node->type == ePolygon) continue;
                         coord_t    neighbour_radius = scale_(neighbour_node->radius);
                         Point     pt_north = neighbour + Point(0, neighbour_radius), pt_south = neighbour - Point(0, neighbour_radius),
                               pt_west = neighbour - Point(neighbour_radius, 0), pt_east = neighbour + Point(neighbour_radius, 0);
                         if (is_inside_ex(node.overhang, neighbour) && is_inside_ex(node.overhang, pt_north) && is_inside_ex(node.overhang, pt_south)
                             && is_inside_ex(node.overhang, pt_west) && is_inside_ex(node.overhang, pt_east)){
-                            node.distance_to_top           = std::max(node.distance_to_top, neighbour_node->distance_to_top);
-                            node.support_roof_layers_below = std::max(node.support_roof_layers_below, neighbour_node->support_roof_layers_below);
-                            node.dist_mm_to_top            = std::max(node.dist_mm_to_top, neighbour_node->dist_mm_to_top);
-                            node.merged_neighbours.push_front(neighbour_node);
-                            node.merged_neighbours.insert(node.merged_neighbours.end(), neighbour_node->merged_neighbours.begin(), neighbour_node->merged_neighbours.end());
-                            neighbour_node->valid = false;
+                            // Whether the neighbour is still valid is settled in the apply phase;
+                            // the geometry above does not depend on it.
+                            plan.neighbours.push_back(neighbour);
                         }
                     }
+                    if (!plan.neighbours.empty())
+                        plan.kind = TreeMergeKind::PolygonAbsorb;
                 } else if (neighbours.size() == 1 && vsize2_with_unscale(neighbours[0] - node.position) < get_max_move_dist(p_node, 2) &&
                            mst.adjacent_nodes(neighbours[0]).size() == 1 &&
-                           nodes_this_part[neighbours[0]]->type!=ePolygon) // We have just two nodes left, and they're very close, and the only neighbor is not ePolygon
+                           node_at(neighbours[0]) != nullptr && node_at(neighbours[0])->type != ePolygon) // We have just two nodes left, and they're very close, and the only neighbor is not ePolygon
                 {
                     //Insert a completely new node and let both original nodes fade.
                     Point next_position = (node.position + neighbours[0]) / 2; //Average position of the two nodes.
@@ -2656,24 +2707,10 @@ void TreeSupport::drop_nodes()
                         const coordf_t max_move_between_samples = max_move_distance + radius_sample_resolution + EPSILON; //100 micron extra for rounding errors.
                         move_out_expolys(avoid_layer, next_position, radius_sample_resolution + EPSILON, max_move_between_samples);
                     }
-
-                    SupportNode* neighbour = nodes_this_part[neighbours[0]];
-                    SupportNode* node_parent;
-                    if (p_node->parent && neighbour->parent)
-                        node_parent = (node.dist_mm_to_top >= neighbour->dist_mm_to_top) ? p_node : neighbour;
-                    else
-                        node_parent = p_node->parent ? p_node : neighbour;
-                    // Make sure the next pass doesn't drop down either of these (since that already happened).
-                    node_parent->merged_neighbours.push_front(node_parent == p_node ? neighbour : p_node);
-                    const bool to_buildplate = !is_inside_ex(get_collision(0, obj_layer_nr_next), next_position);
-                    SupportNode* next_node = m_ts_data->create_node(next_position, node_parent->distance_to_top + 1, obj_layer_nr_next, node_parent->support_roof_layers_below - 1, to_buildplate, node_parent,
-                        print_z_next, height_next);
-                    get_max_move_dist(next_node);
-                    m_ts_data->m_mutex.lock();
-                    contact_nodes[layer_nr_next].push_back(next_node);
-                    neighbour->valid = false;
-                    p_node->valid = false;
-                    m_ts_data->m_mutex.unlock();
+                    plan.kind               = TreeMergeKind::PairMerge;
+                    plan.neighbours.push_back(neighbours[0]);
+                    plan.pair_position      = next_position;
+                    plan.pair_to_buildplate = !is_inside_ex(get_collision(0, obj_layer_nr_next), next_position);
                 }
                 else if (neighbours.size() > 1) //Don't merge leaf nodes because we would then incur movement greater than the maximum move distance.
                 {
@@ -2682,78 +2719,143 @@ void TreeSupport::drop_nodes()
                     {
                         if (vsize2_with_unscale(neighbour - node.position) < get_max_move_dist(&node,2))
                         {
-                            SupportNode* neighbour_node = nodes_this_part[neighbour];
+                            SupportNode* neighbour_node = node_at(neighbour);
+                            if (neighbour_node == nullptr) continue;
                             if (neighbour_node->type == ePolygon) continue;
                             // only allow bigger node to merge smaller nodes. See STUDIO-6326
                             if(node.dist_mm_to_top < neighbour_node->dist_mm_to_top) continue;
-
-                            m_ts_data->m_mutex.lock();
-                            if (p_node->valid)
-                            {  // since we are processing all nodes in parallel, p_node may have been deleted by another thread. In this case, we should not delete neighbour_node.
-                                node.merged_neighbours.push_front(neighbour_node);
-                                node.merged_neighbours.insert(node.merged_neighbours.end(), neighbour_node->merged_neighbours.begin(), neighbour_node->merged_neighbours.end());
-                                neighbour_node->valid = false;
-                            }
-                            m_ts_data->m_mutex.unlock();
+                            plan.neighbours.push_back(neighbour);
                         }
                     }
+                    if (!plan.neighbours.empty())
+                        plan.kind = TreeMergeKind::AbsorbClose;
+                }
                 }
             }
             );
 
-            //In the second pass, move all middle nodes.
-            tbb::parallel_for_each(nodes_vec.begin(), nodes_vec.end(), [&](const std::pair<const Point, SupportNode*>& entry) {
+            // Phase 1b, sequential in nodes_vec order: apply the merges. This is where the winner
+            // of a merge between two neighbouring nodes is decided, and it is now decided by their
+            // positions rather than by the thread that got there first.
+            for (size_t i = 0; i < nodes_vec.size(); i++)
+            {
+                const TreeMergePlan &plan = merge_plans[i];
+                if (plan.kind == TreeMergeKind::None)
+                    continue;
+                SupportNode *p_node = nodes_vec[i].second;
+                SupportNode &node   = *p_node;
+                if (!p_node->valid)
+                    continue;
+                if (plan.kind == TreeMergeKind::PolygonAbsorb) {
+                    for (const Point &neighbour : plan.neighbours) {
+                        SupportNode *neighbour_node = node_at(neighbour);
+                        if (neighbour_node == nullptr || !neighbour_node->valid) continue;
+                        node.distance_to_top           = std::max(node.distance_to_top, neighbour_node->distance_to_top);
+                        node.support_roof_layers_below = std::max(node.support_roof_layers_below, neighbour_node->support_roof_layers_below);
+                        node.dist_mm_to_top            = std::max(node.dist_mm_to_top, neighbour_node->dist_mm_to_top);
+                        node.merged_neighbours.push_front(neighbour_node);
+                        node.merged_neighbours.insert(node.merged_neighbours.end(), neighbour_node->merged_neighbours.begin(), neighbour_node->merged_neighbours.end());
+                        neighbour_node->valid = false;
+                    }
+                } else if (plan.kind == TreeMergeKind::PairMerge) {
+                    SupportNode *neighbour = node_at(plan.neighbours.front());
+                    if (neighbour == nullptr || !neighbour->valid)
+                        continue;
+                    SupportNode *node_parent;
+                    if (p_node->parent && neighbour->parent)
+                        node_parent = (node.dist_mm_to_top >= neighbour->dist_mm_to_top) ? p_node : neighbour;
+                    else
+                        node_parent = p_node->parent ? p_node : neighbour;
+                    // Make sure the next pass doesn't drop down either of these (since that already happened).
+                    node_parent->merged_neighbours.push_front(node_parent == p_node ? neighbour : p_node);
+                    SupportNode* next_node = m_ts_data->create_node(plan.pair_position, node_parent->distance_to_top + 1, obj_layer_nr_next, node_parent->support_roof_layers_below - 1,
+                        plan.pair_to_buildplate, node_parent, print_z_next, height_next);
+                    get_max_move_dist(next_node);
+                    contact_nodes[layer_nr_next].push_back(next_node);
+                    neighbour->valid = false;
+                    p_node->valid = false;
+                } else { // TreeMergeKind::AbsorbClose
+                    for (const Point &neighbour : plan.neighbours) {
+                        if (!p_node->valid)
+                            break; // this node was itself absorbed by an earlier one
+                        SupportNode *neighbour_node = node_at(neighbour);
+                        if (neighbour_node == nullptr || !neighbour_node->valid) continue;
+                        node.merged_neighbours.push_front(neighbour_node);
+                        node.merged_neighbours.insert(node.merged_neighbours.end(), neighbour_node->merged_neighbours.begin(), neighbour_node->merged_neighbours.end());
+                        neighbour_node->valid = false;
+                    }
+                }
+            }
 
-                SupportNode* p_node = entry.second;
+            //In the second pass, move all middle nodes.
+            std::vector<TreeMovePlan> move_plans(nodes_vec.size());
+
+            // Phase 2a, parallel and read-only: which nodes die on this layer, and what is left of
+            // a polygon node's overhang.
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, nodes_vec.size()), [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t i = range.begin(); i < range.end(); i++) {
+                SupportNode* p_node = nodes_vec[i].second;
                 const SupportNode& node = *p_node;
+                TreeMovePlan& plan = move_plans[i];
                 if (!p_node->valid)
                 {
-                    return;
+                    continue;
                 }
                 if (node.type == ePolygon) {
                     // polygon node do not merge or move
-                    const bool to_buildplate = true;
                     // keep only the part that won't be removed by the next layer
-                    ExPolygons overhangs_next = diff_clipped({ node.overhang }, get_collision(0, obj_layer_nr_next));
-                    for(auto& overhang:overhangs_next) {
-                        Point        next_pt     = overhang.contour.centroid();
-                        SupportNode *next_node   = m_ts_data->create_node(next_pt, p_node->distance_to_top + 1, obj_layer_nr_next, p_node->support_roof_layers_below - 1,
-                                                                          to_buildplate, p_node, print_z_next, height_next);
-                        next_node->max_move_dist = 0;
-                        next_node->overhang = std::move(overhang);
-                        m_ts_data->m_mutex.lock();
-                        contact_nodes[layer_nr_next].emplace_back(next_node);
-                        m_ts_data->m_mutex.unlock();
-
-                    }
-                    return;
+                    plan.kind           = TreeMoveKind::Polygon;
+                    plan.overhangs_next = diff_clipped({ node.overhang }, get_collision(0, obj_layer_nr_next));
+                    continue;
                 }
 
                 //If the branch falls completely inside a collision area (the entire branch would be removed by the X/Y offset), delete it.
                 if (group_index > 0 && is_inside_ex(get_collision(0, obj_layer_nr), node.position))
                 {
-                    std::scoped_lock lock(m_ts_data->m_mutex);
                     const coordf_t branch_radius_node = get_radius(p_node);
                     Point to_outside = projection_onto(get_collision(0, obj_layer_nr), node.position);
                     double dist2_to_outside = vsize2_with_unscale(node.position - to_outside);
                     if (dist2_to_outside >= branch_radius_node * branch_radius_node) //Too far inside.
                     {
-                        if (support_on_buildplate_only)
-                        {
-                            unsupported_branch_leaves.push_front({ layer_nr, p_node });
-                        }
-                        else {
-                            p_node->valid = false;
-                        }
-                        return;
+                        plan.kind = support_on_buildplate_only ? TreeMoveKind::DropUnsupported : TreeMoveKind::Invalidate;
+                        continue;
                     }
                     // if the link between parent and current is cut by contours, mark current as bottom contact node
                     if (p_node->parent && intersection_ln({p_node->position, p_node->parent->position}, layer_contours).empty()==false)
                     {
-                        p_node->valid = false;
-                        return;
+                        plan.kind = TreeMoveKind::Invalidate;
+                        continue;
                     }
                 }
+                plan.kind = TreeMoveKind::Move;
+                }
+            }
+            );
+
+            // Phase 2b, sequential: apply those deaths before anything reads node validity again.
+            // The old code invalidated a node from one worker while another was reading that same
+            // flag to decide whether to move towards it, so a node could be pulled towards a
+            // neighbour that was about to be deleted, or not, depending on the timing. Now every
+            // surviving node sees the same settled picture.
+            for (size_t i = 0; i < nodes_vec.size(); i++)
+            {
+                if (move_plans[i].kind == TreeMoveKind::DropUnsupported)
+                    unsupported_branch_leaves.push_front({ layer_nr, nodes_vec[i].second });
+                else if (move_plans[i].kind == TreeMoveKind::Invalidate)
+                    nodes_vec[i].second->valid = false;
+            }
+
+            // Phase 2c, parallel and read-only: where does each surviving node move to? This is
+            // the expensive part of drop_nodes - the projections, the avoidance walks and the
+            // line/contour intersections - and it stays parallel.
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, nodes_vec.size()), [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t i = range.begin(); i < range.end(); i++) {
+                TreeMovePlan& plan = move_plans[i];
+                if (plan.kind != TreeMoveKind::Move)
+                    continue;
+                SupportNode* p_node = nodes_vec[i].second;
+                const SupportNode& node = *p_node;
+
                 Point next_layer_vertex = node.position;
                 Point move_to_neighbor_center;
                 std::vector<Point>       moves;
@@ -2769,8 +2871,8 @@ void TreeSupport::drop_nodes()
                     Point sum_direction(0, 0);
                     for (const Point &neighbour : neighbours) {
                         // do not move to the neighbor to be deleted
-                        SupportNode *neighbour_node = nodes_this_part[neighbour];
-                        if (!neighbour_node->valid) continue;
+                        SupportNode *neighbour_node = node_at(neighbour);
+                        if (neighbour_node == nullptr || !neighbour_node->valid) continue;
 
                         Point direction = neighbour - node.position;
                         // do not move to neighbor that's too far away (即使以最大速度移动，在接触热床之前都无法汇聚)
@@ -2862,20 +2964,41 @@ void TreeSupport::drop_nodes()
                     }
                 }
                 auto              next_collision = get_collision(0, obj_layer_nr_next);
-                const bool   to_buildplate  = !is_inside_ex(m_ts_data->m_layer_outlines[obj_layer_nr_next], next_layer_vertex);
-                SupportNode *     next_node     = m_ts_data->create_node(next_layer_vertex, node.distance_to_top + 1, obj_layer_nr_next, node.support_roof_layers_below - 1, to_buildplate, p_node,
-                    print_z_next, height_next);
+                plan.next_vertex   = next_layer_vertex;
+                plan.to_buildplate = !is_inside_ex(m_ts_data->m_layer_outlines[obj_layer_nr_next], next_layer_vertex);
                 // don't increase radius if next node will collide partially with the object (STUDIO-7883)
-                to_outside             = projection_onto(next_collision, next_node->position);
-                direction_to_outer     = to_outside - node.position;
-                double dist_to_outer   = unscale_(direction_to_outer.cast<double>().norm());
-                next_node->radius      = std::max(node.radius, std::min(next_node->radius, dist_to_outer));
-                get_max_move_dist(next_node);
-                m_ts_data->m_mutex.lock();
-                contact_nodes[layer_nr_next].push_back(next_node);
-                m_ts_data->m_mutex.unlock();
+                plan.dist_to_outer = unscale_((projection_onto(next_collision, next_layer_vertex) - node.position).cast<double>().norm());
+                }
             }
             );
+
+            // Phase 2d, sequential in nodes_vec order: create the next layer's nodes. This is the
+            // order contact_nodes[layer_nr - 1] ends up in, and therefore the order everything
+            // downstream - the next layer's grouping, its spanning tree, and smooth_nodes() -
+            // sees. It used to be the order the tasks finished in.
+            for (size_t i = 0; i < nodes_vec.size(); i++)
+            {
+                TreeMovePlan &plan   = move_plans[i];
+                SupportNode  *p_node = nodes_vec[i].second;
+                if (plan.kind == TreeMoveKind::Polygon) {
+                    const bool to_buildplate = true;
+                    for (auto& overhang : plan.overhangs_next) {
+                        Point        next_pt     = overhang.contour.centroid();
+                        SupportNode *next_node   = m_ts_data->create_node(next_pt, p_node->distance_to_top + 1, obj_layer_nr_next, p_node->support_roof_layers_below - 1,
+                                                                          to_buildplate, p_node, print_z_next, height_next);
+                        next_node->max_move_dist = 0;
+                        next_node->overhang = std::move(overhang);
+                        contact_nodes[layer_nr_next].emplace_back(next_node);
+                    }
+                } else if (plan.kind == TreeMoveKind::Move) {
+                    const SupportNode &node = *p_node;
+                    SupportNode *next_node  = m_ts_data->create_node(plan.next_vertex, node.distance_to_top + 1, obj_layer_nr_next, node.support_roof_layers_below - 1,
+                        plan.to_buildplate, p_node, print_z_next, height_next);
+                    next_node->radius       = std::max(node.radius, std::min(next_node->radius, plan.dist_to_outer));
+                    get_max_move_dist(next_node);
+                    contact_nodes[layer_nr_next].push_back(next_node);
+                }
+            }
         }
 
 #ifdef SUPPORT_TREE_DEBUG_TO_SVG
