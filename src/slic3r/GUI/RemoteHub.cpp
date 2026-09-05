@@ -625,6 +625,23 @@ static void respond(tcp::socket& s, int status, const std::string& type, const s
       << "Connection: close\r\n\r\n"
       << body;
     write_all(s, o.str());
+    // A request rejected before its body was read still has that body in flight. Closing now makes
+    // Windows answer the unread bytes with RST, and the client sees a connection reset instead of
+    // the 4xx it was sent (the gates hit this as a random status 0). Half-close and drain what is
+    // left, briefly and bounded, so the response reaches the client whole.
+    boost::system::error_code ig;
+    s.shutdown(tcp::socket::shutdown_send, ig);
+    s.non_blocking(true, ig);
+    char       sink[16384];
+    size_t     drained  = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (drained < (4u << 20) && std::chrono::steady_clock::now() < deadline) {
+        const size_t n = s.read_some(boost::asio::buffer(sink), ig);
+        if (ig == boost::asio::error::would_block) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); ig.clear(); continue; }
+        if (ig || n == 0) break; // EOF: the client has closed its side
+        drained += n;
+    }
+    s.non_blocking(false, ig);
 }
 
 static void respond_json(tcp::socket& s, int status, const std::string& body) { respond(s, status, "application/json", body); }
