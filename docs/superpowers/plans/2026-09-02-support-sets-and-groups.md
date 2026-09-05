@@ -120,6 +120,11 @@ file changed) but the script does not exist yet, so **T3 remains a prerequisite 
 
 ## 2b. Stage 2 status (2026-09-03): DONE — T3-T7 shipped, tolerance gate green
 
+> **Hardware pass (2026-09-04):** the user ran the manual checklist on the live build. Steps 1-3 passed
+> on the first install; step 4 (reopen) crashed, traced to the #560 port's plate-name icon (see
+> `fix/support-group-reopen`, merged as 36cb3d3757), and the whole list passed on the fixed build.
+
+
 Stage 2 first stopped at T3 because the plan's §5.1 experiment showed byte identity is
 unachievable on this tree. The reviewer chose option 2 from that finding: **§3.7's byte identity is
 replaced by a tolerance gate built on the fork's own Slice Compare engine**, and the
