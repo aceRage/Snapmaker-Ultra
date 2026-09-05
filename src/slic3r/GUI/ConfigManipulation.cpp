@@ -745,6 +745,13 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, co
         "support_interface_loop_pattern", "support_bottom_interface_spacing" })
         toggle_field(el, have_support_material && have_support_interface);
 
+    // Ultra (over-support surfaces): only reachable with support on and a non-zero top Z distance -
+    // at a zero gap the surface is already a plain bottom shell and there is nothing to reclassify.
+    bool can_over_support = have_support_material && config->opt_float("support_top_z_distance") > 0;
+    toggle_field("over_support_surfaces", can_over_support);
+    for (auto el : { "over_support_flow", "over_support_speed" })
+        toggle_field(el, can_over_support && config->opt_bool("over_support_surfaces"));
+
     bool can_ironing_support = have_raft || (have_support_material && config->opt_int("support_interface_top_layers") > 0);
     toggle_field("support_ironing", can_ironing_support);
     bool has_support_ironing = can_ironing_support && config->opt_bool("support_ironing");
