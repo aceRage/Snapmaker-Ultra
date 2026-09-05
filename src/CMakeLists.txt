@@ -105,9 +105,9 @@ if(ORCA_TOOLS)
             MACOSX_BUNDLE_BUNDLE_NAME "Snapmaker_Orca Profile Validator"
             MACOSX_BUNDLE_BUNDLE_VERSION "${SLIC3R_VERSION}"
             MACOSX_BUNDLE_SHORT_VERSION_STRING "${SLIC3R_VERSION}"
-            MACOSX_BUNDLE_IDENTIFIER "com.Snapmaker.Snapmaker_Orca.profile-validator"
-            MACOSX_BUNDLE_COPYRIGHT "Copyright © 2024-2026 Snapmaker. All rights reserved."
-            MACOSX_BUNDLE_GUI_IDENTIFIER "com.Snapmaker.Snapmaker_Orca.profile-validator"
+            MACOSX_BUNDLE_IDENTIFIER "io.github.acerage.UltraOne.profile-validator"
+            MACOSX_BUNDLE_COPYRIGHT "Copyright © 2024-2026 the UltraOne contributors. All rights reserved."
+            MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.acerage.UltraOne.profile-validator"
         )
     else()
         add_executable(Snapmaker_Orca_profile_validator dev-utils/Snapmaker_Orca_profile_validator.cpp)
@@ -305,7 +305,7 @@ else ()
             MACOSX_BUNDLE TRUE
             MACOSX_BUNDLE_BUNDLE_NAME "Snapmaker Orca"
             MACOSX_BUNDLE_SHORT_VERSION_STRING ${Snapmaker_VERSION}
-            MACOSX_BUNDLE_COPYRIGHT "Copyright © 2024-2026 Snapmaker. All rights reserved.")
+            MACOSX_BUNDLE_COPYRIGHT "Copyright © 2024-2026 the UltraOne contributors. All rights reserved.")
         # Get the bundle directory by going up from the executable to the .app bundle
         if (CMAKE_CONFIGURATION_TYPES)
             set(BIN_RESOURCES_DIR "$<TARGET_FILE_DIR:Snapmaker_Orca>/../Resources")
