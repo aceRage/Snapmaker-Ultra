@@ -17,8 +17,13 @@
 #define BBL_INTERNAL_TESTING 0
 #define ORCA_CHECK_GCODE_PLACEHOLDERS 0
 
-namespace common 
+namespace common
 {
+	// Reads one string out of the "app" section of the app config in the default per-user
+	// data directory. For code that runs before AppConfig exists; returns "" when the file
+	// or the key is missing.
+	std::string get_app_config_string(const std::string& key);
+
 	std::string get_pc_name();
 
 	std::string get_flutter_version();

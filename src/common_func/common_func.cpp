@@ -32,10 +32,64 @@ static std::string get_linux_config_dir()
 }
 #endif
 
+// Ultra: the app config file in the DEFAULT per-user data directory.
+//
+// The callers below run before wxWidgets exists (initSentry() is the first thing main()
+// does), so AppConfig is not available and neither is a parsed --datadir. This is the same
+// path AppConfig itself ends up using when no override is given.
+static std::string ultra_app_config_path()
+{
+#ifdef _WIN32
+    PWSTR   pszPath    = nullptr;
+    size_t  pathLength = 0;
+    char*   path       = new char[MAX_PATH]();
+    HRESULT hr         = SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &pszPath);
+    if (SUCCEEDED(hr) && pszPath != nullptr) {
+        wcstombs_s(&pathLength, path, MAX_PATH, pszPath, MAX_PATH);
+        CoTaskMemFree(pszPath);
+    }
+    std::string cfgfile = std::string(path) + "\\Snapmaker_Orca\\Snapmaker_Orca.conf";
+    delete[] path;
+    return cfgfile;
+#elif __APPLE__
+    const char* home_env = getenv("HOME");
+    if (!home_env || home_env[0] == '\0')
+        return std::string();
+    return std::string(home_env) + "/Library/Application Support/Snapmaker_Orca/Snapmaker_Orca.conf";
+#else
+    std::string config_dir = get_linux_config_dir();
+    if (config_dir.empty())
+        return std::string();
+    return config_dir + "/Snapmaker_Orca.conf";
+#endif
+}
+
 namespace common
 {
+    std::string get_app_config_string(const std::string& key)
+    {
+        const std::string cfgfile = ultra_app_config_path();
+        if (cfgfile.empty())
+            return std::string();
+
+        std::ifstream json_file(cfgfile);
+        if (!json_file.is_open())
+            return std::string();
+
+        // A half-written or hand-edited config must not take the process down: this runs
+        // before any of the app's own error reporting is up.
+        try {
+            nlohmann::json json_data;
+            json_file >> json_data;
+            auto dataObj = json_data.value("app", nlohmann::json::object());
+            return dataObj.value(key, std::string());
+        } catch (const std::exception&) {
+            return std::string();
+        }
+    }
+
     std::string get_pc_name()
-    { 
+    {
         return boost::asio::ip::host_name();
     }
 

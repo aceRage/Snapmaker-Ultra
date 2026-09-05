@@ -133,6 +133,7 @@
 #include "ModelMall.hpp"
 #include "HintNotification.hpp"
 #include "bury_cfg/bury_point.hpp"
+#include "sentry_wrapper/SentryWrapper.hpp"
 //#ifdef WIN32
 //#include "BaseException.h"
 //#endif
@@ -7384,6 +7385,9 @@ void GUI_App::cache_notify(const std::string& key, const json& res)
 void GUI_App::user_update_privacy_notify(const bool& res)
 {
     set_privacy_policy(res);
+    // Ultra: the same checkbox has to reach sentry's consent flag, or crashpad would keep
+    // uploading dumps after the user opted out. It is a no-op unless a DSN is configured.
+    setSentryUserConsent(res);
 
     json data;
 

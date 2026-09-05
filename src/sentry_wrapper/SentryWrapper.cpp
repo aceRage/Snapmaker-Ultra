@@ -49,6 +49,23 @@ namespace Slic3r {
 
 #define SENTRY_KEY_LEVEL "level"
 
+// Ultra: the app config key holding this fork's own Sentry DSN. Empty or absent (the
+// default) means crash reports are never uploaded anywhere. See initSentryEx().
+#define ULTRA_SENTRY_DSN_KEY "ultra_sentry_dsn"
+
+// Ultra: the release this build reports when a DSN IS configured. It must not be
+// Snapmaker_VERSION ("2.3.6"): that is Snapmaker's release number, and tagging our crashes
+// with it made every fault in fork-only code arrive looking like a fault in their product.
+#define ULTRA_SENTRY_RELEASE SLIC3R_APP_KEY "-ultra@" SLIC3R_VERSION
+
+// Ultra: true only when a DSN was configured AND the user opted in. Everything that would
+// put bytes on the network is gated on this; local minidump capture is not.
+static std::atomic<bool> g_ultra_sentry_uploads(false);
+
+// Ultra: true when the app config named a DSN at startup. Without one, no amount of
+// consent turns uploads on - there is nothing to consent to.
+static std::atomic<bool> g_ultra_sentry_dsn_configured(false);
+
 
 #ifdef _WIN32
 // C-style wrapper function for sentry_init to allow use of __try/__except
@@ -85,9 +102,36 @@ static sentry_value_t on_crash_callback(const sentry_ucontext_t* uctx, sentry_va
 void initSentryEx()
 {
     sentry_options_t* options = sentry_options_new();
-    std::string       dsn = std::string("https://282935326eecb9758e7f84a2ad3ae0ab@o4508125599563776.ingest.us.sentry.io/4510425163956224");
+
+    // Ultra: crash reporting is OFF by default and there is no DSN compiled in.
+    //
+    // This used to hard-code Snapmaker's own DSN, so every crash of this fork - including
+    // crashes in code Snapmaker never wrote - was uploaded into their Sentry organisation
+    // and tagged with their release number. We do not send our users' crash data to a third
+    // party who never agreed to receive it.
+    //
+    // Sentry is still initialised, because that is what starts crashpad, and crashpad is
+    // what writes the local minidumps we debug with here (%LOCALAPPDATA%\Snapmaker_Orca\
+    // reports\*.dmp). That is separable from the upload: crashpad takes the upload URL from
+    // the DSN, and with no DSN it is started with an empty URL and simply keeps the dumps.
+    //
+    // A maintainer who wants uploads sets "ultra_sentry_dsn" in the app config to their OWN
+    // Sentry project. Even then nothing is uploaded unless the user has also joined the
+    // Customer Experience Improvement Program (the Preferences checkbox behind
+    // privacy_policy_isagree), which is enforced through Sentry's own consent mechanism so
+    // that it covers crashpad's uploads too, not just the log calls below.
+    std::string dsn = common::get_app_config_string(ULTRA_SENTRY_DSN_KEY);
+    const bool  uploads_allowed = !dsn.empty() && get_privacy_policy();
+    g_ultra_sentry_dsn_configured = !dsn.empty();
+    g_ultra_sentry_uploads        = uploads_allowed;
     {
-        sentry_options_set_dsn(options, dsn.c_str());
+        if (!dsn.empty())
+            sentry_options_set_dsn(options, dsn.c_str());
+        // Always require consent, even when we are about to give it: it is the single switch
+        // sentry checks before crashpad may upload a dump AND before any envelope is sent,
+        // so leaving it on is what lets the Preferences checkbox turn uploads off again at
+        // runtime (sentry__should_skip_upload ignores consent when it is not required).
+        sentry_options_set_require_user_consent(options, 1);
         std::string handlerDir  = "";
         std::string dataBaseDir = "";
 
@@ -262,14 +306,16 @@ void initSentryEx()
         sentry_options_set_on_crash(options, on_crash_callback, NULL);
 
         sentry_options_set_sample_rate(options, 1.0);
-        sentry_options_set_traces_sample_rate(options, 1.0);
+        sentry_options_set_traces_sample_rate(options, uploads_allowed ? 1.0 : 0.0);
 
-        sentry_options_set_enable_logs(options, 1);
+        // Ultra: with nowhere to send them, the structured logs are pure overhead - do not
+        // even collect them.
+        sentry_options_set_enable_logs(options, uploads_allowed ? 1 : 0);
         sentry_options_set_before_send_log(options, before_send_log, NULL);
         sentry_options_set_logs_with_attributes(options, true);
 
-        // Set release version for symbolication
-        sentry_options_set_release(options, Snapmaker_VERSION);
+        // Set release version for symbolication. Ultra: our own release, never Snapmaker's.
+        sentry_options_set_release(options, ULTRA_SENTRY_RELEASE);
         bool init_success = false;
         
 #ifdef _WIN32
@@ -301,9 +347,19 @@ void initSentryEx()
         // Start session and set tags only if initialization succeeded
         if (init_success) {
             std::cout << "Starting Sentry session and setting flags..." << std::endl;
-            sentry_start_session();
-            set_sentry_flags(true);            
-            
+            // Ultra: consent is what crashpad reads to decide whether it may upload a dump.
+            // Revoking it leaves the local .dmp files exactly where they are; it only clears
+            // the upload flag in the crashpad database. Give it only when a DSN of our own
+            // is configured and the user has opted in.
+            if (uploads_allowed) {
+                sentry_user_consent_give();
+                sentry_start_session();
+            } else {
+                sentry_user_consent_revoke();
+            }
+            set_sentry_flags(true);
+
+            sentry_set_tag("ultra_release", ULTRA_SENTRY_RELEASE);
             sentry_set_tag("snapmaker_version", Snapmaker_VERSION);
 
             std::string flutterVersion = common::get_flutter_version();
@@ -331,6 +387,24 @@ void exitSentryEx()
         set_sentry_flags(false);
     }
 }
+
+// Ultra: follow the "Join Customer Experience Improvement Program" preference at runtime.
+// Consent is what gates crashpad's uploads as well as the log envelopes, so flipping the
+// checkbox has to reach sentry and not just the bury_point flag.
+void setSentryUserConsentEx(bool agreed)
+{
+    if (!get_sentry_flags())
+        return;
+
+    // Opting in never turns uploads on by itself: with no DSN of our own there is no
+    // project to report to, and crashpad stays in keep-the-dump-locally mode.
+    const bool allow = agreed && g_ultra_sentry_dsn_configured;
+    g_ultra_sentry_uploads = allow;
+    if (allow)
+        sentry_user_consent_give();
+    else
+        sentry_user_consent_revoke();
+}
 void sentryReportLogEx(SENTRY_LOG_LEVEL   logLevel,
                        const std::string& logContent,
                        const std::string& funcModule,
@@ -342,7 +416,14 @@ void sentryReportLogEx(SENTRY_LOG_LEVEL   logLevel,
     if (!get_sentry_flags()) {
         return;
     }
-    
+
+    // Ultra: with no DSN configured there is nowhere for these to go, and collecting them
+    // would only queue user data on disk. Sentry is initialised for local crash capture
+    // only in that case.
+    if (!g_ultra_sentry_uploads) {
+        return;
+    }
+
     if (!get_privacy_policy()) {
         return;
     }
@@ -458,6 +539,15 @@ void exitSentry()
 {
 #ifdef SLIC3R_SENTRY
     exitSentryEx();
+#endif
+}
+
+void setSentryUserConsent(bool agreed)
+{
+#ifdef SLIC3R_SENTRY
+    setSentryUserConsentEx(agreed);
+#else
+    (void) agreed;
 #endif
 }
 void sentryReportLog(SENTRY_LOG_LEVEL   logLevel,

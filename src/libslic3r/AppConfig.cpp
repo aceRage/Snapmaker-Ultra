@@ -279,6 +279,14 @@ void AppConfig::set_defaults()
         set_bool("legacy_networking", false);
     }
 
+    // Ultra: crash-report destination. Empty means crash reports are never uploaded; the
+    // crash handler still writes local minidumps for debugging. A maintainer who wants
+    // uploads puts THEIR OWN Sentry DSN here - never a third party's. Read at startup by
+    // SentryWrapper.cpp, before this object exists, straight out of the config file.
+    if (!has("ultra_sentry_dsn")) {
+        set("ultra_sentry_dsn", "");
+    }
+
     if(get("check_stable_update_only").empty()) {
         set_bool("check_stable_update_only", false);
     }
