@@ -36,7 +36,7 @@ Each stage builds, ships and is testable on its own. Do not start the next stage
 | 1 — Support sets | `SupportSet` model + on-disk store under `<datadir>/user/<id>/support_set/`, "Support set" row on the process tab's Support page (pick / Apply / Save current as… / Rename / Delete), interface-filament type resolution | `test_support_set.cpp` passes (JSON round trip, name sanitising, enumeration, filament-type resolution incl. every fallback); Apply marks the process preset modified and the changed values show in the tab; **no back-end change at all** → the byte-identity script (§3.7) is green on the corpus with an empty diff, trivially |
 | 2 — Groups on parts | `support_group` key, Object-List "Support group ▸" menu on a part and on a multi-selection, the badge, the Support-groups panel, part-level support keys in the settings menu/part tab, the `is_improper_category` fix, 3MF round trip, invalidation plumbing | `test_3mf.cpp` group round trip passes; `test_support_groups.cpp` group-resolution tests pass (K==1 for equal overrides); assigning a group + re-slice invalidates only `posSupportMaterial` (or `posSlice` when §3.6 flips); **byte identity holds for every project in the corpus, including one that carries groups** — the generator still ignores them |
 | 3 — Interface groups, normal supports **(done, §2c)** | per-group masks, per-group `SupportParameters`, per-group `generate_interface_layers`, per-group interface toolpaths + interface filament | K==1 corpus within tolerance (§3.7 as replaced by §2b's gate); the two-part fixture in `test_support_material.cpp` shows different interface extrusion length above part B and unchanged above part A; a soluble-interface group emits its own extruder via `interface_by_extruder`; support generation time within 1.6× of baseline at K=2 on the corpus. Stage 3 added a third gate — `--gate groups` — for the ON-mode cases, which must differ; see §2c |
-| 4 — Tree parity | organic tree: full parity through the same seam; classic tree: per-group interface *fill* only (documented limit) | K==1 corpus byte-identical with `support_type = tree(auto)` and both styles; organic-tree two-part fixture behaves like Stage 3's; classic tree shows per-group roof pattern/spacing/filament and an explicit "interface layer count is object-wide for classic tree supports" notice |
+| 4 — Tree parity **(done, §2d)** | organic tree: per-group roof depth, fill and filament; classic tree: per-group interface *fill* only (documented limit) | K==1 corpus within tolerance with `support_type = tree(auto)` and all three classic styles plus organic, real handy models included; organic-tree two-part and single-part fixtures behave like Stage 3's; classic tree shows per-group roof pattern/spacing/filament and an explicit "interface layer count is object-wide for classic tree supports" notice; determinism at 1/2/4/20 threads on a grouped tree. The organic half turned out NOT to be "the same seam" - see §2d deviation 1 |
 | 5 — Polish | preview colouring by filament check, empty-group and conflict warnings, docs, `PART_CATEGORY_SETTINGS` "Support" group, tooltip copy | Preview colours the per-group interface with its resolved filament; a group with no parts, a group whose set no longer exists, and a group whose interface filament type cannot be resolved each raise a visible, non-fatal warning; `docs/superpowers/specs/` page written |
 
 ## 2a. Stage 1 status (2026-09-03): DONE, gate held
@@ -928,6 +928,277 @@ whether organic-tree contacts carry `idx_object_layer_above` — is already answ
 is untouched by this stage and remains as planned. Stage 5 inherits: the preview-colour check, every
 warning in its list, the R3.1 seam screenshot, the R3.6 volume-order note, the classic-tree notice,
 and per-group ironing (deviation 6).
+
+## 2d. Stage 4 status (2026-09-05): DONE — both tree generators follow the group, both gates green
+
+Branch `feat/support-sets-stage4`, cut from `feat/ultra-preferences` @ `7c27b20f20`. The baseline the
+gates are measured against is `feat/ultra-preferences` itself (at `e513088d61` by the time the gates
+ran; the only commits between the two touch `src/slic3r/GUI/` and nothing that slices).
+
+§2c predicted this would be "a small stage" because `TreeSupport3D::generate_support_areas` calls the
+same two functions Stage 3 made group-aware. **That prediction was wrong about where an organic
+tree's interface comes from**, and the correction is the substance of 4a — see deviation 1.
+
+### What shipped
+
+- **`src/libslic3r/Support/SupportCommon.{hpp,cpp}`** — the three helpers Stage 3 kept private to
+  `SupportMaterial.cpp` (`support_shared_config`, `support_group_claims`, `clone_contacts_masked`)
+  moved here verbatim, because both tree generators need exactly the same three and one copy is the
+  only way they can stay the same. `support_group_claims()` now also owns the reach computation and
+  the `support_group_masks()` call, so all three generators get the claim rule from one place; it
+  returns an empty vector at K == 1, which is the whole of the off-mode guarantee.
+  New: `object_layer_print_zs()` and `support_group_object_layer_index_at(z, zs, above)`.
+- **The claim rule gained two terms, both forced by measurement** (`support_group_claims`):
+  1. `reach` includes one **branch radius** (`tree_support_branch_diameter / 2`) for tree supports,
+     the tree's own version of the grid cell §2c added for `smsGrid`;
+  2. every group's footprint is **projected downward** over the layers its roof can occupy
+     (`num_top_interface_layers + ceil(top Z gap / layer height) + 2`) before the claims are cut. A
+     tree's roof is not printed at the part's own layers — it sits under the part — so a part
+     floating above the bed has an *empty* footprint at every layer its own roof lives on. Without
+     the projection the classic-tree fixture came out **bit-identical to the ungrouped control** and
+     the organic single-part fixture delivered **61 %** of the object-wide yardstick. The normal
+     generator projects nothing (its contacts carry `idx_object_layer_above` and land exactly), so
+     Stage 3's output is untouched.
+- **`support_group_object_layer_index()` rounds toward the object it serves, not to the nearest
+  layer.** A top contact or roof takes the first object layer at or above its `print_z`; a bottom
+  contact or support floor takes the last one at or below. The old "nearest" fallback is what made
+  the direction ambiguous exactly where it mattered.
+- **`src/libslic3r/Support/TreeSupport3D.cpp` (4a, organic)** — `support_params` is built from
+  `support_shared_config`; `generate_initial_areas()` takes the groups and their claims and
+  **splits every overhang island by claim before placing tips**, calling `sample_overhang_area()`
+  with that group's own roof layer count; the single `generate_interface_layers` call became the
+  same K-way loop Stage 3 wrote, with the *precomputed* organic roof layers cloned per group as well
+  (that vector is consumed by the call, so sharing it would give the whole roof to whichever group
+  ran first); `generate_support_toolpaths` receives the `groups` vector. Plus the §3.6 comment at
+  `group_meshes` saying the config it reads is already group-aware, and R4.2's warning.
+- **`src/libslic3r/Support/TreeSupport.{hpp,cpp}` (4b, classic)** — `TreeSupportGroupContext` (a
+  forward-declared struct defined in the .cpp, so the header keeps its include set),
+  `generate_toolpaths(const TreeSupportGroupContext*)`, and one lambda inside its `parallel_for`
+  that splits `roof_areas` / `roof_1st_layer` / `floor_areas` by claim and fills each piece with its
+  group's pattern, spacing, density and interface filament. The roof *geometry* is untouched.
+- **`src/libslic3r/PrintObject.cpp` / `Print.hpp` / `PrintBase.hpp`** —
+  `PrintObject::has_support_group_interface_layer_override()` and the classic-tree notice
+  (`SlicingSupportGroupTreeInterfaceLayers`, appended so no existing warning id moves), raised from
+  `posSupportMaterial` next to Stage 3's Chameleon one — the only place it can be raised, for the
+  same reason §2c gives.
+- **Tests** — six new `[SupportMaterial][support_groups][tree]` cases and three new
+  `[TreeSupportDeterminism]` cases (below).
+- **Corpus** — nine new cases: six off-mode tree cases (three classic styles, three organic),
+  three real-geometry handy-model cases, and five ON-mode tree cases. `corpus.json` gained a
+  per-case `baseline_has_groups`, and `scripts/support_group_identity.py` honours it.
+
+### The gates
+
+**Off mode — the hard gate.** `scripts/support_group_identity.py` (tolerance, the default), baseline
+and candidate both installed to scratch prefixes, isolated `--datadir`. **Green on all 17 off-mode
+cases, three consecutive passes, identical numbers every time:**
+
+| case | segments | | case | segments |
+|---|---|---|---|---|
+| `normal_grid` | 4466 | | `tree_classic_hybrid` | 4709 |
+| `normal_snug` | 2255 | | `tree_organic_ledge` | 19420 |
+| `normal_ledge` | 2592 | | `tree_organic_onepart` | 19420 |
+| `soluble_interface` | 35647 | | `tree_classic_onepart` | 17901 |
+| `dense_interface` | 4964 | | `raft` | 4726 |
+| `tree_organic` | 36339 | | `no_support` | 1726 |
+| `tree_classic_slim` | 36343 | | `handy_benchy_tree_organic` | 174782 |
+| `tree_classic_strong` | 39039 | | `handy_bunny_tree_organic` | 708354 |
+| | | | `handy_benchy_tree_classic` | 254509 |
+
+Every one satisfies the criteria exactly: zero changed config rows, zero changed layers, zero
+one-sided layers, segments above the threshold.
+
+**Two things the corpus could not hold before, and can now.**
+
+- **`tree_classic` came back.** §2b removed it because classic tree support was not self-reproducible
+  at all — 6.6 % matching segments, baseline against baseline, run after run.
+  `fix/tree-support-determinism`, merged into `feat/ultra-preferences` before this stage, fixed
+  exactly that. Re-measured here with **one executable on both sides**: `tree_classic_slim`,
+  `tree_classic_strong`, `tree_classic_hybrid` and `tree_classic_onepart` are all within tolerance.
+  Three styles, because they take three different paths through `draw_circles()`.
+- **The handy models came back.** §2b recorded that every `.3mf` under `resources/handy_models/`
+  segfaulted the CLI on `--slice`. On this tree all five slice cleanly; three are now corpus cases,
+  and they are the only cases here that are not synthetic boxes.
+
+**On mode.** `--gate groups`, three passes, identical numbers every time. The flag
+`--baseline-has-groups` is now a *default* that a case can override, because against a
+`feat/ultra-preferences` baseline the two halves of the corpus ask opposite questions: the
+normal-support group cases act on **both** sides (so the geometry must be identical and only the
+absolute criteria say anything), while the tree group cases act only in the **candidate** (so they
+must differ). One global flag could not express both.
+
+| case | verdict |
+|---|---|
+| `group_parts` | geometry must MATCH — `config_rows=0 identical=61/61 segments=100.0000%`; `T1` draws **100.0 %** of the support interface on its own part, 1.0 % of the other part's |
+| `group_parts_matching` | the same, with Chameleon on |
+| `group_parts_geom` | geometry must MATCH — `identical=61/61 segments=100.0000%` |
+| `group_single_part` | geometry must MATCH — `identical=41/41 segments=100.0000%` |
+| `group_parts_tree_organic` | must DIFFER — `config_rows=0 changed=26 of 61 layers, segments=4.65 %, dirty_layers=49` |
+| `group_single_part_tree_organic` | must DIFFER — `config_rows=0 changed=21 of 41, segments=6.97 %, dirty_layers=29` |
+| `group_parts_tree_classic` | must DIFFER — `config_rows=0 changed=3 of 61, segments=97.83 %, dirty_layers=3` |
+| `group_parts_tree_organic_filament` | must DIFFER — the same 26 layers, **plus** `T1` drawing **100.0 % of the support interface on its own part and 0.0 mm of the other part's 371.3 mm** |
+| `group_parts_tree_classic_filament` | must DIFFER — the same 3 layers, **plus** `T1` at **100.0 % own / 0.0 mm of 461.2 mm other** |
+
+Read together: `config_rows=0` everywhere says the settings never moved — the one new key still does
+not reach `full_print_config`. The organic cases move a quarter to a half of the layers, which is
+what a per-group roof depth looks like. The classic cases move three layers and 2-3 % of segments,
+which is what a per-group roof *fill* on an object-wide roof looks like — a deliberately small
+number, and the honest measure of 4b's scope. The two `_filament` rows are the per-part tool
+evidence: the group's filament draws its own part's interface and **none** of its neighbour's.
+
+**Unit gates.** `fff_print_tests "[support_groups]"` — **11 cases / 140 assertions, all pass**
+(Stage 3's five plus six new). The six:
+
+1. *per-group interface, organic tree* — the two-part fixture. B's roof grows by more than 30 %;
+   A's stays within 10 % (not the normal generator's 1 %: an organic tree's influence areas
+   propagate down the whole object, so raising the roof count over B moves a little material under
+   A too).
+2. *a group on a single-part organic tree acts like the object's own settings* — control / the same
+   five layers set **object-wide** / the same five asked for by a group on the object's only part.
+   The group must deliver **> 90 % of the object-wide yardstick**. This is the case that fails at
+   61 % if the roof count is left object-wide at tip placement, and at 61 % again if the claim is
+   not projected down onto the layers the roof is printed at. It is the assertion to keep.
+3. *per-group roof fill, classic tree* — B's roof fill grows by more than 20 % where B asks for zero
+   interface spacing; **A's is within 1 %** (exactly, because the classic roof geometry is shared and
+   untouched); and the roof **layer count is identical on both sides**, control and grouped alike.
+4. *classic tree says its interface layer count is object-wide* — a group asking for its own count
+   raises the non-fatal notice, the count really is unchanged, and the **same override on an organic
+   tree raises no notice**, because organic trees do honour it.
+5. *per-group interface filament, organic tree* — `interface_by_extruder[1]` is non-empty, every
+   entity in it is `erSupportMaterialInterface`, no other extruder is ever registered.
+6. *per-group interface filament, classic tree* — the same, plus the per-part split in miniature:
+   the second filament draws its own part and **≤ 5 %** of the other's.
+
+**Determinism.** `fff_print_tests "[TreeSupportDeterminism]"` — **5 cases / 39 assertions, all
+pass**. The two existing classic-tree cases are unchanged; three are new, each slicing the same model
+at **1, 2, 4 and 20** TBB threads and requiring the support digest to be identical:
+
+- a **grouped classic tree** (the deck's short side in a group of its own);
+- a **grouped organic tree** (the same model, the same group);
+- an **ungrouped organic tree**, the control for both.
+
+`support_digest()` now also reads `SupportLayer::interface_by_extruder`, or a grouped case that
+routed its interface to another filament could agree on nothing. Everything Stage 4 added runs under
+TBB — the claims are built in a `parallel_for`, the organic tip placement splits islands inside its
+own `parallel_for`, the classic roof fill inside `generate_toolpaths`' — and none of it carries
+cross-layer state or an unordered container keyed by a pointer, so this holds by construction and is
+measured anyway.
+
+**Suites.** `libslic3r_tests` — 599 cases / 53 725 assertions, the same 2 `[!shouldfail]` cases as
+§2c. `fff_print_tests "[SupportGroups]"` (Stage 2's) — 10 cases / 50 assertions, pass. Build clean:
+0 `error C`, 0 `error LNK`, configure reports `libcurl will have HTTP/2`.
+
+**Unchanged pre-existing failure** — `SCENARIO("SupportMaterial: support_layers_z and contact
+distance")` still SIGSEGVs at `WHEN("First layer height = 0.4")`, as §2c records, along with the
+other legacy PrusaSlicer-era failures §2b lists.
+
+**One transient, recorded rather than hidden.** In one of eleven runs of the ON-mode gate the
+candidate produced no G-code for `group_parts_tree_organic` while another build was saturating the
+machine; the case was then re-run 21 times (12 direct CLI invocations plus 9 gate passes) with no
+failure and identical numbers. Called out so a reviewer who sees it once knows it has been chased.
+
+### Deviations from the plan
+
+1. **4a is not "the same seam". An organic tree's roof DEPTH is decided at tip placement, not in
+   `generate_interface_layers`.** §2c's inherit note says Stage 4a is (a) the shared config,
+   (b) the per-group `generate_interface_layers` loop and (c) passing `groups` to
+   `generate_support_toolpaths`. All three are done and none of them is sufficient:
+   `generate_interface_layers` only converts *intermediate* layers that sit near a contact, while an
+   organic tree's roof is built by `sample_overhang_area()` during tip placement and handed to
+   `generate_interface_layers` as an already-finished input. `TreeSupportSettings::support_roof_layers`
+   — the count that pass uses — comes straight from the object's `support_interface_top_layers`. So
+   Stage 4a also had to make `generate_initial_areas()` group-aware, which it could do cleanly
+   because `sample_overhang_area()` already takes the roof layer count as an argument and is called
+   once per overhang island: split the island by claim, call it once per group with that group's
+   count. The overhang's own OBJECT layer index is exact on that path, so no `print_z` guessing is
+   involved there at all.
+2. **The claim rule changed for tree supports, and the change was needed twice over.** The downward
+   projection and the branch-radius reach are described above. Both are inside
+   `support_group_claims()`, both are gated on `is_tree(support_type)` and on K > 1, and both carry
+   the measured numbers in the comment.
+3. **`support_group_object_layer_index()`'s fallback no longer picks the nearest layer.** It rounds
+   toward the object the surface serves. This can move Stage 3's ON-mode normal-support output where
+   a *merged* contact layer had lost its index — the corpus says it did not (`group_parts`,
+   `group_parts_geom`, `group_single_part` and `group_parts_matching` are all `segments=100.0000%`
+   against the Stage 3 baseline) — and off mode cannot see it at all.
+4. **Classic-tree `Roof1stLayer` follows the group's fill but not its filament.** `Layer.hpp` calls
+   it "the layer just below roof ... printed with regular material", and it is drawn with an
+   `erSupportMaterial` perimeter around it. Routing that into `interface_by_extruder` would put a
+   base-role extrusion into the interface's own storage, which the Chameleon pass and the preview
+   both read as interface. Its pattern, spacing and density do follow the group.
+5. **The classic-tree notice has its own warning id.** `SlicingSupportGroupTreeInterfaceLayers`,
+   appended to `SlicingNotificationType`, for the reason §2c's Chameleon id records: a warning left
+   on the default id is dropped by the CLI's own `result.json` filter and could not be asserted.
+6. **Gate item "Debug build: `TreeSupportSettings::soluble` is true exactly when…" was not run.** No
+   Debug dependencies exist in this tree (§2c deviation 5). What is done instead: the §3.6 comment at
+   the assignment site, and R4.2's warning, which fires on exactly the mixed-plate condition the gate
+   was written to detect and is visible in a Release log.
+7. **Ironing is still object-wide**, as in Stage 3 (§2c deviation 6). `support_ironing*` are stored
+   and resolved per group and remain inert; nothing in Stage 4 changed that, so the plan's mention of
+   per-group ironing under 4b is still Stage 5 work.
+
+### Decisions for the reviewer (the plan's risks)
+
+- **R4.1 — `idx_object_layer_above` on organic-tree contacts.** Settled, and the answer is worse than
+  the risk assumed: the organic roof layers carry **no** object-layer index at all, and the
+  nearest-`print_z` fallback §2c relied on is not merely imprecise there but points at a layer where
+  the part does not exist. Both halves of the fix are above (round toward the object; project the
+  claim down over the roof's depth). The tip-placement path does not use the fallback at all.
+- **R4.2 — `TreeSupportSettings::soluble` is a process-global static.** Not removed — that is a
+  refactor of the tree generator, not of this feature — but it now logs a warning naming both objects
+  when one object on the plate makes it true while another still has a non-zero top Z distance.
+- **R4.3 — tree base geometry is not group-aware.** Still true and intended. A group's roof can sit
+  on a branch grown under the object's own branch parameters; only the roof's depth (organic), its
+  fill and its filament follow the group. `with_sheath` on the per-group `SupportParameters` is
+  deliberately forced to the shared value for the same reason: it is a base property.
+- **4b's limit is asserted, not just documented.** The classic-tree interface layer count stays
+  object-wide, the user is told so by a non-fatal warning, and a unit case checks both the notice and
+  the unchanged layer count. If a reviewer wants per-group roof depth on classic trees too, the place
+  is `draw_circles()` / the influence-area propagation, and it is a stage of its own.
+- **The organic ON-mode cases move a lot of the file (95 % of segments).** That is expected and is
+  not a seam artefact: changing how many roof layers a tree tip carries changes where the branches
+  under it are allowed to move, so the whole branch system under that part is redrawn. The
+  neighbour's is not — the two-part unit fixture measures A at within 10 % — and off mode is
+  byte-stable across three passes.
+
+### Manual checklist
+
+Run against a side install (`cmake --install <build> --config Release --prefix <scratch>`), never over
+`build/Snapmaker_Orca` while the user's slicer is running.
+
+1. A multi-part object with **tree (auto) / organic** supports and an overhang over one part. Assign
+   that part a support group and set the group's *interface layers* to 5 and *interface spacing* to 0.
+   Slice: the tree's roof under that part is visibly deeper and denser, and the neighbour's is not.
+2. **Ctrl+Z** and re-slice: the preview goes back to one uniform roof.
+3. The same object with **support style = tree slim**. Set only the group's *interface spacing* to 0:
+   the roof under that part fills solid, the neighbour's stays spaced, and both keep the same number
+   of roof layers.
+4. On the same classic-tree object set the group's *interface layers* to 5. A non-critical warning
+   appears saying the interface layer count is object-wide for classic tree supports, and the roof
+   depth does not change. Switch the object to organic and re-slice: the warning is gone and the
+   depth does change.
+5. On a two-filament printer give the group its own **interface filament**, on organic and then on
+   classic. The preview colours that group's roof with the second filament, the tool changes appear,
+   and the other part's roof keeps the first filament. On classic, the roof's *first* layer stays the
+   object's filament — deviation 4.
+6. Turn **support filament matching** (Chameleon) on for that object: the Stage 3 warning appears and
+   the group's colour is the one that survives. Turn **flush into support** on as well: the group's
+   roof keeps its colour.
+7. A single-part object with a group on its only part, organic tree: the roof really deepens. This is
+   the shape that hid the Stage 3 bug and the shape that hid the two Stage 4 ones.
+8. Slice an ordinary tree-support project with no groups at all, before and after installing this
+   build, and compare the G-code: it must be the same print. (The automated form is the off-mode gate,
+   now including three real handy models.)
+
+### What Stage 5 inherits
+
+Everything §2c listed, plus: the classic-tree interface-layer-count notice exists and needs its
+inline-panel presentation; per-group **ironing** is still inert on all three generators; the R3.4
+dual-nozzle interface-flow warning now also applies to tree roofs; the R3.1 seam screenshot should be
+taken on a tree as well as on a normal support, because the tree claim is projected downward and its
+seam is a different shape; and the residual §2c names — a claim `reach` that is a fixed radius rather
+than a true nearest-part split — is now three constants (grid cell, branch radius, downward
+projection) in one function, which is the right place for the measurement Stage 5 should aim at.
 
 ## 3. Shared contract
 
@@ -1989,6 +2260,10 @@ interlock 2 d, tests and the re-enabled `#if 0` blocks 2–3 d, byte-identity ch
 ---
 
 ## Stage 4 — Tree support parity
+
+> **Shipped 2026-09-05 on `feat/support-sets-stage4`. Read §2d for what was actually built, the
+> deviations - in particular where an organic tree's roof depth is really decided - and both
+> gates' results. The design below is what was implemented, with the deviations §2d lists.**
 
 Two different code paths, two different answers. Be explicit about both in the UI.
 
