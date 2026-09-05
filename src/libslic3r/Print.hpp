@@ -562,6 +562,12 @@ public:
     // one part's interface and to nothing else, so nobody else's "don't care" support may resolve
     // to them; GCode.cpp's support-extruder resolution excludes them for that reason.
     std::vector<unsigned int>   support_group_interface_extruders() const;
+    // Ultra (support groups, plan Stage 4b): true when some support group asks for a different
+    // number of interface layers than the object does. Classic tree supports cannot honour that -
+    // the roof layer count comes out of influence-area propagation in draw_circles(), object-wide -
+    // so the user is told rather than left wondering. Organic trees and normal supports do honour
+    // it, and never raise the notice.
+    bool                        has_support_group_interface_layer_override() const;
 
     // Ultra (support groups, plan Stage 3 3.1): slice an explicit set of volumes at this object's
     // layer Zs and union them per layer. This is the body slice_support_volumes() always had; that

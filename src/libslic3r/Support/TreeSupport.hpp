@@ -21,6 +21,9 @@
 namespace Slic3r
 {
 class PrintObject;
+// Ultra (support groups, Stage 4b): the resolved groups, their SupportParameters and their
+// per-object-layer claims. Defined in TreeSupport.cpp.
+struct TreeSupportGroupContext;
 class TreeSupport;
 class SupportLayer;
 
@@ -509,7 +512,13 @@ private:
      */
     void insert_dropped_node(std::vector<SupportNode*>& nodes_layer, SupportNode* node);
     void create_tree_support_layers();
-    void generate_toolpaths();
+    // Ultra (support groups, plan 2026-09-02 Stage 4b): the classic tree generator's roof
+    // GEOMETRY is decided object-wide in draw_circles() - the number of roof layers comes out of
+    // influence-area propagation and cannot be per part - but its FILL can follow the group. A
+    // null context is exactly the code this function has always run.
+    // The context is defined in TreeSupport.cpp; only a pointer to it appears here, so this
+    // header keeps its current include set.
+    void generate_toolpaths(const TreeSupportGroupContext *groups = nullptr);
     // get unscaled radius of node
     coordf_t calc_branch_radius(coordf_t base_radius, size_t layers_to_top, size_t tip_layers, double diameter_angle_scale_factor);
     // get unscaled radius(mm) of node based on the distance mm to top

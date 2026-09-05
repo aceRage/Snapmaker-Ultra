@@ -1315,8 +1315,23 @@ static void make_perimeter_and_infill(ExtrusionEntitiesPtr& dst, const ExPolygon
     }
 }
 
-void TreeSupport::generate_toolpaths()
+// Ultra (support groups, plan Stage 4b): everything the classic tree generator needs to split its
+// roof between the groups. `claims` is empty at K == 1 - every project that carries no
+// support_group data - and `active()` is then false, so not one line below it runs.
+struct TreeSupportGroupContext
 {
+    std::vector<PrintObject::SupportGroup> groups;
+    std::vector<SupportParameters>         params;
+    std::vector<std::vector<Polygons>>     claims;
+    std::vector<coordf_t>                  object_layer_zs;
+    bool active() const { return ! claims.empty(); }
+};
+
+void TreeSupport::generate_toolpaths(const TreeSupportGroupContext *groups)
+{
+    // Ultra (support groups): dead for a single-group object, which is every project that carries
+    // no support_group data. See the plan's 3.4 step 5.
+    const bool group_mode = groups != nullptr && groups->active();
     const PrintObjectConfig &object_config = m_object->config();
     coordf_t support_extrusion_width = m_support_params.support_extrusion_width;
     coordf_t nozzle_diameter = m_print_config->nozzle_diameter.get_at(object_config.support_filament - 1);
@@ -1467,6 +1482,96 @@ void TreeSupport::generate_toolpaths()
                 coordf_t support_density         = std::min(1., support_flow.spacing() / support_spacing);
                 ts_layer->support_fills.no_sort = false;
 
+                // Ultra (support groups, Stage 4b): which object layer this support layer's claims
+                // live at. A classic tree owns no SupportGeneratorLayer, so there is no
+                // idx_object_layer_above to read and the layer has to be found from print_z. A roof
+                // supports the object ABOVE it; a support floor rests ON the object below. The
+                // claims are also projected downward over the roof's own depth
+                // (support_group_claims), which is what makes a roof printed several layers under a
+                // floating part land inside that part's claim at all.
+                const size_t idx_object_layer_above = group_mode ?
+                    support_group_object_layer_index_at(ts_layer->print_z, groups->object_layer_zs, true) : size_t(-1);
+                const size_t idx_object_layer_below = group_mode ?
+                    support_group_object_layer_index_at(ts_layer->print_z, groups->object_layer_zs, false) : size_t(-1);
+                // Split one interface area between the groups and fill each piece with its own
+                // group's interface pattern, spacing, density and filament. Returns false when
+                // there was nothing to do, in which case the caller runs today's code unchanged.
+                auto extrude_interface_grouped = [&](const SupportLayer::AreaGroup &area_group,
+                                                     const ExPolygons &polys, const Flow &interface_flow) -> bool {
+                    if (polys.empty())
+                        return false;
+                    const Polygons src = to_polygons(polys);
+                    const size_t   idx_object_layer = area_group.type == SupportLayer::FloorType ?
+                        idx_object_layer_below : idx_object_layer_above;
+                    bool handled = false;
+                    for (size_t g = 0; g < groups->groups.size(); ++ g) {
+                        Polygons piece = support_group_piece(src, &groups->claims[g], idx_object_layer, g);
+                        if (piece.empty())
+                            continue;
+                        handled = true;
+                        const PrintObjectConfig &cfg_g = groups->groups[g].config;
+                        const SupportParameters &par_g = groups->params[g];
+                        // The same two lines the object path computes once at the top of this
+                        // function, with the group's own spacing.
+                        const bool     floor     = area_group.type == SupportLayer::FloorType;
+                        const coordf_t spacing_g = (floor ? cfg_g.support_bottom_interface_spacing.value
+                                                          : cfg_g.support_interface_spacing.value)
+                                                   + m_support_material_interface_flow.spacing();
+                        const coordf_t density_g = std::min(1., m_support_material_interface_flow.spacing() / spacing_g);
+                        // A group that pins its own interface filament emits into its own bucket,
+                        // which is the storage ToolOrdering reads to schedule the tool change -
+                        // the same route the normal generator takes (SupportCommon.cpp).
+                        ExtrusionEntitiesPtr *dst = &ts_layer->support_fills.entities;
+                        const int filament_g = cfg_g.support_interface_filament.value;
+                        // Roof1stLayer is deliberately NOT routed. It is "the layer just below roof
+                        // ... printed with regular material" (Layer.hpp), it is drawn with an
+                        // erSupportMaterial perimeter around it, and interface_by_extruder is the
+                        // interface's own storage - the Chameleon pass and the preview both read it
+                        // as such. Its FILL still follows the group; only its filament does not.
+                        if (filament_g > 0 && filament_g != m_object_config->support_interface_filament.value &&
+                            area_group.type != SupportLayer::Roof1stLayer)
+                            dst = &ts_layer->interface_by_extruder[unsigned(filament_g - 1)].entities;
+                        ExPolygons pieces = union_ex(piece);
+                        if (area_group.type == SupportLayer::Roof1stLayer) {
+                            // The layer just below the roof: a perimeter first, then rectilinear
+                            // infill - as the object path does, at the group's density.
+                            std::unique_ptr<Fill> filler_g(Fill::new_from_type(ipRectilinear));
+                            filler_g->set_bounding_box(bbox_object);
+                            filler_g->angle   = Geometry::deg2rad(object_config.support_angle.value + 90.);
+                            filler_g->spacing = interface_flow.spacing();
+                            for (const ExPolygon &ep : pieces) {
+                                ExtrusionEntityCollection *temp_support_fills = new ExtrusionEntityCollection();
+                                make_perimeter_and_infill(temp_support_fills->entities, ep, 1, interface_flow, erSupportMaterial,
+                                    filler_g.get(), density_g, false);
+                                temp_support_fills->no_sort = true; // make sure loops are first
+                                if (! temp_support_fills->entities.empty())
+                                    dst->push_back(temp_support_fills);
+                                else
+                                    delete temp_support_fills;
+                            }
+                            continue;
+                        }
+                        std::unique_ptr<Fill> filler_g(Fill::new_from_type(par_g.contact_fill_pattern));
+                        filler_g->set_bounding_box(bbox_object);
+                        filler_g->angle   = Geometry::deg2rad(object_config.support_angle.value + 90.);
+                        filler_g->spacing = interface_flow.spacing();
+                        FillParams fill_params_g;
+                        fill_params_g.density     = float(density_g);
+                        fill_params_g.dont_adjust = true;
+                        if (! floor) {
+                            if (cfg_g.support_interface_pattern == smipGrid) {
+                                filler_g->angle = Geometry::deg2rad(object_config.support_angle.value);
+                                fill_params_g.dont_sort = true;
+                            }
+                            if (cfg_g.support_interface_pattern == smipRectilinearInterlaced)
+                                filler_g->layer_id = area_group.interface_id;
+                        }
+                        fill_expolygons_generate_paths(*dst, pieces, filler_g.get(), fill_params_g,
+                                                       erSupportMaterialInterface, interface_flow);
+                    }
+                    return handled;
+                };
+
                 for (auto& area_group : ts_layer->area_groups) {
                     ExPolygon& poly = *area_group.area;
                     ExPolygons polys;
@@ -1487,6 +1592,13 @@ void TreeSupport::generate_toolpaths()
                         fill_params.density = interface_density;
                         fill_params.dont_adjust = true;
                     }
+                    // Ultra (support groups, Stage 4b): the roof this layer carries was drawn once,
+                    // object-wide, in draw_circles(); only its fill follows the group. Skipped on
+                    // the first layer, where the interface carries the brim and the object's own
+                    // flow is what has to draw it.
+                    if (group_mode && layer_id > 0 && area_group.type != SupportLayer::BaseType &&
+                        extrude_interface_grouped(area_group, polys, interface_flow))
+                        continue;
                     if (area_group.type == SupportLayer::Roof1stLayer) {
                         // roof_1st_layer
                         fill_params.density = interface_density;
@@ -1705,7 +1817,19 @@ void TreeSupport::generate()
 
     profiler.stage_start(STAGE_GENERATE_TOOLPATHS);
     m_object->print()->set_status(70, _u8L("Generating support"));
-    generate_toolpaths();
+    // Ultra (support groups, Stage 4b): resolve the groups and their claims. Both are no-ops at
+    // K == 1: support_group_claims() returns an empty vector without slicing anything, and
+    // generate_toolpaths() then takes exactly the path it always took.
+    TreeSupportGroupContext group_context;
+    group_context.groups = m_object->support_groups();
+    group_context.claims = support_group_claims(*m_object, group_context.groups, m_support_params);
+    if (group_context.active()) {
+        group_context.object_layer_zs = object_layer_print_zs(*m_object);
+        group_context.params.reserve(group_context.groups.size());
+        for (const PrintObject::SupportGroup &group : group_context.groups)
+            group_context.params.emplace_back(*m_object, group.config);
+    }
+    generate_toolpaths(group_context.active() ? &group_context : nullptr);
     profiler.stage_finish(STAGE_GENERATE_TOOLPATHS);
 
     profiler.stage_finish(STAGE_total);
