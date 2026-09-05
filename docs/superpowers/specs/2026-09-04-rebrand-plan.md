@@ -50,6 +50,13 @@ had a clearance search. Section 3.4 says what a lawyer would actually have to do
 
 ---
 
+
+> **Decision (2026-09-04):** the client identity tokens stay as they are. The Bambu sign-in token
+> (`BBL-Slicer`) is what makes bambulab.com serve the in-slicer login flow (an honest agent gets the
+> ordinary web login and cloud sign-in never completes), and `SM-Slicer` is matched by the fork's own
+> bundled pages; the user judged both crucial to the process. Only the Sentry half of `fix/client-identity`
+> (a9d3c7ed47) was merged; the user-agent commit (3f485cc29d) stays on that branch unmerged.
+
 ## 1. The legal facts
 
 Every URL in this section was read **2026-09-04**. Confidence notes are the researcher's, not a
