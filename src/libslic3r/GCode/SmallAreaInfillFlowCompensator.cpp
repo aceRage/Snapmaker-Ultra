@@ -98,7 +98,8 @@ double SmallAreaInfillFlowCompensator::flow_comp_model(const double line_length)
 double SmallAreaInfillFlowCompensator::modify_flow(const double line_length, const double dE, const ExtrusionRole role)
 {
     if (flowModel &&
-        (role == ExtrusionRole::erSolidInfill || role == ExtrusionRole::erTopSolidInfill || role == ExtrusionRole::erBottomSurface)) {
+        (role == ExtrusionRole::erSolidInfill || role == ExtrusionRole::erTopSolidInfill || role == ExtrusionRole::erBottomSurface ||
+         role == ExtrusionRole::erBottomSurfaceOverSupport)) {
         return dE * flow_comp_model(line_length);
     }
 

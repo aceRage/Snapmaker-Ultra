@@ -7940,6 +7940,10 @@ std::string GCode::_extrude(const ExtrusionPath& path, std::string description, 
         _mm3_per_mm *= m_config.top_solid_infill_flow_ratio;
     else if (path.role() == erBottomSurface)
         _mm3_per_mm *= m_config.bottom_solid_infill_flow_ratio;
+    // Ultra (over-support surfaces): the object config has already been applied into m_config for
+    // the object being extruded, so this is the per-object value.
+    else if (path.role() == erBottomSurfaceOverSupport)
+        _mm3_per_mm *= m_config.over_support_flow;
     else if (path.role() == erInternalBridgeInfill)
         _mm3_per_mm *= m_config.internal_bridge_flow;
     else if (sloped)
@@ -7975,6 +7979,13 @@ std::string GCode::_extrude(const ExtrusionPath& path, std::string description, 
             speed = m_config.get_abs_value("ironing_speed");
         } else if (path.role() == erBottomSurface) {
             speed = m_config.get_abs_value("initial_layer_infill_speed");
+        } else if (path.role() == erBottomSurfaceOverSupport) {
+            // Ultra (over-support surfaces): 0 means "match the walls around this surface", which
+            // is the whole point of the feature - the surface should look like the outer wall it
+            // is framed by, not like a bridge.
+            speed = m_config.over_support_speed.value;
+            if (speed <= 0.)
+                speed = m_config.get_abs_value("outer_wall_speed");
         } else if (path.role() == erGapFill) {
             speed = m_config.get_abs_value("gap_infill_speed");
         } else if (path.role() == erSupportMaterial || path.role() == erSupportMaterialInterface) {
@@ -8581,6 +8592,7 @@ std::string GCode::extrusion_role_to_string_for_parser(const ExtrusionRole& role
     case erSolidInfill: return "SolidInfill";
     case erTopSolidInfill: return "TopSolidInfill";
     case erBottomSurface: return "BottomSurface";
+    case erBottomSurfaceOverSupport: return "BottomSurfaceOverSupport";
     case erBridgeInfill:
     case erInternalBridgeInfill: return "BridgeInfill";
     case erGapFill: return "GapFill";
