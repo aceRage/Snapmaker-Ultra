@@ -571,6 +571,12 @@ public:
     // Helpers to slice support enforcer / blocker meshes by the support generator.
     std::vector<Polygons>       slice_support_volumes(const ModelVolumeType model_volume_type) const;
     std::vector<Polygons>       slice_support_blockers() const { return this->slice_support_volumes(ModelVolumeType::SUPPORT_BLOCKER); }
+    // Ultra (over-support surfaces): support enforcers / blockers projected onto this object's
+    // layers, built exactly the way SupportAnnotations builds them for the support generator
+    // (volume slices plus the painted facets, blockers expanded by the same epsilon). Used by
+    // detect_surfaces_type, which runs long before the support generator does.
+    // docs/superpowers/specs/2026-09-05-over-support-surfaces.md
+    void                        slice_support_annotations(std::vector<Polygons> &enforcers, std::vector<Polygons> &blockers) const;
     std::vector<Polygons>       slice_support_enforcers() const { return this->slice_support_volumes(ModelVolumeType::SUPPORT_ENFORCER); }
 
     // Helpers to project custom facets on slices
