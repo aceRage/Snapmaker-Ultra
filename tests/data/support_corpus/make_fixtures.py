@@ -140,6 +140,15 @@ def main():
     o_v, o_t = box(-15, -6, 6, 30, 12, 2)
     write_3mf(os.path.join(HERE, "overhang_ledge.3mf"),
               [("pillar", p_v, p_t), ("ledge", o_v, o_t)])
+
+    # The same shape as ONE volume: both boxes in a single <mesh>, so the importer makes one
+    # MODEL_PART. A group on a single-part object has no neighbour to be measured against, so it is
+    # the case where a claim that is too small simply loses its contacts to the default group with
+    # nothing to make that visible - the shape of the bug §2c records. make_group_fixture.py's
+    # "singlepart" profile turns this into onepart_group.3mf.
+    one_v = list(p_v) + list(o_v)
+    one_t = list(p_t) + [(a + len(p_v), b + len(p_v), c + len(p_v)) for a, b, c in o_t]
+    write_3mf(os.path.join(HERE, "onepart_ledge.3mf"), [("ledge", one_v, one_t)])
     return 0
 
 

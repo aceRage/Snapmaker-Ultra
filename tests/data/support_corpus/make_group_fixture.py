@@ -71,6 +71,22 @@ PROFILES = {
             ("support_interface_spacing", "0.15"),
         ],
     },
+    # SINGLE PART: the object has exactly one MODEL_PART volume and that volume carries the group,
+    # so the default group owns no parts at all. There is no neighbour to measure the result
+    # against, which is why the too-small claim of the first Stage 3 build could hand this object's
+    # contacts to the default group and leave the G-code looking like the object's own settings -
+    # the shape of the bug §2c records. onepart_ledge.3mf is written by make_fixtures.py.
+    "singlepart": {
+        "source":    os.path.join(HERE, "onepart_ledge.3mf"),
+        "out":       os.path.join(HERE, "onepart_group.3mf"),
+        "filaments": "Generic PLA",
+        "metadata": [
+            ("support_group", "B"),
+            ("support_interface_top_layers", "5"),
+            ("support_interface_bottom_layers", "4"),
+            ("support_interface_spacing", "0.15"),
+        ],
+    },
 }
 
 # Set by main() from --profile; the module-level name is kept so the helpers below read the same.
@@ -129,11 +145,12 @@ def main():
     if not a.out:
         a.out = profile["out"]
 
+    source = profile.get("source", SOURCE)
     tmp = tempfile.mkdtemp(prefix="sgfixture_")
     try:
         exported = os.path.join(tmp, "exported.3mf")
-        print("1. exporting a project from", os.path.basename(SOURCE))
-        export_3mf(a.exe, a.datadir, SOURCE, exported)
+        print("1. exporting a project from", os.path.basename(source))
+        export_3mf(a.exe, a.datadir, source, exported)
 
         print("2. injecting the support group onto part %d" % a.part)
         inject(exported, a.out, a.part)

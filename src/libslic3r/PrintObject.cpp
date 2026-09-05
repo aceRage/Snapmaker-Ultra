@@ -3338,31 +3338,21 @@ void PrintObject::support_group_masks(std::vector<SupportGroup> &groups) const
         return;
 
     const size_t num_layers = this->layers().size();
-    // Groups 1..K-1 own exactly their own volumes.
-    for (size_t g = 1; g < groups.size(); ++ g) {
+    // EVERY group, group 0 included, owns exactly its own volumes' footprint - which is what
+    // SupportGroup::mask is documented to be (Print.hpp).
+    //
+    // Group 0's mask used to be the COMPLEMENT (all model parts minus the other groups) on the
+    // theory that the K masks then partitioned the footprint with no gap. They do not have to:
+    // group 0 is the complement at CLAIM level (support_group_piece() gives it whatever the other
+    // groups' claims leave of a shared polygon), so nothing downstream needed the complement, and
+    // in fact nothing ever read mask[0]. Its own footprint is worth much more, because
+    // support_group_claims() uses it to stop one group's (deliberately wide) claim from reaching
+    // across a neighbouring part and taking the contacts that belong to it.
+    // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2c.
+    for (size_t g = 0; g < groups.size(); ++ g) {
         groups[g].mask = this->slice_volumes_at_layers(groups[g].volumes);
         groups[g].mask.resize(num_layers);
     }
-    // Group 0 - the default group - is the COMPLEMENT: everything the object's model parts cover
-    // that no other group claimed. Taking the complement rather than group 0's own volumes is what
-    // makes the K masks a partition with no gap, so a contact polygon that spills past every part
-    // outline still belongs to exactly one group.
-    std::vector<const ModelVolume*> all_parts;
-    for (const ModelVolume *volume : this->model_object()->volumes)
-        if (volume != nullptr && volume->is_model_part())
-            all_parts.emplace_back(volume);
-    std::vector<Polygons> all = this->slice_volumes_at_layers(all_parts);
-    all.resize(num_layers);
-    groups[0].mask.assign(num_layers, Polygons());
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers),
-        [&groups, &all](const tbb::blocked_range<size_t> &range) {
-            for (size_t i = range.begin(); i < range.end(); ++ i) {
-                Polygons others;
-                for (size_t g = 1; g < groups.size(); ++ g)
-                    append(others, groups[g].mask[i]);
-                groups[0].mask[i] = others.empty() ? std::move(all[i]) : diff(all[i], union_(others));
-            }
-        });
 }
 
 void PrintObject::add_support_group_chameleon_warning(const std::string &message)

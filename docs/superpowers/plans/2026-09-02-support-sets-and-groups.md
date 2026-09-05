@@ -604,6 +604,143 @@ Run against a side install (`cmake --install <build> --config Release --prefix <
    build, and compare the G-code: it must be the same print. (The automated form of this is the
    off-mode gate above.)
 
+### Hardware pass (2026-09-05): the claim did not reach the contacts
+
+Shipped Stage 3 looked right on the corpus and was wrong on a real print. Branch
+`fix/support-group-single-part`, cut from `feat/ultra-preferences` @ `1c895674ef`.
+
+**The report.** Two slanted cylinders with normal support; one of them put in a support group made
+from a set with more interface layers and interface ironing. Sliced, that part's support interface
+looked exactly like the ungrouped one's and like the global settings.
+
+**What the project actually contained.** `tests/supportgroup_test.3mf` is **one** object ("Assembly",
+Snapmaker U1, 8 filaments, 0.16 mm layers) with **two** `MODEL_PART` volumes, not two objects - the
+GUI's Support-group submenu only appears on a part row, so it could not have been two. The volume
+named "back tongue" (the FRONT one on the plate; the names come from the source model and do not
+match plate position) carries `support_group = "Normal - With Iron"` and all fourteen curated keys.
+Only three of them differ from the object: `support_interface_top_layers` 2 -> 5,
+`support_interface_filament` 0 -> 6, `support_ironing` 0 -> 1. Ironing is inert this stage
+(deviation 6) and filament 6 is the object's own extruder, so the whole visible claim rested on the
+interface layer count.
+
+**The measurement.** Sliced with this branch's build on an isolated data dir, support-interface
+extrusion measured per part (the two parts separate cleanly at y = 95):
+
+| run | grouped part | ungrouped part |
+|---|---|---|
+| group stripped from the 3MF (control) | 12 976.5 mm, 66 layers, 6 780 segments | 10 548.3 mm, 58 layers, 5 188 segments |
+| the user's project, group = 5 layers | 13 133.0 mm, 72 layers, 16 345 segments | **identical** |
+| no group, 5 layers set OBJECT-WIDE | **17 417.9 mm**, 75 layers, 8 453 segments | 13 707.8 mm |
+
+The group delivered **+1.2 %** where the same value object-wide delivered **+34 %** - about a
+thirtieth of the effect - and drew the interface it did produce in 2.4x as many, much shorter
+segments. The ungrouped part was byte-identical, so the group machinery was engaging (the log says
+`2 support groups`) and staying off its neighbour; it simply was not getting the geometry.
+
+**Root cause.** `PrintObjectSupportMaterial::generate` built the per-group claims by expanding each
+group's part footprint by `gap_xy + one interface extrusion width` - about 0.6 mm
+(`src/libslic3r/Support/SupportMaterial.cpp:517-520`, as shipped). But a top contact layer is not
+the part's footprint: `fill_contact_layer` runs every contact through `SupportGridPattern`
+(`SupportMaterial.cpp:2049,2074`), which **stretches each island onto a grid** of
+`support_base_pattern_spacing + support_material_flow.spacing()` - 5.4 mm on stock settings
+(`SupportGridParams`, `SupportMaterial.cpp:811-820`). The narrow crescent a slanted wall sheds on
+each layer therefore becomes a band of 5.4 mm grid cells straddling the part outline, most of it
+outside a 0.6 mm claim. Instrumented on the user's project:
+
+```
+group 0 (default): claimed 6 691 mm2 of 7 506 mm2 of top-contact area -> 1 847 mm2 of interface
+group 1 (the user's group): claimed   814 mm2 (10.9 %)                 -> 294 mm2 of interface
+```
+
+`support_group_piece()` gives group 0 whatever the other claims leave, so the 89 % went to the
+default group and was filled with the OBJECT's two interface layers. The corpus never caught it
+because `twopart_groups*.3mf` overhangs are flat 20 x 16 mm decks - the grid fringe is a small
+fraction of a large contact - and because both fixtures are multi-part, where the neighbour's
+interface at least changes shape. On a **single-part** object nothing in the output moves at all.
+
+**The fix.** Three edits, all inside the group path (K == 1 still returns before any of it):
+
+1. `src/libslic3r/Support/SupportMaterial.cpp` - the claim reach now includes one grid cell for
+   `smsGrid`: `gap_xy + interface width + (support_base_pattern_spacing + support flow spacing)`.
+   The comment carries the measured numbers so the constant is not mysterious.
+2. `support_group_claims()` gained a second cut: a claim is refused any area sitting over **another
+   group's part** (its footprint plus `gap_xy`, which no support may enter anyway). Reaching 5.4 mm
+   is only safe with that guard - without it a wide claim would cross to a neighbour and take the
+   contacts belonging to it.
+3. `PrintObject::support_group_masks()` now gives **every** group its own parts' footprint, group 0
+   included, which is what `SupportGroup::mask` was documented to be. Group 0's mask used to be the
+   complement of the others; nothing ever read it (group 0 is the complement at *claim* level, in
+   `support_group_piece`), and its own footprint is exactly what edit 2 needs. This also drops one
+   full-object slice and K boolean ops per layer.
+
+An `info` line per group now records how many top contact layers it claimed of how many, and how
+many interface layers it produced - the number that would have made this a five-minute diagnosis.
+
+**Evidence after the fix.** Same project, same build machine, same isolated data dir. Support
+interface on the GROUPED part:
+
+| run | interface length | layers | segments | share of the yardstick |
+|---|---|---|---|---|
+| control (group stripped) | 12 976.5 mm | 66 | 6 780 | - |
+| before the fix | 13 133.0 mm | 72 | 16 345 | **3.5 %** |
+| **after the fix** | **15 706.9 mm** | 72 | 9 374 | **61 %** |
+| yardstick: 5 layers set object-wide | 17 417.9 mm | 75 | 8 453 | 100 % |
+
+The ungrouped part is **10 548.3 mm / 58 layers / 5 188 segments in every one of those runs** -
+identical to the last digit, so widening the claim took nothing from the neighbour. The
+fragmentation is largely gone with it: 16 345 segments for 13 133 mm (0.80 mm per segment) became
+9 374 for 15 707 mm (1.68 mm), against the yardstick's 2.06 mm. The new log line reads
+`group 1 ("Normal - With Iron", 1 parts, 5 top interface layers) claimed 61 of 86 top contact
+layers, produced 53 interface layers`.
+
+**The residual, stated honestly.** 61 %, not 100 %. What is left is the outermost grid fringe: a
+contact cell further from the part than one grid cell still goes to the default group, which fills
+it with the object's two layers where an object-wide setting would have given it five. `reach` is
+the lever and it is one line; it was not pushed further because a larger radius can only be paid for
+by taking a neighbour's fringe, and on a flat overhang - the unit fixture below - one grid cell
+already delivers more than 90 %. Widening it further, or replacing the fixed radius with a true
+nearest-part split, is Stage 5 work with a measurement to aim at.
+
+**Gates, all on this branch's own before / after pair (both Stage 3, installed to scratch prefixes,
+isolated `--datadir`).**
+
+- **Off mode, the hard gate** - `scripts/support_group_identity.py`, tolerance: **green on all 8
+  off-mode cases** (`normal_grid` 4466 segments, `normal_snug` 2255, `normal_ledge` 2592,
+  `soluble_interface` 35647, `dense_interface` 4964, `tree_organic` 36339, `raft` 4726,
+  `no_support` 1726). Expected by construction - every line of this fix sits behind `K > 1` - and
+  measured anyway.
+- **On mode** - `--gate groups`: `group_parts_geom` **ok**, `group_single_part` **ok**
+  (`config_rows=0 layers matched=41 identical=35 changed=6 a_only=0 b_only=0 segments=55.36 %
+  dirty_layers=6`). `group_parts` reports `DIFFER ... the baseline already has a T1 tool change -
+  the case proves nothing`: its `expect_tool` criterion asks for a tool change **absent from the
+  baseline**, which only holds when the baseline predates Stage 3. Here both sides are Stage 3 and
+  both emit exactly 3 `T1`, as they should - this fix does not touch filament routing. The
+  criterion is fine; the pairing is not the one it was written for.
+- **Unit** - `fff_print_tests "[support_groups]"`: 3 cases / 35 assertions pass with the fix, and
+  the new one **fails without it** (`grouped > global * 0.90` -> `2469.67 > 2783.20` is false, i.e.
+  79.9 % of the yardstick). `"[SupportGroups]"` (Stage 2's): 8 cases / 44 assertions pass.
+  `libslic3r_tests`: 599 cases / 53 725 assertions, the same 2 `[!shouldfail]` cases as §2c.
+- **Unchanged pre-existing failure** - `SCENARIO("SupportMaterial: support_layers_z and contact
+  distance")` still SIGSEGVs at `WHEN("First layer height = 0.4")`, as §2c records.
+
+**New regression cover.**
+
+- `tests/fff_print/test_support_material.cpp` - `"a group on a single-part object acts like the
+  object's own settings"`. A leg plus a floating cube merged into ONE `MODEL_PART`, so the default
+  group owns no parts. Three runs: control, five interface layers object-wide, five asked for by a
+  group. Asserts the object-wide change really deepens the interface (> 30 %), that the group does
+  too, and that the group delivers > 90 % of what object-wide delivers. Before the fix the third
+  assertion fails by a wide margin.
+- `tests/data/support_corpus/` - `onepart_ledge.3mf` (one volume, written by `make_fixtures.py`) and
+  `onepart_group.3mf` (the `singlepart` profile of `make_group_fixture.py`), plus the
+  `group_single_part` ON-mode case in `corpus.json`.
+
+**What this says about the earlier gates.** Nothing they asserted was wrong: off-mode identity holds
+(the whole group path is behind `K > 1`), and `group_parts` / `group_parts_geom` really did differ
+from the baseline. They were just not sensitive to *how much* of the group's own contact area the
+group actually got - "differs" is a weak claim. The unit test above is the first one that measures
+the magnitude against a yardstick, and it is the assertion to keep.
+
 ### What Stage 4 and Stage 5 inherit
 
 Stage 4a is now a small stage: `TreeSupport3D::generate_support_areas` calls the *same* two functions

@@ -547,10 +547,10 @@ public:
     // per-part top Z distance cannot be honoured, so the strictest group wins object-wide.
     static bool                 support_groups_want_soluble(const ModelObject &object);
     // Ultra (support groups, plan Stage 3 3.2): fill SupportGroup::mask - per object layer, the
-    // union of that group's volumes sliced at the layer's slice_z. Group 0 gets the COMPLEMENT
-    // (every model part minus the other groups), so the K masks partition the object footprint
-    // with no overlap and no gap. A no-op when `groups.size() <= 1`, so the off-mode path never
-    // slices anything extra.
+    // union of that group's volumes sliced at the layer's slice_z. Every group gets its own parts,
+    // group 0 included: it is the complement at CLAIM level, not at mask level, and its own
+    // footprint is what stops another group's claim from reaching across it. A no-op when
+    // `groups.size() <= 1`, so the off-mode path never slices anything extra.
     void                        support_group_masks(std::vector<SupportGroup> &groups) const;
     // Ultra (support groups, plan Stage 3 3.7 / R3.5): true when some MODEL_PART volume pins a
     // support interface filament of its own, different from the object's. Both the Chameleon pass
