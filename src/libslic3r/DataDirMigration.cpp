@@ -121,6 +121,50 @@ size_t rewrite_conf_paths(const fs::path& conf, const fs::path& old_dir, const f
 
 } // namespace
 
+// A new data directory nobody has used yet: no config file, no hub settings, no marker from an
+// earlier migration. Whatever else is in it was put there by this very startup.
+static bool is_fresh_scaffold(const fs::path& new_dir)
+{
+    boost::system::error_code ec;
+    if (fs::exists(new_dir / (std::string(SLIC3R_APP_KEY) + ".conf"), ec)) return false;
+    if (fs::exists(new_dir / "hub" / "settings.json", ec)) return false;
+    if (fs::exists(new_dir / (std::string(".migrated-from-") + SLIC3R_LEGACY_APP_KEY), ec)) return false;
+    return true;
+}
+
+// Move everything under `from` into `into`: directories present on both sides are merged, a file
+// present on both sides is replaced by the staged copy (the user's data beats the defaults).
+static void merge_into(const fs::path& from, const fs::path& into, std::string& error)
+{
+    boost::system::error_code ec;
+    for (fs::directory_iterator it(from, ec), end; it != end; ++it) {
+        const fs::path src = it->path();
+        const fs::path dst = into / src.filename();
+        if (fs::is_directory(src, ec)) {
+            if (fs::is_directory(dst, ec)) {
+                merge_into(src, dst, error);
+                continue;
+            }
+            fs::remove_all(dst, ec);
+        } else if (fs::exists(dst, ec)) {
+            fs::remove(dst, ec);
+        }
+        ec.clear();
+        fs::rename(src, dst, ec);
+        if (ec) {
+            // Across a volume boundary rename is not possible; fall back to a copy.
+            ec.clear();
+            if (fs::is_directory(src, ec)) {
+                fs::create_directories(dst, ec);
+                merge_into(src, dst, error);
+            } else {
+                fs::copy_file(src, dst, fs::copy_option::overwrite_if_exists, ec);
+                if (ec && error.empty()) error = src.string() + ": " + ec.message();
+            }
+        }
+    }
+}
+
 DataDirMigrationResult migrate_data_dir(const std::string& parent,
                                         const std::string& new_dir_str,
                                         bool               include_archive)
@@ -137,7 +181,12 @@ DataDirMigrationResult migrate_data_dir(const std::string& parent,
     res.new_dir = new_dir.string();
 
     boost::system::error_code ec;
-    if (fs::exists(new_dir, ec)) {
+    // Startup creates the new directory (its log/ and the default preset scaffold) before this
+    // point can always be reached, so "the directory exists" is not the same as "the user has
+    // data there". Only a config file, a hub settings file or an earlier migration's marker mean
+    // that; anything else is a fresh scaffold that the copy is merged into.
+    const bool new_exists = fs::exists(new_dir, ec);
+    if (new_exists && !is_fresh_scaffold(new_dir)) {
         res.skipped_new_exists = true;
         return res; // already here, whether we made it or the user did
     }
@@ -229,11 +278,23 @@ DataDirMigrationResult migrate_data_dir(const std::string& parent,
         }
     }
 
-    fs::rename(staging, new_dir, ec);
-    if (ec) {
-        res.error = "could not publish " + staging.string() + " as " + new_dir.string() + ": " + ec.message();
+    if (new_exists) {
+        // The scaffold holds files this process may have open (the log), so it cannot be renamed
+        // away; move the staged entries into it instead, the copy winning over the defaults.
+        std::string merge_error;
+        merge_into(staging, new_dir, merge_error);
         fs::remove_all(staging, ec);
-        return res;
+        if (!merge_error.empty()) {
+            res.error = "could not merge " + staging.string() + " into " + new_dir.string() + ": " + merge_error;
+            return res;
+        }
+    } else {
+        fs::rename(staging, new_dir, ec);
+        if (ec) {
+            res.error = "could not publish " + staging.string() + " as " + new_dir.string() + ": " + ec.message();
+            fs::remove_all(staging, ec);
+            return res;
+        }
     }
 
     res.ran = true;
