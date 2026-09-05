@@ -156,6 +156,19 @@
       ]
     },
     {
+      "name": "group_single_part",
+      "groups": true,
+      "comment": "ON MODE, one filament, ONE part. The object has a single MODEL_PART volume and that volume carries the group, so the default group owns no parts at all and there is no neighbour whose interface could make the result look wrong. It is the regression case for the claim-reach bug of 2c: a group whose claim does not cover the grid-stretched contacts silently hands them back to the default group, and on a single-part object nothing else in the G-code shows it. Same args as group_parts_geom so the two differ only in part count.",
+      "models": [
+        "tests/data/support_corpus/onepart_group.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=normal(auto)",
+        "--support-style=grid"
+      ]
+    },
+    {
       "name": "tree_organic",
       "models": [
         "tests/data/support_corpus/twopart_bridge.3mf"

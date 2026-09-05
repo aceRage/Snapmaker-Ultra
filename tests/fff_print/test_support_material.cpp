@@ -535,3 +535,118 @@ TEST_CASE("SupportMaterial: per-group interface filament", "[SupportMaterial][su
     // Nothing in ToolOrdering was changed by this stage; interface_by_extruder is storage it
     // already read for Chameleon (ToolOrdering.cpp collect_extruders).
 }
+
+
+// ============================================================================================
+// Ultra (support groups) - regression for the claim-reach bug found on hardware.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2c.
+//
+// A group on an object with EXACTLY ONE part has to act like the same values set object-wide.
+// The first Stage 3 build claimed only the part's own footprint plus the XY gap and one interface
+// extrusion width, while fill_contact_layer() stretches every contact onto a grid cell of
+// support_base_pattern_spacing + flow spacing (5.4 mm on stock settings). Most of each contact
+// therefore landed outside the claim and was filled by the DEFAULT group, with the object's own
+// settings - and on a single-part object there is no neighbouring part whose interface would look
+// different, so nothing in the output showed it. That is how it reached a user.
+// ============================================================================================
+
+namespace {
+
+// The two-part fixture's leg and one of its floating cubes, merged into ONE MODEL_PART volume: the
+// object has a single part, so the default group ends up owning no parts at all.
+void make_floating_one_part_print(Slic3r::Print                            &print,
+                                  Slic3r::Model                            &model,
+                                  const Slic3r::DynamicPrintConfig         &config,
+                                  const std::function<void(ModelObject &)> &tweak)
+{
+    ModelObject *object = model.add_object();
+    object->name = "floating_one_part";
+    // A leg on the bed carrying a long, NARROW bar 10 mm above it. Narrow on purpose: the bar is
+    // 3 mm wide where the support grid cell is 5.42 mm, so the contact SupportGridPattern produces
+    // is a band of grid cells much wider than the bar itself. That is the shape a claim of
+    // "footprint + 0.6 mm" cannot cover - a wide flat overhang hides the bug, because its fringe is
+    // a small fraction of a large contact.
+    TriangleMesh mesh = Slic3r::make_cube(2., 2., 10.);      // the leg, on the bed
+    TriangleMesh top  = Slic3r::make_cube(3., 30., 6.);      // the bar, floating 10 mm up
+    top.translate(0.f, 0.f, 10.f);
+    mesh.merge(top);
+    object->add_volume(mesh);
+    object->add_instance();
+    if (tweak)
+        tweak(*object);
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+    print.set_status_silent();
+    print.process();
+}
+
+// erSupportMaterialInterface path length over every support layer, with no left / right split:
+// this object has one part, so there is nothing to split.
+double total_interface_length(const PrintObject &object)
+{
+    double all = 0., unused = 0.;
+    for (const SupportLayer *support_layer : object.support_layers())
+        sum_interface_length(support_layer->support_fills, std::numeric_limits<double>::max(), all, unused);
+    return all;
+}
+
+} // namespace
+
+TEST_CASE("SupportMaterial: a group on a single-part object acts like the object's own settings",
+          "[SupportMaterial][support_groups]")
+{
+    auto interface_of = [](const DynamicPrintConfig                  &config,
+                           const std::function<void(ModelObject &)>  &tweak,
+                           size_t                                     expect_groups) {
+        Slic3r::Print print;
+        Slic3r::Model model;
+        make_floating_one_part_print(print, model, config, tweak);
+        REQUIRE(! print.objects().empty());
+        const PrintObject &object = *print.objects().front();
+        REQUIRE(object.support_groups().size() == expect_groups);
+        REQUIRE(! object.support_layers().empty());
+        return total_interface_length(object);
+    };
+
+    // Control: the object's own two interface layers, no group anywhere.
+    const double control = interface_of(group_fixture_config(), nullptr, 1);
+    REQUIRE(control > 1.);
+
+    // The yardstick: the same five dense interface layers, set OBJECT-WIDE. Whatever a group asks
+    // for, it has to deliver about as much of it as the object asking for it itself does.
+    DynamicPrintConfig global_config = group_fixture_config();
+    global_config.set_deserialize_strict({
+        { "support_interface_top_layers", "5" },
+        { "support_interface_spacing",    "0" },
+    });
+    const double global = interface_of(global_config, nullptr, 1);
+    // Or the yardstick means nothing.
+    REQUIRE(global > control * 1.30);
+
+    // The same five layers, asked for by a GROUP on the object's only part.
+    Slic3r::Print print;
+    Slic3r::Model model;
+    make_floating_one_part_print(print, model, group_fixture_config(), [](ModelObject &object) {
+        ModelVolume *part = object.volumes.front();
+        part->config.set_key_value("support_group", new ConfigOptionString("B"));
+        part->config.set_key_value("support_interface_top_layers", new ConfigOptionInt(5));
+        part->config.set_key_value("support_interface_spacing", new ConfigOptionFloat(0.));
+    });
+    REQUIRE(! print.objects().empty());
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.support_groups().size() == 2);
+    REQUIRE(! object.support_layers().empty());
+    // The single-part shape: the group holds the object's only part and the default group is empty
+    // of parts. It still exists, because downstream code addresses group 0 unconditionally.
+    REQUIRE(object.support_groups()[1].volumes.size() == 1);
+    CHECK(object.support_groups()[0].volumes.empty());
+    const double grouped = total_interface_length(object);
+
+    // The group really acts - this is what the bug broke: `grouped` used to sit near `control`.
+    CHECK(grouped > control * 1.30);
+    // And it delivers essentially all of what the object-wide setting delivers. Not equality: the
+    // default group still takes whatever falls outside the claim, e.g. grid cells more than one
+    // cell out from the part.
+    CHECK(grouped > global * 0.90);
+}

@@ -361,24 +361,42 @@ static PrintObjectConfig support_shared_config(const PrintObject &object,
 }
 
 // Ultra (support groups, plan Stage 3 3.5 / R3.1): turn the raw per-group masks into DISJOINT
-// per-object-layer claims. Every group's footprint is expanded by `e` - the XY gap plus one
-// interface extrusion width - because a contact polygon is inflated well past the part outline it
-// supports; the expansion is then cut against every LOWER group, so the claims never overlap and
-// the split is a hard clip along the (expanded) mask boundary. claims[0] holds the union of all of
-// them: group 0 takes what is left of any shared polygon, so the K pieces cover it exactly.
-// The expansion and the group order are the two knobs behind the seam R3.1 describes.
+// per-object-layer claims. Every group's footprint is expanded by `reach` - how far a top contact
+// layer can sit outside the outline of the part it supports - and the result is then cut against
+// (a) every OTHER group's own part, so a wide claim can never reach across a neighbour and take the
+// contacts that belong to it, and (b) every LOWER group's claim, so the claims stay disjoint and the
+// split is a hard clip along that boundary. claims[0] holds the union of all of them: group 0 takes
+// what is left of any shared polygon, so the K pieces cover it exactly.
+// `reach` and the group order are the two knobs behind the seam R3.1 describes.
 static std::vector<std::vector<Polygons>> support_group_claims(
-    const std::vector<PrintObject::SupportGroup> &groups, float expansion, size_t num_layers)
+    const std::vector<PrintObject::SupportGroup> &groups, float reach, float block, size_t num_layers)
 {
     std::vector<std::vector<Polygons>> claims(groups.size(), std::vector<Polygons>(num_layers));
     tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers),
-        [&groups, &claims, expansion](const tbb::blocked_range<size_t> &range) {
+        [&groups, &claims, reach, block](const tbb::blocked_range<size_t> &range) {
             for (size_t i = range.begin(); i < range.end(); ++ i) {
                 Polygons taken;
                 for (size_t g = 1; g < groups.size(); ++ g) {
                     Polygons c;
                     if (i < groups[g].mask.size() && ! groups[g].mask[i].empty())
-                        c = expand(groups[g].mask[i], expansion);
+                        c = expand(groups[g].mask[i], reach);
+                    if (! c.empty()) {
+                        // Another group's part, plus the gap no support may enter: off limits.
+                        Polygons blocked;
+                        for (size_t h = 0; h < groups.size(); ++ h)
+                            if (h != g && i < groups[h].mask.size() && ! groups[h].mask[i].empty())
+                                append(blocked, expand(groups[h].mask[i], block));
+                        if (! blocked.empty()) {
+                            // ... except over this group's OWN part. Two parts that touch would
+                            // otherwise let the neighbour's gap eat a strip of the group's own
+                            // footprint, which is never the right answer.
+                            blocked = union_(blocked);
+                            if (! groups[g].mask[i].empty())
+                                blocked = diff(blocked, groups[g].mask[i]);
+                            if (! blocked.empty())
+                                c = diff(c, blocked);
+                        }
+                    }
                     if (! c.empty() && ! taken.empty())
                         c = diff(c, taken);
                     if (! c.empty())
@@ -504,10 +522,31 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
         object_layer_zs.emplace_back(layer->print_z);
     if (m_groups.size() > 1) {
         object.support_group_masks(m_groups);
-        // The margin a contact polygon is inflated by past the outline of the part it supports.
-        const float expansion = float(scale_(m_support_params.gap_xy)) +
-                                float(m_support_params.support_material_interface_flow.scaled_width());
-        m_group_claims = support_group_claims(m_groups, expansion, object.layers().size());
+        // How far a top contact layer can sit OUTSIDE the outline of the part it supports. Two
+        // terms, and the second one is the whole reason a group used to barely change anything:
+        //
+        //  - the XY gap plus one interface extrusion width, the margin the contact is inflated by;
+        //  - for grid supports, one grid cell. fill_contact_layer() runs every contact through
+        //    SupportGridPattern, which STRETCHES each island onto a grid of
+        //    support_base_pattern_spacing + support_material_flow.spacing() (SupportGridParams
+        //    above - 5.4 mm with the stock 5 mm spacing) before it is sliced. A narrow overhang -
+        //    the crescent a slanted wall sheds on each layer - therefore becomes a band of grid
+        //    cells straddling the part outline, most of it well beyond the part's own footprint.
+        //    Claiming only footprint + 0.6 mm left the rest to the default group: measured on the
+        //    user's two slanted cylinders, the group claimed 814 mm2 of 7506 mm2 of contact area
+        //    (11 %) and its five interface layers changed that part's interface by 1 %, where the
+        //    same value set object-wide changed it by 34 %.
+        //
+        // Reaching this far is only safe because support_group_claims() then refuses any area
+        // sitting over ANOTHER group's part - `block` below, the part outline plus the gap no
+        // support may enter.
+        // docs/superpowers/plans/2026-09-02-support-sets-and-groups.md 2c.
+        const float block = float(scale_(m_support_params.gap_xy));
+        float       reach = block + float(m_support_params.support_material_interface_flow.scaled_width());
+        if (m_support_params.support_style == smsGrid)
+            reach += float(scale_(m_object_config->support_base_pattern_spacing.value +
+                                  m_support_params.support_material_flow.spacing()));
+        m_group_claims = support_group_claims(m_groups, reach, block, object.layers().size());
         BOOST_LOG_TRIVIAL(info) << "Support generator - " << m_groups.size() << " support groups";
     }
 
@@ -627,6 +666,11 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
             auto [iface_g, base_iface_g] = generate_interface_layers(
                 m_groups[g].config, params_g, bottom_g, top_g, empty_layers, empty_layers,
                 intermediate_layers, layer_storage);
+            BOOST_LOG_TRIVIAL(info) << "Support generator - group " << g << " (\"" << m_groups[g].name
+                << "\", " << m_groups[g].volumes.size() << " parts, "
+                << m_groups[g].config.support_interface_top_layers.value << " top interface layers) claimed "
+                << top_g.size() << " of " << top_contacts.size() << " top contact layers, produced "
+                << iface_g.size() << " interface layers";
             for (SupportGeneratorLayer *l : iface_g)      l->support_group = uint16_t(g);
             for (SupportGeneratorLayer *l : base_iface_g) l->support_group = uint16_t(g);
             append(interface_layers,      iface_g);
