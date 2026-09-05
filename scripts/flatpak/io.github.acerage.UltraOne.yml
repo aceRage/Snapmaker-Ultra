@@ -1,4 +1,4 @@
-app-id: io.github.Snapmaker.Snapmaker_Orca
+app-id: io.github.acerage.UltraOne
 runtime: org.gnome.Platform
 runtime-version: "49"
 sdk: org.gnome.Sdk
@@ -15,8 +15,12 @@ finish-args:
   - --filesystem=/run/media
   - --filesystem=/media
   - --filesystem=/run/spnav.sock:ro
-  # Allow Snapmaker_Orca to talk to other instances
-  - --talk-name=io.github.Snapmaker.Snapmaker_Orca.InstanceCheck.*
+  # The app id changed, so the Flatpak sandbox home changed with it and the first-start
+  # data-dir copy cannot see the old one without this. Read-only, for one release; set
+  # ULTRAONE_LEGACY_DATA_PARENT to that config dir so the migration looks there.
+  - --filesystem=~/.var/app/io.github.Snapmaker.Snapmaker_Orca/config:ro
+  # Allow UltraOne to talk to other instances
+  - --talk-name=io.github.acerage.UltraOne.InstanceCheck.*
   - --system-talk-name=org.freedesktop.UDisks2
   - --env=SPNAV_SOCKET=/run/spnav.sock
 
@@ -336,7 +340,7 @@ modules:
 
       # AppData metainfo for Gnome Software & Co.
       - type: file
-        path: io.github.Snapmaker.Snapmaker_Orca.metainfo.xml
+        path: io.github.acerage.UltraOne.metainfo.xml
 
       # start-up script
       - type: file

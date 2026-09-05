@@ -1165,7 +1165,7 @@ wxWindow *PreferencesDialog ::create_item_radiobox(wxString title, wxWindow *par
 wxBoxSizer* PreferencesDialog::create_item_link_association(wxWindow* parent, wxString url_prefix, wxString website_name)
 {
     wxString title = _L("Associate") + (boost::format(" %1%://") % url_prefix.c_str()).str();
-    wxString tooltip = _L("Associate") + " " + url_prefix + ":// " + _L("with Snapmaker Orca so that Orca can open models from") + " " + website_name;
+    wxString tooltip = _L("Associate") + " " + url_prefix + ":// " + _L("with UltraOne so that Orca can open models from") + " " + website_name;
 
     std::wstring registered_bin; // not used, just here to provide a ref to check fn
     bool reg_to_current_instance = wxGetApp().check_url_association(url_prefix.ToStdWstring(), registered_bin);
@@ -1446,12 +1446,12 @@ wxWindow* PreferencesDialog::create_general_page()
 
     std::vector<wxString> Units         = {_L("Metric") + " (mm, g)", _L("Imperial") + " (in, oz)"};
     auto item_currency = create_item_combobox(_L("Units"), page, _L("Units"), "use_inches", Units);
-    auto item_single_instance = create_item_checkbox(_L("Allow only one Snapmaker Orca instance"), page,
+    auto item_single_instance = create_item_checkbox(_L("Allow only one UltraOne instance"), page,
     #if __APPLE__
             _L("On OSX there is always only one instance of app running by default. However it is allowed to run multiple instances "
                 "of same app from the command line. In such case this settings will allow only one instance."),
     #else
-            _L("If this is enabled, when starting Snapmaker Orca and another instance of the same Snapmaker Orca is already running, that instance will be reactivated instead."),
+            _L("If this is enabled, when starting UltraOne and another instance of the same UltraOne is already running, that instance will be reactivated instead."),
     #endif
             50, "single_instance");
 
@@ -1490,7 +1490,7 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_calc_in_long_retract = create_item_checkbox(_L("Flushing volumes: Auto-calculate every time when the filament is changed."), page, _L("If enabled, auto-calculate every time when filament is changed"), 50, "auto_calculate_when_filament_change");
     auto item_remember_printer_config = create_item_checkbox(_L("Remember printer configuration"), page, _L("If enabled, Orca will remember and switch filament/process configuration for each printer automatically."), 50, "remember_printer_config");
     auto item_step_mesh_setting = create_item_checkbox(_L("Show the step mesh parameter setting dialog."), page, _L("If enabled,a parameter settings dialog will appear during STEP file import."), 50, "enable_step_mesh_setting");
-    auto item_multi_machine = create_item_checkbox(_L("Multi-device Management (Take effect after restarting Snapmaker Orca)."), page, _L("With this option enabled, you can send a task to multiple devices at the same time and manage multiple devices."), 50, "enable_multi_machine");
+    auto item_multi_machine = create_item_checkbox(_L("Multi-device Management (Take effect after restarting UltraOne)."), page, _L("With this option enabled, you can send a task to multiple devices at the same time and manage multiple devices."), 50, "enable_multi_machine");
     auto item_auto_arrange  = create_item_checkbox(_L("Auto arrange plate after cloning"), page, _L("Auto arrange plate after object cloning"), 50, "auto_arrange");
     auto title_presets = create_item_title(_L("Presets"), page, _L("Presets"));
     //auto title_network = create_item_title(_L("Network"), page, _L("Network"));
@@ -1501,17 +1501,17 @@ wxWindow* PreferencesDialog::create_general_page()
     });
 
 #ifdef _WIN32
-    auto title_associate_file = create_item_title(_L("Associate files to Snapmaker Orca"), page, _L("Associate files to Snapmaker Orca"));
+    auto title_associate_file = create_item_title(_L("Associate files to UltraOne"), page, _L("Associate files to UltraOne"));
 
     // associate file
-    auto item_associate_3mf  = create_item_checkbox(_L("Associate .3mf files to Snapmaker Orca"), page,
-                                                        _L("If enabled, sets Snapmaker Orca as default application to open .3mf files"), 50, "associate_3mf");
-    auto item_associate_stl  = create_item_checkbox(_L("Associate .stl files to Snapmaker Orca"), page,
-                                                        _L("If enabled, sets Snapmaker Orca as default application to open .stl files"), 50, "associate_stl");
-    auto item_associate_step = create_item_checkbox(_L("Associate .step/.stp files to Snapmaker Orca"), page,
-                                                         _L("If enabled, sets Snapmaker Orca as default application to open .step files"), 50, "associate_step");
+    auto item_associate_3mf  = create_item_checkbox(_L("Associate .3mf files to UltraOne"), page,
+                                                        _L("If enabled, sets UltraOne as default application to open .3mf files"), 50, "associate_3mf");
+    auto item_associate_stl  = create_item_checkbox(_L("Associate .stl files to UltraOne"), page,
+                                                        _L("If enabled, sets UltraOne as default application to open .stl files"), 50, "associate_stl");
+    auto item_associate_step = create_item_checkbox(_L("Associate .step/.stp files to UltraOne"), page,
+                                                         _L("If enabled, sets UltraOne as default application to open .step files"), 50, "associate_step");
 
-    auto title_associate_url = create_item_title(_L("Associate web links to Snapmaker Orca"), page, _L("Associate URLs to Snapmaker Orca"));
+    auto title_associate_url = create_item_title(_L("Associate web links to UltraOne"), page, _L("Associate URLs to UltraOne"));
 
     auto associate_url_orcaslicer  = create_item_link_association(page, L"orcaslicer", "Printables.com (Orca links)");
     auto associate_url_prusaslicer = create_item_link_association(page, L"prusaslicer", "Printables.com");
@@ -1690,7 +1690,7 @@ wxWindow* PreferencesDialog::create_ultra_page()
     auto item_auto_shadow = create_item_checkbox(_L("Seamless System Filament Edits"), page,
         _L("Saving a modified system preset silently saves and selects \"<name> - Custom\" instead of asking for a new name every time."), 50, "auto_shadow_system_presets");
     auto item_sync_bambu_presets = create_item_checkbox(_L("Import Bambu Studio user presets"), page,
-        _L("At startup, mirror your custom Bambu Studio print & filament presets into Snapmaker Orca so they are usable here too. One-way (Bambu Studio stays the source); your own presets and deletions are preserved. Takes effect after restart."), 50, "sync_bambu_user_presets");
+        _L("At startup, mirror your custom Bambu Studio print & filament presets into UltraOne so they are usable here too. One-way (Bambu Studio stays the source); your own presets and deletions are preserved. Takes effect after restart."), 50, "sync_bambu_user_presets");
     auto item_sync_now = create_item_button(_L("Import from Bambu Studio now"), _L("Sync now"), page,
         _L("Import from Bambu Studio now"),
         _L("Re-run the one-way import of your Bambu Studio custom print/filament/machine presets and refresh the lists immediately."),

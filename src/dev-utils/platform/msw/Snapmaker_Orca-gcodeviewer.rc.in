@@ -6,13 +6,13 @@ PRODUCTVERSION @SLIC3R_RC_VERSION@
  {
   BLOCK "040904E4"
   {
-   VALUE "CompanyName", "Snapmaker"
+   VALUE "CompanyName", "@SLIC3R_APP_NAME@"
    VALUE "FileDescription", "@SLIC3R_APP_NAME@ G-code Viewer"
    VALUE "FileVersion", "@SLIC3R_BUILD_ID@"
    VALUE "ProductName", "@SLIC3R_APP_NAME@ G-code Viewer"
    VALUE "ProductVersion", "@SLIC3R_BUILD_ID@"
    VALUE "InternalName", "@SLIC3R_APP_NAME@ G-code Viewer"
-   VALUE "LegalCopyright", "Copyright © 2024-2026 Snapmaker. All rights reserved."
+   VALUE "LegalCopyright", "Copyright (C) 2024-2026 the @SLIC3R_APP_NAME@ contributors. All rights reserved."
    VALUE "OriginalFilename", "bambu-gcodeviewer.exe"
   }
  }

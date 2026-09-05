@@ -81,6 +81,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/miniz_extension.hpp"
+#include "libslic3r/DataDirMigration.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Color.hpp"
 
@@ -367,7 +368,7 @@ bool is_associate_files(std::wstring extend)
     wchar_t app_path[MAX_PATH];
     ::GetModuleFileNameW(nullptr, app_path, sizeof(app_path));
 
-    std::wstring prog_id             = L" Orca.Slicer.1";
+    std::wstring prog_id             = L"UltraOne.Model.1";
     std::wstring reg_base            = L"Software\\Classes";
     std::wstring reg_extension       = reg_base + L"\\." + extend;
 
@@ -474,7 +475,7 @@ public:
         if (logoBmp != nullptr)
             memDc.DrawBitmap(*logoBmp, logoX, logoY, true);
 
-        // Brand name: "Snapmaker Orca"
+        // Brand name: "UltraOne"
         memDc.SetFont(m_constant_text.titleFont);
         memDc.SetTextForeground(wxColour(23, 23, 23));
         wxSize brandExt = memDc.GetTextExtent(m_constant_text.title);
@@ -594,7 +595,7 @@ private:
 
         void init()
         {
-            title    = "Snapmaker Orca";
+            title    = "UltraOne";
             version  = std::string("V") + Snapmaker_VERSION;
             betaText = _L("Ultra version"); // Ultra: tells the official and Ultra builds apart at launch
 
@@ -895,10 +896,10 @@ void GUI_App::log_version_info()
     });
 
     BOOST_LOG_TRIVIAL(warning) << "========================================";
-    BOOST_LOG_TRIVIAL(warning) << "Snapmaker Orca Version Information";
+    BOOST_LOG_TRIVIAL(warning) << "UltraOne Version Information";
     BOOST_LOG_TRIVIAL(warning) << "========================================";
 
-    BOOST_LOG_TRIVIAL(warning) << "[Version] Snapmaker Orca: " << Snapmaker_VERSION
+    BOOST_LOG_TRIVIAL(warning) << "[Version] UltraOne: " << Snapmaker_VERSION
                                << ", Build: " << SLIC3R_VERSION;
 
     std::string flutter_ver = common::get_flutter_version();
@@ -949,7 +950,7 @@ static void generic_exception_handle()
         // and terminate the app so it is at least certain to happen now.
         BOOST_LOG_TRIVIAL(error) << boost::format("std::bad_alloc exception: %1%") % ex.what();
         flush_logs();
-        wxString errmsg = wxString::Format(_L("Snapmaker Orca will terminate because of running out of memory."
+        wxString errmsg = wxString::Format(_L("UltraOne will terminate because of running out of memory."
                                               "It may be a bug. It will be appreciated if you report the issue to our team."));
         wxMessageBox(errmsg + "\n\n" + wxString(ex.what()), _L("Fatal error"), wxOK | wxICON_ERROR);
 
@@ -958,13 +959,13 @@ static void generic_exception_handle()
      } catch (const boost::io::bad_format_string& ex) {
      	BOOST_LOG_TRIVIAL(error) << boost::format("Uncaught exception: %1%") % ex.what();
         	flush_logs();
-        wxString errmsg = _L("Snapmaker Orca will terminate because of a localization error. "
+        wxString errmsg = _L("UltraOne will terminate because of a localization error. "
                              "It will be appreciated if you report the specific scenario this issue happened.");
         wxMessageBox(errmsg + "\n\n" + wxString(ex.what()), _L("Critical error"), wxOK | wxICON_ERROR);
         std::terminate();
         //throw;
     } catch (const std::exception& ex) {
-        wxLogError(format_wxstr(_L("Snapmaker Orca got an unhandled exception: %1%"), ex.what()));
+        wxLogError(format_wxstr(_L("UltraOne got an unhandled exception: %1%"), ex.what()));
         BOOST_LOG_TRIVIAL(error) << boost::format("Uncaught exception: %1%") % ex.what();
         flush_logs();
         throw;
@@ -1000,6 +1001,10 @@ std::vector<std::string> GUI_App::split_str(std::string src, std::string separat
     return result;
 }
 
+// Set by init_app_config() when the first-start data-dir copy actually ran, and read once by
+// post_init(). A migration happens at most once in the life of an install.
+static Slic3r::DataDirMigrationResult g_datadir_migration;
+
 void GUI_App::post_init()
 {
     assert(initialized());
@@ -1008,6 +1013,22 @@ void GUI_App::post_init()
 
     m_open_method = "double_click";
     bool switch_to_3d = false;
+
+    // The data directory was copied out of the pre-rename one on this start. Say so once, after
+    // the window exists rather than before it - and never on a hidden, hub-managed instance,
+    // which has nobody in front of it to read a dialog.
+    if (g_datadir_migration.ran && !m_hub_managed) {
+        const auto mig = g_datadir_migration;
+        g_datadir_migration = Slic3r::DataDirMigrationResult();
+        wxString msg = wxString::Format(
+            _L("Your settings, presets and phone-hub data were copied over from the previous "
+               "installation.\n\nFrom:\t%s\nTo:\t%s\n\n%llu files were copied. The old folder was "
+               "not changed and is still there, so the previous version keeps working; changes you "
+               "make from now on are not copied back. You can delete the old folder once you are "
+               "happy with this version."),
+            from_u8(mig.old_dir), from_u8(mig.new_dir), (unsigned long long) mig.files_copied);
+        MessageDialog(nullptr, msg, wxString(SLIC3R_APP_NAME), wxOK | wxICON_INFORMATION).ShowModal();
+    }
 
     // Ultra: a hidden (hub-managed) instance gets no WM_PAINT, so GLCanvas3D::render() - the usual
     // trigger for init_opengl() / init() - never runs. Do that work here, before any project loads:
@@ -2178,7 +2199,7 @@ void GUI_App::init_webview_runtime()
 {
     // Check WebView Runtime
     if (!WebView::CheckWebViewRuntime()) {
-        int nRet = wxMessageBox(_L("Snapmaker Orca requires the Microsoft WebView2 Runtime to operate certain features.\nClick Yes to install it now."),
+        int nRet = wxMessageBox(_L("UltraOne requires the Microsoft WebView2 Runtime to operate certain features.\nClick Yes to install it now."),
                                 _L("WebView2 Runtime"), wxYES_NO);
         if (nRet == wxYES) {
             WebView::DownloadAndInstallWebViewRuntime();
@@ -2232,6 +2253,18 @@ void GUI_App::init_app_config()
                 set_data_dir((dir + "/" + GetAppName()).ToUTF8().data());
                 data_dir_path = boost::filesystem::path(data_dir());
             #endif
+            // Ultra rebrand: the data directory is named after the app key, so it moved when
+            // the key did. Copy the old one across before anything creates the new one - this is
+            // the only moment at which "the new dir does not exist yet" is still true.
+            // Copy, never move: the old install keeps working, which is the real rollback.
+            {
+                const auto mig = Slic3r::migrate_data_dir(data_dir_path.parent_path().string(),
+                                                          data_dir_path.string());
+                if (!mig.error.empty())
+                    BOOST_LOG_TRIVIAL(error) << "data dir migration failed, starting fresh: " << mig.error;
+                else if (mig.ran)
+                    g_datadir_migration = mig; // post_init() tells the user what happened
+            }
             if (!boost::filesystem::exists(data_dir_path)){
                 boost::filesystem::create_directory(data_dir_path);
             }
@@ -2703,7 +2736,7 @@ bool GUI_App::on_init_inner()
             RichMessageDialog
                 dlg(nullptr,
                     wxString::Format(_L("%s\nDo you want to continue?"), msg),
-                    "Snapmaker Orca", wxICON_QUESTION | wxYES_NO);
+                    "UltraOne", wxICON_QUESTION | wxYES_NO);
             dlg.ShowCheckBox(_L("Remember my choice"));
             // Ultra: a hidden instance cannot answer and declining would abort start-up: accept (not remembered).
             const int tls_answer = m_hub_managed ? (int) wxID_YES : dlg.ShowModal();
@@ -2833,8 +2866,12 @@ bool GUI_App::on_init_inner()
             associate_files(L"step");
             associate_files(L"stp");
         }
-        associate_url(L"Snapmaker_Orca");
-        associate_url(L"snapmaker-orca");
+        // One scheme, matching what the installer registers machine-wide. Registering
+        // Snapmaker_Orca:// and snapmaker-orca:// here took those handlers away from an
+        // official Snapmaker Orca installed side by side, which is exactly what the
+        // installer script says it is avoiding. Old links still open: is_orca_open()
+        // keeps accepting both spellings.
+        associate_url(L"ultraone");
 
         if (app_config->get("associate_gcode") == "true")
             associate_files(L"gcode");
@@ -2885,7 +2922,7 @@ bool GUI_App::on_init_inner()
                 wxString tips = wxString::Format(_L("Click to download new version in default browser: %s"), version_str);
                 DownloadDialog dialog(this->mainframe,
                     tips,
-                    _L("The Snapmaker Orca needs an upgrade"),
+                    _L("The UltraOne needs an upgrade"),
                     false,
                     wxCENTER | wxICON_INFORMATION);
                 dialog.SetExtendedMessage(description_text);
@@ -3191,7 +3228,7 @@ bool GUI_App::on_init_inner()
         m_config_corrupted = false;
         show_error(nullptr,
                    _u8L(
-                       "The Snapmaker Orca configuration file may be corrupted and cannot be parsed.\nSnapmaker Orca has attempted to recreate the "
+                       "The UltraOne configuration file may be corrupted and cannot be parsed.\nUltraOne has attempted to recreate the "
                        "configuration file.\nPlease note, application settings will be lost, but printer profiles will not be affected."));
     }
 
@@ -4903,7 +4940,7 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
 
     // Version limit
     if (code == HttpErrorVersionLimited) {
-        MessageDialog msg_dlg(nullptr, _L("The version of Snapmaker Orca is too low and needs to be updated to the latest version before it can be used normally"), "", wxAPPLY | wxOK);
+        MessageDialog msg_dlg(nullptr, _L("The version of UltraOne is too low and needs to be updated to the latest version before it can be used normally"), "", wxAPPLY | wxOK);
         if (msg_dlg.ShowModal() == wxOK) {
         }
 
@@ -5462,7 +5499,7 @@ std::string GUI_App::format_display_version()
 {
     if (!version_display.empty()) return version_display;
 
-    version_display = std::string("Snapmaker Orca ") + Snapmaker_VERSION;
+    version_display = std::string("UltraOne ") + Snapmaker_VERSION;
     return version_display;
 }
 
@@ -6194,14 +6231,14 @@ bool GUI_App::load_language(wxString language, bool initial)
 
     if (! wxLocale::IsAvailable(language_info->Language)) {
     	// Loading the language dictionary failed.
-        wxString message = "Switching Snapmaker Orca to language " + language_info->CanonicalName + " failed.";
+        wxString message = "Switching UltraOne to language " + language_info->CanonicalName + " failed.";
 #if !defined(_WIN32) && !defined(__APPLE__)
         // likely some linux system
         message += "\nYou may need to reconfigure the missing locales, likely by running the \"locale-gen\" and \"dpkg-reconfigure locales\" commands.\n";
 #endif
         if (initial)
         	message + "\n\nApplication will close.";
-        wxMessageBox(message, "Snapmaker Orca - Switching language failed", wxOK | wxICON_ERROR);
+        wxMessageBox(message, "UltraOne - Switching language failed", wxOK | wxICON_ERROR);
         if (initial)
 			std::exit(EXIT_FAILURE);
 		else
@@ -6390,8 +6427,7 @@ void GUI_App::open_preferences(size_t open_on_tab, const std::string& highlight_
                 associate_files(L"step");
                 associate_files(L"stp");
             }
-            associate_url(L"Snapmaker_Orca");
-            associate_url(L"snapmaker-orca");
+            associate_url(L"ultraone");
         }
         else {
             if (app_config->get("associate_gcode") == "true")
@@ -7566,8 +7602,11 @@ void GUI_App::associate_files(std::wstring extend)
     ::GetModuleFileNameW(nullptr, app_path, sizeof(app_path));
 
     std::wstring prog_path = L"\"" + std::wstring(app_path) + L"\"";
-    std::wstring prog_id = L" Orca.Slicer.1";
-    std::wstring prog_desc = L"Snapmaker_Orca";
+    // Our own ProgID. The inherited " Orca.Slicer.1" (leading space and all) is shared with
+    // OrcaSlicer and Snapmaker Orca, so associating files here re-pointed theirs as well.
+    // A user upgrading has to tick the association preference once more.
+    std::wstring prog_id = L"UltraOne.Model.1";
+    std::wstring prog_desc = L"UltraOne";
     std::wstring prog_command = prog_path + L" \"%1\"";
     std::wstring reg_base = L"Software\\Classes";
     std::wstring reg_extension = reg_base + L"\\." + extend;
@@ -7591,8 +7630,11 @@ void GUI_App::disassociate_files(std::wstring extend)
     ::GetModuleFileNameW(nullptr, app_path, sizeof(app_path));
 
     std::wstring prog_path = L"\"" + std::wstring(app_path) + L"\"";
-    std::wstring prog_id = L" Orca.Slicer.1";
-    std::wstring prog_desc = L"Snapmaker_Orca";
+    // Our own ProgID. The inherited " Orca.Slicer.1" (leading space and all) is shared with
+    // OrcaSlicer and Snapmaker Orca, so associating files here re-pointed theirs as well.
+    // A user upgrading has to tick the association preference once more.
+    std::wstring prog_id = L"UltraOne.Model.1";
+    std::wstring prog_desc = L"UltraOne";
     std::wstring prog_command = prog_path + L" \"%1\"";
     std::wstring reg_base = L"Software\\Classes";
     std::wstring reg_extension = reg_base + L"\\." + extend;

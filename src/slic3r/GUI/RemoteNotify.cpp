@@ -245,7 +245,7 @@ static std::string message_text(const json& e)
 static std::string title_text(const json& e)
 {
     std::string t = ev_str(e, "title");
-    if (t.empty()) t = "Snapmaker Orca";
+    if (t.empty()) t = "UltraOne";
     return t;
 }
 
@@ -676,7 +676,7 @@ std::pair<int, std::string> test(const std::string& id, const std::string& phone
     e["printer"]  = json{ { "id", "test" }, { "name", "Test" }, { "kind", "printhost" } };
     e["kind"]     = "started";
     e["severity"] = "info";
-    e["title"]    = "Snapmaker Orca test";
+    e["title"]    = "UltraOne test";
     e["text"]     = "This is a test notification from the hub on your PC. If you can read it, notifications work.";
     e["test"]     = true;
 

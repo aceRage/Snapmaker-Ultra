@@ -660,7 +660,7 @@ static SendResult push_with_retries(const Sub& s, const std::string& payload, co
 static std::string payload_for(const json& e, const std::string& link)
 {
     json p;
-    std::string title = ev_str(e, "title", "Snapmaker Orca");
+    std::string title = ev_str(e, "title", "UltraOne");
     std::string body  = ev_str(e, "text");
     std::string who;
     if (e.is_object() && e.contains("printer") && e["printer"].is_object()) who = ev_str(e["printer"], "name");
@@ -1019,7 +1019,7 @@ std::pair<int, std::string> test(const std::string& phone_link)
     e["printer"]  = json{ { "id", "test" }, { "name", "Test" }, { "kind", "printhost" } };
     e["kind"]     = "started";
     e["severity"] = "info";
-    e["title"]    = "Snapmaker Orca test";
+    e["title"]    = "UltraOne test";
     e["text"]     = "This is a test push from the hub on your PC. If you can read it, Web Push works.";
     const std::string payload = payload_for(e, link);
 

@@ -1819,7 +1819,7 @@ Updates PresetUpdater::priv::get_config_updates(const Semver &old_slic3r_version
                     if (!legal) {
                         wxString str = _L("needed, but current version is ");
                         wxString str2 = _L("Bind with Pin Code");
-                        changelog += ("\nSnapmaker Orca " + min_ver.to_string() + " " + _L("needed, but current version is ") + 
+                        changelog += ("\nUltraOne " + min_ver.to_string() + " " + _L("needed, but current version is ") + 
                                       soft_ver.to_string() + "\n")
                                          .ToStdString();
                     }
@@ -2277,7 +2277,7 @@ void PresetUpdater::load_flutter_web(const std::string& resource_path, bool serv
                 bool legal = true;
                 legal      = min_ver <= soft_ver;
                 if (!legal) {
-                    changelog += ("\nSnapmaker Orca " + min_ver.to_string() + " " + _L("needed, but current version is ") +
+                    changelog += ("\nUltraOne " + min_ver.to_string() + " " + _L("needed, but current version is ") +
                                   soft_ver.to_string() + "\n")
                                      .ToStdString();
                 }
@@ -2346,7 +2346,7 @@ void PresetUpdater::load_flutter_web(const std::string& resource_path, bool serv
             GUI::MessageDialog msg_wingow(nullptr,
                                           _L("Updating the web resources requires application restart.") + "\n" +
                                               _L("Do you want to continue?"),
-                                          L("Snapmaker Orca"), wxICON_QUESTION | wxOK | wxCANCEL);
+                                          L("UltraOne"), wxICON_QUESTION | wxOK | wxCANCEL);
             if (msg_wingow.ShowModal() == wxID_CANCEL) {
                 return;
             }
@@ -2453,7 +2453,7 @@ void PresetUpdater::import_system_profile()
                         bool legal = true;
                         legal      = min_ver <= soft_ver;
                         if (!legal) {
-                            changelog += ("\nSnapmaker Orca " + min_ver.to_string() + " " + _L("needed, but current version is ") +
+                            changelog += ("\nUltraOne " + min_ver.to_string() + " " + _L("needed, but current version is ") +
                                           soft_ver.to_string() + "\n")
                                              .ToStdString();
                         }

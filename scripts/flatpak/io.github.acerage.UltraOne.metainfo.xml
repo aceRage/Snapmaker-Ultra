@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop">
-    <id>io.github.Snapmaker.Snapmaker_Orca</id>
-    <launchable type="desktop-id">io.github.Snapmaker.Snapmaker_Orca.desktop</launchable>
+    <id>io.github.acerage.UltraOne</id>
+    <launchable type="desktop-id">io.github.acerage.UltraOne.desktop</launchable>
     <provides>
-        <id>io.github.Snapmaker.Snapmaker_Orca.desktop</id>
+        <id>io.github.acerage.UltraOne.desktop</id>
     </provides>
-    <name>Snapmaker_Orca</name>
+    <name>UltraOne</name>
     <summary>Get even more perfect prints!</summary>
-    <developer_name>Snapmaker</developer_name>
-    <url type="homepage">https://github.com/Snapmaker/OrcaSlicer</url>
-    <url type="help">https://github.com/Snapmaker/OrcaSlicer/wiki</url>
-    <url type="bugtracker">https://github.com/Snapmaker/OrcaSlicer/issues/</url>
+    <developer_name>aceRage</developer_name>
+    <url type="homepage">https://github.com/aceRage/Snapmaker-Ultra</url>
+    <url type="help">https://github.com/aceRage/Snapmaker-Ultra#readme</url>
+    <url type="bugtracker">https://github.com/aceRage/Snapmaker-Ultra/issues/</url>
     <metadata_license>0BSD</metadata_license>
     <project_license>AGPL-3.0-only</project_license>
     <content_rating type="oars-1.1" />

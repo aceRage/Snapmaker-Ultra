@@ -5,7 +5,7 @@
   <key>CFBundleExecutable</key>
   <string>@SLIC3R_APP_KEY@</string>
   <key>CFBundleGetInfoString</key>
-  <string>@SLIC3R_APP_NAME@ Copyright © 2024-2026 Snapmaker. All rights reserved.</string>
+  <string>@SLIC3R_APP_NAME@ Copyright © 2024-2026 the @SLIC3R_APP_NAME@ contributors. All rights reserved.</string>
   <key>CFBundleIconFile</key>
   <string>images/Snapmaker_Orca.icns</string>
   <key>CFBundleName</key>
@@ -28,11 +28,11 @@
   <array>
     <dict>
       <key>CFBundleURLName</key>
-      <string>Snapmaker Orca Open URL</string>
+      <string>@SLIC3R_APP_NAME@ Open URL</string>
       <key>CFBundleURLSchemes</key>
       <array>
-        <string>Snapmaker_Orcaopen</string>
-        <string>Snapmaker_Orca</string>
+        <string>ultraone</string>
+        <string>ultraoneopen</string>
         <string>snapmaker-orca</string>
       </array>
     </dict>
@@ -132,7 +132,7 @@
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>Snapmaker Orca needs access to your local network to discover and connect to your 3D printer(s), and to serve the app's device interface on localhost.</string>
+  <string>UltraOne needs access to your local network to discover and connect to your 3D printer(s), and to serve the app's device interface on localhost.</string>
   <key>NSBonjourServices</key>
   <array>
     <string>_http._tcp</string>

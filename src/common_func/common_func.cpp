@@ -24,10 +24,10 @@ static std::string get_linux_config_dir()
 {
     const char* xdg_config = getenv("XDG_CONFIG_HOME");
     if (xdg_config && xdg_config[0] != '\0')
-        return std::string(xdg_config) + "/Snapmaker_Orca";
+        return std::string(xdg_config) + "/" SLIC3R_APP_KEY;
     const char* home = getenv("HOME");
     if (home && home[0] != '\0')
-        return std::string(home) + "/.config/Snapmaker_Orca";
+        return std::string(home) + "/.config/" SLIC3R_APP_KEY;
     return std::string();
 }
 #endif
@@ -155,12 +155,12 @@ namespace common
         }
 
         std::string filePath = path;
-        versionFilePath      = filePath + "\\" + std::string("Snapmaker_Orca\\system\\Snapmaker.json");
+        versionFilePath      = filePath + "\\" + std::string(SLIC3R_APP_KEY "\\system\\Snapmaker.json");
         delete[] path;
 #elif __APPLE__
         const char* home_env = getenv("HOME");
         versionFilePath      = home_env;
-        versionFilePath      = versionFilePath + "/Library/Application Support/Snapmaker_Orca/system/Snapmaker.json";
+        versionFilePath      = versionFilePath + "/Library/Application Support/" SLIC3R_APP_KEY "/system/Snapmaker.json";
 #else
         std::string config_dir = get_linux_config_dir();
         if (!config_dir.empty())
@@ -194,13 +194,13 @@ namespace common
             }
 
             std::string filePath = path;
-            versionFilePath      = filePath + "\\" + std::string("Snapmaker_Orca\\web\\flutter_web\\version.json");
+            versionFilePath      = filePath + "\\" + std::string(SLIC3R_APP_KEY "\\web\\flutter_web\\version.json");
 
             delete[] path;
 #elif __APPLE__
             const char* home_env = getenv("HOME");
             versionFilePath      = home_env;
-            versionFilePath      = versionFilePath + "/Library/Application Support/Snapmaker_Orca/web/flutter_web/version.json";
+            versionFilePath      = versionFilePath + "/Library/Application Support/" SLIC3R_APP_KEY "/web/flutter_web/version.json";
 #else
             std::string config_dir = get_linux_config_dir();
             if (!config_dir.empty())
@@ -242,17 +242,17 @@ namespace common
         } 
 
         std::string filePath = path;
-        cfgfile              = filePath + "\\" + std::string("Snapmaker_Orca\\Snapmaker_Orca.conf");
+        cfgfile              = filePath + "\\" + std::string(SLIC3R_APP_KEY "\\" SLIC3R_APP_KEY ".conf");
         delete[] path;
 
 #elif __APPLE__
         const char* home_env = getenv("HOME");
         versionFilePath      = home_env;
-        cfgfile              = versionFilePath + "/Library/Application Support/Snapmaker_Orca/Snapmaker_Orca.conf";
+        cfgfile              = versionFilePath + "/Library/Application Support/" SLIC3R_APP_KEY "/" SLIC3R_APP_KEY ".conf";
 #else
         std::string config_dir = get_linux_config_dir();
         if (!config_dir.empty())
-            cfgfile = config_dir + "/Snapmaker_Orca.conf";
+            cfgfile = config_dir + "/" SLIC3R_APP_KEY ".conf";
 #endif
         std::ifstream json_file(cfgfile);
         if (!json_file.is_open()) {
@@ -286,17 +286,17 @@ namespace common
         } 
 
         std::string filePath = path;
-        cfgfile              = filePath + "\\" + std::string("Snapmaker_Orca\\Snapmaker_Orca.conf");
+        cfgfile              = filePath + "\\" + std::string(SLIC3R_APP_KEY "\\" SLIC3R_APP_KEY ".conf");
         delete[] path;
 
 #elif __APPLE__
         const char* home_env = getenv("HOME");
         versionFilePath      = home_env;
-        cfgfile              = versionFilePath + "/Library/Application Support/Snapmaker_Orca/Snapmaker_Orca.conf";
+        cfgfile              = versionFilePath + "/Library/Application Support/" SLIC3R_APP_KEY "/" SLIC3R_APP_KEY ".conf";
 #else
         std::string config_dir = get_linux_config_dir();
         if (!config_dir.empty())
-            cfgfile = config_dir + "/Snapmaker_Orca.conf";
+            cfgfile = config_dir + "/" SLIC3R_APP_KEY ".conf";
 #endif
         std::ifstream json_file(cfgfile);
         if (!json_file.is_open()) {

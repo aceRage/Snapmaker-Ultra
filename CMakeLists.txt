@@ -150,7 +150,10 @@ if (APPLE)
     if (CMAKE_MACOSX_BUNDLE)
         set(CMAKE_INSTALL_RPATH @executable_path/../Frameworks)
     endif()
-    SET(CMAKE_XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.snapmaker.snapmaker-orca")
+    # com.snapmaker.* claimed snapmaker.com, a domain this project does not own.
+    # Changing a bundle id is one-way: macOS treats the result as a different application,
+    # so keychain items, TCC/privacy grants and any notarisation history start again.
+    SET(CMAKE_XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "io.github.acerage.UltraOne")
 
     message(STATUS "Orca: IS_CROSS_COMPILE: ${IS_CROSS_COMPILE}")
 endif ()
@@ -918,7 +921,7 @@ if (WIN32)
     install (PROGRAMS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS} DESTINATION ".")
 elseif (SLIC3R_FHS)
     # CMAKE_INSTALL_FULL_DATAROOTDIR: read-only architecture-independent data root (share)
-    set(SLIC3R_FHS_RESOURCES "${CMAKE_INSTALL_FULL_DATAROOTDIR}/Snapmaker_Orca")
+    set(SLIC3R_FHS_RESOURCES "${CMAKE_INSTALL_FULL_DATAROOTDIR}/${SLIC3R_APP_KEY}")
     install(DIRECTORY ${SLIC3R_RESOURCES_DIR}/ DESTINATION ${SLIC3R_FHS_RESOURCES}
         PATTERN "*/udev" EXCLUDE
     )
@@ -940,17 +943,17 @@ configure_file(${LIBDIR}/dev-utils/platform/unix/fhs.hpp.in ${LIBDIR_BIN}/dev-ut
 
 # Ultra: its own package identity so it installs SIDE BY SIDE with the official Snapmaker Orca
 # (own Program Files folder, Start-menu folder and Add/Remove entry) instead of overwriting it.
-set (CPACK_PACKAGE_NAME "Snapmaker-Ultra")
-set (CPACK_PACKAGE_VENDOR "Snapmaker-Ultra")
+set (CPACK_PACKAGE_NAME "UltraOne")
+set (CPACK_PACKAGE_VENDOR "UltraOne")
 set (CPACK_PACKAGE_VERSION_MAJOR "${ORCA_VERSION_MAJOR}")
 set (CPACK_PACKAGE_VERSION_MINOR "${ORCA_VERSION_MINOR}")
 set (CPACK_PACKAGE_VERSION_PATCH "${ORCA_VERSION_PATCH}")
 # Ultra: keep the 4th version component (2.3.6.x) in Add/Remove Programs; the MAJOR/MINOR/PATCH
 # triple above drops it, which made consecutive patch releases indistinguishable there.
 set (CPACK_PACKAGE_VERSION "${Snapmaker_VERSION}")
-set (CPACK_PACKAGE_FILE_NAME "Snapmaker-Ultra_Windows_Installer_V${Snapmaker_VERSION}")
-set (CPACK_PACKAGE_DESCRIPTION_SUMMARY "Snapmaker Orca is an open source slicer for FDM printers")
-set (CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/Snapmaker/OrcaSlicer")
+set (CPACK_PACKAGE_FILE_NAME "UltraOne_Windows_Installer_V${Snapmaker_VERSION}")
+set (CPACK_PACKAGE_DESCRIPTION_SUMMARY "UltraOne is an open source slicer for FDM printers, for Snapmaker and Bambu Lab machines")
+set (CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/aceRage/Snapmaker-Ultra")
 set (CPACK_PACKAGE_INSTALL_DIRECTORY ${CPACK_PACKAGE_NAME})
 set (CPACK_PACKAGE_ICON "${CMAKE_SOURCE_DIR}/resources/images\\\\Snapmaker_Orca.ico")
 set (CPACK_NSIS_MUI_ICON "${CPACK_PACKAGE_ICON}")
@@ -976,18 +979,23 @@ SnapmakerOrcaPre_silent:
   SetErrorLevel 7
   Quit
 SnapmakerOrcaPre_prompt:
-  MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Snapmaker Orca is still running.$\nClose the program, then click Retry to continue, or Cancel to exit the installer." IDRETRY SnapmakerOrcaPre_check_loop
+  MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "UltraOne is still running.$\nClose the program, then click Retry to continue, or Cancel to exit the installer." IDRETRY SnapmakerOrcaPre_check_loop
   Abort
 SnapmakerOrcaPre_done:
-  ; Ultra: only look for a previous ULTRA install (never touch the official Snapmaker Orca entry).
+  ; Only look for a previous install of OURS - never touch the official Snapmaker Orca entry.
+  ; Both names are checked, so the first UltraOne installer still finds a Snapmaker-Ultra one.
+  ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraOne" "UninstallString"
+  StrCmp $0 "" 0 +2
   ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snapmaker-Ultra" "UninstallString"
   StrCmp $0 "" SnapmakerOrcaPre_read_hkcu_uninst SnapmakerOrcaPre_has_uninst
 SnapmakerOrcaPre_read_hkcu_uninst:
+  ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UltraOne" "UninstallString"
+  StrCmp $0 "" 0 +2
   ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snapmaker-Ultra" "UninstallString"
 SnapmakerOrcaPre_has_uninst:
   StrCmp $0 "" SnapmakerOrcaPre_finish
 
-  MessageBox MB_YESNOCANCEL|MB_ICONEXCLAMATION "Snapmaker-Ultra is already installed.$\n$\nDo you want to uninstall the old version before installing the new one?" /SD IDYES IDYES SnapmakerOrcaPre_uninst IDNO SnapmakerOrcaPre_finish
+  MessageBox MB_YESNOCANCEL|MB_ICONEXCLAMATION "A previous version (UltraOne or Snapmaker-Ultra) is already installed.$\n$\nDo you want to uninstall the old version before installing the new one?" /SD IDYES IDYES SnapmakerOrcaPre_uninst IDNO SnapmakerOrcaPre_finish
   Abort
 
 SnapmakerOrcaPre_uninst:
@@ -1037,22 +1045,28 @@ file(READ "${CMAKE_SOURCE_DIR}/cmake/nsis/SnapmakerURLProtocols_uninstall.nsh" C
 # Desktop shortcut inside MUI_STARTMENU_WRITE_BEGIN: respects "do not create shortcuts" on the start menu page.
 set(CPACK_NSIS_CREATE_ICONS_EXTRA [=[
   SetShellVarContext current
-  CreateShortCut "$DESKTOP\Snapmaker-Ultra.lnk" "$INSTDIR\snapmaker-orca.exe" "" "$INSTDIR\snapmaker-orca.exe" 0
+  CreateShortCut "$DESKTOP\UltraOne.lnk" "$INSTDIR\snapmaker-orca.exe" "" "$INSTDIR\snapmaker-orca.exe" 0
   SetShellVarContext all
 ]=])
 set(CPACK_NSIS_DELETE_ICONS_EXTRA [=[
   SetShellVarContext current
+  Delete "$DESKTOP\UltraOne.lnk"
+  ; and the shortcut the pre-rename installer left, if this is an upgrade of it
   Delete "$DESKTOP\Snapmaker-Ultra.lnk"
   SetShellVarContext all
 ]=])
 set (CPACK_PACKAGE_CHECKSUM SHA256)
-set (CPACK_PACKAGE_INSTALL_REGISTRY_KEY "Snapmaker-Ultra")
+# A new product name is a new Add/Remove entry. The preinstall guard below still reads the
+# old "Snapmaker-Ultra" key so an existing install is found and offered for uninstall.
+set (CPACK_PACKAGE_INSTALL_REGISTRY_KEY "UltraOne")
 set (CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL OFF)
 set (CPACK_NSIS_EXECUTABLES_DIRECTORY ".")
-set(CPACK_PACKAGE_EXECUTABLES "snapmaker-orca;Snapmaker-Ultra")
+set(CPACK_PACKAGE_EXECUTABLES "snapmaker-orca;UltraOne")
 set (CPACK_RESOURCE_FILE_LICENSE ${CMAKE_SOURCE_DIR}/LICENSE.txt) # must also include in install command
 
-set(CPACK_WIX_UPGRADE_GUID "058245e8-20e0-4a95-9ab7-1acfe17ad511")
+# New GUID for the new product: sharing the old one would make the installer treat an
+# UltraOne install as an upgrade of Snapmaker-Ultra and remove it in place.
+set(CPACK_WIX_UPGRADE_GUID "7d1b0c46-3f52-4a9e-8b61-2ce4f0a91d38")
 set(CPACK_GENERATOR NSIS)
 set(CPACK_VERBATIM_VARIABLES ON)
 # Strip CPack "Install Options" page; shortcuts follow the start-menu checkbox only.

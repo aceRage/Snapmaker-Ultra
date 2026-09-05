@@ -267,6 +267,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 #plate .btn.flash { animation: pvflash 1s ease-in-out infinite; }
 @keyframes pvflash { 0%, 100% { background: #0a9e50; color: #fff; } 50% { background: #8ce8b4; color: #000; } }
 #modal .url { font-family: Consolas, monospace; font-size: 12px; color: #9ed; text-align: center; word-break: break-all; user-select: all; }
+/* AGPL-3.0 section 13: the source offer every remote user must be able to see. */
+.view .srcbox { margin: 22px 0 4px; color: #777; font-size: 11px; line-height: 1.5; }
+.view .srcbox a { color: #8ab; }
 @media (max-width: 640px) {
     #topbar { padding: 6px 8px; gap: 6px; }
     .chip { font-size: 12px; padding: 5px 8px; }
@@ -1401,7 +1404,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             evLastId = Math.max(evLastId, last);
             while (evList.length > 60) evList.shift();
             evBadge();
-            if (view === 'devices') { pushRender(); evRender(); }
+            if (view === 'devices') { pushRender(); evRender(); srcRender(); }
             if (then) then();
         }).catch(function() { if (then) then(); });
     }
@@ -1517,6 +1520,17 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         }).then(function() {
             pushSub = null; pushNote = ''; pushBusy = false; pushRender();
         });
+    }
+    // AGPL-3.0 section 13. Appended once, last, and left alone by every redraw:
+    // refreshDevices() only clears the .plist it owns, so this survives with it.
+    function srcRender() {
+        var page = document.getElementById('devices');
+        if (!page || page.querySelector('.srcbox')) return;
+        var box = el('div', 'srcbox');
+        box.innerHTML = 'UltraOne is free software under the '
+            + '<a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer noopener">GNU AGPL v3</a>. '
+            + 'Source: <a href="https://github.com/aceRage/Snapmaker-Ultra" target="_blank" rel="noreferrer noopener">github.com/aceRage/Snapmaker-Ultra</a>';
+        page.appendChild(box);
     }
     function pushRender() {
         var page = document.getElementById('devices');
@@ -2869,9 +2883,10 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     function refreshDevices() {
         var root = document.getElementById('devices');
         pushRender(); // the Enable-notifications control survives every redraw of the tab
+        srcRender();  // and so does the licence/source line below it
         // No slicer, no printer cards - but the hub keeps the events after every instance is
         // closed, so they stay on the tab.
-        if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); evRender(); pushRender(); return; }
+        if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); evRender(); pushRender(); srcRender(); return; }
         // One request per card source: the printers (every card) and the Snapmaker devices call for
         // the optional PC-side connect. A failing devices call only costs the connect button.
         Promise.all([api('/printers'), api('/snapmaker/devices').catch(function() { return {}; })]).then(function(res) {

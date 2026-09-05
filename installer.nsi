@@ -3,9 +3,9 @@
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
 
-!define PRODUCT_NAME "Snapmaker Orca"
-!define PRODUCT_PUBLISHER "Snapmaker"
-!define PRODUCT_WEB_SITE "https://github.com/Snapmaker/OrcaSlicer"
+!define PRODUCT_NAME "UltraOne"
+!define PRODUCT_PUBLISHER "UltraOne"
+!define PRODUCT_WEB_SITE "https://github.com/aceRage/Snapmaker-Ultra"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 !define PRODUCT_UNINST_ROOT_KEY "HKLM"
 !define PRODUCT_INSTALL_KEY "Software\${PRODUCT_PUBLISHER}\${PRODUCT_NAME}"
@@ -19,12 +19,12 @@
 !endif
 !define PACK_SOURCE_DIR "${SOURCE_DIR}"
 
-; 64-bit app: use PROGRAMFILES64 so default path is C:\Program Files\Snapmaker_Orca, not (x86)
-!define INSTALL_DIR_RUNTIME "$PROGRAMFILES64\Snapmaker_Orca"
+; 64-bit app: use PROGRAMFILES64 so default path is C:\Program Files\UltraOne, not (x86)
+!define INSTALL_DIR_RUNTIME "$PROGRAMFILES64\UltraOne"
 InstallDir "${INSTALL_DIR_RUNTIME}"
 
 !ifndef OUTPUT_FILE
-    !define OUTPUT_FILE "Snapmaker_Orca_Windows_Installer_V${VERSION}.exe"
+    !define OUTPUT_FILE "UltraOne_Windows_Installer_V${VERSION}.exe"
 !endif
 
 ; License page: show LICENSE.txt from repo root (same dir as this .nsi)
@@ -39,9 +39,9 @@ SetCompressor lzma
 
 VIProductVersion "${VERSION}.0"
 VIAddVersionKey "ProductName" "${PRODUCT_NAME}"
-VIAddVersionKey "Comments" "Snapmaker Orca is an open source slicer for FDM printers"
+VIAddVersionKey "Comments" "UltraOne is an open source slicer for FDM printers, for Snapmaker and Bambu Lab machines"
 VIAddVersionKey "CompanyName" "${PRODUCT_PUBLISHER}"
-VIAddVersionKey "LegalCopyright" "Copyright (C) ${PRODUCT_PUBLISHER}"
+VIAddVersionKey "LegalCopyright" "Copyright (C) the ${PRODUCT_PUBLISHER} contributors"
 VIAddVersionKey "FileDescription" "${PRODUCT_NAME} ${VERSION} Installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
@@ -125,15 +125,13 @@ Section "Main program" SecMain
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_INSTALL_KEY}" "Version" "${VERSION}"
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_INSTALL_KEY}" "InstallPath" "$INSTDIR"
 
-    ; URL protocols (same as macOS CFBundleURLSchemes): snapmaker-orca:// and Snapmaker_Orca://
-    DetailPrint "Registering URL protocols (snapmaker-orca, Snapmaker_Orca)..."
+    ; URL protocol (same as macOS CFBundleURLSchemes): ultraone://. Registering the official
+    ; app's snapmaker-orca:// and Snapmaker_Orca:// here took its handlers away machine-wide.
+    DetailPrint "Registering the ultraone:// URL protocol..."
     SetRegView 64
-    WriteRegStr HKLM "Software\Classes\snapmaker-orca" "" "URL:Snapmaker Orca"
-    WriteRegStr HKLM "Software\Classes\snapmaker-orca" "URL Protocol" ""
-    WriteRegStr HKLM "Software\Classes\snapmaker-orca\shell\open\command" "" '"$INSTDIR\snapmaker-orca.exe" "%1"'
-    WriteRegStr HKLM "Software\Classes\Snapmaker_Orca" "" "URL:Snapmaker Orca"
-    WriteRegStr HKLM "Software\Classes\Snapmaker_Orca" "URL Protocol" ""
-    WriteRegStr HKLM "Software\Classes\Snapmaker_Orca\shell\open\command" "" '"$INSTDIR\snapmaker-orca.exe" "%1"'
+    WriteRegStr HKLM "Software\Classes\ultraone" "" "URL:${PRODUCT_NAME}"
+    WriteRegStr HKLM "Software\Classes\ultraone" "URL Protocol" ""
+    WriteRegStr HKLM "Software\Classes\ultraone\shell\open\command" "" '"$INSTDIR\snapmaker-orca.exe" "%1"'
     SetRegView 32
 
     DetailPrint "Installation complete!"
@@ -149,14 +147,14 @@ SectionEnd
 Section "Desktop shortcut" SecDesktop
     DetailPrint "Creating desktop shortcut..."
     SetShellVarContext current
-    CreateShortcut "$DESKTOP\Snapmaker Orca.lnk" "$INSTDIR\snapmaker-orca.exe" "" "$INSTDIR\snapmaker-orca.exe" 0
+    CreateShortcut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\snapmaker-orca.exe" "" "$INSTDIR\snapmaker-orca.exe" 0
     SetShellVarContext all
 SectionEnd
 
 Section "Start menu shortcut" SecStartMenu
     DetailPrint "Creating start menu shortcut..."
     CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
-    CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}\Snapmaker Orca.lnk" "$INSTDIR\snapmaker-orca.exe" "" "$INSTDIR\snapmaker-orca.exe" 0
+    CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\snapmaker-orca.exe" "" "$INSTDIR\snapmaker-orca.exe" 0
     CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall.lnk" "$INSTDIR\Uninstall.exe" "" "$INSTDIR\Uninstall.exe" 0
 SectionEnd
 
@@ -175,7 +173,7 @@ Section "Uninstall"
     Sleep 500
     
     DetailPrint "Removing desktop shortcut..."
-    Delete "$DESKTOP\Snapmaker Orca.lnk"
+    Delete "$DESKTOP\Snapmaker Orca.lnk"  ; the shortcut older builds of this installer left
     Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
     
     DetailPrint "Removing start menu shortcut..."
@@ -188,8 +186,7 @@ Section "Uninstall"
     
     DetailPrint "Removing registry entries..."
     SetRegView 64
-    DeleteRegKey HKLM "Software\Classes\snapmaker-orca"
-    DeleteRegKey HKLM "Software\Classes\Snapmaker_Orca"
+    DeleteRegKey HKLM "Software\Classes\ultraone"
     SetRegView 32
     DeleteRegKey ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}"
     DeleteRegKey ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_INSTALL_KEY}"
@@ -216,7 +213,7 @@ Function EnsureSnapmakerNotRunning
         SetErrorLevel 7
         Quit
     snapmaker_prompt:
-        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Snapmaker Orca is still running (snapmaker-orca.exe).$\r$\nClose the program, then click Retry, or Cancel to exit the installer." IDRETRY snapmaker_check_loop
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "${PRODUCT_NAME} is still running (snapmaker-orca.exe).$\r$\nClose the program, then click Retry, or Cancel to exit the installer." IDRETRY snapmaker_check_loop
         Abort
     snapmaker_idle:
 FunctionEnd
