@@ -173,6 +173,36 @@ def compare_tolerance(compare_exe, a_path, b_path):
     return bool(verdict.get("ok")), verdict
 
 
+# Keys the CANDIDATE build has and the BASELINE build cannot: a process setting introduced by the
+# branch under test. diff_configs (src/libslic3r/SliceCompare/Diff.cpp) counts a key present on one
+# side only as a changed row, so without this the tolerance gate would fail EVERY case for the mere
+# existence of a new setting - which says nothing about whether the slicing changed.
+#
+# Only a row whose BASELINE value is missing is forgiven, and only for a key on this list. A new key
+# whose value differs between two builds that BOTH have it is still a changed row, and any other key
+# appearing on one side only is still a changed row.
+#
+# 2026-09-05: the three over-support surface keys
+# (docs/superpowers/specs/2026-09-05-over-support-surfaces.md). They are PrintObjectConfig members,
+# so unlike support_group they do reach full_print_config and therefore the G-code CONFIG_BLOCK.
+NEW_CANDIDATE_KEYS = frozenset((
+    "over_support_surfaces",
+    "over_support_flow",
+    "over_support_speed",
+))
+
+
+def effective_config_rows(verdict):
+    """config_rows, minus the rows that are only there because the candidate knows a new key."""
+    n = verdict.get("config_rows", 0) or 0
+    rows = verdict.get("changed_config")
+    # slice_compare_cli caps the listing at 40 rows; if it is short, do not guess - report as is.
+    if rows is None or len(rows) < n:
+        return n
+    return sum(1 for r in rows
+               if not (r.get("key") in NEW_CANDIDATE_KEYS and not r.get("a")))
+
+
 def tolerance_ok(verdict, segment_tolerance):
     """Apply the gate's criteria to a slice_compare_cli verdict.
 
@@ -183,7 +213,7 @@ def tolerance_ok(verdict, segment_tolerance):
         return False
     lay = verdict.get("layers", {})
     seg = verdict.get("segments", {})
-    return (verdict.get("config_rows", 1) == 0 and
+    return (effective_config_rows(verdict) == 0 and
             lay.get("changed", 1) == 0 and
             lay.get("a_only", 1) == 0 and
             lay.get("b_only", 1) == 0 and
@@ -346,9 +376,9 @@ def groups_ok(verdict, case, baseline_path, candidate_path, segment_tolerance=99
     """
     if "error" in verdict:
         return False, verdict["error"]
-    if verdict.get("config_rows", 0) != 0:
+    if effective_config_rows(verdict) != 0:
         return False, ("%s config row(s) changed - a group must move geometry, not settings"
-                       % verdict.get("config_rows"))
+                       % effective_config_rows(verdict))
     lay = verdict.get("layers", {})
     seg = verdict.get("segments", {})
     moved = (lay.get("changed", 0) or 0) > 0 or float(seg.get("percent", 100.0)) < 100.0 or \
@@ -388,7 +418,7 @@ def describe(verdict):
     seg = verdict.get("segments", {})
     return ("config_rows=%s layers matched=%s identical=%s changed=%s a_only=%s b_only=%s "
             "segments=%.4f%% dirty_layers=%s"
-            % (verdict.get("config_rows"), lay.get("matched"), lay.get("identical"),
+            % (effective_config_rows(verdict), lay.get("matched"), lay.get("identical"),
                lay.get("changed"), lay.get("a_only"), lay.get("b_only"),
                seg.get("percent", 0.0), seg.get("layers_dirty")))
 
