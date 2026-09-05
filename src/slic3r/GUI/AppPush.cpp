@@ -941,7 +941,6 @@ void stop()
 // the one after. Everything above already copes with a provider that is not there - the hub page
 // simply reports the platform as unavailable.
 std::unique_ptr<Provider> make_apns_provider() { return nullptr; }
-std::unique_ptr<Provider> make_fcm_provider() { return nullptr; }
 
 } // namespace AppPush
 } // namespace GUI

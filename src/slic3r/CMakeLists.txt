@@ -423,6 +423,7 @@ set(SLIC3R_GUI_SOURCES
     GUI/AppPush.cpp
     GUI/AppPush.hpp
     GUI/AppPushProvider.hpp
+    GUI/FcmProvider.cpp
     GUI/PrintHostDialogs.cpp
     GUI/PrintHostDialogs.hpp
     GUI/PrintOptionsDialog.cpp
