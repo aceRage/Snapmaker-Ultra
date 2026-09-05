@@ -2385,7 +2385,7 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
     // ---- hub-level API (instances, uploads) ----
     if (rest == "/api" || rest == "/api/") {
         json j;
-        j["name"]    = "Snapmaker-Ultra hub API";
+        j["name"]    = "UltraOne hub API";
         j["version"] = 2;
         j["routes"]  = json::array({
             { {"method", "GET"},  {"path", "/api/instances"},       {"description", "running slicer instances: id (pid), index, title, project path, slicing"} },

@@ -2041,7 +2041,7 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
     auto numd = [](const std::string& s, double def) { try { return s.empty() ? def : std::stod(s); } catch (...) { return def; } };
     if (path.empty() || path == "/") {
         nlohmann::json j;
-        j["name"]    = "Snapmaker-Ultra remote API";
+        j["name"]    = "UltraOne remote API";
         j["version"] = 2;
         j["routes"]  = nlohmann::json::array({
             { {"method", "GET"},  {"path", "/api"},                        {"description", "this manifest"} },
