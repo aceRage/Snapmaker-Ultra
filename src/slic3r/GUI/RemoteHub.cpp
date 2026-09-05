@@ -2310,8 +2310,8 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
         }
         json m;
         m["id"]               = "/r/" + token + "/";
-        m["name"]             = "Snapmaker Orca";
-        m["short_name"]       = "Orca";
+        m["name"]             = "Ultra Hub";
+        m["short_name"]       = "Ultra Hub";
         m["description"]      = "The cameras, printers and prints on the PC in your workshop.";
         m["start_url"]        = "./"; // resolved against this manifest's own URL, so it keeps the token
         m["scope"]            = "./";
@@ -2490,7 +2490,7 @@ p { margin: 0 0 12px; }
 <body><div class="wrap">
 <h1>This link was replaced</h1>
 <p>A new phone link was made on the PC, so this one no longer works.</p>
-<p>On the PC, open the hub page from the Snapmaker Orca icon next to the clock and scan the new code.</p>
+<p>On the PC, open the hub page from the UltraOne icon next to the clock and scan the new code.</p>
 <p class="note">Anything saved from the old link - a bookmark, a QR code, a home-screen icon - has to be made again from the new one.</p>
 </div></body></html>
 )HTML";
@@ -2826,7 +2826,7 @@ public:
         const int      flags = severity == "error" ? wxICON_ERROR : severity == "warning" ? wxICON_WARNING : wxICON_INFORMATION;
         wxTheApp->CallAfter([self, t, b, flags]() {
 #if defined(__WXMSW__) && wxUSE_TASKBARICON_BALLOONS
-            self->ShowBalloon(t.IsEmpty() ? wxString("Snapmaker-Ultra Hub") : t, b, 10000, flags);
+            self->ShowBalloon(t.IsEmpty() ? wxString("Ultra Hub") : t, b, 10000, flags);
 #else
             (void) self; (void) t; (void) b; (void) flags;
 #endif
@@ -2836,7 +2836,7 @@ public:
     void refresh()
     {
         const HubServer::Snapshot st = m_server.snapshot();
-        wxString tip = "Snapmaker-Ultra Hub";
+        wxString tip = "Ultra Hub";
         tip += st.phone ? "\nPhone access on" : "\nPhone access off";
         tip += wxString::Format("\n%d slicer window%s open", st.instances, st.instances == 1 ? "" : "s");
         if (st.hidden > 0) tip += wxString::Format(" (%d hidden)", st.hidden);
@@ -2848,7 +2848,7 @@ public:
     {
         const HubServer::Snapshot st = m_server.snapshot();
         auto* menu = new wxMenu;
-        menu->Append(ID_STATUS, wxString::Format("Snapmaker-Ultra Hub: %d slicer window%s open", st.instances, st.instances == 1 ? "" : "s"))->Enable(false);
+        menu->Append(ID_STATUS, wxString::Format("Ultra Hub: %d slicer window%s open", st.instances, st.instances == 1 ? "" : "s"))->Enable(false);
         menu->AppendSeparator();
         menu->AppendCheckItem(ID_PHONE, "Phone access")->Check(st.phone);
         menu->Append(ID_NEWLINK, "New phone link (breaks saved links and icons)...");
@@ -2901,7 +2901,7 @@ public:
 
     bool OnInit() override
     {
-        SetAppName("Snapmaker-Ultra Hub");
+        SetAppName("Ultra Hub");
         SetExitOnFrameDelete(false); // no frames: the loop runs until the server thread ends
         wxInitAllImageHandlers();
         if (!m_server.start()) {

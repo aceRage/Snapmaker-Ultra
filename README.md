@@ -1,12 +1,12 @@
-# Snapmaker-Ultra
+# UltraOne
 
 **Bleeding edge featureset, pulled from all slicing worlds. Camera streams, filament manager, expanded printer profiles, expanded assembly and multicolor toolsets.**
 
-[Releases](https://github.com/aceRage/Snapmaker-Ultra/releases) · Windows installer & portable · Linux AppImage · macOS (unsigned) · Based on [Snapmaker Orca](https://github.com/Snapmaker/OrcaSlicer) 2.3.6 (the app still reports itself as Snapmaker Orca 2.3.6.x) · AGPL-3.0
+[Releases](https://github.com/aceRage/Snapmaker-Ultra/releases) · Windows installer & portable · Linux AppImage · macOS (unsigned) · Based on [Snapmaker Orca](https://github.com/Snapmaker/OrcaSlicer) 2.3.6 (a fork of Snapmaker Orca; the app reports itself as UltraOne) · AGPL-3.0
 
 ![Stream camera wall, Support Filament Matching, Compare Slices and the Assemble tool's Auto-fit](docs/images/hero.jpg)
 
-Snapmaker-Ultra keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Artisan / A-series support and the full OrcaSlicer printer library — and adds features pulled from Bambu Studio, OrcaSlicer pull requests and our own work.
+UltraOne keeps everything Snapmaker Orca does — Snapmaker U1 / J1 / Artisan / A-series support and the full OrcaSlicer printer library — and adds features pulled from Bambu Studio, OrcaSlicer pull requests and our own work.
 
 ---
 
@@ -85,10 +85,10 @@ Plate deletion during a slice no longer crashes; fuzzy skin no longer leaves dot
 
 All builds are on the [Releases](https://github.com/aceRage/Snapmaker-Ultra/releases) page.
 
-- **Windows (64-bit) installer** — `Snapmaker-Ultra_Windows_Installer_V<version>.exe`. Installs **side by side** with the official Snapmaker Orca (own folder, Start-menu entry and Add/Remove entry) and upgrades a previous Snapmaker-Ultra install. The splash screen shows *Ultra version* so the two are easy to tell apart.
-- **Windows portable** — `Snapmaker-Ultra_Windows_V<version>_portable.zip`: unzip and run `snapmaker-orca.exe` (needs the Edge WebView2 runtime and the VC++ redistributable, usually already present).
-- **Linux (x86_64)** — `Snapmaker_Orca_Linux_V<version>.AppImage`: `chmod +x` and run. The host must provide WebKitGTK 4.1 and libOpenGL (Ubuntu: `libwebkit2gtk-4.1-0 libopengl0`); they are not bundled.
-- **macOS (Apple silicon)** — the `.dmg` is **unsigned** (no Apple Developer account yet), so macOS refuses it the first time: right-click the app → *Open* → *Open*, or run `xattr -dr com.apple.quarantine "/Applications/Snapmaker Orca.app"` once.
+- **Windows (64-bit) installer** — `UltraOne_Windows_Installer_V<version>.exe`. Installs **side by side** with the official Snapmaker Orca (own folder, Start-menu entry and Add/Remove entry) and upgrades a previous UltraOne install. It has its own name, icon and data directory, so the two are easy to tell apart.
+- **Windows portable** — `UltraOne_Windows_V<version>_portable.zip`: unzip and run `snapmaker-orca.exe` (needs the Edge WebView2 runtime and the VC++ redistributable, usually already present).
+- **Linux (x86_64)** — `UltraOne_Linux_V<version>.AppImage`: `chmod +x` and run. The host must provide WebKitGTK 4.1 and libOpenGL (Ubuntu: `libwebkit2gtk-4.1-0 libopengl0`); they are not bundled.
+- **macOS (Apple silicon)** — the `.dmg` is **unsigned** (no Apple Developer account yet), so macOS refuses it the first time: right-click the app → *Open* → *Open*, or run `xattr -dr com.apple.quarantine "/Applications/UltraOne.app"` once.
 
 The Windows packages include the connectivity plugin; the Linux and macOS builds currently do not.
 
@@ -128,7 +128,7 @@ Windows packaging: `cpack -G NSIS` in `build/` produces the installer (needs NSI
 
 ## Lineage and licence
 
-Snapmaker-Ultra is licensed under the **GNU Affero General Public License, version 3** ([`LICENSE.txt`](LICENSE.txt)). It is a fork of [Snapmaker Orca](https://github.com/Snapmaker/OrcaSlicer) (Snapmaker), based on [OrcaSlicer](https://github.com/SoftFever/OrcaSlicer) by SoftFever, based on [Bambu Studio](https://github.com/bambulab/BambuStudio) by Bambu Lab, based on [PrusaSlicer](https://github.com/prusa3d/PrusaSlicer) by Prusa Research, based on [Slic3r](https://github.com/Slic3r/Slic3r) by Alessandro Ranellucci and the RepRap community; OrcaSlicer also incorporates features from SuperSlicer by @supermerill. All are AGPL-3.0: if you use any part of this software in any way, even behind a web server, your software must be released under the same licence.
+UltraOne is licensed under the **GNU Affero General Public License, version 3** ([`LICENSE.txt`](LICENSE.txt)). It is a fork of [Snapmaker Orca](https://github.com/Snapmaker/OrcaSlicer) (Snapmaker), based on [OrcaSlicer](https://github.com/SoftFever/OrcaSlicer) by SoftFever, based on [Bambu Studio](https://github.com/bambulab/BambuStudio) by Bambu Lab, based on [PrusaSlicer](https://github.com/prusa3d/PrusaSlicer) by Prusa Research, based on [Slic3r](https://github.com/Slic3r/Slic3r) by Alessandro Ranellucci and the RepRap community; OrcaSlicer also incorporates features from SuperSlicer by @supermerill. All are AGPL-3.0: if you use any part of this software in any way, even behind a web server, your software must be released under the same licence.
 
 Ported features: align/distribute helpers, "Sub merge" (our *Assemble Separately*) and *Z overrides X/Y* from Bambu Studio; *Print unsupported walls last* (#15411), *Merge into Single Part* (#15413), *Undertop surface pattern* (#15389), the JSON-config fix (#15370), per-filament Z offset (#4660), drop-to-bed / bottom-referenced Z (#8194, #5315), machine prepare time (#5796) and the Flashforge Creator 5 profiles (#13259) from OrcaSlicer; the Flashforge device stack from the Orca-Flashforge project.
 

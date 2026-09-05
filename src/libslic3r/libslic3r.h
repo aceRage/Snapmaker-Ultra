@@ -2,10 +2,11 @@
 #define _libslic3r_h_
 
 #include "common_func/common_func.hpp"
-#define SLIC3R_APP_FULL_NAME "Snapmaker Orca"
-#define GCODEVIEWER_APP_NAME "Snapmaker_Orca G-code Viewer"
-#define GCODEVIEWER_APP_KEY  "Snapmaker_OrcaGcodeViewer"
-#define GCODEVIEWER_BUILD_ID std::string("Snapmaker_Orca G-code Viewer-") + std::string(SLIC3R_VERSION) + std::string("-RC")
+// All derived from the single SLIC3R_APP_NAME / SLIC3R_APP_KEY in common_func.hpp above.
+#define SLIC3R_APP_FULL_NAME SLIC3R_APP_NAME
+#define GCODEVIEWER_APP_NAME SLIC3R_APP_KEY " G-code Viewer"
+#define GCODEVIEWER_APP_KEY  SLIC3R_APP_KEY "GcodeViewer"
+#define GCODEVIEWER_BUILD_ID std::string(GCODEVIEWER_APP_NAME "-") + std::string(SLIC3R_VERSION) + std::string("-RC")
 
 // this needs to be included early for MSVC (listing it in Build.PL is not enough)
 #include <memory>

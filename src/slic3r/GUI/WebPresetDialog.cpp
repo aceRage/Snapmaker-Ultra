@@ -120,7 +120,7 @@ static wxString update_custom_filaments()
 }
 
 WebPresetDialog::WebPresetDialog(GUI_App* pGUI, long style)
-    : DPIDialog((wxWindow*) (nullptr), wxID_ANY, "Snapmaker Orca", wxDefaultPosition, wxDefaultSize, style), m_appconfig_new()
+    : DPIDialog((wxWindow*) (nullptr), wxID_ANY, "UltraOne", wxDefaultPosition, wxDefaultSize, style), m_appconfig_new()
 {
     SetBackgroundColour(*wxWHITE);
     // INI

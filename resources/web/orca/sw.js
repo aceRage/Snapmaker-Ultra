@@ -31,7 +31,7 @@ self.addEventListener('activate', function (e) {
 function payloadOf(event) {
   // The hub sends JSON. Anything else (a probe, a push service's own keepalive) still has to end
   // in a visible notification, so fall back rather than throwing.
-  var data = { title: 'Snapmaker Orca', body: 'Something happened on your printer.' };
+  var data = { title: 'UltraOne', body: 'Something happened on your printer.' };
   if (!event.data) return data;
   try {
     var j = event.data.json();

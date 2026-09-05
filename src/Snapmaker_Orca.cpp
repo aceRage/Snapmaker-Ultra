@@ -136,8 +136,8 @@ std::map<int, std::string> cli_errors = {
     {CLI_OBJECT_ORIENT_FAILED, "An error occurred when auto-orienting object(s)."},
     {CLI_MODIFIED_PARAMS_TO_PRINTER, "Found modified parameter in printer preset in the 3mf file, which should not be changed."},
         {CLI_FILE_VERSION_NOT_SUPPORTED, "Unsupported 3MF version. Please make sure the 3MF file was created with the official version of Bambu Studio, not a beta version."},
-    {CLI_NO_SUITABLE_OBJECTS, "One of the plate is empty or has no object fully inside it. Please check that the 3mf contains no empty plate in Snapmaker Orca before uploading."},
-    {CLI_VALIDATE_ERROR, "There are some incorrect slicing parameters in the 3mf. Please verify the slicing of all plates in Snapmaker Orca before uploading."},
+    {CLI_NO_SUITABLE_OBJECTS, "One of the plate is empty or has no object fully inside it. Please check that the 3mf contains no empty plate in UltraOne before uploading."},
+    {CLI_VALIDATE_ERROR, "There are some incorrect slicing parameters in the 3mf. Please verify the slicing of all plates in UltraOne before uploading."},
     {CLI_OBJECTS_PARTLY_INSIDE, "Some objects are located over the boundary of the heated bed."},
     {CLI_EXPORT_CACHE_DIRECTORY_CREATE_FAILED, "Failed creating directory when exporting cache data."},
     {CLI_EXPORT_CACHE_WRITE_FAILED, "Failed exporting cache data."},
@@ -147,13 +147,13 @@ std::map<int, std::string> cli_errors = {
     {CLI_SLICING_TIME_EXCEEDS_LIMIT, "Slicing time of a certain plate exceeds the limit. Please simplify the model or use a larger slicing layer height."},
     {CLI_TRIANGLE_COUNT_EXCEEDS_LIMIT, "Triangle count of single plate exceeds the limit. Please simplify the model and try to upload again."},
     {CLI_NO_SUITABLE_OBJECTS_AFTER_SKIP, "No printable objects to slice after skipping."},
-    {CLI_FILAMENT_NOT_MATCH_BED_TYPE, "Filaments are not compatible with the plate type. Please verify the slicing of all plates in Snapmaker Orca before uploading."},
-    {CLI_FILAMENTS_DIFFERENT_TEMP, "The temperature difference of the filaments used is too large. Please verify the slicing of all plates in Snapmaker Orca before uploading."},
-    {CLI_OBJECT_COLLISION_IN_SEQ_PRINT, "Object conflicts were detected when using print-by-object mode. Please verify the slicing of all plates in Snapmaker Orca before uploading."},
-    {CLI_OBJECT_COLLISION_IN_LAYER_PRINT, "Object conflicts were detected. Please verify the slicing of all plates in Snapmaker Orca before uploading."},
-    {CLI_SPIRAL_MODE_INVALID_PARAMS, "Some slicing parameters cannot work with Spiral Vase mode. Please solve the issue in Snapmaker Orca before uploading."},
-    {CLI_SLICING_ERROR, "Failed slicing the model. Please verify the slicing of all plates on Snapmaker Orca before uploading."},
-    {CLI_GCODE_PATH_CONFLICTS, " G-code conflicts detected after slicing. Please make sure the 3mf file can be successfully sliced in the latest Snapmaker Orca."}
+    {CLI_FILAMENT_NOT_MATCH_BED_TYPE, "Filaments are not compatible with the plate type. Please verify the slicing of all plates in UltraOne before uploading."},
+    {CLI_FILAMENTS_DIFFERENT_TEMP, "The temperature difference of the filaments used is too large. Please verify the slicing of all plates in UltraOne before uploading."},
+    {CLI_OBJECT_COLLISION_IN_SEQ_PRINT, "Object conflicts were detected when using print-by-object mode. Please verify the slicing of all plates in UltraOne before uploading."},
+    {CLI_OBJECT_COLLISION_IN_LAYER_PRINT, "Object conflicts were detected. Please verify the slicing of all plates in UltraOne before uploading."},
+    {CLI_SPIRAL_MODE_INVALID_PARAMS, "Some slicing parameters cannot work with Spiral Vase mode. Please solve the issue in UltraOne before uploading."},
+    {CLI_SLICING_ERROR, "Failed slicing the model. Please verify the slicing of all plates on UltraOne before uploading."},
+    {CLI_GCODE_PATH_CONFLICTS, " G-code conflicts detected after slicing. Please make sure the 3mf file can be successfully sliced in the latest UltraOne."}
 };
 
 typedef struct  _sliced_plate_info{
@@ -6343,13 +6343,13 @@ bool CLI::setup(int argc, char **argv)
     // We hope that if a DLL is being injected into a Snapmaker_Orca process, it happens at the very start of the application,
     // thus we shall detect them now.
     if (BlacklistedLibraryCheck::get_instance().perform_check()) {
-        std::wstring text = L"Following DLLs have been injected into the Snapmaker Orca process:\n\n";
+        std::wstring text = L"Following DLLs have been injected into the UltraOne process:\n\n";
         text += BlacklistedLibraryCheck::get_instance().get_blacklisted_string();
         text += L"\n\n"
-                L"Snapmaker Orca is known to not run correctly with these DLLs injected. "
+                L"UltraOne is known to not run correctly with these DLLs injected. "
                 L"We suggest stopping or uninstalling these services if you experience "
-                L"crashes or unexpected behaviour while using Snapmaker Orca.\n"
-                L"For example, ASUS Sonic Studio injects a Nahimic driver, which makes Snapmaker Orca "
+                L"crashes or unexpected behaviour while using UltraOne.\n"
+                L"For example, ASUS Sonic Studio injects a Nahimic driver, which makes UltraOne "
                 L"to crash on a secondary monitor";
         MessageBoxW(NULL, text.c_str(), L"Warning"/*L"Incopatible library found"*/, MB_OK);
     }

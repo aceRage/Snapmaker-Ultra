@@ -22,7 +22,7 @@ cp resources/images/@SLIC3R_APP_KEY@_192px.png usr/share/icons/hicolor/192x192/a
 
 cat >io.github.Snapmaker.Snapmaker_Orca.desktop <<EOF
 [Desktop Entry]
-Name=Snapmaker Orca
+Name=UltraOne
 Exec=AppRun %F
 Icon=@SLIC3R_APP_KEY@
 Type=Application

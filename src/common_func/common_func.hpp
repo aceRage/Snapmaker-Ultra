@@ -3,8 +3,15 @@
 #include <iostream>
 
 
-#define SLIC3R_APP_NAME "Snapmaker Orca"
-#define SLIC3R_APP_KEY "Snapmaker_Orca"
+// The product name lives here and nowhere else. version.inc reads these two lines back
+// out of this header for CMake, and libslic3r.h derives its own names from them, so the
+// three definitions that used to drift apart are now one.
+#define SLIC3R_APP_NAME "UltraOne"
+#define SLIC3R_APP_KEY "UltraOne"
+// The data directory we used to live in, before the rename. Read from here by the
+// first-start migration (DataDirMigration.cpp) and by nothing else, so a later release
+// can drop the migration by deleting one constant and one call.
+#define SLIC3R_LEGACY_APP_KEY "Snapmaker_Orca"
 #define SLIC3R_VERSION "01.10.01.50"
 #define Snapmaker_VERSION "2.3.6"
 #define MIN_FIRM_VER "1.5.0"

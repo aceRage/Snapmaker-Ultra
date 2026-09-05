@@ -473,7 +473,7 @@ public:
         if (logoBmp != nullptr)
             memDc.DrawBitmap(*logoBmp, logoX, logoY, true);
 
-        // Brand name: "Snapmaker Orca"
+        // Brand name: "UltraOne"
         memDc.SetFont(m_constant_text.titleFont);
         memDc.SetTextForeground(wxColour(23, 23, 23));
         wxSize brandExt = memDc.GetTextExtent(m_constant_text.title);
@@ -593,7 +593,7 @@ private:
 
         void init()
         {
-            title    = "Snapmaker Orca";
+            title    = "UltraOne";
             version  = std::string("V") + Snapmaker_VERSION;
             betaText = _L("Ultra version"); // Ultra: tells the official and Ultra builds apart at launch
 
@@ -894,10 +894,10 @@ void GUI_App::log_version_info()
     });
 
     BOOST_LOG_TRIVIAL(warning) << "========================================";
-    BOOST_LOG_TRIVIAL(warning) << "Snapmaker Orca Version Information";
+    BOOST_LOG_TRIVIAL(warning) << "UltraOne Version Information";
     BOOST_LOG_TRIVIAL(warning) << "========================================";
 
-    BOOST_LOG_TRIVIAL(warning) << "[Version] Snapmaker Orca: " << Snapmaker_VERSION
+    BOOST_LOG_TRIVIAL(warning) << "[Version] UltraOne: " << Snapmaker_VERSION
                                << ", Build: " << SLIC3R_VERSION;
 
     std::string flutter_ver = common::get_flutter_version();
@@ -948,7 +948,7 @@ static void generic_exception_handle()
         // and terminate the app so it is at least certain to happen now.
         BOOST_LOG_TRIVIAL(error) << boost::format("std::bad_alloc exception: %1%") % ex.what();
         flush_logs();
-        wxString errmsg = wxString::Format(_L("Snapmaker Orca will terminate because of running out of memory."
+        wxString errmsg = wxString::Format(_L("UltraOne will terminate because of running out of memory."
                                               "It may be a bug. It will be appreciated if you report the issue to our team."));
         wxMessageBox(errmsg + "\n\n" + wxString(ex.what()), _L("Fatal error"), wxOK | wxICON_ERROR);
 
@@ -957,13 +957,13 @@ static void generic_exception_handle()
      } catch (const boost::io::bad_format_string& ex) {
      	BOOST_LOG_TRIVIAL(error) << boost::format("Uncaught exception: %1%") % ex.what();
         	flush_logs();
-        wxString errmsg = _L("Snapmaker Orca will terminate because of a localization error. "
+        wxString errmsg = _L("UltraOne will terminate because of a localization error. "
                              "It will be appreciated if you report the specific scenario this issue happened.");
         wxMessageBox(errmsg + "\n\n" + wxString(ex.what()), _L("Critical error"), wxOK | wxICON_ERROR);
         std::terminate();
         //throw;
     } catch (const std::exception& ex) {
-        wxLogError(format_wxstr(_L("Snapmaker Orca got an unhandled exception: %1%"), ex.what()));
+        wxLogError(format_wxstr(_L("UltraOne got an unhandled exception: %1%"), ex.what()));
         BOOST_LOG_TRIVIAL(error) << boost::format("Uncaught exception: %1%") % ex.what();
         flush_logs();
         throw;
@@ -2177,7 +2177,7 @@ void GUI_App::init_webview_runtime()
 {
     // Check WebView Runtime
     if (!WebView::CheckWebViewRuntime()) {
-        int nRet = wxMessageBox(_L("Snapmaker Orca requires the Microsoft WebView2 Runtime to operate certain features.\nClick Yes to install it now."),
+        int nRet = wxMessageBox(_L("UltraOne requires the Microsoft WebView2 Runtime to operate certain features.\nClick Yes to install it now."),
                                 _L("WebView2 Runtime"), wxYES_NO);
         if (nRet == wxYES) {
             WebView::DownloadAndInstallWebViewRuntime();
@@ -2702,7 +2702,7 @@ bool GUI_App::on_init_inner()
             RichMessageDialog
                 dlg(nullptr,
                     wxString::Format(_L("%s\nDo you want to continue?"), msg),
-                    "Snapmaker Orca", wxICON_QUESTION | wxYES_NO);
+                    "UltraOne", wxICON_QUESTION | wxYES_NO);
             dlg.ShowCheckBox(_L("Remember my choice"));
             // Ultra: a hidden instance cannot answer and declining would abort start-up: accept (not remembered).
             const int tls_answer = m_hub_managed ? (int) wxID_YES : dlg.ShowModal();
@@ -2884,7 +2884,7 @@ bool GUI_App::on_init_inner()
                 wxString tips = wxString::Format(_L("Click to download new version in default browser: %s"), version_str);
                 DownloadDialog dialog(this->mainframe,
                     tips,
-                    _L("The Snapmaker Orca needs an upgrade"),
+                    _L("The UltraOne needs an upgrade"),
                     false,
                     wxCENTER | wxICON_INFORMATION);
                 dialog.SetExtendedMessage(description_text);
@@ -3190,7 +3190,7 @@ bool GUI_App::on_init_inner()
         m_config_corrupted = false;
         show_error(nullptr,
                    _u8L(
-                       "The Snapmaker Orca configuration file may be corrupted and cannot be parsed.\nSnapmaker Orca has attempted to recreate the "
+                       "The UltraOne configuration file may be corrupted and cannot be parsed.\nUltraOne has attempted to recreate the "
                        "configuration file.\nPlease note, application settings will be lost, but printer profiles will not be affected."));
     }
 
@@ -4902,7 +4902,7 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
 
     // Version limit
     if (code == HttpErrorVersionLimited) {
-        MessageDialog msg_dlg(nullptr, _L("The version of Snapmaker Orca is too low and needs to be updated to the latest version before it can be used normally"), "", wxAPPLY | wxOK);
+        MessageDialog msg_dlg(nullptr, _L("The version of UltraOne is too low and needs to be updated to the latest version before it can be used normally"), "", wxAPPLY | wxOK);
         if (msg_dlg.ShowModal() == wxOK) {
         }
 
@@ -5461,7 +5461,7 @@ std::string GUI_App::format_display_version()
 {
     if (!version_display.empty()) return version_display;
 
-    version_display = std::string("Snapmaker Orca ") + Snapmaker_VERSION;
+    version_display = std::string("UltraOne ") + Snapmaker_VERSION;
     return version_display;
 }
 
@@ -6193,14 +6193,14 @@ bool GUI_App::load_language(wxString language, bool initial)
 
     if (! wxLocale::IsAvailable(language_info->Language)) {
     	// Loading the language dictionary failed.
-        wxString message = "Switching Snapmaker Orca to language " + language_info->CanonicalName + " failed.";
+        wxString message = "Switching UltraOne to language " + language_info->CanonicalName + " failed.";
 #if !defined(_WIN32) && !defined(__APPLE__)
         // likely some linux system
         message += "\nYou may need to reconfigure the missing locales, likely by running the \"locale-gen\" and \"dpkg-reconfigure locales\" commands.\n";
 #endif
         if (initial)
         	message + "\n\nApplication will close.";
-        wxMessageBox(message, "Snapmaker Orca - Switching language failed", wxOK | wxICON_ERROR);
+        wxMessageBox(message, "UltraOne - Switching language failed", wxOK | wxICON_ERROR);
         if (initial)
 			std::exit(EXIT_FAILURE);
 		else
