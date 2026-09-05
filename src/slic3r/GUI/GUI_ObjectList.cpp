@@ -4088,9 +4088,11 @@ wxDataViewItemArray ObjectList::add_volumes_to_object_in_list(size_t obj_idx, st
             ui_volume_idx++;
             add_settings_item(vol_item, &volume->config.get());
             // Ultra (support groups): the badge is set as the row is created, so a project
-            // reopened from disk shows it without a separate refresh pass.
-            static_cast<ObjectDataViewModelNode*>(vol_item.GetID())
-                ->set_support_group(from_u8(SettingsFactory::part_support_group(volume)));
+            // reopened from disk shows it without a separate refresh pass. AddVolumeChild returns
+            // an empty item when the object row is gone, so check it the way add_settings_item
+            // does instead of dereferencing it.
+            if (auto* vol_node = static_cast<ObjectDataViewModelNode*>(vol_item.GetID()))
+                vol_node->set_support_group(from_u8(SettingsFactory::part_support_group(volume)));
 
             if (add_to_selection && add_to_selection(volume))
                 items.Add(vol_item);
