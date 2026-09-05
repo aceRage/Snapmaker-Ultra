@@ -8,10 +8,15 @@
 namespace Slic3r {
 struct SupportParameters {
     SupportParameters() = delete;
-    SupportParameters(const PrintObject& object)
+    // Ultra (support groups, plan 2026-09-02 Stage 3 3.3): the parameters are derived from a
+    // PrintObjectConfig. A support GROUP is exactly that - the object's config with the part-level
+    // support overrides of one group applied - so the generator needs a form that takes the config
+    // rather than reading object.config() itself. This delegating constructor keeps every one of
+    // the existing call sites byte-identical; only the group loop passes a different config.
+    SupportParameters(const PrintObject& object) : SupportParameters(object, object.config()) {}
+    SupportParameters(const PrintObject& object, const PrintObjectConfig& object_config)
     {
         const PrintConfig& print_config = object.print()->config();
-        const PrintObjectConfig& object_config = object.config();
         const SlicingParameters& slicing_params = object.slicing_parameters();
 
 	    this->soluble_interface = slicing_params.soluble_interface;
@@ -43,9 +48,9 @@ struct SupportParameters {
                 this->num_bottom_base_interface_layers       = differnt_support_interface_filament ? 1 : 0;
 	        }
 	    }
-        this->first_layer_flow = Slic3r::support_material_1st_layer_flow(&object, float(slicing_params.first_print_layer_height));
-        this->support_material_flow = Slic3r::support_material_flow(&object, float(slicing_params.layer_height));
-        this->support_material_interface_flow = Slic3r::support_material_interface_flow(&object, float(slicing_params.layer_height));
+        this->first_layer_flow = Slic3r::support_material_1st_layer_flow(&object, object_config, float(slicing_params.first_print_layer_height));
+        this->support_material_flow = Slic3r::support_material_flow(&object, object_config, float(slicing_params.layer_height));
+        this->support_material_interface_flow = Slic3r::support_material_interface_flow(&object, object_config, float(slicing_params.layer_height));
     	this->raft_interface_flow                = support_material_interface_flow;
 
         this->ironing = object_config.support_ironing;

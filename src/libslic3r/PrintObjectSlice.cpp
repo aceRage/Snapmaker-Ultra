@@ -5611,14 +5611,15 @@ ExPolygons PrintObject::_shrink_contour_holes(double contour_delta, double hole_
     return union_ex(new_ex_polys);
 }
 
-std::vector<Polygons> PrintObject::slice_support_volumes(const ModelVolumeType model_volume_type) const
+// Ultra (support groups, plan 2026-09-02 Stage 3 3.1): this is verbatim the body
+// slice_support_volumes() used to hold, with the "which volumes" question lifted out to the
+// caller. slice_support_volumes() below is now a two-liner over it, so enforcer / blocker
+// behaviour cannot have changed; PrintObject::support_group_masks() slices a group's MODEL_PART
+// volumes through the very same code.
+std::vector<Polygons> PrintObject::slice_volumes_at_layers(const std::vector<const ModelVolume*> &volumes) const
 {
-    auto it_volume     = this->model_object()->volumes.begin();
-    auto it_volume_end = this->model_object()->volumes.end();
-    for (; it_volume != it_volume_end && (*it_volume)->type() != model_volume_type; ++ it_volume) ;
     std::vector<Polygons> slices;
-    if (it_volume != it_volume_end) {
-        // Found at least a single support volume of model_volume_type.
+    if (! volumes.empty()) {
         std::vector<float> zs = zs_from_layers(this->layers());
         std::vector<char>  merge_layers;
         bool               merge = false;
@@ -5626,27 +5627,26 @@ std::vector<Polygons> PrintObject::slice_support_volumes(const ModelVolumeType m
         auto               throw_on_cancel_callback = std::function<void()>([print](){ print->throw_if_canceled(); });
         MeshSlicingParamsEx params;
         params.trafo = this->trafo_centered();
-        for (; it_volume != it_volume_end; ++ it_volume)
-            if ((*it_volume)->type() == model_volume_type) {
-                std::vector<ExPolygons> slices2 = slice_volume(*(*it_volume), zs, params, throw_on_cancel_callback);
-                if (slices.empty()) {
-                    slices.reserve(slices2.size());
-                    for (ExPolygons &src : slices2)
-                        slices.emplace_back(to_polygons(std::move(src)));
-                } else if (!slices2.empty()) {
-                    if (merge_layers.empty())
-                        merge_layers.assign(zs.size(), false);
-                    for (size_t i = 0; i < zs.size(); ++ i) {
-                        if (slices[i].empty())
-                            slices[i] = to_polygons(std::move(slices2[i]));
-                        else if (! slices2[i].empty()) {
-                            append(slices[i], to_polygons(std::move(slices2[i])));
-                            merge_layers[i] = true;
-                            merge = true;
-                        }
+        for (const ModelVolume *volume : volumes) {
+            std::vector<ExPolygons> slices2 = slice_volume(*volume, zs, params, throw_on_cancel_callback);
+            if (slices.empty()) {
+                slices.reserve(slices2.size());
+                for (ExPolygons &src : slices2)
+                    slices.emplace_back(to_polygons(std::move(src)));
+            } else if (!slices2.empty()) {
+                if (merge_layers.empty())
+                    merge_layers.assign(zs.size(), false);
+                for (size_t i = 0; i < zs.size(); ++ i) {
+                    if (slices[i].empty())
+                        slices[i] = to_polygons(std::move(slices2[i]));
+                    else if (! slices2[i].empty()) {
+                        append(slices[i], to_polygons(std::move(slices2[i])));
+                        merge_layers[i] = true;
+                        merge = true;
                     }
                 }
             }
+        }
         if (merge) {
             std::vector<Polygons*> to_merge;
             to_merge.reserve(zs.size());
@@ -5662,6 +5662,15 @@ std::vector<Polygons> PrintObject::slice_support_volumes(const ModelVolumeType m
         }
     }
     return slices;
+}
+
+std::vector<Polygons> PrintObject::slice_support_volumes(const ModelVolumeType model_volume_type) const
+{
+    std::vector<const ModelVolume*> volumes;
+    for (const ModelVolume *volume : this->model_object()->volumes)
+        if (volume->type() == model_volume_type)
+            volumes.emplace_back(volume);
+    return this->slice_volumes_at_layers(volumes);
 }
 
 } // namespace Slic3r

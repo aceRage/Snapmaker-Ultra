@@ -3,6 +3,8 @@
 
 #include "Flow.hpp"
 #include "PrintConfig.hpp"
+// Ultra (support groups): the members below hold PrintObject::SupportGroup by value.
+#include "../Print.hpp"
 #include "Slicing.hpp"
 #include "Fill/FillBase.hpp"
 #include "SupportLayer.hpp"
@@ -92,6 +94,22 @@ private:
 	// Pre-calculated parameters shared between the object slicer and the support generator,
 	// carrying information on a raft, 1st layer height, 1st object layer height, gap between the raft and object etc.
 	SlicingParameters	     m_slicing_params;
+	// Ultra (support groups, plan 2026-09-02 Stage 3): the object's support groups, keyed by
+	// resolved config (PrintObject::support_groups()). size() == 1 - the default group alone - for
+	// every project that carries no support_group data, and every group-aware branch in
+	// generate() is then dead, which is the whole of the off-mode guarantee.
+	std::vector<PrintObject::SupportGroup> m_groups;
+	// The object's config with support_interface_top_layers / _bottom_layers raised to the MAX over
+	// all groups. m_support_params is built from this rather than from the object config directly,
+	// because SupportParameters collapses the interface flow into the base flow when the top layer
+	// count is 0, and the bottom-contact layer HEIGHTS are decided from that flow - shared geometry.
+	// Equal to the object's own config whenever there is a single group.
+	PrintObjectConfig                      m_shared_config;
+	// One SupportParameters per group, built from that group's resolved config.
+	std::vector<SupportParameters>         m_group_params;
+	// Per group, per OBJECT layer: the disjoint claim used to split the shared contact layers.
+	// Empty unless there is more than one group.
+	std::vector<std::vector<Polygons>>     m_group_claims;
 	// Various precomputed support parameters to be shared with external functions.
 	SupportParameters   	 m_support_params;
 };

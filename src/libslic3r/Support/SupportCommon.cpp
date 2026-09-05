@@ -11,6 +11,10 @@
 
 #include <cmath>
 #include <boost/container/static_vector.hpp>
+// Ultra (support groups): LayerCache::nonempty needs 3 + 2*K entries with K groups; small_vector
+// keeps the same inline capacity of 5 (so a single-group object still never allocates) and spills
+// to the heap beyond it. See the plan's 5.3 experiment.
+#include <boost/container/small_vector.hpp>
 #include <boost/log/trivial.hpp>
 
 #include <tbb/parallel_for.h>
@@ -1479,6 +1483,40 @@ SupportGeneratorLayersPtr generate_support_layers(
     return layers_sorted;
 }
 
+size_t support_group_object_layer_index(const SupportGeneratorLayer &layer, bool use_above,
+                                        const std::vector<coordf_t> &object_layer_zs)
+{
+    const size_t idx = use_above ? layer.idx_object_layer_above : layer.idx_object_layer_below;
+    if (idx != size_t(-1) && idx < object_layer_zs.size())
+        return idx;
+    // merge_contact_layers (SupportMaterial.cpp) merges contacts closer than support_layer_height_min
+    // and SupportGeneratorLayer::merge does not merge the object layer indices, so a merged layer can
+    // arrive here with none. Fall back to the nearest object layer by print_z - a contact layer sits
+    // against the object either way, so this is never far off.
+    if (object_layer_zs.empty())
+        return size_t(-1);
+    const coordf_t z = use_above ? layer.print_z : layer.bottom_z;
+    auto it = std::lower_bound(object_layer_zs.begin(), object_layer_zs.end(), z);
+    if (it == object_layer_zs.end())
+        return object_layer_zs.size() - 1;
+    if (it != object_layer_zs.begin() && (*it - z) > (z - *(it - 1)))
+        -- it;
+    return size_t(it - object_layer_zs.begin());
+}
+
+Polygons support_group_piece(const Polygons &src, const std::vector<Polygons> *claim,
+                             size_t idx_object_layer, size_t g)
+{
+    if (claim == nullptr || idx_object_layer == size_t(-1) || idx_object_layer >= claim->size())
+        // No mask for this layer: the default group keeps everything, the others get nothing. That
+        // is the conservative direction - geometry is never dropped, only attributed to group 0.
+        return g == 0 ? src : Polygons();
+    const Polygons &c = (*claim)[idx_object_layer];
+    if (g == 0)
+        return c.empty() ? src : diff(src, c);
+    return c.empty() ? Polygons() : intersection(src, c);
+}
+
 void generate_support_toolpaths(
     SupportLayerPtrs                    &support_layers,
     const PrintObjectConfig             &config,
@@ -1489,8 +1527,14 @@ void generate_support_toolpaths(
     const SupportGeneratorLayersPtr     &top_contacts,
     const SupportGeneratorLayersPtr     &intermediate_layers,
     const SupportGeneratorLayersPtr     &interface_layers,
-    const SupportGeneratorLayersPtr     &base_interface_layers)
+    const SupportGeneratorLayersPtr     &base_interface_layers,
+    const std::vector<SupportGroupToolpaths> *groups,
+    const std::vector<coordf_t>              *object_layer_zs)
 {
+    // Ultra (support groups): everything below that reads `group_mode` is dead for a single-group
+    // object, which is every project that carries no support_group data - see the plan's 3.4 step 5.
+    const size_t num_groups = groups == nullptr ? 0 : groups->size();
+    const bool   group_mode = num_groups > 1 && object_layer_zs != nullptr;
     // loop_interface_processor with a given circle radius.
     LoopInterfaceProcessor loop_interface_processor(1.5 * support_params.support_material_interface_flow.scaled_width());
     loop_interface_processor.n_contact_loops = config.support_interface_loop_pattern.value ? 1 : 0;
@@ -1597,13 +1641,32 @@ void generate_support_toolpaths(
         SupportGeneratorLayerExtruded         *layer_extruded;
         std::vector<SupportGeneratorLayer*>    overlapping;
     };
+    // Ultra (support groups): interface extrusions belonging to a group that pins its own interface
+    // filament. They are height-modulated exactly like the layer they came from, then moved into
+    // SupportLayer::interface_by_extruder instead of support_fills - which is what makes
+    // ToolOrdering schedule the tool change (ToolOrdering.cpp collect_extruders).
+    struct GroupInterfaceItem {
+        const SupportGeneratorLayerExtruded *parent   { nullptr };  // to copy the overlapping list from
+        SupportGeneratorLayer               *layer    { nullptr };
+        unsigned                             extruder { 0 };        // 0-based, as the map wants
+        ExtrusionEntitiesPtr                 extrusions;
+        std::vector<SupportGeneratorLayer*>  overlapping;
+    };
     struct LayerCache {
         SupportGeneratorLayerExtruded                                     bottom_contact_layer;
         SupportGeneratorLayerExtruded                                     top_contact_layer;
         SupportGeneratorLayerExtruded                                     base_layer;
         SupportGeneratorLayerExtruded                                     interface_layer;
         SupportGeneratorLayerExtruded                                     base_interface_layer;
-        boost::container::static_vector<LayerCacheItem, 5>  nonempty;
+        // Ultra (support groups): the sibling interface layers of groups 1..K-1 at this print_z.
+        // Empty for a single-group object. unique_ptr because SupportGeneratorLayerExtruded declares
+        // a move assignment and therefore has no implicit move constructor.
+        std::vector<std::unique_ptr<SupportGeneratorLayerExtruded>>       extra_interface_layers;
+        std::vector<std::unique_ptr<SupportGeneratorLayerExtruded>>       extra_base_interface_layers;
+        std::vector<GroupInterfaceItem>                                   group_interfaces;
+        // Ultra (support groups): 5 fixed slots plus up to 2 extra interface layers per group.
+        // small_vector keeps the same inline capacity, so a single-group object allocates nothing.
+        boost::container::small_vector<LayerCacheItem, 5>  nonempty;
 
         float    ironing_angle;
         Polygons polys_to_iron;
@@ -1612,6 +1675,10 @@ void generate_support_toolpaths(
             for (SupportGeneratorLayerExtruded *item : { &bottom_contact_layer, &top_contact_layer, &interface_layer, &base_interface_layer, &base_layer })
                 if (! item->empty())
                     this->nonempty.emplace_back(item);
+            for (auto &vec : { &this->extra_interface_layers, &this->extra_base_interface_layers })
+                for (auto &item : *vec)
+                    if (! item->empty())
+                        this->nonempty.emplace_back(item.get());
             // Sort the layers with the same print_z coordinate by their heights, thickest first.
             std::stable_sort(this->nonempty.begin(), this->nonempty.end(), [](const LayerCacheItem &lc1, const LayerCacheItem &lc2) { return lc1.layer_extruded->layer->height > lc2.layer_extruded->layer->height; });
         }
@@ -1620,7 +1687,7 @@ void generate_support_toolpaths(
 
     tbb::parallel_for(tbb::blocked_range<size_t>(n_raft_layers, support_layers.size()),
         [&config, &slicing_params, &support_params, &support_layers, &bottom_contacts, &top_contacts, &intermediate_layers, &interface_layers, &base_interface_layers, &layer_caches, &loop_interface_processor,
-            &bbox_object, &angles, n_raft_layers, link_max_length_factor]
+            &bbox_object, &angles, n_raft_layers, link_max_length_factor, groups, object_layer_zs, num_groups, group_mode]
             (const tbb::blocked_range<size_t>& range) {
         // Indices of the 1st layer in their respective container at the support layer height.
         size_t idx_layer_bottom_contact   = size_t(-1);
@@ -1643,6 +1710,16 @@ void generate_support_toolpaths(
         auto filler_base_interface  = std::unique_ptr<Fill>(base_interface_layers.empty() ? nullptr :
             Fill::new_from_type(support_params.interface_density > 0.95 || support_params.with_sheath ? ipRectilinear : ipSupportBase));
         auto filler_support         = std::unique_ptr<Fill>(Fill::new_from_type(support_params.base_fill_pattern));
+        // Ultra (support groups): one interface filler per group, so each group's interface is laid
+        // down with its own contact_fill_pattern. Empty for a single-group object.
+        std::vector<std::unique_ptr<Fill>> filler_interface_groups;
+        if (group_mode) {
+            filler_interface_groups.reserve(num_groups);
+            for (const SupportGroupToolpaths &grp : *groups) {
+                filler_interface_groups.emplace_back(Fill::new_from_type(grp.params->contact_fill_pattern));
+                filler_interface_groups.back()->set_bounding_box(bbox_object);
+            }
+        }
         filler_interface->set_bounding_box(bbox_object);
         if (filler_first_layer_ptr)
             filler_first_layer_ptr->set_bounding_box(bbox_object);
@@ -1682,6 +1759,24 @@ void generate_support_toolpaths(
                 interface_layer.layer = interface_layers[idx_layer_interface];
             if (idx_layer_base_interface < base_interface_layers.size() && base_interface_layers[idx_layer_base_interface]->print_z < support_layer.print_z + EPSILON)
                 base_interface_layer.layer = base_interface_layers[idx_layer_base_interface];
+            // Ultra (support groups): with K groups there are up to K interface layers at one
+            // print_z - one per group, produced by K calls to generate_interface_layers. The lowest
+            // group's stays in layer_cache.interface_layer so every merge below behaves exactly as
+            // it does today; the siblings are extruded alongside it with their own parameters.
+            if (group_mode) {
+                auto collect_siblings = [&support_layer](const SupportGeneratorLayersPtr &src, size_t idx_first,
+                                                         std::vector<std::unique_ptr<SupportGeneratorLayerExtruded>> &dst) {
+                    if (idx_first >= src.size() || src[idx_first]->print_z >= support_layer.print_z + EPSILON)
+                        return;
+                    for (size_t k = idx_first + 1; k < src.size() && src[k]->print_z < support_layer.print_z + EPSILON; ++ k) {
+                        auto item = std::make_unique<SupportGeneratorLayerExtruded>();
+                        item->layer = src[k];
+                        dst.emplace_back(std::move(item));
+                    }
+                };
+                collect_siblings(interface_layers,      idx_layer_interface,      layer_cache.extra_interface_layers);
+                collect_siblings(base_interface_layers, idx_layer_base_interface, layer_cache.extra_base_interface_layers);
+            }
             if (idx_layer_intermediate < intermediate_layers.size() && intermediate_layers[idx_layer_intermediate]->print_z < support_layer.print_z + EPSILON)
                 base_layer.layer = intermediate_layers[idx_layer_intermediate];
 
@@ -1734,8 +1829,74 @@ void generate_support_toolpaths(
 
             // Top and bottom contacts, interface layers.
             enum class InterfaceLayerType { TopContact, BottomContact, RaftContact, Interface, InterfaceAsBase };
+            // Ultra (support groups, plan Stage 3 3.6 item 3): the SHARED contact layers are split
+            // between the groups here, at EXTRUSION time - never in the layer graph, where K sibling
+            // TopContact layers at one print_z would trip assert(num_top_contacts <= 1) in
+            // generate_support_layers (see the plan's 5.2 experiment). Interface layers were already
+            // produced per group by generate_interface_layers and carry their own support_group tag,
+            // so they are used whole. Returns false when there is nothing group-specific to do, in
+            // which case the caller runs today's single-config code unchanged.
+            auto extrude_interface_grouped = [&](SupportGeneratorLayerExtruded &layer_ex, InterfaceLayerType interface_layer_type) -> bool {
+                if (! group_mode || interface_layer_type == InterfaceLayerType::RaftContact)
+                    return false;
+                const bool interface_as_base = interface_layer_type == InterfaceLayerType::InterfaceAsBase;
+                const SupporLayerType lt     = layer_ex.layer->layer_type;
+                const bool shared            = lt == SupporLayerType::TopContact || lt == SupporLayerType::BottomContact;
+                const size_t idx_object_layer = shared ?
+                    support_group_object_layer_index(*layer_ex.layer, lt == SupporLayerType::TopContact, *object_layer_zs) :
+                    size_t(-1);
+                const Polygons src = layer_ex.polygons_to_extrude();
+                for (size_t g = 0; g < num_groups; ++ g) {
+                    const SupportGroupToolpaths &grp = (*groups)[g];
+                    Polygons piece = shared ? support_group_piece(src, grp.claim, idx_object_layer, g) :
+                                              (size_t(layer_ex.layer->support_group) == g ? src : Polygons());
+                    if (piece.empty())
+                        continue;
+                    Fill *filler = filler_interface_groups[g].get();
+                    auto interface_flow = layer_ex.layer->bridging ?
+                        Flow::bridging_flow(layer_ex.layer->height, grp.params->support_material_bottom_interface_flow.nozzle_diameter()) :
+                        (interface_as_base ? &grp.params->support_material_flow : &grp.params->support_material_interface_flow)
+                            ->with_height(float(layer_ex.layer->height));
+                    const float group_interface_angle = (grp.params->support_style == smsGrid || grp.config->support_interface_pattern == smipRectilinear) ?
+                        grp.params->interface_angle : grp.params->raft_interface_angle(support_layer.interface_id());
+                    filler->angle   = interface_as_base ? angles[support_layer_id % angles.size()] : group_interface_angle;
+                    double density  = interface_as_base ? grp.params->support_density : grp.params->interface_density;
+                    filler->spacing = interface_as_base ? grp.params->support_material_flow.spacing() : grp.params->support_material_interface_flow.spacing();
+                    filler->link_max_length = coord_t(scale_(filler->spacing * link_max_length_factor / density));
+                    // A group that pins its own interface filament emits into its own bucket, which
+                    // becomes SupportLayer::interface_by_extruder after the height modulation - the
+                    // same storage the Chameleon pass uses, and the reason the two are interlocked.
+                    ExtrusionEntitiesPtr *dst = &layer_ex.extrusions;
+                    if (! interface_as_base && grp.interface_filament > 0 && grp.interface_filament != config.support_interface_filament.value) {
+                        const unsigned extruder = unsigned(grp.interface_filament - 1);
+                        size_t slot = size_t(-1);
+                        for (size_t i = 0; i < layer_cache.group_interfaces.size(); ++ i)
+                            if (layer_cache.group_interfaces[i].parent == &layer_ex && layer_cache.group_interfaces[i].extruder == extruder) {
+                                slot = i;
+                                break;
+                            }
+                        if (slot == size_t(-1)) {
+                            GroupInterfaceItem gi;
+                            gi.parent   = &layer_ex;
+                            gi.layer    = layer_ex.layer;
+                            gi.extruder = extruder;
+                            layer_cache.group_interfaces.push_back(std::move(gi));
+                            slot = layer_cache.group_interfaces.size() - 1;
+                        }
+                        dst = &layer_cache.group_interfaces[slot].extrusions;
+                    }
+                    fill_expolygons_generate_paths(
+                        *dst,
+                        union_safety_offset_ex(piece),
+                        filler, float(density),
+                        interface_as_base ? ExtrusionRole::erSupportMaterial : ExtrusionRole::erSupportMaterialInterface, interface_flow);
+                }
+                return true;
+            };
             auto extrude_interface = [&](SupportGeneratorLayerExtruded &layer_ex, InterfaceLayerType interface_layer_type) {
                 if (! layer_ex.empty() && ! layer_ex.polygons_to_extrude().empty()) {
+                    if (extrude_interface_grouped(layer_ex, interface_layer_type))
+                        return;
                     bool interface_as_base = interface_layer_type == InterfaceLayerType::InterfaceAsBase;
                     bool raft_contact      = interface_layer_type == InterfaceLayerType::RaftContact;
                     //FIXME Bottom interfaces are extruded with the briding flow. Some bridging layers have its height slightly reduced, therefore
@@ -1773,28 +1934,44 @@ void generate_support_toolpaths(
             extrude_interface(top_contact_layer,    raft_layer ? InterfaceLayerType::RaftContact : top_interfaces ? InterfaceLayerType::TopContact : InterfaceLayerType::InterfaceAsBase);
             extrude_interface(bottom_contact_layer, bottom_interfaces ? InterfaceLayerType::BottomContact : InterfaceLayerType::InterfaceAsBase);
             extrude_interface(interface_layer,      top_interfaces ? InterfaceLayerType::Interface : InterfaceLayerType::InterfaceAsBase);
+            // Ultra (support groups): the sibling interface layers produced for the other groups at
+            // this print_z. Each carries its own support_group tag, so extrude_interface_grouped
+            // fills it with that group's pattern, density, flow and angle. Empty at K == 1.
+            if (group_mode)
+                for (auto &extra : layer_cache.extra_interface_layers)
+                    extrude_interface(*extra, top_interfaces ? InterfaceLayerType::Interface : InterfaceLayerType::InterfaceAsBase);
 
             // Base interface layers under soluble interfaces
-            if ( ! base_interface_layer.empty() && ! base_interface_layer.polygons_to_extrude().empty()) {
+            auto extrude_base_interface = [&](SupportGeneratorLayerExtruded &layer_ex) {
+                if (layer_ex.empty() || layer_ex.polygons_to_extrude().empty())
+                    return;
                 Fill *filler = filler_base_interface.get();
                 //FIXME Bottom interfaces are extruded with the briding flow. Some bridging layers have its height slightly reduced, therefore
                 // the bridging flow does not quite apply. Reduce the flow to area of an ellipse? (A = pi * a * b)
-                assert(! base_interface_layer.layer->bridging);
-                Flow interface_flow = support_params.support_material_flow.with_height(float(base_interface_layer.layer->height));
+                assert(! layer_ex.layer->bridging);
+                // Ultra (support groups): a base interface layer belongs wholly to the group that
+                // produced it - it is never shared - so it simply uses that group's parameters.
+                // At K == 1 params_g IS support_params and this is the code that was here before.
+                const SupportParameters &params_g = (group_mode && size_t(layer_ex.layer->support_group) < num_groups) ?
+                    *(*groups)[layer_ex.layer->support_group].params : support_params;
+                Flow interface_flow = params_g.support_material_flow.with_height(float(layer_ex.layer->height));
                 filler->angle   = support_interface_angle;
-                filler->spacing = support_params.support_material_interface_flow.spacing();
-                filler->link_max_length = coord_t(scale_(filler->spacing * link_max_length_factor / support_params.interface_density));
+                filler->spacing = params_g.support_material_interface_flow.spacing();
+                filler->link_max_length = coord_t(scale_(filler->spacing * link_max_length_factor / params_g.interface_density));
                 fill_expolygons_generate_paths(
                     // Destination
-                    base_interface_layer.extrusions,
-                    //base_layer_interface.extrusions,
+                    layer_ex.extrusions,
                     // Regions to fill
-                    union_safety_offset_ex(base_interface_layer.polygons_to_extrude()),
+                    union_safety_offset_ex(layer_ex.polygons_to_extrude()),
                     // Filler and its parameters
-                    filler, float(support_params.interface_density),
+                    filler, float(params_g.interface_density),
                     // Extrusion parameters
                     ExtrusionRole::erSupportMaterial, interface_flow);
-            }
+            };
+            extrude_base_interface(base_interface_layer);
+            if (group_mode)
+                for (auto &extra : layer_cache.extra_base_interface_layers)
+                    extrude_base_interface(*extra);
 
             // Base support or flange.
             if (! base_layer.empty() && ! base_layer.polygons_to_extrude().empty()) {
@@ -1883,6 +2060,14 @@ void generate_support_toolpaths(
                 // Order the layers by lexicographically by an increasing print_z and a decreasing layer height.
                 std::stable_sort(layer_cache_item.overlapping.begin(), layer_cache_item.overlapping.end(), [](auto *l1, auto *l2) { return *l1 < *l2; });
             }
+            // Ultra (support groups): a group's own-filament interface came out of one of the layers
+            // above, so it is modulated against exactly that layer's overlapping set.
+            for (GroupInterfaceItem &gi : layer_cache.group_interfaces)
+                for (const LayerCacheItem &item : layer_cache.nonempty)
+                    if (item.layer_extruded == gi.parent) {
+                        gi.overlapping = item.overlapping;
+                        break;
+                    }
             assert(support_layer.support_islands.empty());
             if (! polys.empty()) {
                 support_layer.support_islands = union_ex(polys);
@@ -1905,6 +2090,18 @@ void generate_support_toolpaths(
                 // Trim the extrusion height from the bottom by the overlapping layers.
                 modulate_extrusion_by_overlapping_layers(layer_cache_item.layer_extruded->extrusions, *layer_cache_item.layer_extruded->layer, layer_cache_item.overlapping);
                 support_layer.support_fills.append(std::move(layer_cache_item.layer_extruded->extrusions));
+            }
+
+            // Ultra (support groups): the height modulation is applied first, exactly as the plan's
+            // 3.6 item 4 asks, and only then does the group's interface leave support_fills for
+            // SupportLayer::interface_by_extruder. From there ToolOrdering::collect_extruders
+            // registers the extruder on this layer and GCode::process_layer emits it after the
+            // toolchange - nothing new is needed in ToolOrdering, the wipe tower or the G-code writer.
+            for (GroupInterfaceItem &gi : layer_cache.group_interfaces) {
+                if (gi.extrusions.empty())
+                    continue;
+                modulate_extrusion_by_overlapping_layers(gi.extrusions, *gi.layer, gi.overlapping);
+                support_layer.interface_by_extruder[gi.extruder].append(std::move(gi.extrusions));
             }
 
             // Orca: Generate iron toolpath for contact layer

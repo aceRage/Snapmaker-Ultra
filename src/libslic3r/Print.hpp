@@ -546,7 +546,27 @@ public:
     // True when any MODEL_PART volume of `object` asks for a soluble interface. See 3.6: a
     // per-part top Z distance cannot be honoured, so the strictest group wins object-wide.
     static bool                 support_groups_want_soluble(const ModelObject &object);
+    // Ultra (support groups, plan Stage 3 3.2): fill SupportGroup::mask - per object layer, the
+    // union of that group's volumes sliced at the layer's slice_z. Group 0 gets the COMPLEMENT
+    // (every model part minus the other groups), so the K masks partition the object footprint
+    // with no overlap and no gap. A no-op when `groups.size() <= 1`, so the off-mode path never
+    // slices anything extra.
+    void                        support_group_masks(std::vector<SupportGroup> &groups) const;
+    // Ultra (support groups, plan Stage 3 3.7 / R3.5): true when some MODEL_PART volume pins a
+    // support interface filament of its own, different from the object's. Both the Chameleon pass
+    // and WipingExtrusions write / repaint the same SupportLayer::interface_by_extruder map this
+    // feature owns, so both stand down for such an object.
+    bool                        has_support_group_interface_filament() const;
+    // Ultra (support groups): raise the non-critical warning that says Chameleon stood down for
+    // this object. active_step_add_warning is protected on PrintObjectBaseWithState, and the
+    // Chameleon pass is a static free function in Print.cpp, so it needs a public door.
+    void                        add_support_group_chameleon_warning(const std::string &message);
 
+    // Ultra (support groups, plan Stage 3 3.1): slice an explicit set of volumes at this object's
+    // layer Zs and union them per layer. This is the body slice_support_volumes() always had; that
+    // function is now a two-liner over it, so enforcer / blocker behaviour is unchanged by
+    // construction and support_group_masks() reuses exactly the same machinery.
+    std::vector<Polygons>       slice_volumes_at_layers(const std::vector<const ModelVolume*> &volumes) const;
     // Helpers to slice support enforcer / blocker meshes by the support generator.
     std::vector<Polygons>       slice_support_volumes(const ModelVolumeType model_volume_type) const;
     std::vector<Polygons>       slice_support_blockers() const { return this->slice_support_volumes(ModelVolumeType::SUPPORT_BLOCKER); }

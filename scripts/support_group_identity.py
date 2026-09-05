@@ -24,6 +24,18 @@ TWO GATES, and the default is the tolerance one:
                     functions directly - nothing was added to the shipped application.
   --gate bytes      the original byte comparison, described below. Kept for the day the
                     determinism fix lands; it does NOT pass on this tree.
+  --gate groups     the ON-mode gate, added in Stage 3. It runs ONLY the corpus cases marked
+                    "groups": true - the ones whose parts actually carry support_group data -
+                    and inverts the question: each one must DIFFER from the baseline, because the
+                    baseline ignores the groups and the candidate honours them. It also requires
+                    zero changed CONFIG rows, so the difference is provably geometry and not a
+                    settings change, and where a case names "expect_tool" it requires that tool
+                    change to appear in the candidate's G-code and NOT in the baseline's.
+
+The two default gates (tolerance, bytes) SKIP the "groups": true cases, for the same reason:
+from Stage 3 on those cases are meant to differ. Off mode - every project that carries no
+support_group data, plus any where every part resolves to the same support config - is what the
+tolerance gate covers, and it is the hard gate.
 
 Why the default moved: the plan's own 5.1 experiment - run this script with the SAME
 executable on both sides - showed that about a third of same-binary comparisons differ by a
@@ -177,6 +189,49 @@ def tolerance_ok(verdict, segment_tolerance):
             float(seg.get("percent", 0.0)) >= segment_tolerance)
 
 
+def has_tool_change(path, token):
+    """True when the G-code contains a bare tool-change line for `token` (e.g. "T1")."""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if s == token or s.startswith(token + " ") or s.startswith(token + ";"):
+                return True
+    return False
+
+
+def groups_ok(verdict, case, baseline_path, candidate_path):
+    """The ON-mode criterion: the groups must ACT, and only on the geometry.
+
+    Three requirements, in the order they are worth reading:
+
+      1. the two G-codes must DIFFER - some layer changed, or some segments did not match. A
+         baseline that ignores support_group and a candidate that honours it cannot agree;
+      2. zero changed CONFIG rows. The only new key never reaches full_print_config (3.1), and no
+         group value is a process setting, so the config block must be identical - which is what
+         makes requirement 1 a statement about geometry rather than about settings;
+      3. where the case names expect_tool, that tool change must appear in the CANDIDATE and not
+         in the baseline: the group's own interface filament being scheduled, end to end.
+    """
+    if "error" in verdict:
+        return False, verdict["error"]
+    if verdict.get("config_rows", 0) != 0:
+        return False, ("%s config row(s) changed - a group must move geometry, not settings"
+                       % verdict.get("config_rows"))
+    lay = verdict.get("layers", {})
+    seg = verdict.get("segments", {})
+    moved = (lay.get("changed", 0) or 0) > 0 or float(seg.get("percent", 100.0)) < 100.0 or \
+            (lay.get("a_only", 0) or 0) > 0 or (lay.get("b_only", 0) or 0) > 0
+    if not moved:
+        return False, "identical to the baseline - the support group did NOT act"
+    token = case.get("expect_tool")
+    if token:
+        if not has_tool_change(candidate_path, token):
+            return False, "no %s tool change in the candidate - the group's interface filament was not scheduled" % token
+        if has_tool_change(baseline_path, token):
+            return False, "the baseline already has a %s tool change - the case proves nothing" % token
+    return True, ""
+
+
 def describe(verdict):
     """One-line summary of a tolerance verdict."""
     if "error" in verdict:
@@ -229,9 +284,11 @@ def main(argv=None):
                     help="report every differing case instead of stopping at the first "
                          "(useful when screening the corpus for reproducibility)")
     ap.add_argument("--timeout", type=float, default=900)
-    ap.add_argument("--gate", choices=("tolerance", "bytes"), default="tolerance",
-                    help="tolerance (default): the Slice Compare criteria; bytes: the original "
-                         "byte comparison, which this tree cannot pass - see the docstring")
+    ap.add_argument("--gate", choices=("tolerance", "bytes", "groups"), default="tolerance",
+                    help="tolerance (default): the Slice Compare criteria on the off-mode cases; "
+                         "bytes: the original byte comparison, which this tree cannot pass; "
+                         "groups: the ON-mode gate over the cases marked \"groups\": true, which "
+                         "must DIFFER - see the docstring")
     ap.add_argument("--segment-tolerance", type=float, default=99.0,
                     help="minimum per cent of matching segments (default 99.0); see the "
                          "module docstring for why this is not 100")
@@ -245,7 +302,7 @@ def main(argv=None):
     for exe in (a.baseline, a.candidate):
         if not os.path.exists(exe):
             raise SystemExit("no such executable: " + exe)
-    if a.gate == "tolerance" and not os.path.exists(a.compare_exe):
+    if a.gate in ("tolerance", "groups") and not os.path.exists(a.compare_exe):
         raise SystemExit("no slice_compare_cli at %s - build the slice_compare_cli target"
                          % a.compare_exe)
     if a.single_core:
@@ -257,6 +314,12 @@ def main(argv=None):
     presets = manifest["presets"]
     common_args = manifest.get("common_args", [])
     cases = [c for c in manifest["cases"] if not a.only or c["name"] in a.only]
+    # Cases carrying support_group data belong to exactly one of the two gates, never both:
+    # from Stage 3 on the generator acts on those keys, so they must differ under --gate groups
+    # and are not off-mode material for the tolerance / bytes gates.
+    wanted_groups = a.gate == "groups"
+    skipped = [c["name"] for c in cases if bool(c.get("groups")) != wanted_groups]
+    cases = [c for c in cases if bool(c.get("groups")) == wanted_groups]
     if not cases:
         raise SystemExit("no cases selected")
 
@@ -266,7 +329,9 @@ def main(argv=None):
     print("gate     : %s%s%s" % (a.gate,
           "" if a.gate == "bytes" else "   (segments >= %.2f%%)" % a.segment_tolerance,
           "   (pinned to one CPU)" if a.single_core else ""))
-    print("corpus   : %d case(s)\n" % len(cases))
+    print("corpus   : %d case(s)%s\n"
+          % (len(cases), ("   (skipped %s: %s)" % ("group cases" if not wanted_groups else "off-mode cases",
+                                                   ", ".join(skipped))) if skipped else ""))
 
     os.makedirs(a.out, exist_ok=True)
     failures = 0
@@ -308,7 +373,13 @@ def main(argv=None):
             else:
                 _strict, verdict = compare_tolerance(a.compare_exe, bf, cf)
                 total += int(verdict.get("segments", {}).get("both", 0) or 0)
-                if not tolerance_ok(verdict, a.segment_tolerance):
+                if a.gate == "groups":
+                    ok, why = groups_ok(verdict, case, bf, cf)
+                    detail = "          " + describe(verdict)
+                    if not ok:
+                        bad = (os.path.basename(bf), why)
+                        break
+                elif not tolerance_ok(verdict, a.segment_tolerance):
                     bad = (os.path.basename(bf), describe(verdict))
                     detail = "          " + json.dumps(verdict)[:600]
                     break
@@ -317,7 +388,10 @@ def main(argv=None):
             unit = "lines" if a.gate == "bytes" else "segments"
             print("ok      %d file(s), %d %s, %.0fs"
                   % (len(base_files), total, unit, time.time() - t0))
-            if not a.keep:
+            if a.gate == "groups" and detail:
+                # The ON-mode gate is evidence, not just a pass: show WHAT moved.
+                print(detail)
+            if not a.keep and a.gate != "groups":
                 shutil.rmtree(os.path.join(a.out, name), ignore_errors=True)
         else:
             f, why = bad
@@ -334,7 +408,8 @@ def main(argv=None):
         print("RESULT: %d case(s) differ" % failures)
         return 1
     print("RESULT: %s on all %d case(s)"
-          % ("byte-identical" if a.gate == "bytes" else "within tolerance", len(cases)))
+          % ("byte-identical" if a.gate == "bytes" else
+             "the groups act" if a.gate == "groups" else "within tolerance", len(cases)))
     return 0
 
 

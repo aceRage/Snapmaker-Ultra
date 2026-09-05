@@ -102,6 +102,15 @@ public:
 	size_t 	 idx_object_layer_below { size_t(-1) };
 	// Use a bridging flow when printing this support layer.
 	bool 	 bridging { false };
+	// Ultra (support groups, plan 2026-09-02 Stage 3 3.4): index into PrintObject::support_groups()
+	// whose interface parameters this layer was generated with. 0 for every layer of a single-group
+	// object, so nothing about a single-group object changes. Only interface / base-interface layers
+	// ever carry a non-zero value; contacts, bases and rafts are SHARED geometry and stay 0 - they
+	// are split between the groups at extrusion time instead (see SupportCommon.cpp's
+	// generate_support_toolpaths). reset() restores 0 through `*this = SupportGeneratorLayer()`, and
+	// merge() needs no change because interface layers of different groups live in different vectors
+	// and are never merged into one another.
+	uint16_t support_group { 0 };
 
 	// Polygons to be filled by the support pattern.
 	Polygons polygons;

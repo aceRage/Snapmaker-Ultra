@@ -39,16 +39,43 @@ TARGET = os.path.join(HERE, "twopart_groups.3mf")
 
 PRINTER = "Snapmaker U1 (0.4 nozzle)"
 PROCESS = "0.20 Standard @Snapmaker U1 (0.4 nozzle)"
-FILAMENTS = "Generic PLA;Generic PLA"
 
-# Injected onto the SECOND part; the first stays in the object's default group.
-GROUP_METADATA = [
-    ("support_group", "B"),
-    ("support_interface_top_layers", "5"),
-    ("support_interface_bottom_layers", "4"),
-    ("support_interface_spacing", "0.15"),
-    ("support_interface_filament", "2"),
-]
+# Two profiles, because Stage 3 needs two kinds of ON-mode evidence:
+#
+#   filament - the original fixture. The group changes its interface geometry AND pins its own
+#              interface filament, so the candidate must also schedule a tool change the baseline
+#              never had. Needs two filaments loaded.
+#   geometry - the same group without support_interface_filament, on ONE filament. The candidate
+#              must differ from the baseline purely in support-interface geometry, with no tool
+#              change anywhere - which is the cleaner proof that the interface stage, and nothing
+#              else, moved.
+PROFILES = {
+    "filament": {
+        "out":       TARGET,
+        "filaments": "Generic PLA;Generic PLA",
+        "metadata": [
+            ("support_group", "B"),
+            ("support_interface_top_layers", "5"),
+            ("support_interface_bottom_layers", "4"),
+            ("support_interface_spacing", "0.15"),
+            ("support_interface_filament", "2"),
+        ],
+    },
+    "geometry": {
+        "out":       os.path.join(HERE, "twopart_groups_geom.3mf"),
+        "filaments": "Generic PLA",
+        "metadata": [
+            ("support_group", "B"),
+            ("support_interface_top_layers", "5"),
+            ("support_interface_bottom_layers", "4"),
+            ("support_interface_spacing", "0.15"),
+        ],
+    },
+}
+
+# Set by main() from --profile; the module-level name is kept so the helpers below read the same.
+FILAMENTS = PROFILES["filament"]["filaments"]
+GROUP_METADATA = PROFILES["filament"]["metadata"]
 
 
 def export_3mf(exe, datadir, src, dst):
@@ -89,8 +116,18 @@ def main():
     ap.add_argument("--exe", required=True, help="path to snapmaker-orca.exe (a side install, never the user's tree)")
     ap.add_argument("--datadir", help="isolated data directory - always pass this")
     ap.add_argument("--part", type=int, default=2, help="which <part id> gets the group (default 2)")
-    ap.add_argument("--out", default=TARGET)
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="filament",
+                    help="filament (default): the group pins its own interface filament; "
+                         "geometry: the same group on one filament, interface geometry only")
+    ap.add_argument("--out")
     a = ap.parse_args()
+
+    global FILAMENTS, GROUP_METADATA
+    profile = PROFILES[a.profile]
+    FILAMENTS = profile["filaments"]
+    GROUP_METADATA = profile["metadata"]
+    if not a.out:
+        a.out = profile["out"]
 
     tmp = tempfile.mkdtemp(prefix="sgfixture_")
     try:

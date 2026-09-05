@@ -9,6 +9,8 @@
 namespace Slic3r {
 
 class PrintObject;
+// Ultra (support groups): the support flows below have a form taking an explicit object config.
+class PrintObjectConfig;
 
 // Extra spacing of bridge threads, in mm.
 #define BRIDGE_EXTRA_SPACING 0.05
@@ -139,9 +141,17 @@ private:
     bool        m_bridge { false };
 };
 
+// Ultra (support groups, plan 2026-09-02 Stage 3 3.3): the three support flows below read the
+// object's OWN PrintObjectConfig. A support group is a PrintObjectConfig with the part-level
+// support overrides applied, so the generator needs the same flow computed against THAT config.
+// The object-only forms forward with object->config(), so all ~123 existing call sites are
+// byte-identical and the group forms are the only ones that can see a different config.
+extern Flow support_material_flow(const PrintObject* object, const PrintObjectConfig &object_config, float layer_height = 0.f);
 extern Flow support_material_flow(const PrintObject* object, float layer_height = 0.f);
 extern Flow support_transition_flow(const PrintObject *object); //BBS
+extern Flow support_material_1st_layer_flow(const PrintObject *object, const PrintObjectConfig &object_config, float layer_height = 0.f);
 extern Flow support_material_1st_layer_flow(const PrintObject *object, float layer_height = 0.f);
+extern Flow support_material_interface_flow(const PrintObject *object, const PrintObjectConfig &object_config, float layer_height = 0.f);
 extern Flow support_material_interface_flow(const PrintObject *object, float layer_height = 0.f);
 
 }
