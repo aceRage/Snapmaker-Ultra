@@ -470,11 +470,16 @@ private:
 	// is not a preset - Apply copies its values into the edited process settings through
 	// Tab::load_config(), so the preset shows as modified exactly like a hand edit.
 	// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md, Stage 1.
+	// Apply and Groups are text buttons in the fork's own style; Edit / Save / Delete are the
+	// slicer's own preset-row icons (pencil / floppy disk / minus), so the row reads the way the
+	// preset combo above it does. Renaming a set is "save it under another name", so there is no
+	// Rename button any more.
 	ComboBox*		m_support_set_combo   = nullptr;
 	Button*			m_support_set_apply   = nullptr;
-	Button*			m_support_set_save    = nullptr;
-	Button*			m_support_set_rename  = nullptr;
-	Button*			m_support_set_delete  = nullptr;
+	ScalableButton*	m_support_set_edit    = nullptr;
+	ScalableButton*	m_support_set_save    = nullptr;
+	ScalableButton*	m_support_set_delete  = nullptr;
+	Button*			m_support_set_groups  = nullptr;
 	wxStaticText*	m_support_set_note     = nullptr;
 	// Set names in combo order; index 0 of the combo is the "- none -" entry and has no name.
 	std::vector<std::string> m_support_set_names;
@@ -492,9 +497,10 @@ private:
 	DynamicPrintConfig support_set_filament_config() const;
 
 	void		on_support_set_apply();
+	void		on_support_set_edit();
 	void		on_support_set_save_as();
-	void		on_support_set_rename();
 	void		on_support_set_delete();
+	void		on_support_set_groups();
 };
 
 class TabPrintModel : public TabPrint

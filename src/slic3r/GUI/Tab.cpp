@@ -59,10 +59,11 @@
 // Ultra (support sets): the Support-set row on the Support page.
 #include "libslic3r/SupportSet.hpp"
 #include "GUI_Factories.hpp"
+#include "SupportGroupsDialog.hpp"
+#include "SupportSetEditDialog.hpp"
 #include "Widgets/ComboBox.hpp"
 #include "Widgets/Button.hpp"
 #include <wx/textdlg.h>
-#include <wx/wrapsizer.h>
 #ifdef WIN32
 	#include <commctrl.h>
 #endif // WIN32
@@ -2813,9 +2814,11 @@ void TabPrint::support_set_update_buttons()
     const std::string name = support_set_selected_name();
     const SupportSet* set  = name.empty() ? nullptr : SupportSetStore::instance().find(name);
     if (m_support_set_apply  != nullptr) m_support_set_apply->Enable(set != nullptr);
-    // A set read from the shared "default" folder can be applied but not edited from here.
+    // The pencil needs a set to open; saving over a shared set is allowed and simply writes the
+    // user's own copy (SupportSetStore::save always writes into dir()), so Edit follows Apply.
+    if (m_support_set_edit   != nullptr) m_support_set_edit->Enable(set != nullptr);
+    // A set read from the shared "default" folder can be applied and copied but not deleted.
     const bool editable = set != nullptr && !set->read_only;
-    if (m_support_set_rename != nullptr) m_support_set_rename->Enable(editable);
     if (m_support_set_delete != nullptr) m_support_set_delete->Enable(editable);
 }
 
@@ -2919,27 +2922,82 @@ void TabPrint::on_support_set_save_as()
     support_set_set_note(format_wxstr(_L("Saved \"%1%\"."), from_u8(name)), false);
 }
 
-void TabPrint::on_support_set_rename()
+// The pop-out set editor. It edits the FILE, never the project: SupportSetEditDialog drives its
+// own DynamicPrintConfig, so nothing here goes near m_config or Tab::load_config. Putting a set
+// to work stays where it was - "Apply" on this row, "Re-apply set" in the Support groups window.
+void TabPrint::on_support_set_edit()
 {
     const std::string name = support_set_selected_name();
-    if (name.empty())
+    const SupportSet* set  = name.empty() ? nullptr : SupportSetStore::instance().find(name);
+    if (set == nullptr)
         return;
-    wxTextEntryDialog dlg(this, _L("New name for this support set:"), _L("Rename support set"), from_u8(name));
+    // By value: the store's vector is rebuilt by every reload() and the dialog outlives that.
+    const SupportSet before = *set;
+
+    SupportSetEditDialog dlg(this, before, support_set_filament_config());
     if (dlg.ShowModal() != wxID_OK)
         return;
-    wxString entered = dlg.GetValue();
-    entered.Trim(true).Trim(false);
-    const std::string to = into_u8(entered);
-    if (to.empty() || to == name)
-        return;
+
+    // Save writes straight back to the same name, with no name prompt - renaming a set is what
+    // the save icon does, under another name. SupportSetStore::save() decides where the file
+    // goes: a shared set is shadowed by the account's own copy rather than edited in place.
+    if (before.read_only)
+        MessageDialog(this, format_wxstr(_L("\"%1%\" is shared with every account on this computer. "
+                                            "Saving your changes creates your own copy, which hides the shared one."),
+                                         from_u8(name)),
+                      _L("Edit support set"), wxICON_INFORMATION | wxOK).ShowModal();
 
     std::string err;
-    if (!SupportSetStore::instance().rename(name, to, &err)) {
-        MessageDialog(this, from_u8(err), _L("Rename support set"), wxICON_ERROR | wxOK).ShowModal();
+    if (!SupportSetStore::instance().save(dlg.edited_set(), &err)) {
+        MessageDialog(this, from_u8(err), _L("Edit support set"), wxICON_ERROR | wxOK).ShowModal();
         return;
     }
-    support_set_reload_list(to);
-    support_set_set_note(format_wxstr(_L("Renamed to \"%1%\"."), from_u8(to)), false);
+    support_set_reload_list(name);
+    // A group references its set by name and shows "(modified)" when the parts no longer match
+    // the set's values; those values just changed, so an open window has to look again.
+    support_groups_dialog_refresh();
+    support_set_set_note(format_wxstr(_L("Saved changes to \"%1%\". The current project is unchanged - "
+                                         "use Apply to put them to work."), from_u8(name)), false);
+}
+
+// The Support groups window belongs to an object, not to the process preset, so the row's Groups
+// button has to pick one: whatever the user has highlighted, else the first object that actually
+// has parts to group. The window itself is the same singleton the object context menu opens.
+void TabPrint::on_support_set_groups()
+{
+    ModelObject* target = nullptr;
+    if (const std::vector<ModelVolume*> parts = selected_part_volumes(); !parts.empty())
+        target = parts.front()->get_object();
+    else if (ObjectList* list = wxGetApp().obj_list(); list != nullptr) {
+        const int obj_idx = list->get_selected_obj_idx();
+        if (obj_idx >= 0)
+            target = list->object(obj_idx);
+    }
+    if (target == nullptr && wxGetApp().plater() != nullptr) {
+        ModelObject* first = nullptr;
+        for (ModelObject* object : wxGetApp().plater()->model().objects) {
+            if (object == nullptr)
+                continue;
+            if (first == nullptr)
+                first = object;
+            size_t parts = 0;
+            for (const ModelVolume* volume : object->volumes)
+                if (volume != nullptr && volume->is_model_part())
+                    ++ parts;
+            if (parts > 1) {
+                target = object;
+                break;
+            }
+        }
+        if (target == nullptr)
+            target = first;
+    }
+    if (target == nullptr) {
+        support_set_set_note(_L("Load an object first: support groups are made from an object's parts."), true);
+        return;
+    }
+    support_set_set_note(wxEmptyString, false);
+    open_support_groups_dialog(wxGetApp().plater(), target);
 }
 
 void TabPrint::on_support_set_delete()
@@ -2967,10 +3025,10 @@ wxSizer* TabPrint::support_set_create_widget(wxWindow* parent)
 {
     const int em = em_unit(parent);
 
-    // The combo takes the whole row; the buttons wrap underneath, since the process panel is
-    // narrow and four buttons beside a combo do not fit on one line.
+    // The combo takes the whole row; the buttons sit underneath it - Apply and the three
+    // preset-row icons on the left, Groups pushed out to the right edge.
     auto* vsizer = new wxBoxSizer(wxVERTICAL);
-    auto* hsizer = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+    auto* hsizer = new wxBoxSizer(wxHORIZONTAL);
 
     m_support_set_combo = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
                                        wxSize(20 * em, -1), 0, nullptr, wxCB_READONLY);
@@ -2983,19 +3041,50 @@ wxSizer* TabPrint::support_set_create_widget(wxWindow* parent)
     });
     vsizer->Add(m_support_set_combo, 0, wxEXPAND);
 
-    // The fork's themed buttons, styled like the sidebar's "Flushing volumes" (Confirm for the
-    // one that changes the settings, Regular for the housekeeping ones).
-    auto add_button = [this, parent, em, hsizer](Button** btn, const wxString& label, ButtonStyle style,
-                                                 void (TabPrint::*handler)()) {
+    // The fork's themed buttons for the two that stay text (Confirm for the one that changes the
+    // project's settings, Regular for the one that only opens a window).
+    auto add_text_button = [this, parent](Button** btn, const wxString& label, const wxString& tip,
+                                          ButtonStyle style, void (TabPrint::*handler)()) {
         *btn = new Button(parent, label);
         (*btn)->SetStyle(style, ButtonType::Compact);
+        (*btn)->SetToolTip(tip);
         (*btn)->Bind(wxEVT_BUTTON, [this, handler](wxCommandEvent&) { (this->*handler)(); });
-        hsizer->Add(*btn, 0, wxRIGHT | wxTOP, em / 2);
     };
-    add_button(&m_support_set_apply,  _L("Apply"),      ButtonStyle::Confirm, &TabPrint::on_support_set_apply);
-    add_button(&m_support_set_save,   _L("Save As..."), ButtonStyle::Regular, &TabPrint::on_support_set_save_as);
-    add_button(&m_support_set_rename, _L("Rename"),     ButtonStyle::Regular, &TabPrint::on_support_set_rename);
-    add_button(&m_support_set_delete, _L("Delete"),     ButtonStyle::Regular, &TabPrint::on_support_set_delete);
+    // Edit / Save / Delete are the very icons the preset row above uses - "edit" is the pencil,
+    // "save" the floppy disk, "cross" the boxed minus that is this slicer's delete (see
+    // m_btn_save_preset / m_btn_delete_preset in Tab::create_preset_tab). add_scaled_button gives
+    // them the tab's own ScalableBitmap sizing, its greyed-out disabled bitmap and its dark-mode
+    // redraw; clear_pages() takes them back out of m_scaled_buttons when the page goes.
+    auto add_icon_button = [this, parent, em, hsizer](ScalableButton** btn, const std::string& icon,
+                                                     const wxString& tip, void (TabPrint::*handler)()) {
+        add_scaled_button(parent, btn, icon);
+        (*btn)->SetToolTip(tip);
+        (*btn)->Bind(wxEVT_BUTTON, [this, handler](wxCommandEvent&) { (this->*handler)(); });
+        hsizer->Add(*btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT | wxTOP, em / 2);
+    };
+
+    add_text_button(&m_support_set_apply, _L("Apply"),
+                    _L("Copy this set's values into the current process settings"),
+                    ButtonStyle::Confirm, &TabPrint::on_support_set_apply);
+    hsizer->Add(m_support_set_apply, 0, wxRIGHT | wxTOP, em / 2);
+
+    add_icon_button(&m_support_set_edit, "edit",
+                    _L("Edit the selected support set. The current project is not changed."),
+                    &TabPrint::on_support_set_edit);
+    add_icon_button(&m_support_set_save, "save",
+                    _L("Save the current support settings as a support set"),
+                    &TabPrint::on_support_set_save_as);
+    add_icon_button(&m_support_set_delete, "cross",
+                    _L("Delete the selected support set"),
+                    &TabPrint::on_support_set_delete);
+
+    // Groups sits at the right edge of the full-width row, away from the set buttons: it acts on
+    // the object, not on the set.
+    hsizer->AddStretchSpacer(1);
+    add_text_button(&m_support_set_groups, _L("Groups"),
+                    _L("Open the Support groups window for the selected object"),
+                    ButtonStyle::Regular, &TabPrint::on_support_set_groups);
+    hsizer->Add(m_support_set_groups, 0, wxTOP, em / 2);
 
     m_support_set_note = new wxStaticText(parent, wxID_ANY, wxEmptyString);
     m_support_set_note->SetFont(wxGetApp().normal_font());
@@ -3173,12 +3262,19 @@ void TabPrint::clear_pages()
     m_recommended_thin_wall_thickness_description_line = nullptr;
     m_top_bottom_shell_thickness_explanation = nullptr;
 
-    // Ultra (support sets): the page owns these windows, so drop the pointers with it.
+    // Ultra (support sets): the page owns these windows, so drop the pointers with it. The three
+    // icon buttons registered themselves in Tab::m_scaled_buttons for the DPI / dark-mode passes,
+    // and those iterate raw pointers, so they have to come back out before the page is destroyed.
+    for (ScalableButton* btn : { m_support_set_edit, m_support_set_save, m_support_set_delete })
+        if (btn != nullptr)
+            m_scaled_buttons.erase(std::remove(m_scaled_buttons.begin(), m_scaled_buttons.end(), btn),
+                                   m_scaled_buttons.end());
     m_support_set_combo  = nullptr;
     m_support_set_apply  = nullptr;
+    m_support_set_edit   = nullptr;
     m_support_set_save   = nullptr;
-    m_support_set_rename = nullptr;
     m_support_set_delete = nullptr;
+    m_support_set_groups = nullptr;
     m_support_set_note   = nullptr;
     m_support_set_names.clear();
     m_support_set_page_was_active = false;
