@@ -32,7 +32,12 @@ set(_curl_platform_flags
 
 if (WIN32)
   #set(_curl_platform_flags  ${_curl_platform_flags} -DCMAKE_USE_SCHANNEL=ON)
-  set(_curl_platform_flags  ${_curl_platform_flags} -DCMAKE_USE_OPENSSL=ON -DCURL_CA_PATH:STRING=none)
+  # curl puts its own CMake/ directory ahead of ours in CMAKE_MODULE_PATH, so its bundled FindNGHTTP2
+  # (not cmake/modules/FindNGHTTP2.cmake) is what finds the library, and nothing defines NGHTTP2_STATICLIB
+  # for http2.c: the objects then reference __imp_nghttp2_* import stubs that a static build never has.
+  # Pass the define here, together with the flags CMake would have set for MSVC on its own.
+  set(_curl_platform_flags  ${_curl_platform_flags} -DCMAKE_USE_OPENSSL=ON -DCURL_CA_PATH:STRING=none
+    "-DCMAKE_C_FLAGS:STRING=/DWIN32 /D_WINDOWS /W3 /DNGHTTP2_STATICLIB")
 elseif (APPLE)
   set(_curl_platform_flags 
     
