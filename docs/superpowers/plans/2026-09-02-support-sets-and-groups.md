@@ -381,6 +381,11 @@ Nothing in `RemoteAccess`, `RemoteHub`, `StreamPanel` or `resources/web/orca/` w
 
 ## 2c. Stage 3 status (2026-09-04): DONE — the interface follows the group, both gates green
 
+> **Hardware pass (2026-09-05):** the user ran the Stage 3 checklist on the live build fdd5d5ac47 (after
+> `fix/support-group-single-part` and `fix/support-group-filament`): every step passed. UI notes that came out
+> of it: the groups dialog needed more width for the standard header font (0f056be6d4), and the Support set row
+> is being reworked on `feat/support-set-ui` (Groups button, icon buttons, a pop-out set editor).
+
 The first stage that changes what is printed. The shared geometry pipeline — contacts, bases,
 columns, rafts — runs **once and unchanged**; only the interface stage and the interface toolpaths
 became per group, exactly as §3.5/§3.6 of the Stage 3 section describe. Branch
