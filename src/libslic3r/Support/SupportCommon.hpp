@@ -65,6 +65,41 @@ SupportGeneratorLayersPtr generate_support_layers(
     const SupportGeneratorLayersPtr     &interface_layers,
     const SupportGeneratorLayersPtr     &base_interface_layers);
 
+// Ultra (support groups, plan 2026-09-02 Stage 3 3.6): per-group interface parameters plus the
+// per-object-layer claim that decides which piece of a SHARED contact layer belongs to the group.
+// Passing nullptr for `groups` - the default - is exactly today's single-config behaviour, so
+// every call site that does not pass one is unchanged.
+struct SupportGroupToolpaths {
+    // The group's resolved PrintObjectConfig: the object's, with this group's part-level support
+    // overrides applied (PrintObject::support_groups()).
+    const PrintObjectConfig     *config { nullptr };
+    // SupportParameters built from that config.
+    const SupportParameters     *params { nullptr };
+    // Per OBJECT layer. For groups >= 1 this is the group's footprint, expanded by the interface
+    // margin and cut against every lower group, and a shared polygon is INTERSECTED with it. For
+    // group 0 it is the union of all the others, and a shared polygon is what is LEFT after
+    // subtracting it - so the K pieces partition the polygon exactly, with no overlap and no gap.
+    const std::vector<Polygons> *claim  { nullptr };
+    // 1-based support interface filament slot; 0 = "same as the object". When it is non-zero and
+    // differs from the object's, this group's interface goes into SupportLayer::interface_by_extruder
+    // rather than support_fills, which is what schedules the tool change (ToolOrdering.cpp).
+    int                          interface_filament { 0 };
+};
+
+// Ultra (support groups): the object layer a SHARED contact layer sits against. The contact
+// generators do set idx_object_layer_above / _below, but merge_contact_layers keeps only the
+// surviving layer's index, so fall back to the nearest object layer print_z. Returns size_t(-1)
+// only when there are no object layers at all.
+size_t support_group_object_layer_index(const SupportGeneratorLayer &layer, bool use_above,
+                                        const std::vector<coordf_t> &object_layer_zs);
+
+// Ultra (support groups): cut one polygon set down to the piece group `g` owns. Groups >= 1 take
+// the intersection with their own claim; group 0 takes the remainder - everything the others did
+// not claim - so the K pieces partition `src` exactly, with no overlap and no gap. A missing claim
+// gives group 0 everything, which is the conservative direction: geometry is never dropped.
+Polygons support_group_piece(const Polygons &src, const std::vector<Polygons> *claim,
+                             size_t idx_object_layer, size_t g);
+
 // Produce the support G-code.
 // Used by both classic and tree supports.
 void generate_support_toolpaths(
@@ -77,7 +112,11 @@ void generate_support_toolpaths(
     const SupportGeneratorLayersPtr   	&top_contacts,
     const SupportGeneratorLayersPtr   	&intermediate_layers,
 	const SupportGeneratorLayersPtr   	&interface_layers,
-    const SupportGeneratorLayersPtr   	&base_interface_layers);
+    const SupportGeneratorLayersPtr   	&base_interface_layers,
+    // Ultra (support groups): nullptr / empty / a single entry all mean "one config", i.e. exactly
+    // the code this function has always run.
+    const std::vector<SupportGroupToolpaths> *groups = nullptr,
+    const std::vector<coordf_t>              *object_layer_zs = nullptr);
 
 // FN_HIGHER_EQUAL: the provided object pointer has a Z value >= of an internal threshold.
 // Find the first item with Z value >= of an internal threshold of fn_higher_equal.

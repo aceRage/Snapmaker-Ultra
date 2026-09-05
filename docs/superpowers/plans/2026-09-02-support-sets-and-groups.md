@@ -35,7 +35,7 @@ Each stage builds, ships and is testable on its own. Do not start the next stage
 |---|---|---|
 | 1 — Support sets | `SupportSet` model + on-disk store under `<datadir>/user/<id>/support_set/`, "Support set" row on the process tab's Support page (pick / Apply / Save current as… / Rename / Delete), interface-filament type resolution | `test_support_set.cpp` passes (JSON round trip, name sanitising, enumeration, filament-type resolution incl. every fallback); Apply marks the process preset modified and the changed values show in the tab; **no back-end change at all** → the byte-identity script (§3.7) is green on the corpus with an empty diff, trivially |
 | 2 — Groups on parts | `support_group` key, Object-List "Support group ▸" menu on a part and on a multi-selection, the badge, the Support-groups panel, part-level support keys in the settings menu/part tab, the `is_improper_category` fix, 3MF round trip, invalidation plumbing | `test_3mf.cpp` group round trip passes; `test_support_groups.cpp` group-resolution tests pass (K==1 for equal overrides); assigning a group + re-slice invalidates only `posSupportMaterial` (or `posSlice` when §3.6 flips); **byte identity holds for every project in the corpus, including one that carries groups** — the generator still ignores them |
-| 3 — Interface groups, normal supports | per-group masks, per-group `SupportParameters`, per-group `generate_interface_layers`, per-group interface toolpaths + interface filament | K==1 corpus byte-identical (§3.7); the two-part fixture in `test_support_material.cpp` shows different interface extrusion length above part B and unchanged above part A; a soluble-interface group emits its own extruder via `interface_by_extruder`; support generation time within 1.6× of baseline at K=2 on the corpus |
+| 3 — Interface groups, normal supports **(done, §2c)** | per-group masks, per-group `SupportParameters`, per-group `generate_interface_layers`, per-group interface toolpaths + interface filament | K==1 corpus within tolerance (§3.7 as replaced by §2b's gate); the two-part fixture in `test_support_material.cpp` shows different interface extrusion length above part B and unchanged above part A; a soluble-interface group emits its own extruder via `interface_by_extruder`; support generation time within 1.6× of baseline at K=2 on the corpus. Stage 3 added a third gate — `--gate groups` — for the ON-mode cases, which must differ; see §2c |
 | 4 — Tree parity | organic tree: full parity through the same seam; classic tree: per-group interface *fill* only (documented limit) | K==1 corpus byte-identical with `support_type = tree(auto)` and both styles; organic-tree two-part fixture behaves like Stage 3's; classic tree shows per-group roof pattern/spacing/filament and an explicit "interface layer count is object-wide for classic tree supports" notice |
 | 5 — Polish | preview colouring by filament check, empty-group and conflict warnings, docs, `PART_CATEGORY_SETTINGS` "Support" group, tooltip copy | Preview colours the per-group interface with its resolved filament; a group with no parts, a group whose set no longer exists, and a group whose interface filament type cannot be resolved each raise a visible, non-fatal warning; `docs/superpowers/specs/` page written |
 
@@ -373,6 +373,243 @@ isolated data dir, driving a **hidden** instance - ALL PASS:
 - `POST /api/settings/process` and `/settings/process/revert` behave exactly as before.
 
 Nothing in `RemoteAccess`, `RemoteHub`, `StreamPanel` or `resources/web/orca/` was touched.
+
+## 2c. Stage 3 status (2026-09-04): DONE — the interface follows the group, both gates green
+
+The first stage that changes what is printed. The shared geometry pipeline — contacts, bases,
+columns, rafts — runs **once and unchanged**; only the interface stage and the interface toolpaths
+became per group, exactly as §3.5/§3.6 of the Stage 3 section describe. Branch
+`feat/support-sets-stage3`, cut from `feat/ultra-preferences` @ `eadc7ec8ed`.
+
+### What shipped
+
+- **`src/libslic3r/Flow.{hpp,cpp}`** — `support_material_flow`, `support_material_1st_layer_flow` and
+  `support_material_interface_flow` gained a `const PrintObjectConfig&` form; the object-only forms
+  forward with `object->config()`, so all existing call sites are byte-identical.
+- **`src/libslic3r/Support/SupportParameters.hpp`** — `SupportParameters(object, object_config)`,
+  with `SupportParameters(object)` delegating to it. The body moved unchanged; `object_config` was
+  already a local reference, so the diff is three lines plus the flow calls.
+- **`src/libslic3r/Support/SupportLayer.hpp`** — the `uint16_t support_group` tag on
+  `SupportGeneratorLayer`, 0 for everything a single-group object produces.
+- **`src/libslic3r/PrintObjectSlice.cpp`** — `PrintObject::slice_volumes_at_layers(volumes)`, the
+  verbatim body `slice_support_volumes(type)` used to hold; the latter is now a two-liner over it, so
+  enforcer / blocker behaviour cannot have moved.
+- **`src/libslic3r/PrintObject.cpp` / `Print.hpp`** — `PrintObject::support_group_masks()` (groups
+  1..K-1 slice their own volumes; group 0 gets the **complement**, so the masks partition the
+  footprint with no gap) and `PrintObject::has_support_group_interface_filament()`, the predicate the
+  Chameleon pass and `WipingExtrusions` both stand down on. Both are no-ops at K==1 —
+  `support_group_masks()` returns before slicing anything.
+- **`src/libslic3r/Support/SupportMaterial.{hpp,cpp}`** — the per-group interface stage:
+  `support_shared_config()` (the object config with the interface layer counts raised to the max over
+  all groups, §3.5), `support_group_claims()` (per-group footprints expanded by
+  `gap_xy + interface flow width` and cut against every lower group, so the claims are disjoint),
+  `clone_contacts_masked()` (a sibling of each contact layer holding only one group's share, fed to
+  `generate_interface_layers` and **never** to the layer graph), and the K-way loop that replaces the
+  single `generate_interface_layers` call, carving `intermediate_layers` in group order and tagging
+  every layer it produces.
+- **`src/libslic3r/Support/SupportCommon.{hpp,cpp}`** — `SupportGroupToolpaths`,
+  `support_group_object_layer_index()` (with the nearest-`print_z` fallback R3.2 asks for),
+  `support_group_piece()`, and four `groups == nullptr`-guarded edits inside
+  `generate_support_toolpaths`: `LayerCache::nonempty` became a `small_vector`, the sibling interface
+  layers of the other groups are collected at each print_z, `extrude_interface` splits a shared
+  contact layer by claim and fills each piece with its group's pattern / density / flow / angle, and
+  a group that pins its own interface filament emits into its own bucket, which becomes
+  `SupportLayer::interface_by_extruder` **after** the height modulation.
+- **`src/libslic3r/Print.cpp`** — the Chameleon interlock of §3.7, plus
+  `PrintObject::add_support_group_chameleon_warning()` because `active_step_add_warning` is protected
+  and the Chameleon pass is a free function.
+- **`src/libslic3r/GCode/ToolOrdering.cpp`** — R3.5: `is_support_overriddable` returns false for an
+  object with a group interface filament, so `flush_into_support` cannot repaint it.
+- **`tests/fff_print/test_support_material.cpp`** — the two Stage 3 gate fixtures (below).
+- **`tests/data/support_corpus/`** — `twopart_groups_geom.3mf` (new, one filament) and a second
+  profile in `make_group_fixture.py` that builds it; `corpus.json` reclassifies `group_parts` and adds
+  `group_parts_geom` as **ON-mode** cases.
+- **`scripts/support_group_identity.py`** — `--gate groups`, the ON-mode gate.
+
+### The gates
+
+**Off mode — the hard gate.** `scripts/support_group_identity.py` (tolerance, the default) with the
+baseline installed from `feat/ultra-preferences`'s build tree and the candidate from this branch,
+both to scratch prefixes, on an isolated `--datadir`. **Green on all 8 off-mode cases, three passes:**
+
+| case | pass 1 | pass 2 | pass 3 |
+|---|---|---|---|
+| `normal_grid` (4466 segments) | ok | ok | ok |
+| `normal_snug` (2255) | ok | ok | ok |
+| `normal_ledge` (2592) | ok | ok | ok |
+| `soluble_interface` (35647) | ok | ok | ok |
+| `dense_interface` (4964) | ok | ok | ok |
+| `tree_organic` (36339) | ok | ok | ok |
+| `raft` (4726) | ok | ok | ok |
+| `no_support` (1726) | ok | ok | ok |
+
+Every one of them satisfies the criteria exactly: zero changed config rows, zero changed layers, zero
+one-sided layers, segments above the threshold. Note what `tree_organic` being green means — the
+organic tree path calls the very functions this stage rewrote (`generate_interface_layers`,
+`generate_support_toolpaths`) and is untouched by them, which is the foundation Stage 4a builds on.
+
+**On mode — the new gate.** `--gate groups` runs only the cases whose parts carry `support_group` and
+inverts the question: they must **differ**, and only in geometry. Green, three passes, identical
+numbers every time:
+
+| case | verdict |
+|---|---|
+| `group_parts` | `config_rows=0  layers matched=61 identical=55 changed=6  a_only=0 b_only=0  segments=88.40%  dirty_layers=6` — plus the `expect_tool` criterion: **3 `T1` tool changes in the candidate, 0 in the baseline** |
+| `group_parts_geom` | the same six layers and 88.40 % of segments, on **one** filament and with **no** tool change anywhere |
+
+Read together those two lines are the whole claim. `config_rows=0` says the settings did not move —
+the one new key never reaches `full_print_config` (§3.1), so the G-code config block is identical.
+`changed=6` of 61 layers says the geometry did move, and only on the layers carrying part B's support
+interface. `group_parts_geom` proves that happens with a single filament, so it cannot be an artefact
+of filament ordering; `group_parts` adds the tool change on top, which is the interface filament being
+scheduled and emitted end to end.
+
+**Unit gates.** `tests/fff_print/test_support_material.cpp`, `[SupportMaterial][support_groups]`:
+
+1. *per-group interface* — the two-part fixture of the plan's gate item 2. A leg on the bed plus two
+   20 mm cubes floating 10 mm above it, three `MODEL_PART` volumes of one object, 20 mm apart in X.
+   A control run with no overrides asserts `support_groups().size() == 1`; then part B asks for five
+   dense interface layers where the object asks for two sparse ones. Measured over every support
+   layer, by summing `erSupportMaterialInterface` path length either side of the gap: **B's interface
+   grows by more than 30 %, A's stays within 1 % of the control.** The split X is read off the
+   object's own slices rather than assumed, so the test does not depend on where `trafo_centered()`
+   puts the origin.
+2. *per-group interface filament* — the same fixture with `support_interface_filament = 2` on part B:
+   `interface_by_extruder[1]` is non-empty on the layers under B, every entity in it is
+   `erSupportMaterialInterface`, no other extruder is ever registered, and
+   `has_support_group_interface_filament()` is true.
+
+**Suites.** `libslic3r_tests` — 599 cases / 53 725 assertions, the 2 `[!shouldfail]` cases unchanged.
+`fff_print_tests "[SupportGroups]"` (Stage 2's) — 8 cases / 44 assertions, pass.
+`fff_print_tests "[support_groups]"` (new) — 2 cases / 20 assertions, pass. Build clean: 0 `error C`,
+0 `error LNK`.
+
+**Pre-existing and not reachable from this work:** `fff_print_tests` still carries the 9 legacy
+PrusaSlicer-era failures §2b lists, and one of them is in this very file —
+`SCENARIO("SupportMaterial: support_layers_z and contact_distance")` SIGSEGVs at its
+`WHEN("First layer height = 0.4")` branch. It was **verified to crash identically on the
+`feat/ultra-preferences` baseline binary** (same scenario, same branch, same signal), so it predates
+Stage 3. §2b's list should have named it; it does now.
+
+### Deviations from the plan
+
+1. **`group_parts` changed sides.** The plan's Stage 2 gate had it as an off-mode case: the fixture
+   carries `support_interface_top_layers`, `_bottom_layers`, `_spacing` and `_filament`, all tier A,
+   and Stage 2's generator ignored them. Stage 3 makes tier A act, so the case must now differ. It is
+   marked `"groups": true` in `corpus.json`, the default gate skips it by name and says so in its
+   header line, and `--gate groups` claims it. `group_parts_geom` was added so the ON-mode evidence
+   does not rest on a two-filament case alone.
+2. **The ON-mode criterion is a third gate, not a hand-checked diff.** §3.7's "second, cheaper
+   control" suggests using Slice Compare for diagnosis at K==2. It is used as an *assertion* instead:
+   differ, with zero config rows, plus the named tool change present in the candidate and absent from
+   the baseline. That is reproducible and it fails loudly if the feature silently stops working.
+3. **Gate item 3's ToolOrdering half is asserted by the corpus, not by the unit test.** The plan asks
+   the unit test to check that `ToolOrdering` lists the group's extruder on those layers. On the
+   synthetic two-entry filament config a unit fixture can assemble, `ToolOrdering` does not even keep
+   one `LayerTools` per layer (layers go missing from its table and the reorder pass leaves
+   "don't care" entries in place), so such an assertion would be testing the fixture. The claim is
+   instead proven on a real printer profile by the `expect_tool` criterion above — 3 `T1` tool changes
+   in the candidate's G-code, 0 in the baseline's — which is strictly stronger evidence, and the test
+   file says so at the point where the assertion would have been. **Nothing in `ToolOrdering` was
+   changed by this stage**; `interface_by_extruder` is storage it already read for Chameleon.
+4. **Gate item 4 — the two `#if 0` blocks — was not done, and should be struck from the plan.** They
+   are not "API drift": `SupportMaterial: forced support is generated` calls
+   `SupportMaterial::support_layers_z()`, and neither that function nor that class exists anywhere in
+   this tree (`grep -rn support_layers_z src/libslic3r/` is empty); it also uses
+   `support_material_enforce_layers`, which survives only as a legacy alias in `handle_legacy`, plus
+   `print.objects` and `print.default_object_config` as public members. Reviving them means writing
+   two new tests against a different generator, not fixing two compile errors. The suite's missing
+   geometry assertion — the actual reason the plan wanted them — is supplied by the two new fixtures,
+   which measure extrusion length rather than layer Zs.
+5. **Gate item 5 was run with `assert()` re-enabled in one translation unit, not on a Debug build.**
+   No Debug dependencies exist in this tree. See §5 answer 2 for the method and for the positive
+   control that makes the result meaningful rather than vacuous.
+6. **Ironing stays object-wide in this stage.** `support_ironing*` are tier A keys and are stored and
+   resolved per group, but `generate_support_toolpaths` takes its ironing parameters from the shared
+   `SupportParameters`, which is the object's. The plan's §3.6 change list does not cover ironing, and
+   splitting `polys_to_iron` per group is Stage 5 polish; today a group's ironing keys are inert,
+   which is why off-mode is unaffected.
+7. **`interface_filament` is compared against the object's value, and a group matching the object is
+   not routed.** `SupportGroupToolpaths::interface_filament` is the group's raw
+   `support_interface_filament`; the bucket is only used when it is non-zero **and** differs from the
+   object's. A group that merely repeats the object's choice therefore keeps extruding into
+   `support_fills`, which is what the object was going to print with anyway.
+8. **The lowest group's interface layer is still merged into the shared top contact layer.** §3.6
+   item 2 sanctions this explicitly ("keeping the lowest-group one in `layer_cache.interface_layer` so
+   the existing merge logic behaves as before"), and it is why `interface_layers` is `stable_sort`ed
+   after the group loop rather than `sort`ed: at equal `print_z` the groups must stay in group order.
+   The merged polygons are then re-split by claim at extrusion time and land back in their own group.
+
+### Decisions for the reviewer (the plan's risks)
+
+- **R3.1 — the seam at group boundaries.** Accepted, and made explicit. `support_group_claims()`
+  expands each group's footprint by `scale_(gap_xy) + interface flow scaled width` and then subtracts
+  every *lower* group's claim, so the claims are disjoint by construction and the split is a hard clip
+  along that boundary. Group 0 takes the remainder, so nothing is ever dropped. The two knobs R3.1
+  names — the expansion and the group order — are both in that one function, with the reason in a
+  comment. A screenshot of the seam is Stage 5 documentation work.
+- **R3.2 — merged contact layers with no object-layer index.** Handled by
+  `support_group_object_layer_index()`: it uses `idx_object_layer_above` / `_below` when they are set
+  and otherwise binary-searches the nearest object layer `print_z`. Not asserted as "rare" — a Debug
+  counter needs a Debug build (see above) — but the fallback is exact for any contact layer, since a
+  contact sits against the object by definition.
+- **R3.3 — K is not capped at 8.** `LayerCache::nonempty` is now a `small_vector`, which grows, so the
+  capacity argument for the cap is gone. Groups are keyed by resolved config, so K is bounded by the
+  number of *distinct* support configurations a user actually creates. If a cap is still wanted it
+  belongs in the resolver with a UI notice — Stage 5 — not here.
+- **R3.4 — dual-nozzle interface flow.** Not addressed in this stage; a group whose interface filament
+  sits on a different nozzle gets a different interface flow width, which is correct and may not tile
+  with the object's. Stage 5's warning is the mitigation the plan already assigns.
+- **R3.5 — `flush_into_support` repainting the interface.** Done, one clause next to the Chameleon one
+  in `is_support_overriddable`.
+- **R3.6 — group order determinism.** Group order comes from `ModelObject::volumes` order, the
+  interface layers are `stable_sort`ed so equal keys keep it, and the claims are cut against lower
+  groups in that same order. Reordering an object's volumes therefore changes the output at K>1 — the
+  same class of dependency the slicer already has via `clip_multipart_objects`. Worth one line in the
+  Stage 5 docs.
+- **New — the Chameleon interlock raises a warning the user will see.** `chameleon_assign_support_
+  interfaces` now skips an object whose group picks its own interface filament and posts a
+  NON_CRITICAL warning saying so. Both features write `interface_by_extruder`; running both would make
+  the result depend on ordering. The group wins, as §4 decided.
+
+### Manual checklist
+
+Run against a side install (`cmake --install <build> --config Release --prefix <scratch>`), never over
+`build/Snapmaker_Orca` while the user's slicer is running.
+
+1. Load a multi-part object with an overhang over one part. Assign that part a support group
+   (**Support group ▸ New group**) and set the group's *interface layers* to 5 and *interface spacing*
+   to 0 in the part parameter panel. Slice. In the preview, the support interface under that part is
+   visibly denser and deeper than under its neighbour, and the neighbour's is unchanged.
+2. Undo the assignment (**Ctrl+Z**) and re-slice: the preview goes back to a single uniform interface.
+3. On a two-filament printer, give the group a different **interface filament**. Slice: the preview
+   colours that group's support interface with the second filament, the tool changes appear in the
+   G-code preview, and the other part's interface keeps the first filament.
+4. With that group still holding its own interface filament, turn **support filament matching**
+   (Chameleon) on for the object. Slice: a non-critical warning appears saying Chameleon is off for
+   this object because a support group picks its own interface filament, and the group's colour is the
+   one that survives.
+5. Set **flush into support** on as well. The group's interface must keep its colour — no purge
+   material repainted into it.
+6. Give two different parts groups with *identical* values. They collapse into one group (the
+   Support-groups window shows one row), and the output is the same as assigning one group to both.
+7. Set a group's `support_top_z_distance` to 0 on an object whose own value is non-zero. The whole
+   object becomes soluble-interface (§3.6) — this is Stage 2 behaviour, re-check it still holds.
+8. Slice an ordinary project with supports and no groups at all, before and after installing this
+   build, and compare the G-code: it must be the same print. (The automated form of this is the
+   off-mode gate above.)
+
+### What Stage 4 and Stage 5 inherit
+
+Stage 4a is now a small stage: `TreeSupport3D::generate_support_areas` calls the *same* two functions
+this stage made group-aware, so organic-tree parity is (a) building its `SupportParameters` from
+`support_shared_config`, (b) the same per-group `generate_interface_layers` loop with
+`clone_contacts_masked`, and (c) passing the `groups` vector to `generate_support_toolpaths`. R4.1 —
+whether organic-tree contacts carry `idx_object_layer_above` — is already answered defensively by
+`support_group_object_layer_index()`'s nearest-`print_z` fallback. Stage 4b (classic tree roof fill)
+is untouched by this stage and remains as planned. Stage 5 inherits: the preview-colour check, every
+warning in its list, the R3.1 seam screenshot, the R3.6 volume-order note, the classic-tree notice,
+and per-group ironing (deviation 6).
 
 ## 3. Shared contract
 
@@ -748,6 +985,40 @@ Both paths are no-ops when no part carries a support override, which is the Stag
    fallback when `preset_folder != "default"`. Recommendation: the fallback — one extra directory scan,
    and it makes sets behave the way users will expect.
 
+### Answers — all five settled
+
+1. **Settled in Stage 2 (§2b): no, the corpus does not reproduce byte-for-byte.** Same executable on
+   both sides differs on about a third of runs. §3.7's byte identity was replaced by the tolerance
+   gate; `tree_classic` was dropped from the corpus because it is not self-reproducible at all.
+2. **Settled in Stage 3, empirically, and the answer is yes — it trips.** A Debug build is
+   impossible in this tree (`deps/build/OrcaSlicer_dep/usr/local/lib` holds Release import libraries
+   only, 1 debug lib out of 54), so the experiment was run by re-enabling `assert()` in the single
+   translation unit that holds it: `#undef NDEBUG` + `#include <assert.h>` at the top of
+   `SupportCommon.cpp`, in an otherwise ordinary Release build. Undefining `NDEBUG` is ABI-neutral
+   (`_ITERATOR_DEBUG_LEVEL` / `_DEBUG` are untouched), so the object still links against the Release
+   dependencies. Two runs:
+   - **positive control** — feed the per-group contact clones into `top_contacts` before
+     `generate_support_layers`, i.e. do exactly the thing the design refuses to do, and run the K==2
+     fixture: `Assertion failed: num_top_contacts <= 1, ... SupportCommon.cpp, line 1458`. The
+     assumption behind "split contacts at extrusion time" is therefore **measured, not assumed**.
+   - **the shipped design** — same assert-enabled build, no probe, both K==2 fixtures plus the whole
+     `[SupportGroups]` suite: all pass. `Test::verify_nonempty` (the other `#ifndef NDEBUG` block, at
+     the end of `generate_support_toolpaths`) is active in that build too and does not fire. That is
+     **Stage 3 gate item 5**, run the only way this tree allows.
+3. **Settled: `boost::container::small_vector<LayerCacheItem, 5>`, no output change at K==1.** The
+   same inline capacity, so a single-group object still allocates nothing, and it spills to the heap
+   beyond it. The off-mode tolerance gate is the proof: green on all 8 cases, three passes.
+4. **Settled: the masks are cheap — no caching needed.** On the largest corpus model, with the
+   slicer's own `--debug 3` timestamps around `"Support generator - Start"` … `" - End"`, the
+   mask + claim prologue measures **1 ms** against a 11–28 ms support-generation window, i.e. well
+   under §5.4's 10 % trigger, and the whole window at K==2 is 0.58–0.99× the K==1 baseline over three
+   repetitions (**Stage 3 gate item 6** wanted < 1.6×). Caveat, stated plainly: at 20 ms the corpus
+   models are too small for the ratio to mean much — run-to-run noise dominates and that is why it
+   sometimes lands below 1.0. The number that is solid is the prologue's 1 ms, which is what §5.4
+   actually asked about, and `PrintObject::support_group_masks()` returns before slicing anything at
+   all when K==1, so off-mode pays exactly zero.
+5. **Settled in Stage 1 (§2a deviation 4): the read-only `default` fallback**, as recommended.
+
 ---
 
 ## Stage 1 — Support sets (UI + storage), no back-end change
@@ -1097,6 +1368,10 @@ Object-List menu / SupportGroupsDialog
 ---
 
 ## Stage 3 — Interface-only support groups in the normal support generator
+
+> **Shipped 2026-09-04 on `feat/support-sets-stage3`. Read §2c for what was actually built, the
+> deviations, and both gates' results. The design below is what was implemented, with the deviations
+> §2c lists.**
 
 The shared geometry pipeline runs **once, unchanged** (so contacts, bases and columns are bit-for-bit
 what they are today); only the *interface* stage and the *interface toolpaths* become per-group. This is

@@ -211,15 +211,23 @@ double Flow::mm3_per_mm() const
     return res;
 }
 
-Flow support_material_flow(const PrintObject *object, float layer_height)
+// Ultra (support groups): the body now reads `object_config` instead of object->config(), so a
+// support group's resolved config can be passed in. The object-only form below forwards with
+// object->config() and is therefore byte-identical to what this function was.
+Flow support_material_flow(const PrintObject *object, const PrintObjectConfig &object_config, float layer_height)
 {
     return Flow::new_from_config_width(
         frSupportMaterial,
         // The width parameter accepted by new_from_config_width is of type ConfigOptionFloatOrPercent, the Flow class takes care of the percent to value substitution.
-        (object->config().support_line_width.value > 0) ? object->config().support_line_width : object->config().line_width,
-        // if object->config().support_filament == 0 (which means to not trigger tool change, but use the current extruder instead), get_at will return the 0th component.
-        float(object->print()->config().nozzle_diameter.get_at(object->config().support_filament-1)),
-        (layer_height > 0.f) ? layer_height : float(object->config().layer_height.value));
+        (object_config.support_line_width.value > 0) ? object_config.support_line_width : object_config.line_width,
+        // if object_config.support_filament == 0 (which means to not trigger tool change, but use the current extruder instead), get_at will return the 0th component.
+        float(object->print()->config().nozzle_diameter.get_at(object_config.support_filament-1)),
+        (layer_height > 0.f) ? layer_height : float(object_config.layer_height.value));
+}
+
+Flow support_material_flow(const PrintObject *object, float layer_height)
+{
+    return support_material_flow(object, object->config(), layer_height);
 }
 //BBS
 Flow support_transition_flow(const PrintObject* object)
@@ -229,27 +237,37 @@ Flow support_transition_flow(const PrintObject* object)
     return Flow::bridging_flow(dmr, dmr);
 }
 
-Flow support_material_1st_layer_flow(const PrintObject *object, float layer_height)
+Flow support_material_1st_layer_flow(const PrintObject *object, const PrintObjectConfig &object_config, float layer_height)
 {
     const PrintConfig &print_config = object->print()->config();
-    const auto &width = (print_config.initial_layer_line_width.value > 0) ? print_config.initial_layer_line_width : object->config().support_line_width;
+    const auto &width = (print_config.initial_layer_line_width.value > 0) ? print_config.initial_layer_line_width : object_config.support_line_width;
     return Flow::new_from_config_width(
         frSupportMaterial,
         // The width parameter accepted by new_from_config_width is of type ConfigOptionFloatOrPercent, the Flow class takes care of the percent to value substitution.
-        (width.value > 0) ? width : object->config().line_width,
-        float(print_config.nozzle_diameter.get_at(object->config().support_filament-1)),
+        (width.value > 0) ? width : object_config.line_width,
+        float(print_config.nozzle_diameter.get_at(object_config.support_filament-1)),
         (layer_height > 0.f) ? layer_height : float(print_config.initial_layer_print_height.value));
 }
 
-Flow support_material_interface_flow(const PrintObject *object, float layer_height)
+Flow support_material_1st_layer_flow(const PrintObject *object, float layer_height)
+{
+    return support_material_1st_layer_flow(object, object->config(), layer_height);
+}
+
+Flow support_material_interface_flow(const PrintObject *object, const PrintObjectConfig &object_config, float layer_height)
 {
     return Flow::new_from_config_width(
         frSupportMaterialInterface,
         // The width parameter accepted by new_from_config_width is of type ConfigOptionFloatOrPercent, the Flow class takes care of the percent to value substitution.
-        (object->config().support_line_width > 0) ? object->config().support_line_width : object->config().line_width,
-        // if object->config().support_interface_filament == 0 (which means to not trigger tool change, but use the current extruder instead), get_at will return the 0th component.
-        float(object->print()->config().nozzle_diameter.get_at(object->config().support_interface_filament-1)),
-        (layer_height > 0.f) ? layer_height : float(object->config().layer_height.value));
+        (object_config.support_line_width > 0) ? object_config.support_line_width : object_config.line_width,
+        // if object_config.support_interface_filament == 0 (which means to not trigger tool change, but use the current extruder instead), get_at will return the 0th component.
+        float(object->print()->config().nozzle_diameter.get_at(object_config.support_interface_filament-1)),
+        (layer_height > 0.f) ? layer_height : float(object_config.layer_height.value));
+}
+
+Flow support_material_interface_flow(const PrintObject *object, float layer_height)
+{
+    return support_material_interface_flow(object, object->config(), layer_height);
 }
 
 }

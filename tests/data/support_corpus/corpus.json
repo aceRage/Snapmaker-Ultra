@@ -35,6 +35,13 @@
     "layers, run after run. Organic tree, normal supports and rafts are all stable through the",
     "tolerance gate; only the classic tree path is not. 5.1 says to drop such a case and say so.",
     "",
+    "From Stage 3 on the corpus has TWO gates. Cases marked \"groups\": true carry support_group",
+    "data that the generator now acts on, so they are EXCLUDED from the default tolerance gate and",
+    "run under --gate groups instead, where they must DIFFER from the baseline (and only in",
+    "geometry: zero changed config rows). Every other case is off-mode and must stay within",
+    "tolerance. Stage 2's note below is kept for the record; the fixture it says did not exist now",
+    "does, and make_group_fixture.py builds both of its profiles.",
+    "",
     "There is deliberately NO case here carrying support_group data. Writing a loadable multi-part",
     "fixture by hand did not work: a plain core-spec 3MF built from <component>s imports as one",
     "ModelObject PER component, and per-part settings keyed on either the assembly object id or the",
@@ -119,7 +126,9 @@
     },
     {
       "name": "group_parts",
-      "comment": "A project whose parts carry support_group and part-level support keys, and which the SLICER ITSELF produced - see make_group_fixture.py. Stage 2's generator ignores those keys, so this case must come out exactly like the baseline, a build that does not even know support_group and drops it on load. That is the whole off-mode claim, measured. It deliberately carries no support_top_z_distance: that one ACTS in Stage 2 through the soluble rule, and a case carrying it would rightly differ.",
+      "groups": true,
+      "expect_tool": "T1",
+      "comment": "ON MODE from Stage 3 on. A project whose parts carry support_group and part-level support keys, produced by the SLICER ITSELF - see make_group_fixture.py. Through Stage 2 this was an OFF-mode case: the generator ignored those keys, so it had to come out exactly like a baseline that does not even know support_group and drops it on load. Stage 3 makes the tier A keys ACT, so the case moved to the groups gate: it must now DIFFER from the baseline, with zero changed config rows - the settings did not move, the geometry did - and the candidate must schedule a tool change to the group's own interface filament that the baseline never has. It deliberately carries no support_top_z_distance: that one acts through the soluble rule of 3.6 and would change far more than the interface.",
       "models": [
         "tests/data/support_corpus/twopart_groups.3mf"
       ],
@@ -131,6 +140,19 @@
       "filaments": [
         "Generic PLA",
         "Generic PLA"
+      ]
+    },
+    {
+      "name": "group_parts_geom",
+      "groups": true,
+      "comment": "ON MODE, one filament. The same group as group_parts minus support_interface_filament, so the only thing that can move is the support INTERFACE geometry - no tool change, no second extruder, nothing that could be mistaken for a filament-ordering effect. The cleanest single statement of what Stage 3 does.",
+      "models": [
+        "tests/data/support_corpus/twopart_groups_geom.3mf"
+      ],
+      "args": [
+        "--enable-support=1",
+        "--support-type=normal(auto)",
+        "--support-style=grid"
       ]
     },
     {

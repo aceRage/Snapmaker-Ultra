@@ -1882,6 +1882,15 @@ bool WipingExtrusions::is_support_overriddable(const ExtrusionRole role, const P
     if (object.config().support_filament_matching.value)
         return false;
 
+    // Ultra (support groups, plan 2026-09-02 Stage 3 R3.5): the same pin, for the same reason, when
+    // a support group picks its own interface filament. That group's interface lives in
+    // SupportLayer::interface_by_extruder and never reaches support_fills, but what IS left in
+    // support_fills sits right next to it - and mark_wiping_extrusions would happily claim it and
+    // repaint it with an arbitrary purge-target extruder, undoing a deliberately chosen interface
+    // colour on the layers that matter most.
+    if (object.has_support_group_interface_filament())
+        return false;
+
     if (role == erMixed) {
         return object.config().support_filament == 0 || object.config().support_interface_filament == 0;
     }

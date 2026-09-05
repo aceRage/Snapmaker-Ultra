@@ -3330,6 +3330,62 @@ std::vector<PrintObject::SupportGroup> PrintObject::support_groups() const
     return groups;
 }
 
+void PrintObject::support_group_masks(std::vector<SupportGroup> &groups) const
+{
+    // Off mode: a single group means today's code path, and today's code path slices nothing
+    // extra. This early return is what keeps the mask machinery free for every existing project.
+    if (groups.size() <= 1)
+        return;
+
+    const size_t num_layers = this->layers().size();
+    // Groups 1..K-1 own exactly their own volumes.
+    for (size_t g = 1; g < groups.size(); ++ g) {
+        groups[g].mask = this->slice_volumes_at_layers(groups[g].volumes);
+        groups[g].mask.resize(num_layers);
+    }
+    // Group 0 - the default group - is the COMPLEMENT: everything the object's model parts cover
+    // that no other group claimed. Taking the complement rather than group 0's own volumes is what
+    // makes the K masks a partition with no gap, so a contact polygon that spills past every part
+    // outline still belongs to exactly one group.
+    std::vector<const ModelVolume*> all_parts;
+    for (const ModelVolume *volume : this->model_object()->volumes)
+        if (volume != nullptr && volume->is_model_part())
+            all_parts.emplace_back(volume);
+    std::vector<Polygons> all = this->slice_volumes_at_layers(all_parts);
+    all.resize(num_layers);
+    groups[0].mask.assign(num_layers, Polygons());
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers),
+        [&groups, &all](const tbb::blocked_range<size_t> &range) {
+            for (size_t i = range.begin(); i < range.end(); ++ i) {
+                Polygons others;
+                for (size_t g = 1; g < groups.size(); ++ g)
+                    append(others, groups[g].mask[i]);
+                groups[0].mask[i] = others.empty() ? std::move(all[i]) : diff(all[i], union_(others));
+            }
+        });
+}
+
+void PrintObject::add_support_group_chameleon_warning(const std::string &message)
+{
+    this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, message);
+}
+
+bool PrintObject::has_support_group_interface_filament() const
+{
+    const ModelObject *object = this->model_object();
+    if (object == nullptr)
+        return false;
+    const int object_filament = m_config.support_interface_filament.value;
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || ! volume->is_model_part())
+            continue;
+        if (const ConfigOption *opt = volume->config.option("support_interface_filament"); opt != nullptr)
+            if (int slot = opt->getInt(); slot != 0 && slot != object_filament)
+                return true;
+    }
+    return false;
+}
+
 const std::string                                                    key_extruder { "extruder" };
 static constexpr const std::initializer_list<const std::string_view> keys_extruders { "sparse_infill_filament"sv, "solid_infill_filament"sv, "wall_filament"sv };
 

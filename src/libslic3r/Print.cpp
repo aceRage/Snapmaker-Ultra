@@ -3190,6 +3190,15 @@ static void chameleon_assign_support_interfaces(Print &print)
         // per-layer chameleon_interface_visited guard below on each one.
         if (object->get_shared_object() != nullptr)
             continue;
+        // Ultra (support groups, plan 2026-09-02 Stage 3 3.7): a support group that pins its own
+        // support-interface filament writes the very same SupportLayer::interface_by_extruder map
+        // this pass owns. Letting both run would make the result depend on which ran last, so the
+        // explicit per-part assignment wins and Chameleon stands down for this object.
+        if (object->has_support_group_interface_filament()) {
+            object->add_support_group_chameleon_warning(
+                _u8L("Support filament matching is off for this object because one of its support groups picks its own interface filament."));
+            continue;
+        }
 
         const unsigned object_default_extruder = chameleon_object_default_extruder(print, *object);
         // Spec-mandated fallback: the object's resolved interface extruder, mirroring

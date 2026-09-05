@@ -1,7 +1,20 @@
 #include <catch2/catch.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <functional>
+#include <limits>
+#include <utility>
+#include <vector>
+
+#include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/Print.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/GCode/ToolOrdering.hpp"
 
 #include "test_data.hpp" // get access to init_print, etc
@@ -315,3 +328,210 @@ SCENARIO("SupportMaterial: Checking bridge speed", "[SupportMaterial]")
 }
 
 #endif
+
+
+// ============================================================================================
+// Ultra (support groups) - Stage 3 gate, items 2 and 3.
+// docs/superpowers/plans/2026-09-02-support-sets-and-groups.md, Stage 3 "Gate".
+//
+// The first tests in this suite that assert support GEOMETRY rather than layer Zs or a predicate:
+// they measure the length of the erSupportMaterialInterface extrusions landing under each part of a
+// two-part object, and require that a support group changes its own part's interface and leaves the
+// other part's exactly where it was.
+// ============================================================================================
+
+namespace {
+
+// A leg on the bed plus two cubes floating 10 mm above it, as THREE MODEL_PART volumes of ONE
+// object. The cubes have a full flat underside, so normal supports build a large, easily measured
+// interface under each of them, and they sit 20 mm apart in X so the two interfaces can be told
+// apart by coordinate. The leg is what stops ensure_on_bed() from simply dropping the cubes onto
+// the bed; it carries no overrides, so it lands in the default group along with cube A.
+void make_floating_two_part_print(Slic3r::Print                                        &print,
+                                  Slic3r::Model                                        &model,
+                                  const Slic3r::DynamicPrintConfig                     &config,
+                                  const std::function<void(ModelObject &)>             &tweak)
+{
+    ModelObject *object = model.add_object();
+    object->name = "floating_two_part";
+    object->add_volume(Slic3r::make_cube(2., 2., 10.));                 // the leg, on the bed
+    TriangleMesh a = Slic3r::make_cube(20., 20., 10.);
+    a.translate(0.f, 0.f, 10.f);
+    object->add_volume(a);                                              // part A, floating
+    TriangleMesh b = Slic3r::make_cube(20., 20., 10.);
+    b.translate(40.f, 0.f, 10.f);
+    object->add_volume(b);                                              // part B, floating
+    object->add_instance();
+    if (tweak)
+        tweak(*object);
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+    print.set_status_silent();
+    print.process();
+}
+
+// The object config every case below starts from. Built fresh each time rather than kept in a
+// namespace-scope initializer_list, whose backing array is easy to get wrong.
+DynamicPrintConfig group_fixture_config()
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "enable_support",                  "1" },
+        { "support_type",                    "normal(auto)" },
+        { "support_style",                   "grid" },
+        { "support_interface_top_layers",    "2" },
+        { "support_interface_bottom_layers", "2" },
+        { "support_interface_spacing",       "0.5" },
+        { "support_on_build_plate_only",     "0" },
+    });
+    return config;
+}
+
+// The X coordinate half way between the two floating cubes, in the frame the support fills live
+// in. Read off the object's own slices rather than assumed, because PrintObject slices through
+// trafo_centered() and a test should not have to know where that puts the origin.
+double split_x_between_parts(const PrintObject &object)
+{
+    for (const Layer *layer : object.layers()) {
+        if (layer->print_z < 12. || layer->lslices.size() < 2)
+            continue;
+        std::vector<BoundingBox> bboxes;
+        for (const ExPolygon &island : layer->lslices)
+            bboxes.emplace_back(get_extents(island));
+        std::sort(bboxes.begin(), bboxes.end(),
+                  [](const BoundingBox &l, const BoundingBox &r) { return l.min.x() < r.min.x(); });
+        return 0.5 * (unscale<double>(bboxes.front().max.x()) + unscale<double>(bboxes.back().min.x()));
+    }
+    return 0.;
+}
+
+void sum_interface_length(const ExtrusionEntityCollection &collection, double split_x,
+                          double &left, double &right)
+{
+    for (const ExtrusionEntity *ee : collection.entities) {
+        if (const auto *eec = dynamic_cast<const ExtrusionEntityCollection*>(ee)) {
+            sum_interface_length(*eec, split_x, left, right);
+            continue;
+        }
+        if (ee->role() != erSupportMaterialInterface)
+            continue;
+        (unscale<double>(ee->first_point().x()) < split_x ? left : right) += unscale<double>(ee->length());
+    }
+}
+
+// Interface extrusion length under part A (left) and part B (right), over every support layer.
+std::pair<double, double> interface_lengths(const PrintObject &object)
+{
+    const double split_x = split_x_between_parts(object);
+    double left = 0., right = 0.;
+    for (const SupportLayer *support_layer : object.support_layers())
+        sum_interface_length(support_layer->support_fills, split_x, left, right);
+    return std::make_pair(left, right);
+}
+
+} // namespace
+
+TEST_CASE("SupportMaterial: per-group interface", "[SupportMaterial][support_groups]")
+{
+    // Control: no part carries an override, so PrintObject::support_groups() collapses to a single
+    // group and the generator takes exactly today's path.
+    double control_a = 0., control_b = 0.;
+    {
+        Slic3r::Print print;
+        Slic3r::Model model;
+        make_floating_two_part_print(print, model, group_fixture_config(), nullptr);
+        REQUIRE(! print.objects().empty());
+        const PrintObject &object = *print.objects().front();
+        REQUIRE(object.support_groups().size() == 1);
+        REQUIRE(! object.support_layers().empty());
+        std::tie(control_a, control_b) = interface_lengths(object);
+        // The fixture has to produce a measurable interface under BOTH parts, or nothing below
+        // means anything.
+        REQUIRE(control_a > 1.);
+        REQUIRE(control_b > 1.);
+    }
+
+    // Part B asks for five dense interface layers where the object asks for two sparse ones.
+    double grouped_a = 0., grouped_b = 0.;
+    {
+        Slic3r::Print print;
+        Slic3r::Model model;
+        make_floating_two_part_print(print, model, group_fixture_config(), [](ModelObject &object) {
+            ModelVolume *part_b = object.volumes.back();
+            part_b->config.set_key_value("support_group", new ConfigOptionString("B"));
+            part_b->config.set_key_value("support_interface_top_layers", new ConfigOptionInt(5));
+            part_b->config.set_key_value("support_interface_spacing", new ConfigOptionFloat(0.));
+        });
+        REQUIRE(! print.objects().empty());
+        const PrintObject &object = *print.objects().front();
+        // The default group (the leg and part A) plus B's group.
+        REQUIRE(object.support_groups().size() == 2);
+        REQUIRE(object.support_groups()[1].name == "B");
+        REQUIRE(object.support_groups()[1].volumes.size() == 1);
+        std::tie(grouped_a, grouped_b) = interface_lengths(object);
+    }
+
+    // B's interface got denser and deeper: a big, unmistakable increase.
+    CHECK(grouped_b > control_b * 1.30);
+    // A's interface did not move. The shared pipeline - contacts, bases, columns - ran once and
+    // unchanged, and A is still filled with the object's own interface parameters.
+    CHECK(std::abs(grouped_a - control_a) <= control_a * 0.01);
+}
+
+TEST_CASE("SupportMaterial: per-group interface filament", "[SupportMaterial][support_groups]")
+{
+    DynamicPrintConfig config = group_fixture_config();
+    // A second filament has to exist for a group to be able to pick it. filament_diameter is what
+    // ToolOrdering counts physical extruders from, so it has to grow with nozzle_diameter.
+    config.set_deserialize_strict({
+        { "nozzle_diameter",   "0.4,0.4" },
+        { "filament_diameter", "1.75,1.75" },
+        { "filament_type",     "PLA;PLA" },
+        { "filament_soluble",  "0,0" },
+    });
+
+    Slic3r::Print print;
+    Slic3r::Model model;
+    make_floating_two_part_print(print, model, config, [](ModelObject &object) {
+        ModelVolume *part_b = object.volumes.back();
+        part_b->config.set_key_value("support_group", new ConfigOptionString("B"));
+        part_b->config.set_key_value("support_interface_filament", new ConfigOptionInt(2));
+    });
+    REQUIRE(! print.objects().empty());
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.support_groups().size() == 2);
+    // The predicate both the Chameleon pass and WipingExtrusions stand down on (Stage 3 3.7, R3.5).
+    CHECK(object.has_support_group_interface_filament());
+
+    size_t layers_with_second_extruder = 0;
+    double moved_length = 0.;
+    for (const SupportLayer *support_layer : object.support_layers()) {
+        auto it = support_layer->interface_by_extruder.find(1); // 0-based key: filament 2
+        if (it == support_layer->interface_by_extruder.end() || it->second.entities.empty())
+            continue;
+        ++ layers_with_second_extruder;
+        for (const ExtrusionEntity *ee : it->second.entities) {
+            moved_length += unscale<double>(ee->length());
+            // Only B's INTERFACE may be routed to the second extruder, never a base extrusion.
+            CHECK(ee->role() == erSupportMaterialInterface);
+        }
+        // Nothing but that one extruder is ever registered here.
+        for (const auto &kv : support_layer->interface_by_extruder)
+            CHECK(kv.first == 1u);
+    }
+    // The interface under B left support_fills and went to its own extruder.
+    CHECK(layers_with_second_extruder > 0);
+    CHECK(moved_length > 1.);
+
+    // The other half of the plan's gate item 3 - "ToolOrdering lists that extruder on those
+    // layers" - is NOT asserted here, and deliberately so. ToolOrdering's layer table is built
+    // from a real printer profile's filament vectors and filament map; on the synthetic two-entry
+    // config this fixture can put together it does not even keep one LayerTools per layer, so an
+    // assertion over it would be testing the fixture rather than the feature. The claim is instead
+    // proven end to end, on a real profile, by the corpus gate: scripts/support_group_identity.py
+    // --gate groups requires the group_parts case's expect_tool ("T1") to appear in the candidate's
+    // G-code and NOT in the baseline's - i.e. the tool change is actually scheduled and emitted.
+    // Nothing in ToolOrdering was changed by this stage; interface_by_extruder is storage it
+    // already read for Chameleon (ToolOrdering.cpp collect_extruders).
+}

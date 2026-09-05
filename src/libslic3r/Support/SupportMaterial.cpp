@@ -329,13 +329,124 @@ static Polygons contours_simplified(const Vec2i32 &grid_size, const double pixel
 }
 #endif // SUPPORT_USE_AGG_RASTERIZER
 
+// Ultra (support groups, plan 2026-09-02 Stage 3 3.5): the config the SHARED SupportParameters is
+// built from. It is the object's own, with the interface layer counts raised to the max over all
+// groups. Reason: SupportParameters collapses support_material_interface_flow into
+// support_material_flow when support_interface_top_layers == 0, and
+// support_material_bottom_interface_flow - which decides the bottom-contact layer HEIGHTS, i.e.
+// shared geometry - is derived from it. Taking the max keeps the interface flow alive whenever ANY
+// group wants interfaces, and equals the object's own value when there is a single group, which is
+// what keeps the off-mode output where it is. support_interface_filament deliberately stays the
+// OBJECT's, so a group's filament choice can never move a bottom-contact layer height.
+static PrintObjectConfig support_shared_config(const PrintObject &object,
+                                               const std::vector<PrintObject::SupportGroup> &groups)
+{
+    PrintObjectConfig config = object.config();
+    if (groups.size() <= 1)
+        return config;
+    // -1 in support_interface_bottom_layers means "same as top"; resolve it before taking a max.
+    auto resolved_bottom = [](const PrintObjectConfig &c) {
+        return c.support_interface_bottom_layers.value < 0 ? std::max(0, c.support_interface_top_layers.value)
+                                                           : c.support_interface_bottom_layers.value;
+    };
+    int top    = config.support_interface_top_layers.value;
+    int bottom = resolved_bottom(config);
+    for (const PrintObject::SupportGroup &group : groups) {
+        top    = std::max(top,    group.config.support_interface_top_layers.value);
+        bottom = std::max(bottom, resolved_bottom(group.config));
+    }
+    config.support_interface_top_layers.value    = top;
+    config.support_interface_bottom_layers.value = bottom;
+    return config;
+}
+
+// Ultra (support groups, plan Stage 3 3.5 / R3.1): turn the raw per-group masks into DISJOINT
+// per-object-layer claims. Every group's footprint is expanded by `e` - the XY gap plus one
+// interface extrusion width - because a contact polygon is inflated well past the part outline it
+// supports; the expansion is then cut against every LOWER group, so the claims never overlap and
+// the split is a hard clip along the (expanded) mask boundary. claims[0] holds the union of all of
+// them: group 0 takes what is left of any shared polygon, so the K pieces cover it exactly.
+// The expansion and the group order are the two knobs behind the seam R3.1 describes.
+static std::vector<std::vector<Polygons>> support_group_claims(
+    const std::vector<PrintObject::SupportGroup> &groups, float expansion, size_t num_layers)
+{
+    std::vector<std::vector<Polygons>> claims(groups.size(), std::vector<Polygons>(num_layers));
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers),
+        [&groups, &claims, expansion](const tbb::blocked_range<size_t> &range) {
+            for (size_t i = range.begin(); i < range.end(); ++ i) {
+                Polygons taken;
+                for (size_t g = 1; g < groups.size(); ++ g) {
+                    Polygons c;
+                    if (i < groups[g].mask.size() && ! groups[g].mask[i].empty())
+                        c = expand(groups[g].mask[i], expansion);
+                    if (! c.empty() && ! taken.empty())
+                        c = diff(c, taken);
+                    if (! c.empty())
+                        append(taken, c);
+                    claims[g][i] = std::move(c);
+                }
+                claims[0][i] = taken.empty() ? Polygons() : union_(taken);
+            }
+        });
+    return claims;
+}
+
+// Ultra (support groups, plan Stage 3 3.5): a sibling of every contact layer holding only the part
+// of it group `g` owns. The clones are input to generate_interface_layers and are NEVER added to
+// the layer graph, so generate_support_layers' assert(num_top_contacts <= 1) is untouched - which
+// is exactly why the plan splits contacts at extrusion time and not here.
+static SupportGeneratorLayersPtr clone_contacts_masked(
+    const SupportGeneratorLayersPtr &contacts,
+    size_t                           g,
+    const std::vector<Polygons>     &claim,
+    const std::vector<coordf_t>     &object_layer_zs,
+    SupportGeneratorLayerStorage    &layer_storage,
+    bool                             use_above)
+{
+    SupportGeneratorLayersPtr out;
+    out.reserve(contacts.size());
+    for (SupportGeneratorLayer *src : contacts) {
+        const size_t idx = support_group_object_layer_index(*src, use_above, object_layer_zs);
+        Polygons polygons = support_group_piece(src->polygons, &claim, idx, g);
+        if (polygons.empty())
+            continue;
+        SupportGeneratorLayer &dst = layer_storage.allocate(src->layer_type);
+        dst.print_z                = src->print_z;
+        dst.bottom_z               = src->bottom_z;
+        dst.height                 = src->height;
+        dst.bridging               = src->bridging;
+        dst.idx_object_layer_above = src->idx_object_layer_above;
+        dst.idx_object_layer_below = src->idx_object_layer_below;
+        dst.support_group          = uint16_t(g);
+        dst.polygons               = std::move(polygons);
+        // Snug supports project *overhang_polygons rather than polygons, and dereference it
+        // unconditionally, so every optional polygon set travels with the clone.
+        auto mask_ptr = [&claim, idx, g](const std::unique_ptr<Polygons> &s, std::unique_ptr<Polygons> &d) {
+            if (s)
+                d = std::make_unique<Polygons>(support_group_piece(*s, &claim, idx, g));
+        };
+        mask_ptr(src->contact_polygons,  dst.contact_polygons);
+        mask_ptr(src->overhang_polygons, dst.overhang_polygons);
+        mask_ptr(src->enforcer_polygons, dst.enforcer_polygons);
+        out.emplace_back(&dst);
+    }
+    return out;
+}
+
 PrintObjectSupportMaterial::PrintObjectSupportMaterial(const PrintObject *object, const SlicingParameters &slicing_params) :
     m_print_config          (&object->print()->config()),
     m_object_config         (&object->config()),
     m_slicing_params        (slicing_params),
-    m_support_params        (*object),
+    m_groups                (object->support_groups()),
+    m_shared_config         (support_shared_config(*object, m_groups)),
+    m_support_params        (*object, m_shared_config),
 	m_object                (object)
 {
+    // One SupportParameters per group. At K == 1 this is a single copy of the object's own and
+    // nothing reads it, because every group-aware branch is guarded on m_groups.size() > 1.
+    m_group_params.reserve(m_groups.size());
+    for (const PrintObject::SupportGroup &group : m_groups)
+        m_group_params.emplace_back(*object, group.config);
 }
 
 // Using the std::deque as an allocator.
@@ -382,6 +493,23 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     // Layer instances will be allocated by std::deque and they will be kept until the end of this function call.
     // The layers will be referenced by various LayersPtr (of type std::vector<Layer*>)
     SupportGeneratorLayerStorage layer_storage;
+
+    // Ultra (support groups, plan 2026-09-02 Stage 3 3.2): the per-group masks and the disjoint
+    // claims derived from them. support_group_masks() returns immediately when there is a single
+    // group, so a project that carries no support_group data pays nothing here - not one extra
+    // mesh slice, not one extra boolean.
+    std::vector<coordf_t> object_layer_zs;
+    object_layer_zs.reserve(object.layers().size());
+    for (const Layer *layer : object.layers())
+        object_layer_zs.emplace_back(layer->print_z);
+    if (m_groups.size() > 1) {
+        object.support_group_masks(m_groups);
+        // The margin a contact polygon is inflated by past the outline of the part it supports.
+        const float expansion = float(scale_(m_support_params.gap_xy)) +
+                                float(m_support_params.support_material_interface_flow.scaled_width());
+        m_group_claims = support_group_claims(m_groups, expansion, object.layers().size());
+        BOOST_LOG_TRIVIAL(info) << "Support generator - " << m_groups.size() << " support groups";
+    }
 
     BOOST_LOG_TRIVIAL(info) << "Support generator - Creating top contacts";
 
@@ -477,7 +605,42 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     // Propagate top / bottom contact layers to generate interface layers 
     // and base interface layers (for soluble interface / non souble base only)
 	SupportGeneratorLayersPtr empty_layers;
-    auto [interface_layers, base_interface_layers] = generate_interface_layers(*m_object_config, m_support_params, bottom_contacts, top_contacts, empty_layers, empty_layers, intermediate_layers, layer_storage);
+    SupportGeneratorLayersPtr interface_layers, base_interface_layers;
+    if (m_group_claims.empty()) {
+        // Off mode - one group, i.e. every project that carries no support_group data. Literally
+        // the call this branch replaced.
+        std::tie(interface_layers, base_interface_layers) = generate_interface_layers(
+            *m_object_config, m_support_params, bottom_contacts, top_contacts,
+            empty_layers, empty_layers, intermediate_layers, layer_storage);
+    } else {
+        // Ultra (support groups, plan Stage 3 3.5): the shared pipeline above ran ONCE and is
+        // untouched - contacts, bases and columns are what they have always been. Only the
+        // interface stage is per group: each group projects only the contacts over its own parts,
+        // with its own SupportParameters, and carves its interface out of what the previous groups
+        // left in intermediate_layers (generate_interface_layers already subtracts from them).
+        for (size_t g = 0; g < m_groups.size(); ++ g) {
+            const SupportParameters &params_g = m_group_params[g];
+            if (! params_g.has_interfaces())
+                continue;
+            SupportGeneratorLayersPtr top_g    = clone_contacts_masked(top_contacts,    g, m_group_claims[g], object_layer_zs, layer_storage, true);
+            SupportGeneratorLayersPtr bottom_g = clone_contacts_masked(bottom_contacts, g, m_group_claims[g], object_layer_zs, layer_storage, false);
+            auto [iface_g, base_iface_g] = generate_interface_layers(
+                m_groups[g].config, params_g, bottom_g, top_g, empty_layers, empty_layers,
+                intermediate_layers, layer_storage);
+            for (SupportGeneratorLayer *l : iface_g)      l->support_group = uint16_t(g);
+            for (SupportGeneratorLayer *l : base_iface_g) l->support_group = uint16_t(g);
+            append(interface_layers,      iface_g);
+            append(base_interface_layers, base_iface_g);
+        }
+        // stable_sort, not sort: at one print_z the groups must stay in GROUP order. The lowest
+        // group is the one generate_support_toolpaths keeps in its layer cache (so every merge
+        // there behaves as it does today), and a reproducible order is what makes the output
+        // deterministic - see R3.6.
+        std::stable_sort(interface_layers.begin(), interface_layers.end(),
+                         [](const SupportGeneratorLayer *l, const SupportGeneratorLayer *r) { return *l < *r; });
+        std::stable_sort(base_interface_layers.begin(), base_interface_layers.end(),
+                         [](const SupportGeneratorLayer *l, const SupportGeneratorLayer *r) { return *l < *r; });
+    }
 
     BOOST_LOG_TRIVIAL(info) << "Support generator - Creating raft";
 
@@ -552,7 +715,23 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
 #endif /* SLIC3R_DEBUG */
 
     // Generate the actual toolpaths and save them into each layer.
-    generate_support_toolpaths(object.support_layers(), *m_object_config, m_support_params, m_slicing_params, raft_layers, bottom_contacts, top_contacts, intermediate_layers, interface_layers, base_interface_layers);
+    // Ultra (support groups): an empty `group_toolpaths` - which is what a single-group object
+    // produces - makes generate_support_toolpaths take exactly the path it always took.
+    std::vector<SupportGroupToolpaths> group_toolpaths;
+    if (! m_group_claims.empty()) {
+        group_toolpaths.reserve(m_groups.size());
+        for (size_t g = 0; g < m_groups.size(); ++ g) {
+            SupportGroupToolpaths gt;
+            gt.config             = &m_groups[g].config;
+            gt.params             = &m_group_params[g];
+            gt.claim              = &m_group_claims[g];
+            gt.interface_filament = m_groups[g].config.support_interface_filament.value;
+            group_toolpaths.emplace_back(gt);
+        }
+    }
+    generate_support_toolpaths(object.support_layers(), *m_object_config, m_support_params, m_slicing_params, raft_layers, bottom_contacts, top_contacts, intermediate_layers, interface_layers, base_interface_layers,
+                               group_toolpaths.empty() ? nullptr : &group_toolpaths,
+                               group_toolpaths.empty() ? nullptr : &object_layer_zs);
 
 #ifdef SLIC3R_DEBUG
     {
