@@ -1322,6 +1322,17 @@ void PartPlate::render_right_arrow(const ColorRGBA render_color, bool use_lighti
 
 static void register_model_for_picking(GLCanvas3D &canvas, PickingModel &model, int id)
 {
+    // Ultra: a PickingModel whose geometry has been invalidated carries no raycaster until
+    // something rebuilds it. Dereferencing the empty unique_ptr here handed SceneRaycasterItem a
+    // null MeshRaycaster, and the next picking pass over the bed dereferenced it inside
+    // MeshRaycaster::closest_hit - an access violation reading 0x18 (&MeshRaycaster::m_emesh on a
+    // null this). A model with no geometry has nothing to pick, so skipping is correct; whoever
+    // rebuilds it registers it again.
+    if (model.mesh_raycaster == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": picking id " << id
+                                   << " has no raycaster, not registered";
+        return;
+    }
     canvas.add_raycaster_for_picking(SceneRaycaster::EType::Bed, id, *model.mesh_raycaster, Transform3d::Identity());
 }
 
@@ -1336,6 +1347,18 @@ void PartPlate::register_raycasters_for_picking(GLCanvas3D &canvas)
         register_model_for_picking(canvas, m_plate_settings_icon, picking_id_component(5));
 
     canvas.remove_raycasters_for_picking(SceneRaycaster::EType::Bed, picking_id_component(6));
+    // Ultra: the plate-name edit icon is the only plate PickingModel set_shape() does not build -
+    // generate_plate_name_texture() does, and invalidate_plate_name_texture() (PartPlate::clear,
+    // set_plate_name) throws it away again. GLCanvas3D::reload_scene() re-registers every plate
+    // component and used to run in that window - reopening a project is exactly such a moment -
+    // which is how a null MeshRaycaster reached the scene raycaster. Rebuild the icon from the
+    // name texture we have; the next render's generate_plate_name_texture() replaces it with the
+    // final metrics once the texture is back.
+    if (m_plate_name_edit_icon.mesh_raycaster == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": plate " << m_plate_index
+                                   << " name edit icon had no raycaster, rebuilt before registering";
+        calc_vertex_for_plate_name_edit_icon(&m_name_texture, 0, m_plate_name_edit_icon);
+    }
     register_model_for_picking(canvas, m_plate_name_edit_icon, picking_id_component(6));
     register_model_for_picking(canvas, m_move_front_icon, picking_id_component(7));
 }
