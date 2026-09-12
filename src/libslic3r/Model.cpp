@@ -1308,6 +1308,9 @@ ModelObject& ModelObject::assign_copy(const ModelObject &rhs)
     this->printable                   = rhs.printable;
     this->origin_translation          = rhs.origin_translation;
     this->cut_id.copy(rhs.cut_id);
+    // RE-EDITABLE CUTS: the recipe describes the cut this object came out of, so a
+    // copy of the object is a copy of that history too.
+    this->cut_recipe                  = rhs.cut_recipe;
     this->copy_transformation_caches(rhs);
 
     this->clear_volumes();
@@ -2098,6 +2101,10 @@ bool ModelObject::has_connectors() const
 void ModelObject::invalidate_cut()
 {
     this->cut_id.invalidate();
+    // "Invalidate cut info" means this object is no longer half of a cut, so the
+    // recipe goes with it - leaving it would offer "Edit cut" on an object whose
+    // other half the model no longer relates to.
+    this->cut_recipe.reset();
     for (ModelVolume *volume : this->volumes)
         volume->invalidate_cut_info();
 }
