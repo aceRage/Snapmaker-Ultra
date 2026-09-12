@@ -71,6 +71,14 @@ The injected rounder in the tests is **not a fake**: it builds an analytically e
 | the measurement helpers agree with hand-checked meshes | cube = 90°, sphere < 20°, an open cube is not watertight |
 | rounding the same mesh twice gives an identical result | determinism |
 
+**Result: 11/11 pass, 13,166 assertions.** `[MeshRemesh]` still passes 7/7, so the `remesh_keep_flat_bottom()` reuse did not disturb its owner.
+
+Three of these failed on the first run and all three were faults in the *test scaffolding*, not the production code — worth recording because each was a real lesson about the fixture:
+
+* the stub's octant-split sphere was geometrically closed but **topologically full of holes** (poles, the longitude seam and every octant boundary duplicate positions under different indices); welding coincident vertices *before* dropping degenerate facets fixes it, and the two sides of a seam need a coordinate **snap** first because they are computed by different trigonometry and land a few ULPs apart;
+* the default tessellation was too coarse — the measured quantity is a *small difference of large numbers*, so a 0.6% shortfall in arc area became a **33% error in the volume loss**; at 64 × 128 it lands inside the brief's 10%;
+* "a sphere has no flat bottom" is **false** for a UV sphere, whose bottom pole is a fan of bed-facing facets within a fraction of a voxel of `z_min`; the fallback test now uses a cube standing on one corner, which genuinely has none.
+
 ---
 
 ## Step 2 — Edge bevel / chamfer (phase 2)
@@ -201,6 +209,15 @@ Offered **only for a chain selection** — a bevel acts on edges and a face regi
 | refusals are reported | `width = 0` → `NoOp` with the mesh unchanged; empty list → `EmptyChain`; a coplanar edge → dropped as flat, counted |
 | the session applies and undoes a bevel | undo depth, topology follows the new mesh, redo, and a preview changes nothing |
 
+**Result: 14 of 21 `[MeshEdit]` pass, 7 fail** (the 9 phase-1 cases still pass, so nothing was regressed). Every failure is `BevelStatus::Failed` — the mesh is built but not closed — and they are exactly the cases the construction flaw predicts:
+
+| | |
+|---|---|
+| **passing** | the width solve and its order-independence; the same-bevel-twice determinism; every refusal path (`width = 0` identity, empty list, too-flat drop); all 9 phase-1 cases |
+| **failing** | chamfer one cube edge; round vs chamfer over segment counts; all-12 at N = 4; all-12 chamfered; chain on a chamfered box; the too-small-face clamp; the concave drop's convex control |
+
+The all-12 chamfer *did* match the closed-form volume at one point mid-debugging (after the side grouping, before the corner rewrite), which is the clue that led to the diagnosis: the all-edges cases can close by accident because every neighbouring side moves too.
+
 ---
 
 ## Deviations from the brief
@@ -223,7 +240,11 @@ Offered **only for a chain selection** — a bevel acts on edges and a face regi
 
 ## Click-tests
 
-Run against a debug-free Release build of the worktree, on a 20 mm cube unless noted.
+> **These have NOT been run.** No GUI build was produced — the worktree built and ran `libslic3r_tests` only, and `libslic3r_gui` was never linked, so nothing below has been clicked. They are written as the script to follow, not as a record of results. The bevel half (8–15) cannot pass as things stand in any case: the geometry is unfinished and Apply will report a failure.
+>
+> The GUI code *has* been compiled as far as the test target requires — which is to say not at all for `GLGizmoEdit.cpp` and `RoundDialog.cpp`. **Those two files are unverified even at the compiler level.** Building `libslic3r_gui` is the first thing the next session should do.
+
+Intended script, against a Release build of the worktree, on a 20 mm cube unless noted.
 
 ### Round all edges
 
