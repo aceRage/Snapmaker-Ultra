@@ -755,6 +755,9 @@ set(SLIC3R_GUI_SOURCES
     Utils/CrealityPrint.hpp
     Utils/Duet.cpp
     Utils/Duet.hpp
+    Utils/ElegooCanvas.cpp
+    Utils/ElegooCanvas.hpp
+    Utils/ElegooCanvasQuery.cpp
     Utils/ElegooLink.cpp
     Utils/ElegooLink.hpp
     Utils/EmbossStyleManager.cpp
