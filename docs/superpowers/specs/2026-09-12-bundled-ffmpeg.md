@@ -337,45 +337,51 @@ throwaway go2rtc instances from the **staged** copy or a scratch dir, never from
 kill them when finished. `test_quality.py` itself is safe: it drives the hub's own go2rtc out of
 the scratch *install*, and its teardown quits only the hub it started.
 
-## 6b. OPEN: the hub's go2rtc rejects `ffmpeg:` sources (blocks the variants)
+## 6b. The exec-source startup race (found by the gate, fixed)
 
-**Found by the gate, unresolved, and it blocks the feature in production.** Everything up to this
-point works - the binary ships, the config is right, the variants are *reported* - but when a
-variant is actually registered against the **hub-spawned** go2rtc, it is refused:
+The gate caught this and it would have shipped the feature broken: on a normal start the hub
+reported `_med`/`_low` variants it had **failed to register**, so every Quality tile would have
+gone black.
+
+**A freshly started go2rtc answers its API before it will accept an *exec* source.** For roughly
+the first five seconds a PUT of an `ffmpeg:` stream comes back
 
 ```
-PUT /api/streams?name=cam_low&src=ffmpeg:cam#video=h264#width=854#raw=-r#raw=10
-  -> 400 streams: source not supported
+400 streams: source not supported
 ```
 
-The same PUT against a **standalone** go2rtc succeeds (200). What has been ruled out, by testing
-each in isolation against the same binary:
+and so does `echo:` - the other exec scheme - while `rtsp:` is accepted immediately. Measured
+against a hub-spawned go2rtc: refused at t+0, accepted from t+5 onward, and from then on
+indefinitely.
 
-* the source string (no spaces, `#raw=` per token - §3.2b);
-* the `ffmpeg: bin:` / `h264:` block;
-* `local_auth`, `allow_paths`, the credentials;
-* the `webrtc:` listener and `ice_servers`, including on a contended 8556;
-* the rtsp loopback listener (§3.2), and registration order (rtsp source first, then variant);
-* the config file's location and the process's working directory;
-* the exe itself (install copy and worktree copy are byte-identical);
-* persisted `streams:` accumulating in the config (go2rtc does write them back, but the hub
-  rewrites the file on every start, so nothing accumulates).
+The hub registers streams the moment go2rtc is up. The source stream (`rtsp:`, or the hub's own
+`/relay/h264`) is not an exec source, so it always landed; the variants always fell inside the
+window. `update_go2rtc_streams()` already retried - and correctly, since a 400 goes to `on_error`
+rather than `on_complete`, leaving `ok` false - but three attempts at 1.5 s covers only 4.5 s and
+never quite reached the far side. It is now **twelve attempts (~18 s)**, with a logged warning if
+it still fails, because a missing variant is otherwise invisible until a viewer opens the tile.
 
-Run standalone with the hub's *exact* config and exe, `ffmpeg:` is accepted. Spawned by the hub, it
-is not. The untested difference that remains, and the most likely cause, is that the hub puts
-go2rtc in a **Job Object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`start_go2rtc()`, so go2rtc
-dies with the hub). go2rtc's `ffmpeg:` source is an *exec* source - it has to spawn a child - and
-`echo:` (the other exec scheme) is refused by the same hub instance while `rtsp:` is accepted.
-That pattern is what a process that cannot create children looks like.
+**Two other explanations were tested first and ruled out**, each in isolation against the
+hub-spawned process:
 
-**Next step for whoever picks this up:** add `JOB_OBJECT_LIMIT_BREAKAWAY_OK` (or
-`SILENT_BREAKAWAY_OK`) to the job's `LimitFlags` and re-run `test_quality.py`; if that is the cause,
-the variant PUT starts returning 200 and the live transcode half of the gate runs. The gate already
-distinguishes the two cases - it reports `could not register a stream directly with go2rtc (400)`
-and skips rather than passing silently.
+* **the environment block** - `CreateProcess` is called with `lpEnvironment = nullptr`, so go2rtc
+  inherits ours. Dumped from the live child's PEB: 113 variables, with `SystemRoot`, `PATH`,
+  `TEMP`, `TMP`, `ComSpec`, `windir` and `USERPROFILE` all present. Nothing missing that Go's
+  `os/exec` needs;
+* **the job object** - `ffmpeg:` is accepted under `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, with and
+  without `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, and with no job at all (tested by reproducing the hub's
+  exact spawn: `CreateProcess` then `AssignProcessToJobObject`). So **no breakaway flag is needed**
+  and go2rtc keeps dying with the hub, which is the property that flag would have weakened.
 
-Until then the Quality steps still work on the **Bambu MJPEG** path (the `?fps=` knob, which needs
-no transcode at all); it is the go2rtc `_med`/`_low` variants that do not start.
+Also ruled out along the way: the source string, the `ffmpeg: bin:` / `h264:` block,
+`local_auth` / `allow_paths` / credentials, the `webrtc:` listener and `ice_servers` (including on
+a contended 8556), the rtsp loopback listener, registration order, the config file's location, the
+working directory, the exe itself (install and worktree copies are byte-identical), and streams
+persisted back into the config (go2rtc does write them, but the hub rewrites the file each start).
+
+The gate retries the same way rather than racing the window, and now also asserts that **no
+`ffmpeg.exe` from the install survives hub shutdown** - an ffmpeg that escaped the job object would
+be an orphan holding the camera with nobody watching.
 
 ## 7. Click-tests (owner)
 
