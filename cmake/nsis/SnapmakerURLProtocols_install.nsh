@@ -29,3 +29,17 @@ nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall delete rule name="Ed
 Pop $0
 nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall add rule name="EdgeSlicer LAN discovery" dir=in action=allow program="$INSTDIR\EdgeSlicer.exe" protocol=UDP localport=2021,1990 profile=private,domain enable=yes'
 Pop $0
+; WebRTC camera video: go2rtc (bundled, $INSTDIR\resources\tools\go2rtc\go2rtc.exe) carries the
+; media straight from this PC to the phone rather than through the hub, so unlike everything else
+; the hub runs it needs an inbound port. It takes the first free one in 8555-8574 (RemoteHub.cpp,
+; free_webrtc_port), hence the range rather than a single port, and both protocols: UDP is the
+; media, TCP is go2rtc's ICE-TCP fallback for networks that drop UDP. Program-bound like the rules
+; above, so nothing else on the PC gains a port. Without this rule Windows prompts on go2rtc's
+; first bind and writes a *block* rule if the prompt is dismissed - which the hub then has to
+; detect and explain (RemoteHub.cpp, firewall_query). Pre-creating it is what stops that.
+nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall delete rule name="EdgeSlicer WebRTC video"'
+Pop $0
+nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall add rule name="EdgeSlicer WebRTC video" dir=in action=allow program="$INSTDIR\resources\tools\go2rtc\go2rtc.exe" protocol=UDP localport=8555-8574 profile=private,domain enable=yes'
+Pop $0
+nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall add rule name="EdgeSlicer WebRTC video" dir=in action=allow program="$INSTDIR\resources\tools\go2rtc\go2rtc.exe" protocol=TCP localport=8555-8574 profile=private,domain enable=yes'
+Pop $0

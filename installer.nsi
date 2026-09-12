@@ -143,6 +143,18 @@ Section "Main program" SecMain
     nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall add rule name="${PRODUCT_NAME}" dir=in action=allow program="$INSTDIR\EdgeSlicer.exe" protocol=TCP localport=13640 profile=private,domain enable=yes'
     Pop $0
 
+    ; WebRTC camera video: go2rtc (bundled) carries the media straight from this PC to the phone,
+    ; so unlike everything else the hub runs it needs an inbound port - the first free one in
+    ; 8555-8574 (RemoteHub.cpp, free_webrtc_port), hence a range, on both UDP (the media) and TCP
+    ; (go2rtc's ICE-TCP fallback for networks that drop UDP). Program-bound, like the rule above.
+    DetailPrint "Adding the Windows Firewall rule for WebRTC video (UDP/TCP 8555-8574)..."
+    nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall delete rule name="${PRODUCT_NAME} WebRTC video"'
+    Pop $0
+    nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall add rule name="${PRODUCT_NAME} WebRTC video" dir=in action=allow program="$INSTDIR\resources\tools\go2rtc\go2rtc.exe" protocol=UDP localport=8555-8574 profile=private,domain enable=yes'
+    Pop $0
+    nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall add rule name="${PRODUCT_NAME} WebRTC video" dir=in action=allow program="$INSTDIR\resources\tools\go2rtc\go2rtc.exe" protocol=TCP localport=8555-8574 profile=private,domain enable=yes'
+    Pop $0
+
     DetailPrint "Installation complete!"
     Goto end_section
     
@@ -204,6 +216,9 @@ Section "Uninstall"
 
     DetailPrint "Removing the Windows Firewall rule..."
     nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall delete rule name="${PRODUCT_NAME}"'
+    Pop $0
+    ; Both WebRTC rules share one name, so one delete removes them.
+    nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall delete rule name="${PRODUCT_NAME} WebRTC video"'
     Pop $0
 
     DeleteRegKey ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}"
