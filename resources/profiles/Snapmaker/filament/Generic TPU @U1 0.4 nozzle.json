@@ -1,57 +1,58 @@
 {
     "type": "filament",
-    "name": "Generic PLA-CF",
-    "inherits": "Generic PLA-CF @base",
+    "name": "Generic TPU @U1 0.4 nozzle",
+    "inherits": "fdm_filament_tpu_generic",
     "from": "system",
-    "setting_id": "GFSL9811",
+    "filament_id": "GFU99",
+    "setting_id": "GFSR99",
     "instantiation": "true",
+    "filament_max_volumetric_speed": [
+        "3.2"
+    ],
     "compatible_printers": [
         "Snapmaker U1 (0.4 nozzle)"
+    ],
+    "filament_start_gcode": [
+        "; filament start gcode\n"
     ],
     "enable_pressure_advance": [
         "0"
     ],
     "filament_end_gcode": [
-        ""
-    ],
-    "filament_minimal_purge_on_wipe_tower": [
-        "15"
+        "; filament end gcode \n\n"
     ],
     "filament_multitool_ramming": [
         "1"
     ],
     "filament_multitool_ramming_flow": [
-        "20"
+        "3.2"
     ],
     "filament_multitool_ramming_volume": [
-        "0.5"
-    ],
-    "filament_start_gcode": [
-        ""
+        "0.1"
     ],
     "filament_vendor": [
         "Generic"
     ],
     "filament_retract_length_toolchange": [
-        "10"
+        "2"
     ],
-    "textured_plate_temp": [
-        "65"
+    "filament_deretraction_speed": [
+        "20"
     ],
-    "textured_plate_temp_initial_layer": [
-        "65"
+    "filament_retraction_length": [
+        "1.5"
     ],
-    "hot_plate_temp": [
-        "65"
+    "filament_retraction_speed": [
+        "20"
     ],
-    "hot_plate_temp_initial_layer": [
-        "65"
+    "pressure_advance": [
+        "0.4"
     ],
     "graphic_effect_plate_temp": [
-        "65"
+        "35"
     ],
     "graphic_effect_plate_temp_initial_layer": [
-        "65"
+        "35"
     ],
-    "filament_type": ["PLA-CF"]
+    "filament_type": ["TPU"]
 }

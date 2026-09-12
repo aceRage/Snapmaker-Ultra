@@ -1,54 +1,39 @@
 {
     "type": "filament",
-    "name": "Generic PVA",
-    "inherits": "Generic PVA @base",
+    "name": "Generic PLA @U1 0.4 nozzle",
+    "inherits": "Generic PLA @base",
     "from": "system",
-    "setting_id": "GFSS99",
+    "setting_id": "GFSL991",
     "instantiation": "true",
     "compatible_printers": [
         "Snapmaker U1 (0.4 nozzle)"
+    ],
+    "filament_start_gcode": [
+        ""
     ],
     "enable_pressure_advance": [
         "0"
     ],
     "filament_end_gcode": [
-        "; filament end gcode \n\n"
+        "\n"
+    ],
+    "filament_minimal_purge_on_wipe_tower": [
+        "15"
     ],
     "filament_multitool_ramming": [
         "1"
     ],
     "filament_multitool_ramming_flow": [
-        "6"
+        "20"
     ],
     "filament_multitool_ramming_volume": [
-        "0.1"
-    ],
-    "filament_start_gcode": [
-        "; filament start gcode\n"
+        "0.5"
     ],
     "filament_vendor": [
         "Generic"
     ],
     "filament_retract_length_toolchange": [
-        "3"
-    ],
-    "filament_max_volumetric_speed": [
-        "6"
-    ],
-    "nozzle_temperature": [
-        "240"
-    ],
-    "nozzle_temperature_initial_layer": [
-        "240"
-    ],
-    "pressure_advance": [
-        "0.028"
-    ],
-    "hot_plate_temp": [
-        "65"
-    ],
-    "hot_plate_temp_initial_layer": [
-        "65"
+        "10"
     ],
     "textured_plate_temp": [
         "65"
@@ -56,5 +41,17 @@
     "textured_plate_temp_initial_layer": [
         "65"
     ],
-    "filament_type": ["PVA"]
+    "hot_plate_temp": [
+        "65"
+    ],
+    "hot_plate_temp_initial_layer": [
+        "65"
+    ],
+    "graphic_effect_plate_temp": [
+        "65"
+    ],
+    "graphic_effect_plate_temp_initial_layer": [
+        "65"
+    ],
+    "filament_type": ["PLA"]
 }

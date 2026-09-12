@@ -490,7 +490,7 @@ programmatically: **these lists are order-sensitive, not sets.**
 | same, baseline (parent commit, same script) | 31 errors -> all 31 fixed, none introduced |
 | `orca_extra_profile_check.py --vendor Creality --check-filaments --check-materials` | **0 errors** |
 | `orca_extra_profile_check.py --vendor Sovol` (assets) | **0 errors** |
-| Upstream `OrcaSlicer_profile_validator -l 2` (CI's binary, run under WSL) | 26 errors, **identical to the 26 on the baseline** -- no regression; all pre-existing (Prusa/RatRig `printer_variant`, and vendors whose `@System` parents this validator does not load) |
+| Upstream `OrcaSlicer_profile_validator -l 2` (CI's binary, run under WSL) | 26 errors -- **the "no regression" reading of this number was wrong; see the correction below** |
 | `ctest -R profile` (standalone probe of the new entry) | **Passed**, label `profile` |
 | Negative test: hid `creality_k2_buildplate_texture.svg` | correctly reported + non-zero exit; restored |
 | `sh -n` on both gate scripts + `profiles` section run in isolation | syntax OK, gate **PASS** |
@@ -499,12 +499,42 @@ programmatically: **these lists are order-sensitive, not sets.**
 validator exercises the same `PresetBundle` load path and ran clean, so a full MSVC configure
 was not worth it for no additional signal. No build directory was created.
 
+### Correction (2026-09-12, `fix/housekeeping-0912` and `fix/snapmaker-preset-names`)
+
+**The "identical to the 26 on the baseline -- no regression" claim above is wrong on both
+halves, and this import did introduce a regression.**
+
+The mistake was methodological. In validation mode the loader rethrows on the first bad
+vendor (`PresetBundle.cpp:1472`), so a whole-tree run **aborts early**: 26 is a floor, not a
+total, and two runs can both print 26 while hiding different numbers of unreached errors.
+The 26 lines were also not 26 errors -- each dangling `inherits` logs two to four lines, so
+they were 17 distinct errors with 10 more behind the abort.
+
+Re-derived with per-vendor sweeps, which avoid the abort entirely: **27 distinct errors on
+the post-import tree against 17 pre-import**. This import added 10 of them. All ten were the
+same mistake in the new `Generic X @Creality K2-all` filaments, which each declared
+`renamed_from: "Creality Generic X @K2-all;Creality Generic X K2-all"`. The second clause
+collides with the old name the pre-existing `Creality Generic X @K2-all` preset *auto-derives*
+by `@`-stripping (`PresetBundle.cpp:3562`), so two presets claimed one old name and
+`update_map_system_profile_renamed` (`Preset.cpp:3309`) logged an error for each. The first
+clause is the real rename and was uncontested.
+
+Fixed in `fix/housekeeping-0912` by dropping the redundant clause, which together with the
+`OrcaFilamentLibrary` manifest and the `printer_variant` corrections took the tree to 10
+errors -- a pre-existing BBL/Snapmaker display-name clash unrelated to this import.
+`fix/snapmaker-preset-names` then resolved those ten by renaming the Snapmaker generics to
+`Generic X @U1 0.4 nozzle`, and the tree now validates at **0 errors**. A `profile_names`
+ctest (`scripts/check_preset_name_clashes.py`) guards both classes so neither can return
+unnoticed.
+
 ## 6.8 Known pre-existing issues, not touched
 
 - **112 `--check-materials` errors** (Anycubic Kobra 2 family, Afinia, Z-Bolt, Sovol SV08 MAX):
   machine `default_materials` naming filaments that do not exist. Present identically at the
   baseline; that flag is opt-in and not run by CI. Worth a follow-up of its own.
-- **26 upstream-validator errors**, unchanged from baseline (see 6.7).
+- ~~**26 upstream-validator errors**, unchanged from baseline (see 6.7).~~ Superseded: the
+  count was a floor hiding an early abort, and 10 of the errors were introduced by this
+  import. All resolved -- the tree now validates at 0 errors. See the correction in 6.7.
 - **`bed_texture` is resolved but never rendered** in this fork (dead code in `3DBed.cpp`),
   as section 2 found. This import does not start relying on it; the gate checks the files
   exist so the reference is honest, which is what makes the eventual re-enable safe.

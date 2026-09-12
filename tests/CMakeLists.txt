@@ -61,6 +61,19 @@ if (Python3_Interpreter_FOUND)
                      ${PROJECT_SOURCE_DIR}/scripts/orca_extra_profile_check.py
                      --check-materials --no-check-assets)
     set_tests_properties(profile_materials PROPERTIES LABELS "profile")
+
+    # No two vendors may ship the same user-selectable preset display name, and no two
+    # presets may claim the same "renamed_from" old name. Both are errors for upstream's
+    # profile validator (the binary check_profiles.yml downloads), and both are invisible
+    # here at runtime: merge_presets special-cases the Snapmaker bundle so a clashing
+    # Snapmaker preset survives next to BBL's, but which one find_preset then returns
+    # depends on load order, i.e. on the filesystem. This is the regression guard for the
+    # Snapmaker generics rename (Generic X -> Generic X @U1 0.4 nozzle).
+    add_test(NAME profile_names
+             COMMAND ${Python3_EXECUTABLE}
+                     ${PROJECT_SOURCE_DIR}/scripts/check_preset_name_clashes.py
+                     -p ${PROJECT_SOURCE_DIR}/resources/profiles)
+    set_tests_properties(profile_names PROPERTIES LABELS "profile")
 else()
     message(STATUS "Python3 interpreter not found - skipping the profile tests")
 endif()

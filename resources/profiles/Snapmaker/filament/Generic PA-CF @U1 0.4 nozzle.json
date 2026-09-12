@@ -1,52 +1,34 @@
 {
     "type": "filament",
-    "name": "Generic PA",
+    "name": "Generic PA-CF @U1 0.4 nozzle",
     "inherits": "fdm_filament_pa_generic",
     "from": "system",
-    "filament_id": "GFN99",
-    "setting_id": "GFSN98",
+    "filament_id": "GFN98",
+    "setting_id": "GFSN99",
     "instantiation": "true",
-    "chamber_temperatures": [
-        "60"
-    ],
     "fan_cooling_layer_time": [
-        "65"
+        "5"
     ],
     "fan_max_speed": [
-        "85"
+        "30"
     ],
     "fan_min_speed": [
-        "40"
+        "10"
     ],
-    "filament_max_volumetric_speed": [
-        "12"
+    "filament_type": [
+        "PA-CF"
     ],
-    "nozzle_temperature": [
-        "260"
-    ],
-    "nozzle_temperature_initial_layer": [
-        "260"
-    ],
-    "nozzle_temperature_range_high": [
-        "280"
-    ],
-    "nozzle_temperature_range_low": [
-        "240"
+    "full_fan_speed_layer": [
+        "2"
     ],
     "overhang_fan_speed": [
-        "95"
+        "40"
     ],
     "overhang_fan_threshold": [
-        "10%"
+        "0%"
     ],
-    "required_nozzle_HRC": [
-        "3"
-    ],
-    "slow_down_layer_time": [
-        "8"
-    ],
-    "slow_down_min_speed": [
-        "10"
+    "temperature_vitrification": [
+        "170"
     ],
     "compatible_printers": [
         "Snapmaker U1 (0.4 nozzle)"
@@ -61,7 +43,7 @@
         "1"
     ],
     "filament_multitool_ramming_flow": [
-        "12"
+        "8"
     ],
     "filament_multitool_ramming_volume": [
         "0.5"
@@ -75,6 +57,5 @@
     "filament_vendor": [
         "Generic"
     ],
-    "filament_is_high_temperature": ["1"],
-    "filament_type": ["PA"]
+    "filament_is_high_temperature": ["1"]
 }
