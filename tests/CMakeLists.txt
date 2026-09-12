@@ -36,3 +36,20 @@ add_subdirectory(slice_compare_cli)
 add_subdirectory(cpp17 EXCLUDE_FROM_ALL)    # does not have to be built all the time
 add_subdirectory(fuzz_gltf EXCLUDE_FROM_ALL) # glTF reader fuzz driver, built on demand
 # add_subdirectory(example)
+
+# Profile sanity check: every bed model/texture, cover image and "inherits" parent a
+# vendor profile names has to resolve to a file that exists. These all fail silently at
+# runtime (the load sites gate on exists() or swallow the exception), so without this the
+# only symptom is a degraded bed or an empty printer-picker card. GitHub Actions runs the
+# same script via check_profiles.yml; this makes `ctest -R profile` catch it locally too.
+# Needs no compilation, so it is registered here rather than in a C++ test target.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME profile_assets
+             COMMAND ${Python3_EXECUTABLE}
+                     ${PROJECT_SOURCE_DIR}/scripts/orca_extra_profile_check.py
+                     --check-assets)
+    set_tests_properties(profile_assets PROPERTIES LABELS "profile")
+else()
+    message(STATUS "Python3 interpreter not found - skipping the profile_assets test")
+endif()
