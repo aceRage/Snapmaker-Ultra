@@ -80,6 +80,26 @@ struct DrawCutParams
     // how far past each END the surface reaches along the tangent - which is what
     // lets the cut get past the silhouette so the boolean separates the part.
     double           extension{ 5.0 };
+    // PHASE 2. The DRAFT ANGLE, in DEGREES, signed. It tilts the sweep direction
+    // away from the local surface normal toward the stroke's OUTWARD binormal,
+    // per sample:
+    //
+    //   d_i = cos(theta) * (-n_i) + sin(theta) * b_i
+    //
+    // POSITIVE FLARES OUTWARD - the ruling leans away from the loop's interior as
+    // it goes in, so a closed stroke's plug widens with depth and the surrounding
+    // shell opens out like a moulding draft. NEGATIVE UNDERCUTS - the plug narrows
+    // with depth, so it is a dovetail that cannot be pulled straight out.
+    //
+    // The sign is tied to the same outward binormal DrawCutStroke::binormal()
+    // defines, which is winding-independent, so a loop drawn clockwise and one
+    // drawn counter-clockwise draft the same way.
+    //
+    // Only DrawCutDirection::SurfaceNormal uses it. The constant-direction modes
+    // (View, Axis X/Y/Z) are by definition ONE direction at every sample - that is
+    // what "as-is extrusion" means - and a per-sample tilt is exactly what they are
+    // not, so draw_cut_inward_dir() ignores it there and the panel greys it out.
+    double           angle_deg{ 0.0 };
     // How far it reaches IN. `through_all` ignores `depth` and uses a reach
     // derived from the object's bounding box, large enough to exit any side.
     bool             through_all{ true };
@@ -165,6 +185,20 @@ public:
     // The resampled, smoothed samples finish() produced. Empty until finish()
     // has run and succeeded.
     const std::vector<DrawCutSample>& path() const { return m_path; }
+    // PHASE 2. Replace the finished path IN PLACE, keeping the open/closed
+    // decision, and recompute the binormals from it.
+    //
+    // This exists for exactly one caller: the gizmo's re-projection of the smoothed
+    // path back onto the mesh (phase 1 deviation #7). That has to happen AFTER
+    // finish() - smoothing is what moves the samples off the surface - and it must
+    // not re-resample, because the path already is resampled and running the
+    // resampler over its own output would walk the samples a little further every
+    // time a slider moved. The binormals DO have to be recomputed, because they are
+    // built from the positions and the normals this replaces.
+    //
+    // Refuses a path of a different length, which would invalidate the closed
+    // decision finish() made.
+    void set_path(const std::vector<DrawCutSample>& path);
     bool         is_closed() const { return m_closed; }
     DrawCutError error() const { return m_error; }
     bool         valid() const { return m_error == DrawCutError::None && m_path.size() >= size_t(MinSamples); }
@@ -243,6 +277,45 @@ int draw_cut_smooth_passes(double smoothing);
 double draw_cut_closing_tolerance(double spacing);
 
 // ---------------------------------------------------------------------------
+// The cut direction, and the draft angle that tilts it. PHASE 2.
+// ---------------------------------------------------------------------------
+
+// The panel's limit on the draft angle, in degrees, and the limit the geometry
+// itself imposes. 60 degrees is already a very deep undercut / flare; past about
+// 80 the ruling is so close to tangent to the surface that the strip grazes the
+// face it was drawn on for its whole length and the boolean has nothing clean to
+// work with.
+static constexpr double DrawCutMaxAngleDeg = 60.0;
+
+// The unit ray at path sample `i`, pointing INTO the part - the ruling direction
+// of the swept strip, and the one place the draft angle is applied.
+//
+// For the constant directions it is that direction, at every sample. For Surface
+// normal it is the inward normal rotated toward the OUTWARD binormal by
+// params.angle_deg:
+//
+//   d_i = cos(theta) * (-n_i) + sin(theta) * b_i
+//
+// which is a rotation in the plane the two span, so d stays unit and the ruling
+// stays a straight line. theta == 0 gives -n_i exactly, which is phase 1's
+// behaviour bit for bit.
+//
+// Exposed (it was file-static in phase 1) because the fold guard, the surface
+// frame and the tests all have to ask the SAME question the cutter builder asks.
+Vec3d draw_cut_inward_dir(const DrawCutStroke& stroke, const DrawCutParams& params, size_t i);
+
+// True when a CLOSED stroke's binormal field does not close up on itself - the
+// frame comes back flipped after going round the loop, so there is no consistent
+// "outward" side and a draft angle would flare one way on one part of the loop
+// and the other way on the rest (a Moebius path on the surface).
+//
+// compute_binormals() already orients a closed loop's field from the centroid
+// rather than by transport, so the field itself never tears; what this detects is
+// the case where that orientation is fighting the surface - adjacent binormals
+// that disagree in sign. The caller falls back to angle 0 and warns.
+bool draw_cut_frame_holonomy_flips(const DrawCutStroke& stroke);
+
+// ---------------------------------------------------------------------------
 // The cutter solid.
 // ---------------------------------------------------------------------------
 
@@ -286,6 +359,88 @@ indexed_triangle_set draw_cut_cutter_solid(const DrawCutStroke& stroke,
                                            const BoundingBoxf3& bbox,
                                            double               face_offset = 0.0);
 
+// ---------------------------------------------------------------------------
+// THE DRAWN SURFACE AS A SURFACE. PHASE 2, and what connectors stand on.
+//
+// The curved cut's connectors ride on curved_cut_sheet_frame(): a rotation built
+// from the sheet's own local normal, composed after the plane's m_rotation_m, so
+// nothing in the connector path itself has to know about the sheet. The drawn
+// surface needs the same three functions against the RULED STRIP instead of the
+// height field.
+//
+// The strip's parameters are (s, w):
+//   s - arc length along the stroke, in mm from the first path sample. For a
+//       closed stroke it wraps at length().
+//   w - the ruled parameter, in mm along the ruling from the stroke itself:
+//       w == 0 is on the stroke, w > 0 is INTO the part, w < 0 is out of it. The
+//       strip the cutter builds spans w in [-extension, +depth].
+// ---------------------------------------------------------------------------
+
+// The point of the ruled surface at (s, w), in the cut plane's frame.
+Vec3d draw_cut_surface_point(const DrawCutStroke& stroke, const DrawCutParams& params, double s, double w);
+
+// The strip's OWN unit normal at (s, w): normalize(t x d), the direction the two
+// halves separate along. Sign-fixed the same way the cutter's `sweep` is, so it
+// is continuous along the stroke and points consistently to one side.
+//
+// It is w-independent for a straight ruling, which is what the ruling is here -
+// the parameter is taken so callers do not have to know that, and so a future
+// twisted ruling would not change the signature.
+Vec3d draw_cut_surface_normal(const DrawCutStroke& stroke, const DrawCutParams& params, double s, double w);
+
+// A right-handed frame ON the drawn surface at (s, w), expressed in the cut
+// plane's frame: local Z is the surface normal above, local X is the plane's own
+// X projected onto the tangent plane (falling back to the plane's Y where that
+// degenerates - the same construction and the same guard curved_cut_sheet_frame()
+// uses), and `z_angle` spins the frame about its own Z the way a connector's
+// Rotation does.
+//
+// A connector placed with this frame stands PERPENDICULAR TO THE CUT SURFACE, so
+// its hole in one half and its plug in the other are coaxial by construction and
+// survive the split - and, because both halves are cut by the same strip, they
+// survive the kerf too (the kerf moves both faces along this same normal).
+Transform3d draw_cut_surface_frame(const DrawCutStroke& stroke, const DrawCutParams& params,
+                                   double s, double w, double z_angle = 0.0);
+
+// The (s, w) of the point on the drawn surface CLOSEST to `p` (in the plane's
+// frame), and the distance to it. This is the inverse of draw_cut_surface_point()
+// and it is what turns a raycast hit on the cutter shell into surface parameters
+// the frame can be built from.
+//
+// Returns false only for a stroke that is not valid().
+bool draw_cut_surface_project(const DrawCutStroke& stroke, const DrawCutParams& params,
+                              const Vec3d& p, double& s, double& w, double* distance = nullptr);
+
+// True when (s, w) lies within the strip's own domain - the Draw analogue of the
+// curved cut's (u,v)-in-contour test. `w` must be inside [-extension, +depth] with
+// `margin` mm of room on each side (the connector's own radius, so a connector is
+// not hung off the rim), and for an OPEN stroke `s` must likewise be `margin`
+// clear of both ends. A closed stroke wraps, so `s` is never out of range there.
+bool draw_cut_surface_contains(const DrawCutStroke& stroke, const DrawCutParams& params,
+                               double s, double w, double margin, double depth_reach);
+
+// The curvature radius of the strip ACROSS the rules at (s, w), in mm - i.e. how
+// sharply the surface bends as you walk ALONG the stroke. Along the rules the
+// strip is developable (a straight ruling has zero curvature that way), which is
+// exactly why a straight-featured connector sits flatter here than on a dome:
+// only one of the two directions can be curved at all.
+//
+// Infinity (a huge number) where the strip is locally flat.
+double draw_cut_surface_curvature_radius(const DrawCutStroke& stroke, const DrawCutParams& params, double s, double w);
+
+// The analogue of curved_cut_patch_is_flat_enough(): the patch under a connector
+// of half-extent `extent` is flat enough when the cross-rule curvature radius is
+// at least CurvedConnectorFlatPatchFactor times that extent. Same constant, same
+// meaning, so the panel's wording does not have to change between the two modes.
+bool draw_cut_patch_is_flat_enough(const DrawCutStroke& stroke, const DrawCutParams& params,
+                                   double s, double w, double extent);
+
+// The tilt of the drawn surface's normal away from the cut plane's own +Z, in
+// degrees - the analogue of curved_cut_sheet_tilt_deg(). A connector standing on
+// a steeply tilted patch prints at that angle, which is what
+// CurvedConnectorTiltWarnDeg warns about.
+double draw_cut_surface_tilt_deg(const DrawCutStroke& stroke, const DrawCutParams& params, double s, double w);
+
 // True when the stroke's projection onto its own best-fit plane crosses itself.
 // A self-crossing closed loop has no well-defined interior, so phase 1 refuses
 // the cut rather than guessing which sub-loop the user meant.
@@ -295,17 +450,35 @@ indexed_triangle_set draw_cut_cutter_solid(const DrawCutStroke& stroke,
 // stroke, the first-against-last pair for the same reason.
 bool draw_cut_self_crossing(const DrawCutStroke& stroke);
 
-// True when the ruled strip FOLDS: the offset rails cross because the stroke
-// turns with a radius tighter than the offset reaches. A fold at sample i means
-// E * kappa_i > 1 for the outward rail.
+// True when the ruled strip FOLDS: the rails cross because the stroke turns with
+// a radius tighter than the ruling reaches sideways.
 //
-// Phase 1 only DETECTS this and reports it (the spec's "self-intersecting
-// concave stroke with large curvature is detected"); phase 2 adds the local
-// clamp that tapers E back toward 1/kappa. Manifold tolerates a slightly
-// self-intersecting cutter and mcut is the fallback, so a detected fold is a
-// warning, not a refusal - `worst_kappa`, when non-null, receives the largest
-// curvature found so the panel can say how tight.
-bool draw_cut_strip_folds(const DrawCutStroke& stroke, double extension, double* worst_kappa = nullptr);
+// TWO reaches matter, and phase 1 only knew about the first:
+//
+//  1. The OUTWARD rail, pushed back out of the face by Extension E along the
+//     ruling. At angle 0 the ruling is the inward normal, so that push is
+//     straight out of the surface and moves the rail NOWHERE sideways - which is
+//     why phase 1's test is `E * kappa > 1` only where the turn centre is on the
+//     outward side (a concave corner). At angle theta the ruling leans sideways by
+//     sin(theta), so the outward rail's lateral offset is E * sin(theta) and the
+//     inward rail's is D * sin(theta) the other way - and the INWARD one is the
+//     dangerous one, because D is the depth and can be tens of millimetres.
+//
+//  2. So the reach to test is max(E * |sin theta|, D * |sin theta|) on the side
+//     the lean goes, plus phase 1's E on the outward side. A concave stroke with
+//     a large angle folds where the spec says it does.
+//
+// `depth` is the reach the cut will actually use, in mm (through-all's derived
+// reach, or the Depth slider). `angle_deg` is the draft angle. A fold is a
+// WARNING, not a refusal: Manifold tolerates a slightly self-intersecting cutter
+// and mcut is the fallback, so a missed fold degrades to "boolean failed ->
+// complement recovery" rather than to a wrong cut. `worst_kappa`, when non-null,
+// receives the largest curvature found so the panel can say how tight.
+bool draw_cut_strip_folds(const DrawCutStroke& stroke,
+                          double               extension,
+                          double*              worst_kappa = nullptr,
+                          double               angle_deg = 0.0,
+                          double               depth = 0.0);
 
 // ---------------------------------------------------------------------------
 // The split.
