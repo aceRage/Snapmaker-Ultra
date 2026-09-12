@@ -224,6 +224,23 @@ not moved — other gates read them.
 Wired into `gate_all.sh` as a `webrtc` section and into `gate_smart.sh`'s file map:
 `RemoteHub|BambuCamRelay|resources/web/orca/(stream_center|player)\.html → webrtc`.
 
+### 5.1 Two things the gate had to learn, both found by running it wrong
+
+Worth recording, because both were mistakes in how the gate was wired rather than in the feature,
+and both would have wasted someone else's afternoon:
+
+* **It must skip, not fail, on an install without the feature.** `gate_all.sh` runs its sections
+  against the shared `inst_all`, built from `SnapmakerOrcaPhone` — which has no WebRTC code. Every
+  check then failed for one uninteresting reason (`webrtc_port` is 0) and took a whole `gate_all.sh`
+  run to `GATE_ALL_EXIT=1`. The gate now checks for a `webrtc_port` key in `hub.json` and exits 0
+  with `RESULT: SKIP` when it is absent, naming what to build. A missing feature is not a
+  regression.
+* **It must read the pages out of the install, not a source tree.** `WEB` defaulted to a hard-coded
+  `C:\Dev\wt_webrtc\resources\web\orca`, which evaporated the moment that worktree was removed. It
+  now defaults to `<INSTALL>\resources\web\orca` — the pages the hub actually serves, copied there
+  verbatim — so the gate depends on no source tree at all. `SNORCA_WEB` still overrides, which is
+  useful for checking an edit before re-installing.
+
 ## 6. Measurements and click-tests
 
 ### 6.1 Gate
