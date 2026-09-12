@@ -83,9 +83,10 @@ Three of these failed on the first run and all three were faults in the *test sc
 
 ## Step 2 — Edge bevel / chamfer (phase 2)
 
-> **STATUS: NOT FINISHED — 18 / 21. Two real defects fixed; one geometric error in the rail placement remains, and it is now derived exactly. Do not ship this half.**
+> **STATUS: FINISHED — 21 / 21.** The rail-placement error derived in the previous
+> revision is fixed by the inset-corner model below.
 >
-> **`[MeshEdit]` 18 / 21**, `[MeshRound]` 11 / 11 (13,166 assertions).
+> **`[MeshEdit]` 21 / 21** (691 assertions), **`[MeshRound]` 11 / 11** (13,166 assertions).
 >
 > #### Fixed here (1): rails are shared by position
 >
@@ -151,40 +152,92 @@ Three of these failed on the first run and all three were faults in the *test sc
 > then covers the chord triangle a second time, sealing a sliver of void inside a mesh
 > that is still closed and still manifold but has the wrong volume.
 >
-> #### What is left, derived exactly: the rail is placed on the wrong point
+> #### Fixed here (3): the rail was placed on the wrong point — the inset-corner model
 >
-> The three still failing are the all-12 round, the all-12 chamfer against the closed
-> form, and the chain on a chamfered box. The chamfer case now reports
-> `corner_patches=0`, `is_closed_manifold` **true**, and a volume that is wildly wrong —
-> `removed 5626` where 432 is right. That combination is the whole diagnosis: the surface
-> closes by count while pinching, so the enclosed volume is not the part.
+> The previous revision derived this defect exactly but did not fix it. `rail_of()`
+> returned `v + w·t` — the edge pushed back by `w` along the incident face's in-plane
+> normal — and handed that same point to the side polygon, to the strip and to the
+> corner patch. On the 20 mm cube at `w = 2`, corner `(20,20,0)`, that put face
+> `z = 0`'s two points at **(20,18,0)** and **(18,20,0)**, both *on the cube's own
+> edges*. The side rewrite chorded between them; the vertical edge's strip had its
+> bottom end pair at exactly that same pair; so the chord was claimed twice, no hole
+> was left for the corner triangle, and the surface closed **by count while pinching** —
+> `corner_patches=0`, `is_closed_manifold` true, `removed 5626` where 432 is right.
 >
-> Worked through on the 20 mm cube at `w = 2`, corner `(20,20,0)`:
+> **The fix is one point per (SIDE, VERTEX) rather than one per (edge, side, vertex).**
+> A face's polygon corner is the intersection of *its own two offset lines*: on `z = 0`
+> the line `y = 18` meets `x = 18` at the single point **(18,18,0)**, which is the
+> octagon's corner. Solved as a 2×2 system in the side's own plane — the side is planar
+> by construction, and the determinant is the sine of the corner angle, the quantity the
+> width clamp already keeps away from zero.
 >
-> * `rail_of()` returns `v + w·t`, `t` the in-plane perpendicular. For face `z = 0` that
->   puts the two rails at **(20,18,0)** and **(18,20,0)** — both *on the cube's own
->   edges*, 2 mm from the corner.
-> * The side rewrite then drops `v` (both its boundary edges are bevelled) and **chords
->   between those two rails**.
-> * But the *vertical* edge's strip, running up from `(20,20,0)`, has its bottom end pair
->   at exactly `((20,18,0), (18,20,0))` as well. So that edge is claimed by the face chord
->   and by a strip end — two facets, no hole, and the corner triangle has nowhere to go.
->   Hence `corner_patches=0` and the pinch.
+> The same point then serves all three producers, and that is what closes the surface:
+> the strip quad of an edge runs between the inset points of the two **adjacent sides**
+> at each of its endpoints, and the corner patch is the ring of inset points of the
+> sides around the vertex. Every seam is then an edge between two inset points, carried
+> by exactly one facet from either side of it. On the chamfered cube the corner ring is
+> the three inset points `(18,18,0)`, `(20,18,2)`, `(18,20,2)` and the patch is the
+> single triangle between them.
 >
-> The correct geometry says what the rail should have been. A face's polygon corner is the
-> intersection of **its own two offset lines**: on `z = 0` the line `y = 18` (the offset of
-> the −x edge) and `x = 18` (the offset of the −y edge) meet at the single point
-> **(18,18,0)**. A chamfered cube is 6 octagons + 12 rectangles + 8 triangles, and each
-> octagon's corner is that one point — not a two-rail chord. The rail endpoints
-> `(20,18,0)` and `(18,20,0)` are the right points for the *corner triangle*, but they are
-> not the right points for the *face polygon*.
+> Degrees at a vertex, within one side: **two** bevelled boundary edges → intersect the
+> two offset lines; **one** → keep the old rail `v + w·t` and the strip end cap that
+> goes with it; **three or more** (a pinched boundary passing through `v` twice) → the
+> mean of the pairwise intersections, which degenerates to the same answer when they
+> agree.
 >
-> So the remaining work is a change to the rail model, not another patch on the filler:
-> each face needs its own inset corner point, computed as the intersection of the two
-> offset lines in that face's plane, with the per-edge rail endpoints kept for the strips
-> and the corner triangles. That is the piece to do next, and the stage probe (inert
-> behind `MESHEDIT_BEVEL_DIAG`) reports `coincident_dups`, the per-corner
-> `open_edges` count and the loop sizes, which is what these three measurements came from.
+> The round profile's **arc centre slides along the edge** with the inset points. At a
+> vertex where another bevelled edge meets this one the inset points are pulled back off
+> the original vertex down the edge, and a centre left at `v` is no longer equidistant
+> from them — the ring bows out of the cylinder the strip's other end lies on. Taking
+> the centre at the *mean axial position* of the two endpoints keeps the arc a true
+> cross-section at both ends, and reduces to `its.vertices[v]` exactly in the
+> one-bevelled-edge case.
+>
+> **Verified against the closed form before it was built.** The convex hull of the 24
+> inset points of a 20 mm cube at `w = 2` loses **437.3** against the closed form's
+> **432.0** — 1.2%, inside the test's 5%, and the residue is precisely the eight corner
+> tetrahedra the chamfer planes would also have left. The hull has **26 distinct planes**:
+> 6 octagons + 12 rectangles + 8 triangles, which is the decomposition the spec demands.
+> A standalone model of the assembled construction gave 24 vertices, 44 triangles,
+> 8 corner patches, 0 open and 0 non-manifold edges before a line of C++ was compiled.
+>
+> #### Fixed here (4): two sides sharing one inset point must both drop the vertex
+>
+> The last failure was the rim chain on the chamfered box, and it is worth recording
+> because three *geometric* tests for it were wrong before a topological one was right.
+>
+> The box came back `open=0`, `nonmanifold=2`: edges `(4,16)` and `(9,17)` carried
+> **four** facets each. Side 4 is the −X wall and side 5 the −Y end cap; both contain
+> vertex 0, each has one rim edge bevelled, and their two offset lines happen to meet
+> the shared un-bevelled edge `0→4` at the same place — so the position dedupe, quite
+> correctly, hands them **one** index, 16 at `(0,0,19)`. That point is a *seam* between
+> the two faces, and the stretch from `v` down to it lies on the far side of it: with
+> both faces also keeping `v`, each emitted the run through `v` and the piece `16..0`
+> was covered from both.
+>
+> **Collinearity cannot be the discriminator**, which is the trap. The cube's
+> single-edge chamfer has the identical configuration — the inset sits on the
+> un-bevelled edge, strictly between `v` and the far vertex (measured: `side=1 v=4
+> (10,10,10) inset=8 (9,10,10) far=5 (0,10,10)`) — and it needs `v` **kept**. Testing
+> collinearity took the suite from 20/21 to **15/21**, breaking every single-edge case.
+>
+> The real condition is topological: `v` is redundant exactly when **some other side at
+> this vertex resolved to the same inset point**. One owner is the cube case, keep `v`;
+> two owners is the box case, drop it. Every side at the vertex is resolved before the
+> count is taken, so the answer does not depend on the order the sides are rewritten in —
+> `inset` is filled lazily, and a half-built read would answer differently for the first
+> side than for the second and break the determinism the whole pass is built around.
+>
+> #### The measurements, after
+>
+> | case | probe |
+> |---|---|
+> | all 12 chamfered | `tris=44 verts=32 coincident_dups=0 patches=8`, every corner `loop=3` |
+> | all 12 round, N = 4 | `tris=204 verts=112 coincident_dups=0 patches=8` |
+> | rim chain on the chamfered box | `tris=72 verts=40 coincident_dups=0 patches=4` |
+>
+> `coincident_dups=0` throughout, no case reaches the `BEVELDIAG(manifold)` dump, and
+> the generic `fill_open_loops()` fallback finds nothing left to do in any of them.
 
 ### The contract, stated once
 
@@ -315,14 +368,19 @@ Offered **only for a chain selection** — a bevel acts on edges and a face regi
 | refusals are reported | `width = 0` → `NoOp` with the mesh unchanged; empty list → `EmptyChain`; a coplanar edge → dropped as flat, counted |
 | the session applies and undoes a bevel | undo depth, topology follows the new mesh, redo, and a preview changes nothing |
 
-**Result: 14 of 21 `[MeshEdit]` pass, 7 fail** (the 9 phase-1 cases still pass, so nothing was regressed). Every failure is `BevelStatus::Failed` — the mesh is built but not closed — and they are exactly the cases the construction flaw predicts:
+**Result: 21 of 21 `[MeshEdit]` pass** (691 assertions), `[MeshRound]` 11 / 11 (13,166 assertions).
 
-| | |
-|---|---|
-| **passing** | the width solve and its order-independence; the same-bevel-twice determinism; every refusal path (`width = 0` identity, empty list, too-flat drop); all 9 phase-1 cases |
-| **failing** | chamfer one cube edge; round vs chamfer over segment counts; all-12 at N = 4; all-12 chamfered; chain on a chamfered box; the too-small-face clamp; the concave drop's convex control |
+It took four revisions to get there, and the record of what each one cost is in the status
+block at the top of this section: rails shared by position, winding settled globally, the
+inset-corner model, and the topological test for a vertex two sides share. Three of the four
+were found by the stage probe rather than by reasoning, which is why it is still in the file
+behind `MESHEDIT_BEVEL_DIAG`.
 
-The all-12 chamfer *did* match the closed-form volume at one point mid-debugging (after the side grouping, before the corner rewrite), which is the clue that led to the diagnosis: the all-edges cases can close by accident because every neighbouring side moves too.
+One historical note worth keeping. The all-12 chamfer *did* match the closed-form volume at one
+point mid-debugging (after the side grouping, before the corner rewrite), and that was
+misleading rather than encouraging: the all-edges cases can close by accident because every
+neighbouring side moves too, so a green all-12 with a red single-edge case means the
+construction is wrong and the symmetry is hiding it.
 
 ---
 

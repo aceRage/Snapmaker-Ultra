@@ -1375,32 +1375,114 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         edges_at_vertex[ev(1)].push_back(kv.first);
     }
 
+    // --- the inset corner points -----------------------------------------------
+    //
+    // ONE POINT PER (SIDE, VERTEX), not one per (edge, side, vertex).
+    //
+    // This is the rail model, and getting it wrong is what the previous revision
+    // measured but could not name. `rail_of()` used to return `v + w*t` - the edge
+    // pushed back by w along the incident face's in-plane normal - and used that
+    // same point for the side polygon, for the strip and for the corner patch. On
+    // the 20 mm cube at w = 2, corner (20,20,0), that puts the two points of face
+    // z = 0 at (20,18,0) and (18,20,0), BOTH OF THEM ON THE CUBE'S OWN EDGES. The
+    // side rewrite then dropped v and chorded between them - but the vertical
+    // edge's strip had its bottom end pair at exactly that same ((20,18,0),
+    // (18,20,0)) too, so the chord edge was claimed twice, no hole was left for the
+    // corner triangle, and the surface closed by count while pinching:
+    // corner_patches=0, is_closed_manifold true, removed 5626 where 432 is right.
+    //
+    // The correct geometry says what the point should have been. A face's polygon
+    // corner is the intersection of ITS OWN TWO OFFSET LINES: on z = 0 the line
+    // y = 18 (the offset of the -x edge) meets x = 18 (the offset of the -y edge)
+    // at the single point (18,18,0). A chamfered cube is 6 octagons + 12 rectangles
+    // + 8 triangles, and each octagon's corner is that ONE point, not a two-rail
+    // chord. Checked against the closed form before this was written: the convex
+    // hull of the 24 inset points of a 20 mm cube at w = 2 loses 437.3 against the
+    // closed form's 432.0, 1.2% - inside the test's 5%, and the residue is exactly
+    // the eight corner tetrahedra the chamfer planes would also have left.
+    //
+    // The same point then serves all three producers, which is what closes the
+    // surface: the strip quad of an edge runs between the inset points of the two
+    // ADJACENT SIDES at each of its endpoints, and the corner patch is the ring of
+    // inset points of the sides around the vertex. Every seam is then an edge
+    // between two inset points, carried by exactly one facet from each side of it.
+    //
+    // Degrees at the vertex, within one side:
+    //   two bevelled boundary edges  -> intersect the two offset lines (the case
+    //                                   above, and the ordinary corner);
+    //   one                          -> keep the old rail, v + w*t, and the strip
+    //                                   end cap that goes with it. The face still
+    //                                   reaches v along its un-bevelled edge, so
+    //                                   there is no corner to cut, only a point on
+    //                                   the way there;
+    //   three or more (a pinched side boundary passing through v twice) -> the mean
+    //                                   of the pairwise intersections, which
+    //                                   degenerates to the same answer when they
+    //                                   agree and stays inside the face when they
+    //                                   do not.
+    //
     // Vertices where a strip END CAP was emitted, so the corner filler can tell
     // an already-closed strip end from a real multi-bevel corner.
     std::set<int> capped_vertices;
 
-    // rail[(edge, side, vertex)] -> index of the inserted point.
-    std::map<std::tuple<int, int, int>, int> rail;
+    // Which bevelled edges of each SIDE's boundary meet at each vertex. Built from
+    // the facet adjacency rather than from the side boundary walk below, so it is
+    // available before any geometry is emitted: an edge is on side s's boundary
+    // when one of its two facets is in s and the other is not.
+    std::map<std::pair<int, int>, std::vector<int>> side_bev_at; // (side, vertex) -> edges
+    for (const auto &kv : width_of) {
+        const int     e  = kv.first;
+        const Vec2i32 ff = topo.edge_faces[e];
+        const Vec2i32 ev = topo.edge_vertices[e];
+        for (int k = 0; k < 2; ++k) {
+            if (ff(k) < 0)
+                continue;
+            const int s = side_of[size_t(ff(k))];
+            for (int j = 0; j < 2; ++j)
+                side_bev_at[std::make_pair(s, ev(j))].push_back(e);
+        }
+    }
+    // Deterministic order, and no duplicate when both facets of an edge somehow
+    // landed in one side (which the side split forbids, but cheap to be sure of).
+    for (auto &kv : side_bev_at) {
+        std::sort(kv.second.begin(), kv.second.end());
+        kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+    }
 
-    // ...and the same points keyed by POSITION, per original vertex, which is what
-    // makes two sides meeting at a bevelled vertex reference ONE rail point instead
-    // of a pair of twins.
+    // The old per-(edge, side, vertex) rail point, v + w*t. Still the answer when
+    // only one bevelled edge of the side meets at v, and still the direction the
+    // offset lines are built from.
+    auto rail_point = [&](int e, int side, int v, Vec3f *out_t) -> bool {
+        const Vec2i32 ff = topo.edge_faces[e];
+        size_t        on_side = size_t(-1);
+        for (int k = 0; k < 2; ++k)
+            if (ff(k) >= 0 && side_of[size_t(ff(k))] == side)
+                on_side = size_t(ff(k));
+        if (on_side == size_t(-1))
+            return false;
+        const Vec2i32 ev = topo.edge_vertices[e];
+        const int     u  = ev(0) == v ? ev(1) : ev(0);
+        const Vec3f   t  = in_plane_normal(its, topo, on_side, v, u);
+        if (t.squaredNorm() < 1e-18f)
+            return false;
+        *out_t = width_of.at(e) * t;
+        return true;
+    };
+
+    // inset[(side, vertex)] -> index of the inserted point.
+    std::map<std::pair<int, int>, int> inset;
+
+    // ...and the same points keyed by POSITION, per original vertex.
     //
-    // Why the (edge, side, vertex) key alone is not enough. Take the cube corner
-    // where the edges along X, Y and Z meet, with the three faces XY, YZ, ZX. The
-    // rail of the X edge measured in face XY is v + w*Y; the rail of the Z edge
-    // measured in face YZ is ALSO v + w*Y - a different edge and a different side,
-    // the same point. Each corner therefore produced three such twin pairs and the
-    // all-12 cube twenty-four (measured: coincident_dups=24, verts 136 -> 104
-    // across its_merge_vertices()). The filler then stitched the zero-area slivers
-    // BETWEEN the twins, reached the right patch count for that topology, and the
-    // merge welded the twins and collapsed every patch it had just made.
-    //
-    // So the dedupe has to happen at INSERTION, before anything is triangulated:
-    // the strips, the rewritten sides and the corner loops must all name the same
-    // index for the same point, or they do not share an edge and the surface is not
-    // closed. Merging afterwards is too late - by then the topology has been built
-    // around the duplicates.
+    // Still needed, and for the same reason the per-(edge, side) key needed it: two
+    // sides that meet at v along an UN-bevelled crease inset to the same point
+    // whenever the bevelled edges they see are the same ones - a chain that stops
+    // at v presents exactly that - and the strips, the rewritten sides and the
+    // corner loops must all name one index for one point or they do not share an
+    // edge and the surface is not closed. Merging afterwards is too late: by then
+    // the topology has been built around the duplicates (measured before the
+    // dedupe existed: coincident_dups=24 on the all-12 cube, and the merge welded
+    // them and collapsed every patch the filler had just made).
     //
     // Keyed by a quantised position rather than by exact float equality: the two
     // computations that land on one point run through different face normals and
@@ -1410,7 +1492,7 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
     // a value that is deterministic, so the same input still gives the same output
     // bit for bit. The key is per ORIGINAL VERTEX as well as per position, so two
     // genuinely distinct corners of a tiny feature can never collide across the mesh.
-    std::map<std::pair<int, std::tuple<int64_t, int64_t, int64_t>>, int> rail_by_pos;
+    std::map<std::pair<int, std::tuple<int64_t, int64_t, int64_t>>, int> inset_by_pos;
     auto pos_key = [](const Vec3f &p) {
         // llround, not a truncating cast: a cast rounds toward zero, so two values
         // straddling zero by an ULP land in different buckets.
@@ -1420,36 +1502,114 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
                                int64_t(std::llround(double(p.z()) * q)));
     };
 
-    auto rail_of = [&](int e, int side, int v) -> int {
-        const auto key = std::make_tuple(e, side, v);
-        auto       it  = rail.find(key);
-        if (it != rail.end())
+    // Intersect the two offset lines of edges `e0` and `e1` inside side `side`'s
+    // plane, at the shared vertex v.
+    //
+    // Each offset line is {v + o_i + s * d_i}, where o_i is the edge's own offset
+    // (w_i along the face's in-plane normal) and d_i the edge's direction away from
+    // v. Two lines in a plane, so the intersection is the 2x2 solve of
+    // o0 + s0*d0 = o1 + s1*d1 projected onto the plane's own basis. Solved in that
+    // 2D basis rather than by a 3D least-squares because the plane is exact here (a
+    // side is planar by construction) and the 2D determinant is the sine of the
+    // corner angle, which is the quantity the clamp already keeps away from zero.
+    auto intersect_offsets = [&](int side, int v, int e0, int e1, const Vec3f &n, Vec3f *outp) -> bool {
+        Vec3f o0, o1;
+        if (!rail_point(e0, side, v, &o0) || !rail_point(e1, side, v, &o1))
+            return false;
+        const Vec2i32 ev0 = topo.edge_vertices[e0];
+        const Vec2i32 ev1 = topo.edge_vertices[e1];
+        const Vec3f   d0  = (its.vertices[ev0(0) == v ? ev0(1) : ev0(0)] - its.vertices[v]).normalized();
+        const Vec3f   d1  = (its.vertices[ev1(0) == v ? ev1(1) : ev1(0)] - its.vertices[v]).normalized();
+
+        // A 2D basis of the side's plane. Any orthonormal pair spanning it will do;
+        // taking it from d0 keeps the determinant below equal to sin(corner angle).
+        Vec3f bx = d0 - n * d0.dot(n);
+        if (bx.squaredNorm() < 1e-18f)
+            return false;
+        bx.normalize();
+        const Vec3f by = n.cross(bx);
+
+        auto to2 = [&](const Vec3f &p) { return Vec2f(p.dot(bx), p.dot(by)); };
+        const Vec2f p0 = to2(o0), p1 = to2(o1);
+        const Vec2f a0 = to2(d0), a1 = to2(d1);
+
+        // p0 + s0*a0 = p1 + s1*a1  ->  s0*a0 - s1*a1 = p1 - p0
+        const float det = a0.x() * (-a1.y()) - (-a1.x()) * a0.y();
+        if (std::abs(det) < 1e-7f)
+            return false;   // the two edges are collinear at v: no corner to cut
+        const Vec2f rhs = p1 - p0;
+        const float s0  = (rhs.x() * (-a1.y()) - (-a1.x()) * rhs.y()) / det;
+        *outp = its.vertices[v] + o0 + d0 * s0;
+        return true;
+    };
+
+    auto inset_of = [&](int side, int v) -> int {
+        const auto key = std::make_pair(side, v);
+        auto       it  = inset.find(key);
+        if (it != inset.end())
             return it->second;
-        // The facet of this edge that lies on this side gives the plane the
-        // offset is measured in.
-        const Vec2i32 ff = topo.edge_faces[e];
-        size_t        on_side = size_t(-1);
-        for (int k = 0; k < 2; ++k)
-            if (ff(k) >= 0 && side_of[size_t(ff(k))] == side)
-                on_side = size_t(ff(k));
-        if (on_side == size_t(-1))
+
+        auto bit = side_bev_at.find(key);
+        if (bit == side_bev_at.end() || bit->second.empty())
             return -1;
-        const Vec2i32 ev = topo.edge_vertices[e];
-        const int     u  = ev(0) == v ? ev(1) : ev(0);
-        const Vec3f   t  = in_plane_normal(its, topo, on_side, v, u);
-        const Vec3f   p  = its.vertices[v] + width_of.at(e) * t;
+        const std::vector<int> &es = bit->second;
+
+        // The side's plane. Any of its facets gives it; they are coplanar by the
+        // side split's own condition.
+        Vec3f n = Vec3f::Zero();
+        {
+            const Vec2i32 ff = topo.edge_faces[es.front()];
+            for (int k = 0; k < 2; ++k)
+                if (ff(k) >= 0 && side_of[size_t(ff(k))] == side)
+                    n = topo.face_normals[size_t(ff(k))];
+        }
+        if (n.squaredNorm() < 1e-18f)
+            return -1;
+
+        Vec3f p;
+        if (es.size() == 1) {
+            // Only one bevelled edge of this side reaches v: there is no corner to
+            // cut here, just the rail on the way to a vertex the face still keeps.
+            Vec3f o;
+            if (!rail_point(es.front(), side, v, &o))
+                return -1;
+            p = its.vertices[v] + o;
+        } else {
+            // Two (the ordinary corner) or, for a pinched boundary, more: the mean
+            // of the pairwise intersections. With two that IS the intersection.
+            Vec3f  acc = Vec3f::Zero();
+            int    got = 0;
+            for (size_t i = 0; i < es.size(); ++i)
+                for (size_t j = i + 1; j < es.size(); ++j) {
+                    Vec3f q;
+                    if (intersect_offsets(side, v, es[i], es[j], n, &q)) {
+                        acc += q;
+                        ++got;
+                    }
+                }
+            if (got == 0) {
+                // Collinear offsets (two bevelled edges continuing straight through
+                // v): the offsets coincide, so either rail is the answer.
+                Vec3f o;
+                if (!rail_point(es.front(), side, v, &o))
+                    return -1;
+                p = its.vertices[v] + o;
+            } else {
+                p = acc / float(got);
+            }
+        }
 
         const auto pkey = std::make_pair(v, pos_key(p));
-        auto       pit  = rail_by_pos.find(pkey);
-        if (pit != rail_by_pos.end()) {
-            // Another (edge, side) already inserted this exact point. Share it.
-            rail.emplace(key, pit->second);
+        auto       pit  = inset_by_pos.find(pkey);
+        if (pit != inset_by_pos.end()) {
+            // Another side already inserted this exact point. Share it.
+            inset.emplace(key, pit->second);
             return pit->second;
         }
         const int nv = int(out.vertices.size());
         out.vertices.emplace_back(p);
-        rail.emplace(key, nv);
-        rail_by_pos.emplace(pkey, nv);
+        inset.emplace(key, nv);
+        inset_by_pos.emplace(pkey, nv);
         return nv;
     };
 
@@ -1563,21 +1723,90 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
                     poly.push_back(idx);
             };
 
-            if (in_bev)
-                push(rail_of(e_in, side, v));
-            // v is dropped only when BOTH of its boundary edges are bevelled -
-            // then the corner really is cut away and the two rails replace it.
-            // When only one is, v must stay: the face still reaches the vertex
-            // along its un-bevelled edge, and the rail is merely an extra point
-            // on the way there. Dropping it leaves that un-bevelled edge with one
-            // facet on one side and none on the other (measured: the single-edge
-            // chamfer came back non-closed, with edge 4-5 open). The rail is
-            // collinear with v and the next boundary vertex, which keeps the
-            // polygon simple - collinear is not self-intersecting.
-            if (!(in_bev && out_bev))
+            // BOTH boundary edges bevelled: the corner is cut away and replaced by
+            // the SINGLE inset point where this face's own two offset lines meet.
+            // One point, not a two-rail chord - that chord is exactly what pinched
+            // the surface, because the strip of the third edge meeting at this
+            // vertex claimed the very same pair as its own end, leaving no hole for
+            // the corner patch (measured on the all-12 chamfer: corner_patches=0,
+            // removed 5626 against 432). On z = 0 of the cube the chord
+            // (20,18,0)-(18,20,0) becomes the point (18,18,0), which is the
+            // octagon's corner.
+            //
+            // Only ONE bevelled: v USUALLY stays. The face still reaches the vertex
+            // along its un-bevelled edge, and the inset point (which for this case
+            // IS the old rail, v + w*t) is an extra point on the way there.
+            // Dropping it leaves that un-bevelled edge with one facet on one side
+            // and none on the other (measured: the single-edge chamfer came back
+            // non-closed, with edge 4-5 open).
+            //
+            // EXCEPT when the inset point lands ON that un-bevelled edge, which it
+            // does whenever the bevelled edge's offset line is parallel to it. Then
+            // v is BEYOND the inset point along the same line, and keeping it makes
+            // the polygon a zero-area spike: the ear clip trims the spike, emits the
+            // chord from the far vertex straight back to the inset point, and that
+            // chord is a fourth facet on an edge that already had two. Measured on
+            // the chamfered box's rim chain, whose -X face keeps 0 = (0,0,20) after
+            // its inset 16 = (0,0,19), with the far vertex 4 = (0,0,0) - all three
+            // on x = 0, y = 0: edge (4,16) came back carrying FOUR facets, open=0,
+            // nonmanifold=2, and the same at (9,17) on the other end.
+            //
+            // And the test that decides it is TOPOLOGICAL, not geometric - which is
+            // the thing three geometric attempts got wrong before the probe settled
+            // it. Collinearity cannot be the discriminator, because the cube's
+            // single-edge chamfer has exactly the same geometry and needs v KEPT:
+            // there too the inset sits on the un-bevelled edge, strictly between v
+            // and the far vertex (measured: side=1 v=4 (10,10,10) inset=8 (9,10,10)
+            // far=5 (0,10,10)). Testing collinearity dropped v on both and took the
+            // suite from 20/21 to 15/21.
+            //
+            // What is different about the box is that TWO sides resolve to the SAME
+            // inset point. Side 4 is the -X wall and side 5 the -Y end cap; both
+            // contain vertex 0, each has one rim edge bevelled, and the two offset
+            // lines happen to meet the shared un-bevelled edge 0->4 at the same
+            // place, so the position dedupe - correctly - hands them one index, 16
+            // at (0,0,19). That point is then a SEAM between the two faces, and the
+            // stretch from v down to it is on the far side of the seam: if both
+            // faces keep v as well, each emits the run through v and the piece
+            // 16..0 is covered from both, which is what put four facets on (4,16)
+            // and (9,17).
+            //
+            // So: v is redundant exactly when some OTHER side at this vertex already
+            // resolved to this same inset point. One side owning the point is the
+            // cube case (keep v); two sides sharing it is the box case (drop it).
+            // Every side at this vertex is resolved FIRST, so the count below does not
+            // depend on the order the sides happen to be rewritten in - `inset` is
+            // filled lazily, and a test that read it half-built would answer
+            // differently for the first side than for the second and break the
+            // determinism the whole pass is built around.
+            auto v_is_redundant = [&](int inset_idx) {
+                if (inset_idx < 0)
+                    return false;
+                int owners = 0;
+                for (const auto &kv : side_bev_at) {
+                    if (kv.first.second != v)
+                        continue;                       // a different vertex
+                    if (inset_of(kv.first.first, v) == inset_idx)
+                        ++owners;
+                }
+                return owners > 1;
+            };
+
+            if (in_bev && out_bev) {
+                push(inset_of(side, v));
+            } else if (in_bev) {
+                const int ip = inset_of(side, v);
+                push(ip);
+                if (!v_is_redundant(ip))
+                    push(v);
+            } else if (out_bev) {
+                const int ip = inset_of(side, v);
+                if (!v_is_redundant(ip))
+                    push(v);
+                push(ip);
+            } else {
                 push(v);
-            if (out_bev)
-                push(rail_of(e_out, side, v));
+            }
         }
         while (poly.size() > 1 && poly.front() == poly.back())
             poly.pop_back();
@@ -1612,8 +1841,16 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         const size_t  f0 = size_t(ff(0)), f1 = size_t(ff(1));
         const int     s0 = side_of[f0], s1 = side_of[f1];
 
-        const int a0 = rail_of(e, s0, a), b0 = rail_of(e, s0, b);
-        const int a1 = rail_of(e, s1, a), b1 = rail_of(e, s1, b);
+        // The strip runs between the INSET POINTS of the two adjacent sides, at each
+        // of the edge's two endpoints - the same points the side polygons were
+        // rewritten around, which is what makes each seam an edge shared by exactly
+        // one facet from either side of it. On the cube's vertical edge at
+        // (20,20,z) that is (20,18,2) on face x = 20 and (18,20,2) on face y = 20 at
+        // the bottom, and the same pair at z = 18 at the top: the chamfer rectangle
+        // of the 6 + 12 + 8 decomposition, no longer a band reaching down onto the
+        // cube's own edges.
+        const int a0 = inset_of(s0, a), b0 = inset_of(s0, b);
+        const int a1 = inset_of(s1, a), b1 = inset_of(s1, b);
         if (a0 < 0 || b0 < 0 || a1 < 0 || b1 < 0)
             continue;
 
@@ -1756,7 +1993,26 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
             ring.reserve(size_t(rings) + 1);
             ring.push_back(cA);
             // Values, not references: out.vertices grows inside this loop.
-            const Vec3f C  = its.vertices[v] + bis * centre_dist;
+            //
+            // The centre slides ALONG THE EDGE with the inset points. At a vertex
+            // where another bevelled edge meets this one, the inset points are
+            // pulled back off the original vertex down the edge, and an arc centre
+            // left at `v` would not be equidistant from them any more - the ring
+            // would bow out of the cylinder the strip's other end lies on and the
+            // two ends would not be parallel. Taking the centre at the MEAN AXIAL
+            // POSITION of the two endpoints keeps the arc a true cross-section of
+            // the same rolling-ball surface at both ends, and it is exactly
+            // `its.vertices[v]` in the one-bevelled-edge case, where the inset
+            // points are the old rails and nothing was pulled back.
+            Vec3f axis = its.vertices[v == a ? b : a] - its.vertices[v];
+            const float axis_len = axis.norm();
+            float       slide    = 0.f;
+            if (axis_len > 1e-9f) {
+                axis /= axis_len;
+                slide = 0.5f * ((out.vertices[cA] - its.vertices[v]).dot(axis) +
+                                (out.vertices[cB] - its.vertices[v]).dot(axis));
+            }
+            const Vec3f C  = its.vertices[v] + axis * slide + bis * centre_dist;
             const Vec3f dA = (out.vertices[cA] - C).normalized();
             const Vec3f dB = (out.vertices[cB] - C).normalized();
             const float rA = (out.vertices[cA] - C).norm();
@@ -1808,13 +2064,24 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
     // eight classic three-sided corners.
     //
     // ONE LOOP PER CORNER, built from the strips' own end edges. Each bevelled edge
-    // at `v` left an open end there (its rail pair for a chamfer, its whole arc ring
-    // for a round), and those ends were recorded in `strip_end_ring` as they were
-    // emitted. Because the rails are now shared by position, two edges adjacent
-    // around `v` TERMINATE ON THE SAME RAIL - the point offset into the face they
-    // have in common - so the ends chain terminal-to-terminal into exactly one
-    // closed ring, which is the patch boundary. Walking that ring is the
-    // construction; there is nothing to search for.
+    // at `v` left an open end there (its inset-point pair for a chamfer, its whole
+    // arc ring for a round), and those ends were recorded in `strip_end_ring` as
+    // they were emitted. Because every strip now terminates on the INSET POINTS of
+    // the two sides it runs between, two edges adjacent around `v` terminate on the
+    // SAME point - the one inset point of the face they have in common - so the ends
+    // chain terminal-to-terminal into exactly one closed ring, which is the patch
+    // boundary. Walking that ring is the construction; there is nothing to search
+    // for. On the chamfered cube that ring is the three inset points of the three
+    // faces at the corner - (18,18,0), (20,18,2), (18,20,2) at (20,20,0) - and the
+    // patch is the single triangle between them, which is the eighth of the
+    // 6 octagons + 12 rectangles + 8 triangles a chamfered cube is made of.
+    //
+    // This is what the two-rail chord could not leave room for. With the old rails
+    // the face's corner was a CHORD between (20,18,0) and (18,20,0), and the
+    // vertical edge's strip ended on that very same pair, so the edge had its two
+    // facets, nothing was open, and the corner triangle had nowhere to go
+    // (measured: corner_patches=0, is_closed_manifold true, removed 5626 where 432
+    // is right - closed by count while pinched).
     //
     // This replaces hunting for open boundary runs after the fact, and the reason is
     // measured rather than aesthetic. The old filler counted directed edges over the
@@ -1867,23 +2134,18 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
 
     // ONE CORNER AT A TIME, and every hole that corner owns.
     //
-    // The measured reason it is a set of holes rather than one. A chamfered corner is
-    // a single triangle between its three rails, and that is what the first version
-    // of this assumed. A ROUNDED corner is not: each rewritten side still closes its
-    // own cut with a straight CHORD between its two rails, while the strip that runs
-    // between those same two rails follows the ARC - so every pair of rails is joined
-    // twice, by a chord and by an arc, and the corner's boundary graph gives each rail
-    // degree four (measured, N = 4 on the all-12 cube: deg=4, and a longest-cycle walk
-    // came back with 9 of the 12 points). The region to close is therefore the chord
-    // triangle in the middle plus one lens between each chord and its arc: four loops,
-    // not one, and no single cycle spans them.
-    //
-    // So the walk does not try to be clever about which loop is "the" corner. It takes
-    // every open loop whose points all belong to this corner - the rails and arc
-    // points its own strips left exposed, plus the original vertex when a side kept it
-    // - fills each, and counts the whole corner as ONE corner patch. That is what a
-    // corner patch means to the caller and to the panel: the geometry that closes one
-    // corner, however many triangles and loops it takes.
+    // The reason it is a SET of holes rather than always one. A chamfered corner is a
+    // single triangle between the three inset points, and with the inset model that
+    // is now exactly what the strips leave open. A ROUNDED corner is not: each strip
+    // leaves its whole arc ring exposed, so the corner's boundary is a ring of arcs
+    // meeting at the sides' inset points, and how that ring decomposes depends on the
+    // valence and on whether any side kept its original vertex. So the walk does not
+    // try to be clever about which loop is "the" corner. It takes every open loop
+    // whose points all belong to this corner - the inset and arc points its own
+    // strips left exposed, plus the original vertex when a side kept it - fills each,
+    // and counts the whole corner as ONE corner patch. That is what a corner patch
+    // means to the caller and to the panel: the geometry that closes one corner,
+    // however many triangles and loops it takes.
     //
     // Restricting to the corner's own points is what the old global filler could not
     // do, and it is the entire fix. It never had to decide which of several boundary
@@ -1916,20 +2178,19 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         own.insert(v);
 
         // Which of this corner's open edges are the STRIP's own - a consecutive pair of
-        // one arc ring, or a chamfer's rail pair. The rest are CHORDS: the straight cut
-        // a rewritten side made across its corner between those same two rails.
+        // one arc ring, or a chamfer's inset-point pair. Anything else bounding the
+        // opening is a cut a rewritten side made across its own corner.
         //
         // The distinction decides the ORDER the holes are filled in, and getting it
         // wrong yields a closed mesh with the wrong volume rather than an obvious
-        // failure - which is why it is taken from recorded data rather than guessed from
-        // geometry. A rounded corner's four holes are the three lenses (one chord plus
-        // one arc run) and the chord triangle between them, and those tile the opening
-        // exactly once. Fill a lens and its chord is consumed. Fill the chord triangle
-        // FIRST and all three chords go at once, after which the only cycle left is the
-        // whole arc ring, whose fan then covers the chord triangle a second time -
-        // still closed, still manifold, but with a sliver of void sealed inside and the
-        // corner's volume wrong. So a cycle carrying a strip edge is always preferred:
-        // the lenses go first and the chord triangle is closed by them.
+        // failure - which is why it is taken from recorded data rather than guessed
+        // from geometry. Where a corner does decompose into several holes, filling the
+        // inner one first consumes all of its bounding cuts at once, and the only cycle
+        // left is then the outer ring, whose fan covers that inner region a SECOND time
+        // - still closed, still manifold, but with a sliver of void sealed inside and
+        // the corner's volume wrong. So a cycle carrying a strip edge is always
+        // preferred, which fills from the outside in and leaves the inner region to be
+        // closed by what surrounds it.
         std::set<std::pair<int, int>> strip_edge;
         for (int e : es) {
             auto it = strip_end_ring.find(std::make_pair(v, e));
