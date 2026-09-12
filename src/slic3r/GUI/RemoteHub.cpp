@@ -840,6 +840,207 @@ static int free_loopback_port()
     } catch (...) { return 0; }
 }
 
+// Native separators: this path is shown to the user to paste into the firewall dialog.
+static std::string go2rtc_exe_path()
+{
+    return fs::path(resources_dir() + "/tools/go2rtc/go2rtc.exe").make_preferred().string();
+}
+
+// ---- Stream quality variants -------------------------------------------------------------
+// The phone's Quality setting picks a *stream name*: "<name>" as the camera sends it, or a
+// "<name>_med" / "<name>_low" variant registered beside it. Registering those variants means
+// re-encoding, and go2rtc re-encodes by shelling out to an ffmpeg binary (its `ffmpeg:` source
+// scheme) - it does not carry a codec of its own. We do not bundle ffmpeg: resources/tools/go2rtc
+// holds go2rtc.exe and nothing else, and the Bambu live view's own camera tooling is not ours to
+// repurpose. So the variants exist only when the user has an ffmpeg on PATH, and the hub says so
+// rather than registering streams that would fail to start.
+//
+// What still works without ffmpeg, and is therefore what Quality actually does today:
+//   * the Bambu MJPEG relay drops frames (BambuCamRelay, ?fps=), which needs no decoder at all -
+//     whole JPEGs are forwarded or skipped - and is the setting that helps most on a slow link,
+//     because MJPEG's bitrate is very nearly linear in frame rate;
+//   * the phone asks for a variant name and falls back to the source name when it is absent, so
+//     the plumbing is live and an ffmpeg on PATH lights the rest up with no page change.
+static std::string ffmpeg_path()
+{
+    // Beside go2rtc first (where a user would drop one so go2rtc finds it), then PATH.
+    const std::string beside = fs::path(resources_dir() + "/tools/go2rtc/ffmpeg.exe").make_preferred().string();
+    boost::system::error_code ec;
+    if (fs::exists(beside, ec)) return beside;
+#ifdef _WIN32
+    std::string out; int code = 0;
+    if (run_capture({ "where", "ffmpeg" }, out, code, 8000) && code == 0) {
+        std::istringstream is(out); std::string line;
+        if (std::getline(is, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty()) return line;
+        }
+    }
+#endif
+    return "";
+}
+// The variant suffixes the hub can actually register, in descending quality. Empty without an
+// ffmpeg: a stream go2rtc cannot start is worse than an absent one, because the tile would go
+// black instead of falling back. Computed once - an ffmpeg appearing mid-run is not worth a
+// PATH lookup per request - and the hub logs which case it is at startup.
+static const std::vector<std::string>& quality_variants()
+{
+    static const std::vector<std::string> v = [] {
+        std::vector<std::string> out;
+        if (!ffmpeg_path().empty()) out = { "med", "low" };
+        return out;
+    }();
+    return v;
+}
+
+// go2rtc's `ffmpeg:` source, pointed back at the stream the hub already registered, so a variant
+// is a re-encode of our own stream rather than a second connection to the printer - the camera
+// still sees exactly one consumer. #hardware lets go2rtc pick a GPU encoder (dxva2/cuda on this
+// platform) and fall back to software by itself.
+static std::string variant_src(const std::string& base_name, const std::string& q)
+{
+    const std::string scale = (q == "low") ? "#width=640" : "#width=1280";
+    const std::string rate  = (q == "low") ? "#raw=-r 10" : "";
+    return "ffmpeg:" + base_name + "#video=h264#hardware" + scale + rate;
+}
+// ---- WebRTC (Phase 2): go2rtc's media port ------------------------------------------------
+// Everything else the hub runs is loopback-only, but WebRTC media goes straight from go2rtc to
+// the phone, so this one port has to be reachable on the LAN and on the tailnet. A predictable
+// port keeps a Windows Firewall rule the user allows once valid across restarts; 8555 is
+// go2rtc's own documented default, and if something else on the PC already holds it (another
+// go2rtc, say) we take the next free one and say which on the hub page.
+static const int WEBRTC_PORT_FIRST = 8555;
+static const int WEBRTC_PORT_LAST  = 8574;
+
+// Free for both protocols on every interface. A dual-stack listener elsewhere on the PC makes
+// the v4 bind fail too, which is what we want: go2rtc would not get the port either.
+static bool port_free_any(int port)
+{
+    try {
+        asio::io_context ioc;
+        tcp::acceptor    a(ioc);
+        a.open(tcp::v4());
+        a.bind(tcp::endpoint(tcp::v4(), (unsigned short) port));
+        asio::ip::udp::socket u(ioc);
+        u.open(asio::ip::udp::v4());
+        u.bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), (unsigned short) port));
+        return true;
+    } catch (...) { return false; }
+}
+
+static int free_webrtc_port()
+{
+    for (int p = WEBRTC_PORT_FIRST; p <= WEBRTC_PORT_LAST; ++p)
+        if (port_free_any(p)) return p;
+    return 0;
+}
+
+// What Windows Firewall thinks of go2rtc.exe. WebRTC media arrives inbound on the port above, so
+// without an allow rule for the profile the phone's network is on, the peer connection never
+// completes and the page silently stays on MSE through the hub. We only *look*: adding a rule
+// needs administrator rights and doing it silently would be wrong, so the answer is shown to the
+// user as a note with the two things they can allow.
+struct FirewallState
+{
+    std::string state { "unknown" }; // allowed | partial | missing | blocked | unknown
+    std::string note;                // one sentence, shown on the hub page (and on the phone)
+    std::string networks;            // profiles the PC's live networks are in ("Public, Private")
+    long long   checked_at { 0 };
+};
+
+// Joined for a sentence, each value once (two rules for the same profile, two networks in the
+// same profile - the user only wants to read "Private" once).
+static std::string join_words(const std::vector<std::string>& v, const char* sep)
+{
+    std::string              out;
+    std::vector<std::string> seen;
+    for (const std::string& s : v) {
+        if (std::find(seen.begin(), seen.end(), s) != seen.end()) continue;
+        seen.push_back(s);
+        if (!out.empty()) out += sep;
+        out += s;
+    }
+    return out;
+}
+
+// Windows Firewall through PowerShell rather than netsh: Get-NetFirewallRule answers with
+// property values (Allow/Inbound/Private) that are the same in every Windows display language,
+// while netsh's verbose output is localised and would have to be parsed by label.
+static FirewallState firewall_query(const std::string& exe, int port)
+{
+    FirewallState fw;
+    fw.checked_at = (long long) std::time(nullptr);
+#ifdef _WIN32
+    std::string quoted = exe; // '' escapes a quote inside a PowerShell single-quoted string
+    for (size_t i = 0; i < quoted.size(); ++i)
+        if (quoted[i] == '\'') quoted.insert(i++, 1, '\'');
+    const std::string script =
+        "$p='" + quoted + "';$f=[IO.Path]::GetFullPath($p);"
+        "$r=@(Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue |"
+        " Where-Object { try { [IO.Path]::GetFullPath($_.Program) -ieq $f } catch { $false } } |"
+        " Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' -and"
+        " $_.Direction -eq 'Inbound' });"
+        "foreach ($x in $r) { $(if ($x.Action -eq 'Block') { 'BLOCK=' } else { 'RULE=' }) + $x.Profile };"
+        "foreach ($n in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) { 'NET=' + $n.NetworkCategory };"
+        "'DONE'";
+    std::string out;
+    int         code = 0;
+    if (!run_capture({ "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script }, out, code, 30000) ||
+        out.find("DONE") == std::string::npos) {
+        fw.note = "Windows Firewall could not be checked. If remote video does not start, allow "
+                  "go2rtc.exe (inbound, UDP and TCP port " + std::to_string(port) + ").";
+        return fw;
+    }
+    std::vector<std::string> rules, blocks, nets;
+    std::istringstream       is(out);
+    std::string              line;
+    while (std::getline(is, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.compare(0, 5, "RULE=") == 0) rules.push_back(line.substr(5));
+        else if (line.compare(0, 6, "BLOCK=") == 0) blocks.push_back(line.substr(6));
+        else if (line.compare(0, 4, "NET=") == 0) nets.push_back(line.substr(4) == "DomainAuthenticated" ? "Domain" : line.substr(4));
+    }
+    // Only the profiles the PC's live networks are in matter: a rule that covers Public does
+    // nothing for a phone on a network Windows filed as Private.
+    auto covers = [](const std::vector<std::string>& rs, const std::string& n) {
+        for (const std::string& r : rs)
+            if (r == "Any" || lower(r).find(lower(n)) != std::string::npos) return true;
+        return false;
+    };
+    std::vector<std::string> uncovered, denied;
+    for (const std::string& n : nets) {
+        if (covers(blocks, n) && std::find(denied.begin(), denied.end(), n) == denied.end()) denied.push_back(n);
+        else if (!covers(rules, n) && std::find(uncovered.begin(), uncovered.end(), n) == uncovered.end()) uncovered.push_back(n);
+    }
+    fw.networks = join_words(nets, ", ");
+    const std::string allow = "In Windows Defender Firewall allow go2rtc.exe (inbound, UDP and TCP), or open port " +
+                              std::to_string(port) + " for UDP and TCP.";
+    if (!denied.empty()) {
+        // Windows writes one of these when the user dismisses its "allow access?" prompt, and a
+        // block rule wins over any allow rule, so this has to be reported ahead of them.
+        fw.state = "blocked";
+        fw.note  = "Windows Firewall has a rule that blocks go2rtc.exe on " + join_words(denied, " and ") +
+                   " networks (it is written when the firewall prompt is dismissed), so direct video cannot reach the phone; "
+                   "it falls back to relayed video through this hub. Delete that rule in Windows Defender Firewall > Inbound Rules. " + allow;
+    } else if (rules.empty()) {
+        fw.state = "missing";
+        fw.note  = "Windows Firewall has no inbound rule for go2rtc.exe, so direct video will not reach the phone; "
+                   "it falls back to relayed video through this hub. " + allow;
+    } else if (!uncovered.empty()) {
+        fw.state = "partial";
+        fw.note  = "Windows Firewall allows go2rtc.exe on " + join_words(rules, " / ") + " networks, but this PC is on a " +
+                   join_words(uncovered, " and ") + " network. " + allow;
+    } else {
+        fw.state = "allowed";
+        fw.note  = "";
+    }
+#else
+    (void) exe; (void) port;
+    fw.note = "Direct video needs inbound UDP and TCP port " + std::to_string(port) + " open for go2rtc.";
+#endif
+    return fw;
+}
+
 // The Host header must name this PC's loopback (a DNS-rebound name is not accepted).
 static bool loopback_host(const std::string& host)
 {
@@ -1263,6 +1464,7 @@ private:
     std::string state_for_phone();
     bool  lookup_host(const std::string& id, std::string& ip, std::string& code);
     std::string relay_h264_url(const std::string& id); // the U1 raw stream behind /relay/h264?id=, or ""
+    FirewallState  firewall_state(bool refresh);       // cached; the query runs on a detached thread
     TailscaleState remote_state(bool refresh);         // cached ~15 s; runs the tailscale CLI off the lock
     bool  set_remote(bool on, std::string& error);     // tailscale serve on/off for this hub
     void  remote_logins(const std::string& add, const std::string& remove);
@@ -1298,6 +1500,9 @@ private:
     std::string                    m_last_login;                 // most recent remote visitor
     long long                      m_last_login_at { 0 };
     int                            m_go2rtc_port { 0 };
+    int                            m_webrtc_port { 0 };          // go2rtc's WebRTC media port (0 = WebRTC off)
+    FirewallState                  m_fw;                         // last firewall_query()
+    std::atomic<bool>              m_fw_busy { false };
     long                           m_go2rtc_pid { 0 };
     void*                          m_job { nullptr };
     std::atomic<bool>              m_quit { false };
@@ -1329,8 +1534,16 @@ static BalloonFn balloon_fn()
 
 json HubServer::info_json()
 {
+    const FirewallState fw = firewall_state(false); // takes m_mutex itself: before the lock below
     json j;
     std::lock_guard<std::mutex> lock(m_mutex);
+    json v;
+    v["webrtc_port"]  = m_webrtc_port;
+    v["firewall"]     = m_webrtc_port ? fw.state : std::string("off");
+    v["note"]         = m_webrtc_port ? fw.note : std::string("No free port for WebRTC video; the phone uses relayed video.");
+    v["networks"]     = fw.networks;
+    v["go2rtc_exe"]   = go2rtc_exe_path();
+    j["video"]       = v;
     j["alive"]       = true;
     j["pid"]         = current_pid();
     j["port"]        = m_port;
@@ -1367,6 +1580,7 @@ void HubServer::write_hub_json()
         j["token"]       = m_token;
         j["secret"]      = m_secret;
         j["go2rtc_port"] = m_go2rtc_port;
+        j["webrtc_port"] = m_webrtc_port;
         j["version"]     = std::string(SLIC3R_VERSION);
         j["remote_on"]      = m_remote_on;
         j["allowed_logins"] = m_allowed_logins;
@@ -1645,7 +1859,7 @@ void HubServer::accept_loop(std::shared_ptr<tcp::acceptor> acceptor, bool admin)
 void HubServer::start_go2rtc()
 {
 #ifdef _WIN32
-    const std::string exe = resources_dir() + "/tools/go2rtc/go2rtc.exe";
+    const std::string exe = go2rtc_exe_path();
     if (!fs::exists(exe)) {
         BOOST_LOG_TRIVIAL(error) << "RemoteHub: missing " << exe;
         return;
@@ -1664,6 +1878,14 @@ void HubServer::start_go2rtc()
     m_go2rtc_user = random_hex(8);
     m_go2rtc_pass = random_hex(16);
     m_go2rtc_auth = basic_auth(m_go2rtc_user, m_go2rtc_pass);
+    // WebRTC media goes straight from go2rtc to the phone (Phase 2). The signalling still rides
+    // the hub's /api/ws tunnel - go2rtc 1.9.14 answers webrtc/offer on the WebSocket, so
+    // allow_paths does not need go2rtc's /api/webrtc (WHEP) route and stays as it is. The public
+    // STUN server only matters off the tailnet: it lets go2rtc learn its own public address so a
+    // phone on mobile data can try a direct path. On the tailnet and on the LAN the host
+    // candidates (100.x, 192.168.x/10.x) are what actually connect.
+    const int webrtc_port = free_webrtc_port();
+    if (webrtc_port == 0) BOOST_LOG_TRIVIAL(warning) << "RemoteHub: no free WebRTC port; video stays on MSE";
     const std::string cfg_path = (fs::path(hub_dir()) / "go2rtc.yaml").string();
     {
         boost::nowide::ofstream cfg(cfg_path);
@@ -1671,19 +1893,24 @@ void HubServer::start_go2rtc()
             << "  username: \"" << m_go2rtc_user << "\"\n  password: \"" << m_go2rtc_pass << "\"\n"
             << "  local_auth: true\n"
             << "  allow_paths: [\"/api/ws\", \"/api/streams\", \"/api/onvif\"]\n"
-            << "rtsp:\n  listen: \"\"\n"
-            // No WebRTC and no SRTP listener, deliberately. go2rtc would need a UDP port bound on
-            // a LAN interface to offer a host candidate, which is a second way into this PC that
-            // nothing here needs; and it would still not carry video over the remote path, because
-            // Tailscale Serve is an HTTPS reverse proxy - it forwards TCP to 127.0.0.1 and cannot
-            // forward the UDP media WebRTC wants. The phone therefore never gets a usable answer
-            // to a WebRTC offer today; stream_center.html knows that (WEBRTC_RELAY, and the spec
-            // note docs/superpowers/specs/2026-09-06-phone-lan-fallback.md) and picks a mode that
-            // rides the /api/ws tunnel instead. Enabling it means: a webrtc listen port here, a
-            // firewall hole, and - for the remote path - the phone on the tailnet itself rather
-            // than behind Serve.
-            << "webrtc:\n  listen: \"\"\n"
-            << "srtp:\n  listen: \"\"\n";
+            << "rtsp:\n  listen: \"\"\n";
+        // WebRTC media (Phase 2). Everything else the hub runs is loopback-only; this is the one
+        // port that has to be reachable from the phone, because the media goes straight from
+        // go2rtc to the phone rather than through the hub. The earlier note here said "no WebRTC
+        // listener, deliberately" - that was true while nothing opened the port or asked the
+        // firewall about it. Both now exist (free_webrtc_port() above, firewall_query()), so the
+        // listener goes on and the page decides per tile whether to use it. What has not changed:
+        // Tailscale Serve is an HTTPS reverse proxy and cannot forward UDP, so a phone arriving
+        // through a Serve origin still cannot use WebRTC - stream_center.html detects that origin
+        // and stays on MSE (see docs/superpowers/specs/2026-09-12-webrtc-video.md). The public
+        // STUN server only matters off the tailnet; on the tailnet and the LAN the host
+        // candidates (100.x, 192.168.x/10.x) are what actually connect.
+        if (webrtc_port > 0)
+            cfg << "webrtc:\n  listen: \":" << webrtc_port << "\"\n"
+                << "  ice_servers:\n    - urls: [\"stun:stun.cloudflare.com:3478\"]\n";
+        else
+            cfg << "webrtc:\n  listen: \"\"\n";
+        cfg << "srtp:\n  listen: \"\"\n";
     }
     if (!m_job) {
         HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
@@ -1700,8 +1927,39 @@ void HubServer::start_go2rtc()
         return;
     }
     m_go2rtc_port = port;
-    BOOST_LOG_TRIVIAL(info) << "RemoteHub: go2rtc pid " << m_go2rtc_pid << " on 127.0.0.1:" << port << " (credential-only)";
+    m_webrtc_port = webrtc_port;
+    BOOST_LOG_TRIVIAL(info) << "RemoteHub: go2rtc pid " << m_go2rtc_pid << " on 127.0.0.1:" << port
+                            << " (credential-only), WebRTC media on " << (webrtc_port ? std::to_string(webrtc_port) : std::string("off"));
+    if (webrtc_port > 0) firewall_state(true); // one PowerShell run on a detached thread; result cached
 #endif
+}
+
+// Cached; a refresh runs the (slow) PowerShell query on a detached thread and never blocks a
+// request, so the hub page's 3 s poll always gets the last answer straight away.
+FirewallState HubServer::firewall_state(bool refresh)
+{
+    int port = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        port = m_webrtc_port;
+        // Re-checked every few minutes so the hub page notices by itself once the user has
+        // allowed go2rtc in the firewall (or removed the rule again).
+        if (!refresh && m_fw.checked_at && (long long) std::time(nullptr) - m_fw.checked_at < 300) return m_fw;
+    }
+    if (port > 0 && !m_fw_busy.exchange(true)) {
+        std::thread([this, port]() {
+            FirewallState fw = firewall_query(go2rtc_exe_path(), port);
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_fw = fw;
+            }
+            if (fw.state != "allowed")
+                BOOST_LOG_TRIVIAL(info) << "RemoteHub: Windows Firewall for go2rtc.exe: " << fw.state << " (" << fw.note << ")";
+            m_fw_busy = false;
+        }).detach();
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_fw;
 }
 
 void HubServer::register_streams()
@@ -1737,6 +1995,23 @@ void HubServer::register_streams()
                     std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // go2rtc may still be starting
                 }
             }).detach();
+            // Quality variants beside the source stream, when an ffmpeg exists to make them (see
+            // quality_variants()). Each is a re-encode of the stream just registered, not a second
+            // connection to the printer, so the camera still sees one consumer. Registered lazily
+            // by go2rtc - the ffmpeg process only starts when a viewer actually opens the variant,
+            // so an unused _med/_low costs nothing.
+            for (const std::string& q : quality_variants()) {
+                const std::string vurl = base + "/api/streams?name=" + name + "_" + q +
+                                         "&src=" + percent_encode(variant_src(name, q));
+                std::thread([vurl]() {
+                    for (int attempt = 0; attempt < 3; ++attempt) {
+                        bool ok = false;
+                        Http::put2(vurl).timeout_connect(2).timeout_max(5).on_complete([&ok](std::string, unsigned) { ok = true; }).perform_sync();
+                        if (ok) return;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                    }
+                }).detach();
+            }
         }
     } catch (...) {}
 }
@@ -1771,14 +2046,28 @@ std::pair<int, std::string> HubServer::onvif_discover()
 // printer-page URLs. Addresses, access codes and camera credentials stay here.
 std::string HubServer::state_for_phone()
 {
+    const FirewallState fw = firewall_state(false); // takes m_mutex itself
     std::string state;
+    int         webrtc_port = 0;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        state = m_state;
+        state       = m_state;
+        webrtc_port = m_webrtc_port;
     }
     json out;
     out["hosts"]  = json::array();
     out["active"] = json::array();
+    // Whether the phone should try WebRTC at all, and - when the PC's firewall would very likely
+    // block it - one sentence the viewer can act on. The player falls back to MSE either way.
+    out["webrtc"]     = webrtc_port > 0;
+    out["video_note"] = (webrtc_port > 0 && fw.state != "allowed") ? fw.note : "";
+    // Quality: which downscaled variants the hub was able to register. Empty means "source only",
+    // and the page then shows Quality as High-only rather than offering settings that do nothing.
+    // See ffmpeg_path(): transcoded variants need an ffmpeg we do not bundle. The Bambu MJPEG
+    // relay's frame-drop knob needs no encoder, so it is reported separately and is always on.
+    out["quality"]      = json::array();
+    for (const std::string& q : quality_variants()) out["quality"].push_back(q);
+    out["quality_mjpeg"] = true; // ?fps= on the Bambu relay, decoder-free
     try {
         json j = json::parse(state);
         for (const auto& h : j.value("hosts", json::array())) {
@@ -1791,6 +2080,14 @@ std::string HubServer::state_for_phone()
             if (!u1_h264_url(h).empty()) {
                 p["rname"] = u1_stream_name(h.value("id", "")); // the go2rtc stream fed by /relay/h264
                 p["relay"] = true;                               // rurl still works on the LAN
+            }
+            // The variant stream names this host actually has, so the page asks for a name that
+            // exists rather than guessing "<name>_low" and getting a 404 from go2rtc.
+            if (!p["rname"].get<std::string>().empty()) {
+                json qn = json::object();
+                for (const std::string& q : quality_variants())
+                    qn[q] = p["rname"].get<std::string>() + "_" + q;
+                p["qnames"] = qn;
             }
             out["hosts"].push_back(p);
         }
@@ -2812,7 +3109,14 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner, bool admin)
             if (!lookup_host(query_param(r.query, "id"), ip, code) || code.empty()) { respond(client, 404, "text/plain", "unknown camera"); return; }
             const int relay = BambuCamRelay::get().port();
             if (relay == 0) { respond(client, 503, "text/plain", "camera relay is not running"); return; }
-            const std::string new_head = "GET /bambu?ip=" + percent_encode(ip) + "&code=" + percent_encode(code) + " HTTP/1.1\r\n" +
+            // Quality for the MJPEG path: the phone passes ?fps= and the relay drops frames to
+            // match (BambuCamRelay). Clamped here as well as there - this is the tunnelled
+            // listener, so the value arrives from the phone and must reach the relay as nothing
+            // but a small integer.
+            int fps = std::atoi(query_param(r.query, "fps").c_str());
+            if (fps < 0 || fps > 60) fps = 0;
+            const std::string new_head = "GET /bambu?ip=" + percent_encode(ip) + "&code=" + percent_encode(code) +
+                                         (fps > 0 ? "&fps=" + std::to_string(fps) : "") + " HTTP/1.1\r\n" +
                                          r.head.substr(r.head.find("\r\n") + 2);
             tunnel(client, relay, force_close(new_head), "");
         } else if (rest == "/ff") {

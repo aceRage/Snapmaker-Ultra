@@ -4,6 +4,7 @@
 #include <boost/asio/ssl.hpp>
 #include <boost/log/trivial.hpp>
 
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -74,6 +75,14 @@ static void serve_client(tcp::socket client)
         auto        params = parse_query(target);
         std::string ip     = params["ip"];
         std::string code   = params["code"];
+        // Quality, the decoder-free half of it: forward only every Nth frame. The printer sends a
+        // fixed stream and we copy whole JPEGs byte for byte - there is no encoder here to lower a
+        // quality factor with - but MJPEG has no inter-frame coding, so its bitrate is very nearly
+        // linear in frame rate, and dropping frames is a real, proportional saving on a slow link.
+        // 0 or absent means every frame, which is what every existing caller gets.
+        int target_fps = 0;
+        try { target_fps = params.count("fps") ? std::stoi(params["fps"]) : 0; } catch (...) { target_fps = 0; }
+        if (target_fps < 0 || target_fps > 60) target_fps = 0;
         if (ip.empty() || code.empty() || code.size() > 32 ||
             ip.find_first_not_of("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.:-_") != std::string::npos) {
             static const char br[] = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
@@ -114,6 +123,7 @@ static void serve_client(tcp::socket client)
         // stream rather than trusting the 16-byte frame headers.
         std::vector<unsigned char> buf;
         buf.reserve(256 * 1024);
+        std::chrono::steady_clock::time_point last_sent {}; // frame pacing, see target_fps above
         unsigned char chunk[8192];
         for (;;) {
             size_t n = upstream.read_some(asio::buffer(chunk, sizeof(chunk)));
@@ -132,13 +142,25 @@ static void serve_client(tcp::socket client)
                     if (buf[i] == 0xFF && buf[i + 1] == 0xD9) { end = i + 2; break; }
                 if (end == std::string::npos)
                     break; // frame incomplete, read more
-                char part[128];
-                int  hl = std::snprintf(part, sizeof(part),
-                                        "--bambuframe\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
-                                        end - start);
-                write_all(client, part, (size_t) hl);
-                write_all(client, (const char*) buf.data() + start, end - start);
-                write_all(client, "\r\n", 2);
+                // Frame pacing: keep a frame only when target_fps worth of time has passed since
+                // the last one we forwarded. Wall-clock rather than a modulo count, because the
+                // printer's own rate is neither fixed nor known.
+                bool keep = true;
+                if (target_fps > 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto gap = std::chrono::milliseconds(1000 / target_fps);
+                    if (last_sent != std::chrono::steady_clock::time_point{} && now - last_sent < gap) keep = false;
+                    else last_sent = now;
+                }
+                if (keep) {
+                    char part[128];
+                    int  hl = std::snprintf(part, sizeof(part),
+                                            "--bambuframe\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
+                                            end - start);
+                    write_all(client, part, (size_t) hl);
+                    write_all(client, (const char*) buf.data() + start, end - start);
+                    write_all(client, "\r\n", 2);
+                }
                 buf.erase(buf.begin(), buf.begin() + end);
             }
         }

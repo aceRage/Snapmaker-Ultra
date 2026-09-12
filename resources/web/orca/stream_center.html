@@ -35,6 +35,8 @@ html, body { width: 100%; height: 100%; background: #2b2b2b; font-family: 'Segoe
 #spacer { flex: 1; }
 select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
 #layoutbox { display: inline-flex; align-items: center; gap: 4px; color: #aaa; font-size: 12px; }
+#videobox { display: none; align-items: center; gap: 4px; margin-right: 8px; }
+#videowarn { display: none; color: #e0a33c; font-size: 15px; cursor: pointer; padding: 0 2px; }
 #grid { position: absolute; top: var(--bar-h, 52px); left: 0; right: 0; bottom: 0; display: grid; gap: 4px; padding: 4px; padding-bottom: calc(4px + env(safe-area-inset-bottom)); padding-left: calc(4px + env(safe-area-inset-left)); padding-right: calc(4px + env(safe-area-inset-right)); background: #2b2b2b; overflow-y: auto; overflow-x: hidden; align-content: start; -webkit-overflow-scrolling: touch; }
 #grid::-webkit-scrollbar { width: 10px; }
 #grid::-webkit-scrollbar-track { background: #222; }
@@ -358,6 +360,20 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     <span class="chip" id="phonechip" title="Open this camera wall on your phone">&#128241; Phone</span>
     <span id="spacer"></span>
     <span id="note"></span>
+    <span id="videobox">
+      <span id="videowarn" title="">&#9888;</span>
+      <select id="videomode" title="How camera video reaches this phone.">
+        <option value="auto">Video: auto</option>
+        <option value="webrtc">Video: WebRTC</option>
+        <option value="mse">Video: relay</option>
+      </select>
+      <select id="videoquality" title="How much picture to send. Lower settings cost less bandwidth on a slow link.">
+        <option value="auto">Quality: auto</option>
+        <option value="high">Quality: high</option>
+        <option value="med">Quality: medium</option>
+        <option value="low">Quality: low</option>
+      </select>
+    </span>
     <span id="layoutbox" title="Grid layout: columns x rows (drag a name to reorder)">
       <select id="cols"></select><span>&times;</span><select id="rows"></select>
     </span>
@@ -573,13 +589,135 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         });
         postToSlicer('stream_state:' + JSON.stringify({ hosts: hosts, active: state.active }));
     }
+    // How video reaches this phone, kept per phone (not on the PC). This is the *default* for
+    // every camera tile; a single tile can still be overridden with its own mode picker (the
+    // badge in its corner), which is what the per-tile modePrefs below are for.
+    //
+    // 'auto' asks the player for 'webrtc,mse': the bundled go2rtc player starts both, plays the
+    // relayed MSE stream at once and swaps to the direct WebRTC one the moment it produces a
+    // picture, so there is no gap and no wait if WebRTC cannot get through (a blocked firewall
+    // port, a network that drops UDP).
+    var VIDEO_KEY = 'snorca_remote_video';
+    var videoPref = 'auto', remoteWebrtc = false, videoNote = '';
+    try { var vp = localStorage.getItem(VIDEO_KEY); if (vp === 'webrtc' || vp === 'mse' || vp === 'auto') videoPref = vp; } catch (e) {}
+    // Tailscale Serve is an HTTPS reverse proxy: it forwards TCP to 127.0.0.1 and cannot forward
+    // the UDP media WebRTC needs, so a phone arriving through a Serve origin (https on a .ts.net
+    // name) can never complete a peer connection however healthy the hub's listener is. Auto
+    // therefore does not even try there - it would cost the fallback timeout on every tile for a
+    // path that cannot work. Forcing 'Video: WebRTC' by hand still tries, because a phone *on*
+    // the tailnet (rather than behind Serve) reaches the media port directly and does work.
+    function serveOrigin() {
+        return location.protocol === 'https:' && /\.ts\.net$/i.test(location.hostname);
+    }
+    // Whether a WebRTC attempt is worth making at all, for Auto. The hub half of this is
+    // remoteWebrtc (see webrtcOffered below); this adds the origin the page was loaded from.
+    function webrtcUsable() { return remoteWebrtc && !serveOrigin(); }
+    // ---- Quality -------------------------------------------------------------------------
+    // What the hub can actually offer, from /state: quality[] is the variant suffixes it managed
+    // to register ('med','low' - empty when the PC has no ffmpeg for go2rtc to re-encode with),
+    // and qnames maps them per host to the go2rtc stream name to ask for. quality_mjpeg says the
+    // Bambu relay's frame-drop knob is available, which needs no encoder and so is always true.
+    var QUALITY_KEY = 'snorca_remote_quality';
+    var qualityPref = 'auto', hubQuality = [], hubQualityMjpeg = false, hostQNames = {};
+    try { var qp = localStorage.getItem(QUALITY_KEY); if (qp === 'high' || qp === 'med' || qp === 'low' || qp === 'auto') qualityPref = qp; } catch (e) {}
+    // Auto: the link decides. A Serve origin or a DERP-relayed tailnet hop is the slow case this
+    // setting exists for, so it starts low there; on the LAN it stays at the source. A tile that
+    // stalls in its first seconds drops one step by itself (see noteTileStall).
+    var qualityStalled = {};   // cell id -> true once its first seconds buffered
+    function autoQuality(id) {
+        if (serveOrigin()) return 'low';
+        if (qualityStalled[id]) return 'low';
+        return connHere === 'home' ? 'high' : 'med';
+    }
+    // The step this tile is on. Deliberately NOT clamped to hubQuality here: the two delivery
+    // paths can honour a step independently, and clamping centrally would break the common one.
+    // A go2rtc tile needs a registered '<name>_med' variant (ffmpeg) and falls back to the source
+    // name without one - that clamp lives in qualityName(). A Bambu MJPEG tile needs no variant at
+    // all, only ?fps=, so it can honour Medium and Low on a PC with no ffmpeg whatsoever - which
+    // is the stock install. Clamping here returned 'high' for everything in that case and turned
+    // the whole setting off.
+    function qualityFor(id) {
+        return qualityPref === 'auto' ? autoQuality(id) : qualityPref;
+    }
+    // The go2rtc stream name for a tile at its chosen step; the source name at 'high' or when the
+    // hub has no variant for it.
+    function qualityName(id, rname) {
+        var q = qualityFor(id);
+        if (q === 'high') return rname;
+        var m = hostQNames[id];
+        return (m && m[q]) ? m[q] : rname;
+    }
+    // The MJPEG (Bambu relay) half: a frame rate rather than a stream name, because that path has
+    // no encoder to re-scale with - see BambuCamRelay. 0 means every frame.
+    function qualityFps(id) {
+        if (!hubQualityMjpeg) return 0;
+        var q = qualityFor(id);
+        return q === 'low' ? 5 : q === 'med' ? 10 : 0;
+    }
+    var QUALITY_LABEL = { high: 'High', med: 'Medium', low: 'Low' };
+    // A tile that buffered in its first seconds steps down once and rebuilds, but only under
+    // Auto - an explicit choice is the user's and is never overridden.
+    function noteTileStall(id) {
+        if (qualityPref !== 'auto' || qualityStalled[id]) return;
+        qualityStalled[id] = true;
+        document.querySelectorAll('#grid .cell').forEach(function(c) { if (c.dataset.id === id) c.remove(); });
+        render();
+    }
+    function renderQualityBox() {
+        if (!REMOTE) return;
+        var sel = document.getElementById('videoquality');
+        if (!sel) return;
+        sel.value = qualityPref;
+        // Steps the hub cannot deliver are hidden rather than offered and silently ignored.
+        ['med', 'low'].forEach(function(q) {
+            var o = sel.querySelector('option[value="' + q + '"]');
+            if (o) o.hidden = hubQuality.indexOf(q) === -1 && !hubQualityMjpeg;
+        });
+        sel.title = 'How much picture to send. Lower settings cost less bandwidth on a slow link.' +
+                    (hubQuality.length === 0
+                     ? ' This PC has no ffmpeg, so go2rtc cannot make downscaled copies of a camera stream: only the Bambu MJPEG relay can be turned down (fewer frames per second).'
+                     : '') +
+                    (qualityPref === 'auto' ? ' Auto starts low over a remote link and at the source quality on your home network.' : '');
+    }
+    function renderVideoBox() {
+        if (!REMOTE) return;
+        var box = document.getElementById('videobox'), sel = document.getElementById('videomode'), warn = document.getElementById('videowarn');
+        box.style.display = document.getElementById('layoutbox').style.display === 'none' ? 'none' : 'inline-flex'; // follows the layout picker
+        sel.value = videoPref;
+        // The WebRTC entry is only offered when the hub has a listener to answer with; without
+        // one it would silently never play. Same rule as streamModes(), one source of truth.
+        var wopt = sel.querySelector('option[value="webrtc"]');
+        if (wopt) wopt.hidden = !remoteWebrtc;
+        if (!remoteWebrtc && videoPref === 'webrtc') { videoPref = 'auto'; sel.value = 'auto'; }
+        // The help text says what Auto will actually do from *this* origin, so the Serve case is
+        // explained where the user meets it rather than only in the docs.
+        sel.title = 'How camera video reaches this phone. Auto tries a direct WebRTC connection and keeps the relayed stream playing until it takes over.' +
+                    (!remoteWebrtc ? ' This hub has no WebRTC listener, so Auto uses the relay.'
+                     : serveOrigin() ? ' You are connected through Tailscale Serve, an HTTPS proxy that cannot carry WebRTC’s UDP media, so Auto uses the relay here. Choosing WebRTC forces an attempt anyway (it works from a phone on the tailnet itself).'
+                     : '');
+        var show = !!videoNote && videoPref !== 'mse' && !serveOrigin();
+        warn.style.display = show ? 'inline' : 'none'; // the stylesheet hides it, so name a value
+        warn.title = videoNote;
+        // The Quality select lives in the same #videobox, so its visibility is already handled;
+        // this keeps its labels and its hidden options in step with the same render.
+        renderQualityBox();
+    }
     // Phone mode: pull the list from the PC now and every 15 s.
     function fetchRemoteState() {
         fetch(REMOTE + 'state').then(function(r) { return r.json(); }).then(function(s) {
             var hosts = (s && s.hosts) || [];
             var known = {};
             hosts.forEach(function(h) { known[h.id] = true; });
-            var changed = JSON.stringify(hosts) !== JSON.stringify(state.hosts);
+            var wasMode = remoteVideoMode();
+            remoteWebrtc = !!(s && s.webrtc);
+            videoNote = (s && s.video_note) || '';
+            hubQuality      = (s && s.quality) || [];
+            hubQualityMjpeg = !!(s && s.quality_mjpeg);
+            hostQNames = {};
+            hosts.forEach(function(h) { if (h.qnames) hostQNames[h.id] = h.qnames; });
+            renderQualityBox();
+            var changed = JSON.stringify(hosts) !== JSON.stringify(state.hosts) || remoteVideoMode() !== wasMode;
+            renderVideoBox();
             state.hosts = hosts;
             var before = state.active.join(',');
             state.active = state.active.filter(function(id) { return known[id]; });
@@ -816,15 +954,21 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     // generated go2rtc.yaml. mp4 and mjpeg ride the /api/ws tunnel that already exists, so 'hls'
     // is deliberately never in the string.
     //
-    // Why not WebRTC by default: the hub's generated go2rtc.yaml sets `webrtc: listen: ""` and
-    // `srtp: listen: ""` (RemoteHub.cpp, start_go2rtc), so go2rtc has no candidate to offer and an
-    // offer is never answered - not even on the LAN; and Tailscale Serve is an HTTPS reverse proxy
-    // that could not carry the UDP media anyway. It stays in the manual list for whoever turns it
-    // on, and WEBRTC_RELAY is the one line to flip when they do.
-    var WEBRTC_RELAY = false;
-    // WebRTC is only offered once the hub's go2rtc has a listener to answer with (WEBRTC_RELAY);
-    // until then the entry would silently never play, so it is not shown.
-    var STREAM_MODES = WEBRTC_RELAY ? ['auto', 'webrtc', 'mp4', 'mjpeg', 'mse'] : ['auto', 'mp4', 'mjpeg', 'mse'];
+    // WebRTC: the hub's generated go2rtc.yaml used to set `webrtc: listen: ""`, so go2rtc had no
+    // candidate to offer and an offer was never answered - not even on the LAN. That is no longer
+    // true: RemoteHub.cpp (start_go2rtc) binds a media port in 8555-8574 and reports it, so the
+    // page asks the hub rather than carrying a hand-flipped constant. A hub built or configured
+    // without the listener reports false and the WebRTC entry stays hidden exactly as before,
+    // which is the point of reading it instead of hard-coding true.
+    //
+    // remoteWebrtc is set from /state (see fetchRemoteState); on the PC's own Stream tab there is
+    // no hub to ask and no WebRTC either, so it stays false and the list is unchanged there.
+    function webrtcOffered() { return REMOTE ? remoteWebrtc : false; }
+    // The mode list is rebuilt whenever that answer changes, so the entry appears the moment the
+    // hub's first /state arrives rather than only on a reload.
+    function streamModes() {
+        return webrtcOffered() ? ['auto', 'webrtc', 'mp4', 'mjpeg', 'mse'] : ['auto', 'mp4', 'mjpeg', 'mse'];
+    }
     var MODE_LABEL   = { auto: 'Auto', webrtc: 'WebRTC', mp4: 'MP4', mjpeg: 'MJPEG', mse: 'MSE' };
     var MODE_KEY     = 'snorca_stream_mode';
     var modePrefs = {};
@@ -836,13 +980,28 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
     }
     function autoStreamMode() {
-        // A desktop browser on the home network keeps exactly what it had: 'mse', byte for byte.
-        if (connHere === 'home' && !iosWebKit()) return 'mse';
-        return WEBRTC_RELAY ? 'webrtc,mp4,mjpeg' : 'mp4,mjpeg';
+        // The PC's own Stream tab (not REMOTE) on the home network keeps exactly what it had:
+        // 'mse', byte for byte. It is same-origin loopback, there is no hub to ask about a
+        // WebRTC listener, and nothing about that path needed improving.
+        //
+        // A *phone* on the home network is a different case, and used to fall in here too: it
+        // loads this page from http://<pc>:13640/r/<token>/, so connHere is 'home', and an
+        // Android phone is not iosWebKit() - which meant the LAN phone, the case WebRTC helps
+        // most and the one the firewall rule exists for, would never have tried it.
+        if (!REMOTE && connHere === 'home' && !iosWebKit()) return 'mse';
+        // The per-phone Video setting is the default for Auto tiles. 'mse' means the relay only;
+        // 'webrtc' forces an attempt even from a Serve origin (the user asked for it); 'auto'
+        // tries WebRTC only where it can actually work - webrtcUsable() is the hub's listener
+        // AND an origin that can carry UDP.
+        if (videoPref === 'mse') return 'mp4,mjpeg';
+        if (videoPref === 'webrtc' && webrtcOffered()) return 'webrtc,mp4,mjpeg';
+        return webrtcUsable() ? 'webrtc,mp4,mjpeg' : 'mp4,mjpeg';
     }
     function streamMode(id) {
         var p = modePrefs[id];
-        if (p === 'webrtc') return 'webrtc,mp4,mjpeg';  // with a fallback: a dead offer is not a black square
+        // A dead offer is not a black square: WebRTC always carries its fallbacks behind it, and
+        // player.html drops the peer connection after rtctimeout if it has not produced a picture.
+        if (p === 'webrtc') return 'webrtc,mp4,mjpeg';
         if (p === 'mp4' || p === 'mjpeg' || p === 'mse') return p;
         return autoStreamMode();
     }
@@ -852,17 +1011,27 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         document.querySelectorAll('#grid .cell').forEach(function(c) { if (c.dataset.id === id) c.remove(); });
         render();
     }
-    // The badge and the override in one control: it reads "Auto \u00b7 MP4" (what is playing) and
-    // opens as a picker. The player inside the iframe shows the mode it actually settled on in its
-    // own corner, which is the check on this one.
+    // Which mode a tile actually ended on, as the player reported it (player.html posts
+    // snorcaMode once it has a picture). Until that arrives the badge shows the first mode we
+    // asked for, which is a guess; afterwards it is the truth, and for 'webrtc,mp4,mjpeg' those
+    // two differ exactly when the fallback happened - which is the thing worth seeing.
+    var tileMode = {};   // cell id -> mode the player settled on, this page load only
+    // The badge and the override in one control: it reads "Auto · WebRTC" (what is playing)
+    // and opens as a picker.
     function modePicker(cell, id) {
-        var active = streamMode(id).split(',')[0];
+        var asked  = streamMode(id).split(',')[0];
+        var active = tileMode[id] || asked;
         var sel = el('select', 'modepick');
-        sel.title = 'Stream mode for this camera (mode=' + streamMode(id) + ')';
+        sel.title = 'Stream mode for this camera (asked for mode=' + streamMode(id) + ')' +
+                    (tileMode[id] && tileMode[id] !== asked ? ', playing ' + MODE_LABEL[tileMode[id]] : '');
         sel.setAttribute('aria-label', 'Stream mode');
         sel.setAttribute('data-active', active);
-        STREAM_MODES.forEach(function(m) {
-            var o = el('option', '', m === 'auto' ? 'Auto \u00b7 ' + MODE_LABEL[active] : MODE_LABEL[m]);
+        streamModes().forEach(function(m) {
+            // "Auto · WebRTC · Low": the path it settled on, then the quality step, but only
+            // when that step is not the source (High is the unremarkable case and stays unsaid).
+            var qs = qualityFor(id);
+            var lbl = 'Auto · ' + (MODE_LABEL[active] || active) + (qs !== 'high' ? ' · ' + QUALITY_LABEL[qs] : '');
+            var o = el('option', '', m === 'auto' ? lbl : MODE_LABEL[m]);
             o.value = m;
             if ((modePrefs[id] || 'auto') === m) o.selected = true;
             sel.appendChild(o);
@@ -909,7 +1078,35 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     window.addEventListener('message', function(e) {
         if (e.origin !== location.origin) return;
         var d = e.data;
-        if (!d || typeof d !== 'object' || typeof d.snorcaAspect !== 'number') return;
+        if (!d || typeof d !== 'object') return;
+        // Which path the tile settled on, for its badge. The cell is found the same way as the
+        // aspect below: e.source is the reporting frame's window.
+        if (typeof d.snorcaMode === 'string' && d.snorcaMode) {
+            document.querySelectorAll('#grid .cell').forEach(function(cell) {
+                var fr = cell.querySelector('iframe');
+                if (!fr || fr.contentWindow !== e.source) return;
+                var id = cell.dataset.id;
+                if (!id || tileMode[id] === d.snorcaMode) return;
+                tileMode[id] = d.snorcaMode;
+                // Relabel in place: rebuilding the cell would restart the stream it just settled.
+                var sel = cell.querySelector('select.modepick');
+                if (!sel) return;
+                sel.setAttribute('data-active', d.snorcaMode);
+                var opt = sel.querySelector('option[value="auto"]');
+                var qs2 = qualityFor(id);
+                if (opt) opt.textContent = 'Auto · ' + (MODE_LABEL[d.snorcaMode] || d.snorcaMode) +
+                                           (qs2 !== 'high' ? ' · ' + QUALITY_LABEL[qs2] : '');
+            });
+        }
+        // A tile that could not keep up in its first seconds: under Auto, step its quality down
+        // once. Same cell lookup as above.
+        if (d.snorcaStall === true) {
+            document.querySelectorAll('#grid .cell').forEach(function(cell) {
+                var fr = cell.querySelector('iframe');
+                if (fr && fr.contentWindow === e.source && cell.dataset.id) noteTileStall(cell.dataset.id);
+            });
+        }
+        if (typeof d.snorcaAspect !== 'number') return;
         var ar = d.snorcaAspect;
         if (!(ar > 0.2 && ar < 6)) return;
         if (d.src) cellAspect[d.src] = ar;
@@ -934,7 +1131,10 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             var f = document.createElement('iframe');
             f.allow = 'autoplay';
             f.setAttribute('scrolling', 'no'); // iOS otherwise grows the frame to its content
-            f.src = '/stream.html?src=' + encodeURIComponent(h.rname) + '&mode=' + encodeURIComponent(streamMode(h.id));
+            // The stream name carries the quality step (a '<name>_med' / '_low' variant the hub
+            // registered, or the source name), so a slow link asks go2rtc for less picture rather
+            // than throttling a full one.
+            f.src = '/stream.html?src=' + encodeURIComponent(qualityName(h.id, h.rname)) + '&mode=' + encodeURIComponent(streamMode(h.id));
             cell.appendChild(f);
             modePicker(cell, h.id);
         } else if (h.rkind === 'p1') {
@@ -945,7 +1145,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             im.addEventListener('load', function() {
                 if (im.naturalWidth && im.naturalHeight) setCellAspect(cell, im.naturalWidth / im.naturalHeight);
             });
-            im.src = REMOTE + 'bambu?id=' + encodeURIComponent(h.id);
+            // The MJPEG relay has no encoder to downscale with, so its quality knob is a frame
+            // rate (BambuCamRelay drops whole JPEGs). 0 = every frame, and the parameter is left
+            // off entirely then so nothing changes for the High case.
+            var fps = qualityFps(h.id);
+            im.src = REMOTE + 'bambu?id=' + encodeURIComponent(h.id) + (fps ? '&fps=' + fps : '');
             cell.appendChild(im);
         } else if (h.rkind === 'url' && h.rurl) {
             var f2 = document.createElement('iframe');
@@ -1547,6 +1751,32 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             save(); render();
         };
     });
+    if (REMOTE) {
+        var vsel = document.getElementById('videomode');
+        vsel.value = videoPref;
+        vsel.onchange = function() {
+            videoPref = vsel.value;
+            try { localStorage.setItem(VIDEO_KEY, videoPref); } catch (e) {}
+            // Every camera tile is an iframe with the mode in its URL: drop them and rebuild.
+            // What each tile had settled on goes with them - it described the old mode.
+            tileMode = {};
+            document.querySelectorAll('#grid .cell').forEach(function(cell) { cell.remove(); });
+            renderVideoBox(); render();
+        };
+        var qsel = document.getElementById('videoquality');
+        qsel.value = qualityPref;
+        qsel.onchange = function() {
+            qualityPref = qsel.value;
+            try { localStorage.setItem(QUALITY_KEY, qualityPref); } catch (e) {}
+            // A step the user chose clears what Auto had learned, so going back to Auto starts
+            // from the link again rather than from an old stall.
+            qualityStalled = {};
+            // The step is in every tile's URL (a stream name, or ?fps=): drop them and rebuild.
+            document.querySelectorAll('#grid .cell').forEach(function(cell) { cell.remove(); });
+            renderQualityBox(); render();
+        };
+        document.getElementById('videowarn').onclick = function() { if (videoNote) alert(videoNote); };
+    }
     window.addEventListener('resize', function() {
         if (REMOTE && remoteAutoLayout && state.layout !== remoteDefaultLayout()) { state.layout = remoteDefaultLayout(); save(); }
         render();
@@ -1718,6 +1948,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         document.getElementById('reprints').style.display = v === 'reprints' ? 'block' : 'none';
         document.getElementById('chips').style.display = v === 'streams' ? '' : 'none';
         document.getElementById('layoutbox').style.display = v === 'streams' ? '' : 'none';
+        renderVideoBox();
         if (v === 'streams') render(); // tile sizes come from the grid's on-screen size
         // Hiding/showing the camera chips row just changed #topbar's height (fewer rows outside
         // Streams); every .view reads --bar-h to know where it starts, so it has to be recomputed
