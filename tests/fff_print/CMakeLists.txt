@@ -19,6 +19,7 @@ add_executable(${_TEST_NAME}_tests
 	test_fuzzy_skin_overhangs.cpp
 	test_offset_layers.cpp
 	test_seam_position.cpp
+	test_slice_bake.cpp
 	test_tree_support_determinism.cpp
 	test_bed_temperature.cpp
 	test_trianglemesh.cpp
