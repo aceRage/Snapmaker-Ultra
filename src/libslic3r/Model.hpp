@@ -21,6 +21,7 @@
 #include "TriangleSelector.hpp"
 #include "ImageFill.hpp"
 #include "FlexiJoint.hpp"
+#include "CutRecipe.hpp"
 
 //BBS: add bbs 3mf
 #include "Format/bbs_3mf.hpp"
@@ -413,6 +414,18 @@ public:
     CutConnectors cut_connectors;
     CutObjectBase cut_id;
 
+    // RE-EDITABLE CUTS. The cut that produced this object, when it was made with
+    // "Keep cut editable" on: the surface, its parameters, the connector
+    // definitions and the object's own pre-cut mesh. BOTH halves of one cut carry
+    // an equal recipe (they already share cut_id), so selecting either one is
+    // enough to reopen the Cut gizmo on the original mesh and cut again.
+    //
+    // Empty for every object that was never cut, for a cut made with the option
+    // off, and for every 3MF written before this existed - all of which then
+    // behave exactly as they always did. See CutRecipe.hpp.
+    std::optional<CutRecipe> cut_recipe;
+    bool has_cut_recipe() const { return cut_recipe.has_value() && cut_recipe->valid(); }
+
     Model*                  get_model() { return m_model; }
     const Model*            get_model() const { return m_model; }
     // BBS: production extension
@@ -701,7 +714,7 @@ private:
             m_bounding_box_approx, m_bounding_box_approx_valid, 
             m_bounding_box_exact, m_bounding_box_exact_valid, m_min_max_z_valid,
             m_raw_bounding_box, m_raw_bounding_box_valid, m_raw_mesh_bounding_box, m_raw_mesh_bounding_box_valid,
-            cut_connectors, cut_id);
+            cut_connectors, cut_id, cut_recipe);
     }
     template<class Archive> void load(Archive& ar) {
         ar(cereal::base_class<ObjectBase>(this));
@@ -714,7 +727,7 @@ private:
             m_bounding_box_approx, m_bounding_box_approx_valid, 
             m_bounding_box_exact, m_bounding_box_exact_valid, m_min_max_z_valid,
             m_raw_bounding_box, m_raw_bounding_box_valid, m_raw_mesh_bounding_box, m_raw_mesh_bounding_box_valid,
-            cut_connectors, cut_id);
+            cut_connectors, cut_id, cut_recipe);
         std::vector<ObjectID> volume_ids2;
         std::transform(volumes.begin(), volumes.end(), std::back_inserter(volume_ids2), std::mem_fn(&ObjectBase::id));
         if (volume_ids != volume_ids2)

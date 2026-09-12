@@ -515,6 +515,85 @@ class GLGizmoCut3D : public GLGizmoBase
     // applies to all of them.
     void           invalidate_cut_surfaces();
 
+    // --- RE-EDITABLE CUTS ---------------------------------------------------
+    // A cut used to be destructive: the plane, the sheet and the stroke were
+    // session state, the two halves were baked, and nothing described how they
+    // had been made. With "Keep cut editable" on, perform_cut() now also writes
+    // a CutRecipe onto both halves - the surface, its parameters, the connector
+    // definitions and the object's own PRE-CUT mesh - so the cut can be reopened
+    // and made again.
+    //
+    // The option itself. Default ON, as the spec asks; the tooltip states the
+    // cost, because the stored mesh roughly doubles the 3MF size of a cut object.
+    // With it OFF nothing is recorded and the cut behaves exactly as before.
+    bool m_keep_cut_editable{ true };
+
+    // THE RE-EDIT SESSION.
+    //
+    // While this is set, the gizmo is not cutting a fresh object: it is editing a
+    // cut that already happened. The two halves are hidden, the ORIGINAL mesh is
+    // shown in their place, and "Perform cut" replaces the halves rather than
+    // splitting the selection.
+    bool m_reedit_active{ false };
+    // The recipe being edited. Held by value: the objects it came from are
+    // deleted and rebuilt by the re-cut, so a reference into the model would
+    // dangle exactly when it is needed.
+    CutRecipe m_reedit_recipe;
+    // The objects the re-edit will REPLACE, by ObjectID rather than by index:
+    // apply_cut_object_to_model() deletes and re-adds objects, and any index
+    // taken before that is meaningless after it.
+    std::vector<ObjectID> m_reedit_object_ids;
+    // The stand-in object that shows the pre-cut mesh while the re-edit is open,
+    // so Cancel can remove it and the re-cut can replace it. Again an ObjectID.
+    ObjectID m_reedit_proxy_id;
+    // The halves themselves, kept aside while the re-edit is open so Cancel can
+    // put them back EXACTLY as they were.
+    //
+    // The obvious alternative - let the plater's undo restore them - does not
+    // work: Plater::TakeSnapshot suppresses snapshots only for its own scope, so
+    // by the time the user cancels, the stack's top is no longer the snapshot the
+    // menu item took and a single undo() would land somewhere else entirely.
+    // Holding the objects is exact, and does not depend on what else has been
+    // snapshotted in between.
+    //
+    // A Model of their own rather than loose pointers: a ModelObject's lifetime
+    // is owned by its Model, and this gives them one for the duration.
+    Model m_reedit_stash;
+    // Only one half of the cut is still in the model: the other was deleted. The
+    // re-cut still works and produces both halves again, but the panel says so
+    // first - re-cutting would otherwise silently resurrect a part the user had
+    // deliberately thrown away.
+    bool m_reedit_one_half_missing{ false };
+    // Set between the menu item and the gizmo actually opening. on_set_state()
+    // flattens every piece of session state when the gizmo opens, so a recipe
+    // applied BEFORE that would be wiped; this parks it until after the reset.
+    bool                  m_reedit_pending{ false };
+    CutRecipe             m_reedit_pending_recipe;
+    std::vector<ObjectID> m_reedit_pending_object_ids;
+
+    // Take the parked recipe and become a re-edit session: hide the halves, put
+    // the pre-cut mesh on the bed in their place, and populate every control from
+    // the recipe. Called at the end of on_set_state()'s On branch.
+    void begin_reedit();
+    // Undo begin_reedit(): remove the stand-in, bring the halves back. Called
+    // when the gizmo closes without a cut.
+    void cancel_reedit();
+    // Put every gizmo control back from a recipe - the plane, the surface, the
+    // parameters, the connectors, and the gizmo-local undo stacks (seeded with
+    // the recipe's own surface, so the first Ctrl+Z in a re-edit returns to what
+    // was loaded rather than to a flat sheet).
+    void apply_recipe_to_gizmo(const CutRecipe& recipe);
+    // The reverse: everything the gizmo currently holds, as a recipe. `mesh` is
+    // the pre-cut mesh to record; the caller supplies it because in a fresh cut
+    // it is the object being cut and in a re-edit it is the recipe's own mesh.
+    CutRecipe build_recipe_from_gizmo(const ModelObject* mo, const TriangleMesh& mesh) const;
+    // The merged, object-frame mesh of a ModelObject's MODEL_PART volumes that
+    // are not cut connectors - i.e. what a cut actually operates on, and so what
+    // a recipe has to remember.
+    static TriangleMesh object_part_mesh(const ModelObject* mo);
+    // The panel's re-edit banner.
+    void render_reedit_notice();
+
     bool m_hide_cut_plane{ false };
     bool m_connectors_editing{ false };
     bool m_cut_plane_as_circle{ false };
@@ -626,6 +705,14 @@ class GLGizmoCut3D : public GLGizmoBase
 
 public:
     GLGizmoCut3D(GLCanvas3D& parent, const std::string& icon_filename, unsigned int sprite_id);
+
+    // RE-EDITABLE CUTS. Arm a re-edit: called from the "Edit cut..." menu item
+    // BEFORE the gizmo is opened, because open_gizmo() runs on_set_state(), which
+    // resets the session state - so the recipe is parked and consumed on the way
+    // out of that reset. False when the recipe cannot be re-cut (no pre-cut mesh,
+    // unknown schema); nothing is armed then and the caller says why.
+    bool arm_reedit(const CutRecipe& recipe, const std::vector<ObjectID>& object_ids);
+    bool is_reedit_active() const { return m_reedit_active; }
 
     std::string get_tooltip() const override;
     bool unproject_on_cut_plane(const Vec2d& mouse_pos, Vec3d& pos, Vec3d& pos_world, bool respect_contours = true);
