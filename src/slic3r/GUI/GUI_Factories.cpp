@@ -1857,6 +1857,13 @@ void MenuFactory::create_extra_object_menu()
     append_menu_item_fix_through_netfabb(&m_object_menu);
     // Object Simplify
     append_menu_item_simplify(&m_object_menu);
+    // Ultra (slice baking, phase 1): turn the SLICED outer wall - fuzzy skin and all - into
+    // a mesh that can be re-sliced. Enabled only once the object has perimeters to bake.
+    // docs/superpowers/specs/2026-09-12-slice-bake-research.md
+    append_menu_item(&m_object_menu, wxID_ANY, _L("Bake slice to mesh..."),
+        _L("Rebuild this object as the outer wall the slicer will actually print, so it can be re-sliced at another layer height"),
+        [](wxCommandEvent&) { obj_list()->bake_slice_to_mesh(); }, "", &m_object_menu,
+        []() { return ObjectList::can_bake_slice_to_mesh(); }, m_parent);
     // Image Fill (Phase 2): on the object menu too - a single-part object never opens the part menu.
     append_menu_item_image_fill(&m_object_menu);
     // merge to single part

@@ -17,6 +17,8 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/MeshRepair.hpp"
 #include "libslic3r/MeshRemesh.hpp"
+#include "libslic3r/SliceBake.hpp"
+#include "libslic3r/Print.hpp"
 #include "GLCanvas3D.hpp"
 #include "Selection.hpp"
 #include "PartPlate.hpp"
@@ -27,6 +29,10 @@
 #include "SingleChoiceDialog.hpp"
 #include "StepMeshDialog.hpp"
 #include "RemeshDialog.hpp"
+#include "SliceBakeDialog.hpp"
+#include "Jobs/SliceBakeJob.hpp"
+#include "Jobs/Worker.hpp"
+#include <wx/filedlg.h>
 #include "QuadRemeshDialog.hpp"
 
 #include <boost/algorithm/string.hpp>
@@ -6046,6 +6052,114 @@ void ObjectList::quad_remesh(bool close_gizmos)
             msg += " " + GUI::format(_L("%1% part(s) failed."), failed);
         notify->push_notification(into_u8(msg));
     }
+}
+
+// Ultra: slice baking (phase 1) - turn the object's SLICED outer wall, fuzzy skin and all,
+// into a watertight mesh that can be re-sliced. The geometry is all in libslic3r/SliceBake;
+// the dialog collects the options and SliceBakeJob does the work off the UI thread.
+//
+// docs/superpowers/specs/2026-09-12-slice-bake-research.md
+
+// The sliced PrintObject behind the object at obj_idx, or nullptr when the plate has not been
+// sliced far enough for a bake (the bake reads LayerRegion::perimeters, so posPerimeters is the
+// step that has to be done - not the whole G-code export).
+static const PrintObject* baked_print_object_for(int obj_idx)
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr || obj_idx < 0)
+        return nullptr;
+    const Model& model = plater->model();
+    if (size_t(obj_idx) >= model.objects.size())
+        return nullptr;
+    const ModelObject* mo = model.objects[size_t(obj_idx)];
+
+    // A slice that is still running owns the layers the bake would read.
+    if (plater->is_background_process_slicing())
+        return nullptr;
+
+    const Print& print = plater->fff_print();
+    for (const PrintObject* po : print.objects())
+        if (po != nullptr && po->model_object() == mo &&
+            po->is_step_done(posPerimeters) && po->layer_count() > 0)
+            return po;
+    return nullptr;
+}
+
+bool ObjectList::can_bake_slice_to_mesh()
+{
+    ObjectList* list = wxGetApp().obj_list();
+    if (list == nullptr)
+        return false;
+    std::vector<int> obj_idxs, vol_idxs;
+    list->get_selection_indexes(obj_idxs, vol_idxs);
+    if (obj_idxs.empty())
+        return false;
+    // The bake covers a whole object (the per-layer union runs over every region of every layer),
+    // so exactly one object at a time and no per-volume selection.
+    if (obj_idxs.size() != 1)
+        return false;
+    const PrintObject* po = baked_print_object_for(obj_idxs.front());
+    return po != nullptr && slice_bake_available(*po);
+}
+
+void ObjectList::bake_slice_to_mesh()
+{
+    if (!wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager().check_gizmos_closed_except(GLGizmosManager::Undefined))
+        return;
+
+    std::vector<int> obj_idxs, vol_idxs;
+    get_selection_indexes(obj_idxs, vol_idxs);
+    if (obj_idxs.size() != 1)
+        return;
+    const int obj_idx = obj_idxs.front();
+
+    const PrintObject* po = baked_print_object_for(obj_idx);
+    if (po == nullptr || !slice_bake_available(*po)) {
+        // The menu gate should have caught this; say why rather than doing nothing, since the
+        // plate can go stale between the menu opening and the click.
+        wxGetApp().notification_manager()->push_plater_warning_notification(
+            _u8L("Slice the plate before baking its slice to a mesh."));
+        return;
+    }
+
+    Plater* plater = wxGetApp().plater();
+    ModelObject* mo = object(obj_idx);
+    if (mo == nullptr)
+        return;
+    const std::string name = mo->name.empty() ? std::string("object") : mo->name;
+
+    // The size line the spec asks for: the count is stated BEFORE the run, not after it has eaten
+    // the memory. Both figures come off the sliced object without building anything.
+    SliceBakeOptions probe;
+    const size_t estimate = slice_bake_estimate_triangles(*po, probe);
+
+    SliceBakeSettings settings;
+    {
+        SliceBakeDialog dlg(wxGetApp().mainframe, from_u8(name), po->layer_count(), estimate);
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+        settings = dlg.settings();
+    }
+
+    // The export path is asked for on the main thread, before the job starts: a file dialog from
+    // finalize() would pop up long after the user moved on.
+    std::string export_path;
+    if (settings.result == SliceBakeResultMode::ExportSTL) {
+        wxFileDialog dlg(this, _L("Export baked mesh"), from_u8(wxGetApp().app_config->get_last_output_dir("")),
+                         from_u8(name) + "_baked.stl", file_wildcards(FT_STL),
+                         wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+        export_path = into_u8(dlg.GetPath());
+        if (export_path.empty())
+            return;
+        wxGetApp().app_config->update_last_output_dir(into_u8(wxFileName(dlg.GetPath()).GetPath()));
+    }
+
+    Worker& worker = plater->get_ui_job_worker();
+    if (!worker.is_idle())
+        return;
+    replace_job(worker, std::make_unique<SliceBakeJob>(plater, po, mo->id(), settings, name, export_path));
 }
 
 void ObjectList::fix_through_netfabb()
