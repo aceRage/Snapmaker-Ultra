@@ -1893,9 +1893,7 @@ void HubServer::start_go2rtc()
             << "  username: \"" << m_go2rtc_user << "\"\n  password: \"" << m_go2rtc_pass << "\"\n"
             << "  local_auth: true\n"
             << "  allow_paths: [\"/api/ws\", \"/api/streams\", \"/api/onvif\"]\n"
-            << "rtsp:
-  listen: \"\"
-";
+            << "rtsp:\n  listen: \"\"\n";
         // WebRTC media (Phase 2). Everything else the hub runs is loopback-only; this is the one
         // port that has to be reachable from the phone, because the media goes straight from
         // go2rtc to the phone rather than through the hub. The earlier note here said "no WebRTC
@@ -1908,19 +1906,11 @@ void HubServer::start_go2rtc()
         // STUN server only matters off the tailnet; on the tailnet and the LAN the host
         // candidates (100.x, 192.168.x/10.x) are what actually connect.
         if (webrtc_port > 0)
-            cfg << "webrtc:
-  listen: \":" << webrtc_port << "\"
-"
-                << "  ice_servers:
-    - urls: [\"stun:stun.cloudflare.com:3478\"]
-";
+            cfg << "webrtc:\n  listen: \":" << webrtc_port << "\"\n"
+                << "  ice_servers:\n    - urls: [\"stun:stun.cloudflare.com:3478\"]\n";
         else
-            cfg << "webrtc:
-  listen: \"\"
-";
-        cfg << "srtp:
-  listen: \"\"
-";
+            cfg << "webrtc:\n  listen: \"\"\n";
+        cfg << "srtp:\n  listen: \"\"\n";
     }
     if (!m_job) {
         HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
