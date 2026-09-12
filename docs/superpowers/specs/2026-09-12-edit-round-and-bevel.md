@@ -83,24 +83,38 @@ Three of these failed on the first run and all three were faults in the *test sc
 
 ## Step 2 — Edge bevel / chamfer (phase 2)
 
-> **STATUS: NOT FINISHED — one named defect left. Do not ship this half.**
+> **STATUS: NOT FINISHED — the single-edge cases are done, the multi-edge ones are not. Do not ship this half.**
 >
-> **`[MeshEdit]` 13 / 21.** The construction has been rewritten to the spec's *insert-and-re-triangulate* approach (see below), and the mesh is now **built, closed and manifold**: `status = Ok`, `is_closed_manifold()` passes, and a single-edge chamfer produces exactly the expected **20 triangles / 12 vertices** with no leftover holes and no spurious corner patches.
+> **`[MeshEdit]` 17 / 21**, `[MeshRound]` 11 / 11. The end-cap winding bug this block used to name is **fixed**, and that took the suite from 13 to 17.
 >
-> What is left is **one winding bug in the strip end cap**, which the pre-cleanup dump names exactly. For the cube's 7→4 edge the two caps are `T19 (4,8,10)` — correct — and `T18 (7,9,11)` — **flipped**. Its three directed edges each occur twice in the *same* direction and never in reverse:
+> **What was fixed.** Both strip end caps were emitted by one `cap_end()` lambda against one shared `outward` reference (the mean of the two incident *face* normals). `outward` is perpendicular to the bevelled edge, while a cap lies roughly perpendicular to the *faces* at one end of it — so the sign of that dot product is near-degenerate, and it came out right at one end of the edge and wrong at the other. `cap_end()` now orients each cap against **the strip band it actually adjoins**: `emit_quad()` records which way it wound each rail pair in a small `strip_dir` map, and the cap takes the reverse of that directed edge, so the two facets sharing it oppose by construction rather than by a normal test. The two ends therefore get opposite relative windings, which is exactly what the shared reference could not produce.
+>
+> **What is left: the multi-edge cases.** The four still failing are all of them and only them —
+>
+> | still failing |
+> |---|
+> | bevelling all 12 cube edges (N = 4, 8 corner patches) |
+> | chamfering all 12 cube edges vs the closed-form volume loss |
+> | a chain on a chamfered box |
+> | the same bevel twice is bit-identical (its fixture bevels several edges) |
+>
+> Everything else passes: the single-edge chamfer, round-vs-chamfer monotonicity over N, the width-solve clamp, order-independence, every refusal path, and all 9 phase-1 cases.
+>
+> **Where the remaining defect is — measured, not reasoned.** Define `MESHEDIT_BEVEL_DIAG` and the stage probe reports, for the all-12 cube:
 >
 > ```
-> directed edge   fwd  rev
->     (7, 9)       2    0
->     (9,11)       2    0
->     (11,7)       2    0
+> pre-fill             tris=132 verts=136 unmatched_dir=120 badwind=120 coincident_dups=24 capped=0
+> post-fill,pre-merge  tris=252 verts=136 badwind=120        coincident_dups=24 patches=8
+> manifold             tris=252 verts=104 open=0 nonmanifold=24 corners=8
 > ```
 >
-> That is precisely why the two closedness checks disagree, and it explains every remaining failure in one stroke: `is_closed_manifold()` is *undirected* (counts two facets per edge — passes), while `its_num_open_edges()` is *winding-aware* (via `its_face_neighbors`, which pairs directed half-edges — fails). Every one of the 8 failures is a `watertight()` assertion reporting `status 0`.
+> Three things that dump settles:
 >
-> **The fix:** both caps are emitted by the same `cap_end()` lambda against the same `outward` reference (the mean of the two incident *face* normals). That reference is correct at one end of the edge and wrong at the other. Orient each cap against **its own strip quad** instead of against the shared `outward`.
+> * **`capped=0`.** The end caps never fire in these cases — correctly, because every vertex there carries more than one bevelled edge. So the winding fix above is *not* what is failing here; that half is done.
+> * **`open=0`, `nonmanifold=24`.** There are no holes. Twenty-four edges carry **four** facets, and each runs between a rail and a corner-patch centroid.
+> * **`coincident_dups=24`, and `verts` 136 → 104 across the merge.** Two sides meeting at a bevelled vertex each insert their *own* rail there, at numerically the same point. The filler is therefore looking at a mesh with duplicate vertices: it fills the zero-area gaps *between* a duplicate and its twin, arrives at the right patch count (8) for that topology, and then `its_merge_vertices()` welds the duplicates and collapses each filled hole onto its neighbour. The patches are correct for a topology that the merge then destroys.
 >
-> Everything not downstream of this passes: the width solve and its proven order-independence, the refusal paths, the `width = 0` identity, and all 9 phase-1 cases.
+> **What was tried and is deliberately not in the tree.** Welding *before* filling (merge, remap `capped_vertices` by position, then fill). It does what it claims — `coincident_dups` goes to 0 and the chamfered box improves from `nonmanifold=6` to `2` — but on the cube the filler then stitches **20** loops where 8 are wanted and leaves `open=84`. The weld is necessary but not sufficient: `fill_open_loops()` also has to stop treating one corner's several boundary runs as separate loops. That is the next piece of work, and the stage probe is in the tree (inert) to measure it.
 
 ### The contract, stated once
 

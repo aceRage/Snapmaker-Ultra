@@ -1464,6 +1464,14 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         // wrong. (The hand-derived winding WAS inverted when this was first
         // written, caught by working the cube corner through on paper.)
         const Vec3f outward = topo.face_normals[f0] + topo.face_normals[f1];
+
+        // Which direction each rail-to-rail edge runs in the strip that was
+        // actually emitted. The end caps read this back: a cap sits on the strip's
+        // open end and must use the REVERSE of the strip's own directed edge, or
+        // the two facets sharing that edge agree in direction instead of opposing
+        // and the surface is closed but inconsistently wound.
+        std::map<std::pair<int, int>, bool> strip_dir; // (x,y) present => strip runs x -> y
+
         auto emit_quad = [&](int p0, int p1, int q1, int q0) {
             const Vec3f A = out.vertices[p0];
             const Vec3f B = out.vertices[p1];
@@ -1477,6 +1485,15 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
             };
             tri(p0, p1, q1);
             tri(p0, q1, q0);
+            // p0->p1 and q1->q0 are the two ends of this band (the rail pairs at
+            // the edge's two endpoints); record them as the strip wound them.
+            if (flip) {
+                strip_dir[std::make_pair(p1, p0)] = true;
+                strip_dir[std::make_pair(q0, q1)] = true;
+            } else {
+                strip_dir[std::make_pair(p0, p1)] = true;
+                strip_dir[std::make_pair(q1, q0)] = true;
+            }
         };
 
         // END CAPS. Where a bevelled edge STOPS at a vertex - because no other
@@ -1502,9 +1519,36 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
                 return;
             if (r0 == r1 || v == r0 || v == r1)
                 return;
-            const Vec3f A = out.vertices[v], B = out.vertices[r0], C = out.vertices[r1];
-            if ((B - A).cross(C - A).dot(outward) < 0.f) out.indices.emplace_back(v, r1, r0);
-            else                                        out.indices.emplace_back(v, r0, r1);
+
+            // Orient against the strip facet this cap actually adjoins, NOT against
+            // `outward`. `outward` is the mean of the two incident FACE normals; it
+            // is perpendicular to the edge, while a cap lies roughly perpendicular
+            // to the FACES at one end of it - so the sign of their dot product is
+            // near-degenerate and comes out right at one end of the edge and wrong
+            // at the other. (Measured: for the cube's 7->4 edge the caps were
+            // T19 (4,8,10) correct and T18 (7,9,11) flipped, whose three directed
+            // edges each occurred twice forward and never reversed. That passes the
+            // undirected is_closed_manifold() and fails the winding-aware
+            // its_num_open_edges(), which is why watertight() reported status 0.)
+            //
+            // The strip already knows which way it wound r0..r1; the cap shares that
+            // edge and must run it backwards.
+            bool have = false, rev = false;
+            if (strip_dir.count(std::make_pair(r0, r1)) > 0) { have = true; rev = true;  }
+            else if (strip_dir.count(std::make_pair(r1, r0)) > 0) { have = true; rev = false; }
+
+            if (have) {
+                // strip ran r0->r1  =>  cap must run r1->r0, i.e. (v, r1, r0).
+                if (rev) out.indices.emplace_back(v, r1, r0);
+                else     out.indices.emplace_back(v, r0, r1);
+            } else {
+                // No strip band on this pair (should not happen; kept so a caller
+                // that reaches here still gets a plausible triangle rather than
+                // none). Fall back to the face-normal reference.
+                const Vec3f A = out.vertices[v], B = out.vertices[r0], C = out.vertices[r1];
+                if ((B - A).cross(C - A).dot(outward) < 0.f) out.indices.emplace_back(v, r1, r0);
+                else                                        out.indices.emplace_back(v, r0, r1);
+            }
             capped_vertices.insert(v);
         };
 
@@ -1599,8 +1643,47 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
     // that was never torn is never open, so it is never touched, and a hole that
     // does exist is filled exactly once whatever produced it. Robust by
     // construction rather than by case analysis.
+    // A STAGE PROBE, for whoever finishes the multi-edge cases. The final dump
+    // below reports the mesh after the merge, which is too late to tell apart the
+    // three things that can go wrong here; this one reports the same counts just
+    // before the fill and just after it, so a failure can be attributed to the
+    // strips, to the filler, or to the merge. `coincident_dups` is what the merge
+    // is about to weld - the all-12 cube carries 24 of them, and that is the trail
+    // the remaining defect is on. (Welding BEFORE the fill was tried: it does clear
+    // the duplicates and takes the chamfered box from nonmanifold=6 to 2, but it
+    // leaves the cube's filler stitching 20 loops where 8 are wanted, so it is not
+    // the whole answer and is not in the tree.)
+#ifdef MESHEDIT_BEVEL_DIAG
+    auto stage_probe = [&](const char *when) {
+        std::map<std::pair<int, int>, int> d;
+        for (const Vec3i32 &f : out.indices)
+            for (int s = 0; s < 3; ++s)
+                ++d[std::make_pair(f[s], f[(s + 1) % 3])];
+        int unmatched = 0, bad = 0;
+        for (const auto &e : d) {
+            auto      it  = d.find(std::make_pair(e.first.second, e.first.first));
+            const int rev = it == d.end() ? 0 : it->second;
+            if (rev == 0) ++unmatched;
+            if (!(e.second == 1 && rev == 1)) ++bad;
+        }
+        std::map<std::tuple<int, int, int>, int> q;
+        for (const Vec3f &v : out.vertices)
+            ++q[std::make_tuple(int(v.x() * 1024.f), int(v.y() * 1024.f), int(v.z() * 1024.f))];
+        int dup = 0;
+        for (const auto &e : q)
+            if (e.second > 1) dup += e.second - 1;
+        std::fprintf(stderr,
+                     "BEVELDIAG(%s) tris=%zu verts=%zu unmatched_dir=%d badwind=%d "
+                     "coincident_dups=%d capped=%zu patches=%zu\n",
+                     when, out.indices.size(), out.vertices.size(), unmatched, bad, dup,
+                     capped_vertices.size(), res.corner_patches);
+    };
+    stage_probe("pre-fill");
+#endif
     fill_open_loops(out, res.corner_patches, capped_vertices);
-
+#ifdef MESHEDIT_BEVEL_DIAG
+    stage_probe("post-fill,pre-merge");
+#endif
 
     // --- clean up ------------------------------------------------------------
     its_merge_vertices(out);
@@ -1628,7 +1711,7 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
                 if (c.second == 1) ++open;
                 else if (c.second > 2) ++over;
             }
-            std::fprintf(stderr, "BEVELDIAG tris=%zu verts=%zu open=%d nonmanifold=%d corners=%zu\n",
+            std::fprintf(stderr, "BEVELDIAG(manifold) tris=%zu verts=%zu open=%d nonmanifold=%d corners=%zu\n",
                          out.indices.size(), out.vertices.size(), open, over, res.corner_patches);
             int shown = 0;
             for (const auto &c : cnt) {
@@ -1639,6 +1722,25 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
                              out.vertices[c.first.first].z(), out.vertices[c.first.second].x(),
                              out.vertices[c.first.second].y(), out.vertices[c.first.second].z());
             }
+            // Winding: a consistently wound closed surface carries each directed
+            // edge exactly once. Report the pairs that do not, which is what tells
+            // a winding fault apart from a genuine hole.
+            std::map<std::pair<int, int>, int> dir;
+            for (const Vec3i32 &f : out.indices)
+                for (int s = 0; s < 3; ++s)
+                    ++dir[std::make_pair(f[s], f[(s + 1) % 3])];
+            int badwind = 0, shown2 = 0;
+            for (const auto &d : dir) {
+                auto      it  = dir.find(std::make_pair(d.first.second, d.first.first));
+                const int rev = it == dir.end() ? 0 : it->second;
+                if (d.second == 1 && rev == 1)
+                    continue;
+                ++badwind;
+                if (shown2++ > 20) continue;
+                std::fprintf(stderr, "  WIND (%d->%d) fwd=%d rev=%d\n",
+                             d.first.first, d.first.second, d.second, rev);
+            }
+            std::fprintf(stderr, "BEVELDIAG badwind=%d\n", badwind);
         }
 #endif
         res.status = BevelStatus::Failed;
@@ -1646,6 +1748,10 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         return res;
     }
     if (params.check_self_intersection && self_intersects(out)) {
+#ifdef MESHEDIT_BEVEL_DIAG
+        std::fprintf(stderr, "BEVELDIAG(selfint) tris=%zu verts=%zu corners=%zu\n",
+                     out.indices.size(), out.vertices.size(), res.corner_patches);
+#endif
         res.status = BevelStatus::Failed;
         res.mesh.clear();
         return res;
