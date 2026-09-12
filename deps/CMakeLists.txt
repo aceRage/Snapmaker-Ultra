@@ -302,6 +302,7 @@ include(CGAL/CGAL.cmake)
 
 include(NLopt/NLopt.cmake)
 include(Manifold/Manifold.cmake)
+include(QuadriFlow/QuadriFlow.cmake)
 include(libnoise/libnoise.cmake)
 
 
@@ -384,6 +385,7 @@ set(_dep_list
     dep_Cereal
     dep_NLopt
     dep_Manifold
+    dep_QuadriFlow
     dep_OpenVDB
     dep_OpenCSG
     dep_OpenCV
