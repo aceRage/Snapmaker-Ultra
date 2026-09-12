@@ -532,7 +532,7 @@ TEST_CASE("PrusaLinkStatus: what a PrusaLink printer says it is doing", "[PrintH
             "{\"printer\":{\"state\":\"IDLE\",\"temp_nozzle\":24.7,\"target_nozzle\":0.0,"
             " \"temp_bed\":23.9,\"target_bed\":0.0,\"axis_z\":10.0,\"flow\":100,\"speed\":100},"
             " \"storage\":{\"path\":\"/usb/\",\"name\":\"usb\",\"read_only\":false}}";
-        const Status st = parse_status(body);
+        const PrusaLinkStatus::Status st = parse_status(body);
         CHECK(st.answered);
         CHECK(st.authorized);
         CHECK(st.raw_state == "IDLE");
@@ -557,7 +557,7 @@ TEST_CASE("PrusaLinkStatus: what a PrusaLink printer says it is doing", "[PrintH
             "{\"id\":34,\"state\":\"PRINTING\",\"progress\":62.0,\"time_remaining\":1440,"
             " \"time_printing\":2400,\"file\":{\"name\":\"CUBE~1.BGC\",\"display_name\":\"calibration cube.bgcode\","
             " \"path\":\"/usb\",\"size\":91234}}";
-        const Status st = parse_status(status, job);
+        const PrusaLinkStatus::Status st = parse_status(status, job);
         CHECK(st.answered);
         CHECK(st.state == "printing");
         CHECK(st.has_progress);
@@ -575,7 +575,7 @@ TEST_CASE("PrusaLinkStatus: what a PrusaLink printer says it is doing", "[PrintH
     SECTION("a job with no display_name falls back to the on-disk one") {
         const std::string status = "{\"printer\":{\"state\":\"PAUSED\"}}";
         const std::string job    = "{\"state\":\"PAUSED\",\"file\":{\"name\":\"PART~1.GCO\"}}";
-        const Status      st     = parse_status(status, job);
+        const PrusaLinkStatus::Status st     = parse_status(status, job);
         CHECK(st.state == "paused");
         CHECK(st.filename == "PART~1.GCO");
     }
@@ -603,7 +603,7 @@ TEST_CASE("PrusaLinkStatus: what a PrusaLink printer says it is doing", "[PrintH
     }
 
     SECTION("progress is clamped, negative times are dropped") {
-        const Status st = parse_status(
+        const PrusaLinkStatus::Status st = parse_status(
             "{\"printer\":{\"state\":\"PRINTING\"},\"job\":{\"progress\":100.0001,\"time_remaining\":-1}}");
         CHECK(st.has_progress);
         CHECK(st.progress == Approx(100.0));
