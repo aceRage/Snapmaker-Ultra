@@ -28,6 +28,8 @@
 #include "StepMeshDialog.hpp"
 #include "RemeshDialog.hpp"
 #include "QuadRemeshDialog.hpp"
+// RE-EDITABLE CUTS: edit_cut() arms the Cut gizmo with a stored recipe.
+#include "Gizmos/GLGizmoCut.hpp"
 
 #include <boost/algorithm/string.hpp>
 #include <wx/progdlg.h>
@@ -3370,6 +3372,104 @@ bool ObjectList::has_selected_cut_object() const
     }
 
     return false;
+}
+
+// RE-EDITABLE CUTS: is any selected object a cut half that remembers the cut that
+// made it? This is the enable condition for the "Edit cut..." menu item.
+bool ObjectList::has_selected_editable_cut() const
+{
+    wxDataViewItemArray sels;
+    GetSelections(sels);
+    if (sels.IsEmpty())
+        return false;
+
+    for (wxDataViewItem item : sels) {
+        const int obj_idx = m_objects_model->GetObjectIdByItem(item);
+        // Same index guard has_selected_cut_object() carries, and for the same
+        // reason: a deleted item can still be in sels.
+        if (obj_idx >= 0 && obj_idx < int(m_objects->size()) && object(obj_idx)->has_cut_recipe())
+            return true;
+    }
+
+    return false;
+}
+
+// RE-EDITABLE CUTS: reopen the Cut gizmo on the cut that produced the selection.
+//
+// The recipe is carried by BOTH halves, so any one of them is enough to find it;
+// what the re-edit needs beyond that is every object that came out of the SAME
+// cut, because those are the objects it will replace. They are found by cut_id,
+// the link the cut machinery already maintains between the halves - and not by
+// the recipe, which is deliberately equal on both and so cannot tell two
+// different cuts apart.
+void ObjectList::edit_cut()
+{
+    auto plater = wxGetApp().plater();
+    if (!plater)
+        return;
+    GLGizmosManager &gizmos_mgr = plater->get_view3D_canvas3D()->get_gizmos_manager();
+
+    // Do not re-edit from inside another gizmo: the snapshot below would refer to
+    // that gizmo's internal stack. The rule ObjectList::simplify() follows.
+    if (!gizmos_mgr.check_gizmos_closed_except(GLGizmosManager::EType::Cut))
+        return;
+
+    // Find the selected half that carries a recipe.
+    int src_idx = -1;
+    {
+        wxDataViewItemArray sels;
+        GetSelections(sels);
+        for (wxDataViewItem item : sels) {
+            const int obj_idx = m_objects_model->GetObjectIdByItem(item);
+            if (obj_idx >= 0 && obj_idx < int(m_objects->size()) && object(obj_idx)->has_cut_recipe()) {
+                src_idx = obj_idx;
+                break;
+            }
+        }
+    }
+    if (src_idx < 0)
+        return;
+
+    const ModelObject *src    = object(src_idx);
+    const CutRecipe    recipe = *src->cut_recipe;
+
+    // Every object of the same cut. When only one is left the re-edit still runs;
+    // the gizmo notices and warns that cutting again brings back both halves.
+    std::vector<ObjectID> ids;
+    for (size_t i = 0; i < m_objects->size(); ++i) {
+        const ModelObject *o = (*m_objects)[i];
+        if (o == src || (o->is_cut() && src->is_cut() && o->cut_id.has_same_id(src->cut_id)))
+            ids.push_back(o->id());
+    }
+    if (ids.empty())
+        ids.push_back(src->id());
+
+    GLGizmoCut3D *cut = dynamic_cast<GLGizmoCut3D *>(gizmos_mgr.get_gizmo(GLGizmosManager::EType::Cut));
+    if (!cut)
+        return;
+
+    // ONE snapshot brackets the whole re-edit: opening it (which removes the
+    // halves and puts the original in their place), the edits, and the re-cut.
+    // That is what makes a single Ctrl+Z - and Cancel, which uses the same undo -
+    // put the two halves back in one step.
+    Plater::TakeSnapshot snapshot(plater, _u8L("Edit cut"));
+
+    if (!cut->arm_reedit(recipe, ids)) {
+        // The recipe cannot reproduce the cut - no stored mesh, or a schema this
+        // build does not know. Say why rather than opening a gizmo that would
+        // then cut the wrong thing.
+        MessageDialog(plater, _L("This cut cannot be edited: the project does not contain the original, "
+                                 "uncut shape. It was cut with \"Keep cut editable\" turned off, or the "
+                                 "project was written by a different version."),
+                      _L("Edit cut"), wxOK | wxICON_INFORMATION).ShowModal();
+        return;
+    }
+
+    // open_gizmo() toggles when the type is already current, so close first - the
+    // same two-step the Emboss and SVG menu items use.
+    if (gizmos_mgr.get_current_type() == GLGizmosManager::Cut)
+        gizmos_mgr.open_gizmo(GLGizmosManager::EType::Cut);
+    gizmos_mgr.open_gizmo(GLGizmosManager::EType::Cut);
 }
 
 void ObjectList::invalidate_cut_info_for_selection()

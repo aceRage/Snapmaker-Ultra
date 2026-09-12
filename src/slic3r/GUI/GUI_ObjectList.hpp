@@ -319,6 +319,11 @@ public:
     bool                can_mesh_boolean() const;
 
     bool                has_selected_cut_object() const;
+    // RE-EDITABLE CUTS: is any selected object a cut half that remembers how it was
+    // cut? The enable condition for "Edit cut...".
+    bool                has_selected_editable_cut() const;
+    // Reopen the Cut gizmo on that cut, with its original mesh and settings.
+    void                edit_cut();
     void                invalidate_cut_info_for_selection();
     void                invalidate_cut_info_for_object(int obj_idx);
     void                delete_all_connectors_for_selection();

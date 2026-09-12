@@ -1736,6 +1736,25 @@ void MenuFactory::append_menu_item_edit_svg(wxMenu *menu)
     append_menu_item(menu, wxID_ANY, name, description, open_svg, icon, nullptr, can_edit_svg, m_parent);
 }
 
+// RE-EDITABLE CUTS. Reopen the Cut gizmo on the cut that produced the selected object,
+// with its original uncut shape and the surface and settings it was cut with.
+//
+// Dynamic, like "Invalidate cut info" beside it: the item only exists while the
+// selection actually carries a recipe, so it is destroyed and re-appended on every
+// menu open rather than being greyed out forever on objects that were never cut.
+void MenuFactory::append_menu_item_edit_cut(wxMenu *menu)
+{
+    const wxString menu_name = _L("Edit cut...");
+
+    auto menu_item_id = menu->FindItem(menu_name);
+    if (menu_item_id != wxNOT_FOUND)
+        menu->Destroy(menu_item_id);
+
+    if (obj_list()->has_selected_editable_cut())
+        append_menu_item(menu, wxID_ANY, menu_name, _L("Edit the cut that produced this object"),
+            [](wxCommandEvent &) { obj_list()->edit_cut(); },
+            "", menu, []() { return true; }, m_parent);
+}
 void MenuFactory::append_menu_item_invalidate_cut_info(wxMenu *menu)
 {
     const wxString menu_name = _L("Invalidate cut info");
@@ -2303,6 +2322,7 @@ wxMenu* MenuFactory::object_menu()
 {
     append_menu_items_convert_unit(&m_object_menu);
     append_menu_items_flush_options(&m_object_menu);
+    append_menu_item_edit_cut(&m_object_menu);
     append_menu_item_invalidate_cut_info(&m_object_menu);
     append_menu_item_edit_text(&m_object_menu);
     append_menu_item_edit_svg(&m_object_menu);
