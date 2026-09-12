@@ -854,9 +854,31 @@ void draw_cut_empty_sides(const indexed_triangle_set& mesh,
     // `lower`. draw_cut_split() then swaps the pair for a closed stroke (the plug
     // is the upper half), so the swap has to happen here too or the panel would
     // name the wrong side.
+    //
+    // COST. Each test is one parity ray against the cutter's faces, and the loop
+    // short-circuits as soon as both sides have a vertex - which on a cut that works
+    // is the first handful of vertices. The bad case is the cut that does NOT work:
+    // then one side never fills in and every vertex is tested, which on a 500k-vertex
+    // model against a few thousand cutter faces is a visible stall - and this runs on
+    // every parameter change, from a slider being dragged.
+    //
+    // So the walk is STRIDED: it visits at most MaxProbes vertices, spread evenly
+    // over the mesh rather than taken from the front (the front of an STL's vertex
+    // list is one corner of the part, which would answer for that corner only). The
+    // test stays conservative in the direction that matters - it can only ever claim
+    // a side is NON-empty, which requires actually finding a vertex there - so a
+    // stride can produce a false "empty", never a false "has material". A false
+    // "empty" on a part whose only material on one side is a feature smaller than one
+    // stride is the trade, and the panel's warning is advisory in that direction: it
+    // says "this line does not separate the part", which is the safe thing to say
+    // about a cut leaving a sliver.
+    static const size_t MaxProbes = 20000;
+    const size_t n_verts = mesh.vertices.size();
+    const size_t stride  = n_verts > MaxProbes ? (n_verts + MaxProbes - 1) / MaxProbes : 1;
+
     bool inside_empty = true, outside_empty = true;
-    for (const Vec3f& v : mesh.vertices) {
-        const Vec3d pt = v.cast<double>();
+    for (size_t i = 0; i < n_verts; i += stride) {
+        const Vec3d pt = mesh.vertices[i].cast<double>();
         if (inside_empty && point_in_solid(cutter_lo, pt))
             inside_empty = false;
         if (outside_empty && !point_in_solid(kerf ? cutter_hi : cutter_lo, pt))
