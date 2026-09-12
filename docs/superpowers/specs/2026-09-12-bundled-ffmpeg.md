@@ -319,6 +319,13 @@ build on this PC took several attempts, for two reasons worth recording.
    before any project of ours. Reverting needs `-UCMAKE_VS_GLOBALS`: simply dropping the flag from
    the configure line leaves the value sitting in `CMakeCache.txt` and it keeps applying.
 
+4. **`cmake --install` wants `paho-mqtt3a-static.lib`, which our targets do not build.** Building
+   only `Snapmaker_Orca` + `Snapmaker_Orca_app_gui` produces the SSL variant
+   (`paho-mqtt3as-static.lib`) but not the plain one, and the install step then stops with
+   `file INSTALL cannot find .../paho-mqtt3a-static.lib`. Unrelated to this branch - it is the
+   mqtt subproject's own install rule. Build the extra target once
+   (`cmake --build . --config Release --target paho-mqtt3a-static`) and re-run the install.
+
 **One trap worth knowing when gating this by hand.** A go2rtc started from the *worktree's*
 `resources/tools/go2rtc/go2rtc.exe` holds that file open, and Windows will then fail the build's
 install/copy step into that tree — silently, as a killed `cmd.exe` with no error in the log. Run
