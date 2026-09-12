@@ -2,7 +2,7 @@
 	"type": "filament",
 	"name": "Generic PETG @Creality K2-all",
 	"inherits": "Generic PETG @Creality",
-	"renamed_from": "Creality Generic PETG @K2-all;Creality Generic PETG K2-all",
+	"renamed_from": "Creality Generic PETG @K2-all",
 	"from": "system",
 	"setting_id": "IrbPRxkyhiUXaPEu",
 	"instantiation": "true",

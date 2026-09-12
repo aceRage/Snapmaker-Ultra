@@ -1,6 +1,7 @@
 {
     "type": "machine",
     "name": "Sovol SV07 1.0 nozzle",
+    "printer_variant": "1.0",
     "inherits": "fdm_machine_common",
     "from": "system",
     "instantiation": "true",
