@@ -2107,12 +2107,26 @@ void HubServer::register_streams()
                 const std::string vurl = base + "/api/streams?name=" + name + "_" + q +
                                          "&src=" + percent_encode(variant_src(name, q));
                 std::thread([vurl]() {
-                    for (int attempt = 0; attempt < 3; ++attempt) {
+                    // A freshly started go2rtc answers its API before it will accept an *exec*
+                    // source: for the first ~5 s a PUT of an `ffmpeg:` (or `echo:`) stream comes
+                    // back `400 streams: source not supported`, while `rtsp:` is taken at once.
+                    // The source stream above therefore registers immediately and the variants
+                    // did not, which is exactly the window the hub registers in - so on a normal
+                    // start the variants were silently absent and every _med/_low tile went black.
+                    //
+                    // Twelve attempts at 1.5 s covers ~18 s, comfortably past that window (the
+                    // old three attempts covered 4.5 s and always fell inside it). A 400 lands in
+                    // on_error, not on_complete, so `ok` stays false and the loop does retry -
+                    // it simply ran out of attempts. Logged on final failure rather than failing
+                    // silently, because a missing variant is otherwise invisible until a viewer
+                    // opens the tile.
+                    for (int attempt = 0; attempt < 12; ++attempt) {
                         bool ok = false;
                         Http::put2(vurl).timeout_connect(2).timeout_max(5).on_complete([&ok](std::string, unsigned) { ok = true; }).perform_sync();
                         if (ok) return;
                         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
                     }
+                    BOOST_LOG_TRIVIAL(warning) << "RemoteHub: go2rtc kept refusing a quality variant; it will fall back to the source stream";
                 }).detach();
             }
         }
