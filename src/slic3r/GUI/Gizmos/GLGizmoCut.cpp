@@ -3125,7 +3125,30 @@ void GLGizmoCut3D::update_draw_preview_models()
                 for (const Vec3f& v : mesh.vertices)
                     bbox.merge(v.cast<double>());
         }
-        const indexed_triangle_set cutter = draw_cut_cutter_solid(m_draw_stroke, m_draw_params, bbox);
+        // THE PREVIEW'S REACH IS NOT THE CUT'S REACH. Through-all deliberately runs
+        // 1.05 * the bbox diagonal so the cutter exits any side of any part, which is
+        // right for the boolean and wrong for the eye: a translucent tube stretching
+        // most of a diagonal past the model reads as a mistake rather than as a cut.
+        //
+        // So the shell is drawn with the depth CLAMPED to what the part can actually
+        // use - the largest distance from the stroke to the far side of the bounding
+        // box - which is the same surface over the part itself, just not trailing off
+        // into empty space. The cut still uses the full reach.
+        DrawCutParams shown = m_draw_params;
+        if (shown.through_all && bbox.defined) {
+            double need = 0.0;
+            for (const DrawCutSample& smp : m_draw_stroke.path()) {
+                // The furthest corner of the box from this sample. Whatever direction
+                // the ray takes, it is outside the box by then - so the shell still
+                // covers the whole part and only the empty-space tail is cut off.
+                need = std::max(need, (bbox.max - smp.pos).norm());
+                need = std::max(need, (smp.pos - bbox.min).norm());
+            }
+            shown.through_all = false;
+            shown.depth       = std::max(1.0, need);
+        }
+
+        const indexed_triangle_set cutter = draw_cut_cutter_solid(m_draw_stroke, shown, bbox);
         if (!cutter.empty())
             m_draw_cutter_model.init_from(cutter);
     }

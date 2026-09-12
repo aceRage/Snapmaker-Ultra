@@ -201,6 +201,7 @@ DrawCutError DrawCutStroke::finish(double spacing, double smoothing, bool force_
     // loop could not fill.
     const double jump = 8.0 * sp;
     std::vector<DrawCutSample> run;
+    bool discarded_a_run = false;
     {
         size_t best_begin = 0, best_end = 0; // [begin, end)
         size_t begin = 0;
@@ -221,12 +222,20 @@ DrawCutError DrawCutStroke::finish(double spacing, double smoothing, bool force_
             cur_len = 0.0;
         }
         run.assign(m_samples.begin() + int(best_begin), m_samples.begin() + int(best_end));
-        if (best_end - best_begin < m_samples.size())
+        discarded_a_run = best_end - best_begin < m_samples.size();
+        if (discarded_a_run)
             BOOST_LOG_TRIVIAL(warning) << "Draw cut: the stroke jumped across empty space; keeping the longest run ("
                                        << (best_end - best_begin) << " of " << m_samples.size() << " samples)";
     }
+    // WHICH ERROR. When the repair kept a run and that run is usable, there is no
+    // error - the whole point of keeping the longest run is that a stroke which
+    // crossed a hole still works. But when what is left is too short, the REASON
+    // the user needs is "your line left the model", not "draw a longer line":
+    // their line was long enough, it just was not all on the part. So the
+    // discarded-run flag decides which of the two gates reports.
+    const DrawCutError short_error = discarded_a_run ? DrawCutError::LeavesMesh : DrawCutError::TooShort;
     if (run.size() < 2) {
-        m_error = DrawCutError::TooShort;
+        m_error = short_error;
         return m_error;
     }
 
@@ -244,7 +253,7 @@ DrawCutError DrawCutStroke::finish(double spacing, double smoothing, bool force_
     draw_cut_smooth(m_path, draw_cut_smooth_passes(smoothing), m_closed);
 
     if (m_path.size() < size_t(MinSamples) || length() < MinLength) {
-        m_error = DrawCutError::TooShort;
+        m_error = short_error;
         return m_error;
     }
 

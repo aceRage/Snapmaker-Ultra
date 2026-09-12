@@ -101,10 +101,13 @@ enum class DrawCutError {
     // open one that does has no well-defined upper side either. Phase 2 could
     // split it into sub-loops; phase 1 refuses.
     SelfCrossing,
-    // The stroke jumped across empty space: the gap between consecutive HITS is
-    // wider than a few sample spacings, so bridging it would run a chord through
-    // air. keep_longest_run() is the repair; this is what is reported when the
-    // longest run left is itself too short.
+    // The stroke jumped across empty space: the gap between consecutive HITS was
+    // wider than a few sample spacings, so bridging it would have run a chord
+    // through air. finish() repairs that by keeping the LONGEST contiguous run,
+    // and when that run is usable there is no error at all - a line that crossed a
+    // hole is meant to work. This is reported when the kept run is itself too
+    // short, because then the reason the user needs is "your line left the model"
+    // rather than "draw a longer line": their line WAS long enough.
     LeavesMesh,
     // The generated cutter, or one of the booleans, produced nothing usable.
     CutterDegenerate,

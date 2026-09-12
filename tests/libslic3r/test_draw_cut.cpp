@@ -305,13 +305,16 @@ TEST_CASE("Draw cut: a stroke that leaves the mesh keeps its longest run", "[Dra
     for (const DrawCutSample& smp : s.path())
         REQUIRE(smp.pos.x() < 100.0);
 
-    // And when the longest surviving run is itself too short, that is reported.
+    // And when the longest surviving run is itself too short, the reported reason is
+    // LeavesMesh, not TooShort - the user's line WAS long enough, it just was not all
+    // on the part, so "draw a longer line" would be the wrong advice.
     DrawCutStroke tiny;
     tiny.append(Vec3d(0.0, 0.0, 0.0), Vec3d::UnitZ());
     tiny.append(Vec3d(0.5, 0.0, 0.0), Vec3d::UnitZ());
     tiny.append(Vec3d(900.0, 0.0, 0.0), Vec3d::UnitZ());
     tiny.append(Vec3d(900.5, 0.0, 0.0), Vec3d::UnitZ());
-    REQUIRE(tiny.finish(1.0, 0.0) == DrawCutError::TooShort);
+    REQUIRE(tiny.finish(1.0, 0.0) == DrawCutError::LeavesMesh);
+    REQUIRE(std::string(draw_cut_error_message(DrawCutError::LeavesMesh)).find("leaves") != std::string::npos);
 }
 
 TEST_CASE("Draw cut: a self-crossing stroke is detected and refused", "[DrawCut]")
