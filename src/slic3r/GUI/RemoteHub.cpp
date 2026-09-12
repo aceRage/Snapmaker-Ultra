@@ -850,20 +850,26 @@ static std::string go2rtc_exe_path()
 // The phone's Quality setting picks a *stream name*: "<name>" as the camera sends it, or a
 // "<name>_med" / "<name>_low" variant registered beside it. Registering those variants means
 // re-encoding, and go2rtc re-encodes by shelling out to an ffmpeg binary (its `ffmpeg:` source
-// scheme) - it does not carry a codec of its own. We do not bundle ffmpeg: resources/tools/go2rtc
-// holds go2rtc.exe and nothing else, and the Bambu live view's own camera tooling is not ours to
-// repurpose. So the variants exist only when the user has an ffmpeg on PATH, and the hub says so
-// rather than registering streams that would fail to start.
+// scheme) - it does not carry a codec of its own. We now **bundle** one: an LGPL-3.0 ffmpeg build
+// installs beside go2rtc.exe (CMake's FFMPEG_BIN_DIR, see docs/superpowers/specs/2026-09-12-bundled-ffmpeg.md),
+// so the transcoded variants are available in a stock install rather than only on a PC where the
+// user happened to put an ffmpeg on PATH.
 //
-// What still works without ffmpeg, and is therefore what Quality actually does today:
-//   * the Bambu MJPEG relay drops frames (BambuCamRelay, ?fps=), which needs no decoder at all -
-//     whole JPEGs are forwarded or skipped - and is the setting that helps most on a slow link,
-//     because MJPEG's bitrate is very nearly linear in frame rate;
-//   * the phone asks for a variant name and falls back to the source name when it is absent, so
-//     the plumbing is live and an ffmpeg on PATH lights the rest up with no page change.
+// The bundled build is LGPL, which means it carries **no libx264** (that is GPL): its software
+// H.264 encoder is libopenh264. That matters here because go2rtc's built-in `h264` template is
+// `-codec:v libx264 ... -preset:v superfast -tune:v zerolatency`, which this ffmpeg would reject
+// outright - so start_go2rtc() writes its own `ffmpeg: h264:` template in the config. See
+// ffmpeg_h264_template() below for the encoder settings and why each one is what it is.
+//
+// Quality still degrades gracefully: a PC whose install lost the bundled exe (or a platform we do
+// not ship one for) falls back to PATH, and with neither the variants are simply not registered -
+// a stream go2rtc cannot start is worse than an absent one, because the tile goes black instead of
+// falling back to the source. Independently of any of this, the Bambu MJPEG relay's frame-rate
+// knob (BambuCamRelay, ?fps=) needs no decoder at all and honours Medium/Low on its own.
 static std::string ffmpeg_path()
 {
-    // Beside go2rtc first (where a user would drop one so go2rtc finds it), then PATH.
+    // The bundled build first (installed by CMake beside go2rtc.exe), then PATH as the fallback
+    // for a tree or platform that has none.
     const std::string beside = fs::path(resources_dir() + "/tools/go2rtc/ffmpeg.exe").make_preferred().string();
     boost::system::error_code ec;
     if (fs::exists(beside, ec)) return beside;
@@ -893,15 +899,73 @@ static const std::vector<std::string>& quality_variants()
     return v;
 }
 
+// The `h264` encoder template go2rtc uses for our variants, replacing its built-in one.
+//
+// go2rtc 1.9.14 ships `-codec:v libx264 -g:v 30 -preset:v superfast -tune:v zerolatency
+// -profile:v main -level:v 4.1`. Every one of those three x264-only flags is fatal with the
+// bundled LGPL build, which has no libx264 at all, so the template is ours:
+//
+//   libopenh264            the LGPL build's software H.264 encoder (Cisco, BSD-2-Clause). It has
+//                          no -preset/-tune knobs; the equivalents are spelled out below.
+//   constrained_baseline   no B-frames by construction, which is what "zerolatency" buys with
+//                          x264: a frame is emitted as soon as it is encoded, nothing is held to
+//                          reorder. Also the profile every phone decoder handles, and what
+//                          WebRTC/MSE want.
+//   -bf 0                  belt and braces on the same point.
+//   -rc_mode bitrate       track -b:v. The default ("quality") lets the bitrate wander, which is
+//                          the opposite of what a Quality step is for.
+//   -g:v                   keyframe interval. Set per variant to ~2 s of that variant's frame
+//                          rate (30 @15 fps, 20 @10 fps) so a joining viewer waits at most 2 s
+//                          for its first picture without spending the bitrate on more IDRs.
+//
+// -b:v and -g:v are appended per variant by variant_src()'s #raw, so one template serves both.
+static std::string ffmpeg_h264_template()
+{
+    return "-codec:v libopenh264 -profile:v constrained_baseline -rc_mode bitrate -bf 0";
+}
+
 // go2rtc's `ffmpeg:` source, pointed back at the stream the hub already registered, so a variant
 // is a re-encode of our own stream rather than a second connection to the printer - the camera
-// still sees exactly one consumer. #hardware lets go2rtc pick a GPU encoder (dxva2/cuda on this
-// platform) and fall back to software by itself.
+// still sees exactly one consumer. go2rtc starts the ffmpeg process lazily - only when a viewer
+// actually opens the variant - and kills it when the last consumer goes, so an unwatched
+// _med/_low costs nothing at all. The gate asserts both halves of that.
+//
+//   Medium  1280x720 @ 15 fps, 1.5 Mbps, keyframe every 2 s
+//   Low      854x480 @ 10 fps, 0.6 Mbps, keyframe every 2 s
+//
+// 854 rather than 640 so Low is a real 16:9 480p: the phone's Low step is meant to be watchable,
+// and at 0.6 Mbps the extra width costs little. #width alone keeps the aspect ratio.
+//
+// Hardware encoding is **off by default**. go2rtc's #hardware would pick a GPU encoder, and on a
+// PC with a working one that is cheaper - but it fails in ways software encoding does not (a
+// headless/RDP session with no GPU, a driver that refuses a second session, an encoder that is
+// already busy with a game), and it fails as a black tile rather than an error the user sees.
+// Software libopenh264 costs ~5% of one core for a 720p Medium on this PC (see the spec), which is
+// not worth that risk by default. To turn it on, add `#hardware` to the strings below and
+// rebuild; go2rtc then tries dxva2/cuda/qsv and falls back to software by itself.
+// Each extra ffmpeg argument is its own #raw= segment, one token per segment and never a space
+// inside one. That is not a style choice: go2rtc rejects a registration whose source contains a
+// space outright, with `400 streams: source with spaces may be insecure`, so the natural
+// `#raw=-r 10 -b:v 600k` form registers as nothing at all and the variant silently does not
+// exist. (Found by gating it - see the spec. The hub's PUT is fire-and-forget on a detached
+// thread, so the 400 would never have surfaced anywhere a user or a log would show it.)
+static std::string variant_raw(std::initializer_list<const char*> toks)
+{
+    std::string s;
+    for (const char* t : toks) s += "#raw=" + std::string(t);
+    return s;
+}
+
 static std::string variant_src(const std::string& base_name, const std::string& q)
 {
-    const std::string scale = (q == "low") ? "#width=640" : "#width=1280";
-    const std::string rate  = (q == "low") ? "#raw=-r 10" : "";
-    return "ffmpeg:" + base_name + "#video=h264#hardware" + scale + rate;
+    const bool low = (q == "low");
+    // -r caps the frame rate, -b:v/-maxrate the bitrate, -g:v the keyframe interval (~2 s at
+    // that rate). #width alone scales and keeps the aspect ratio.
+    if (low)
+        return "ffmpeg:" + base_name + "#video=h264#width=854" +
+               variant_raw({ "-r", "10", "-b:v", "600k", "-maxrate", "600k", "-g:v", "20" });
+    return "ffmpeg:" + base_name + "#video=h264#width=1280" +
+           variant_raw({ "-r", "15", "-b:v", "1500k", "-maxrate", "1500k", "-g:v", "30" });
 }
 // ---- WebRTC (Phase 2): go2rtc's media port ------------------------------------------------
 // Everything else the hub runs is loopback-only, but WebRTC media goes straight from go2rtc to
@@ -1892,8 +1956,24 @@ void HubServer::start_go2rtc()
         cfg << "api:\n  listen: \"127.0.0.1:" << port << "\"\n"
             << "  username: \"" << m_go2rtc_user << "\"\n  password: \"" << m_go2rtc_pass << "\"\n"
             << "  local_auth: true\n"
-            << "  allow_paths: [\"/api/ws\", \"/api/streams\", \"/api/onvif\"]\n"
-            << "rtsp:\n  listen: \"\"\n";
+            << "  allow_paths: [\"/api/ws\", \"/api/streams\", \"/api/onvif\"]\n";
+        // RTSP. This listener used to be off unconditionally, and it has to stay off when we have
+        // no ffmpeg - nothing the hub does needs it and an open RTSP port is surface we do not
+        // want. But go2rtc's `ffmpeg:` sources are **piped back through go2rtc's own RTSP
+        // listener**: with `rtsp: listen: ""` every variant fails at the moment a viewer opens it
+        // with `streams: exec: rtsp module disabled`, which reaches the phone as a black tile.
+        // (Found exactly that way while gating this branch - the config looked right and the
+        // variants registered fine; only requesting one showed it.)
+        //
+        // So: a loopback-only port, and only when there is an ffmpeg to need it. 127.0.0.1 means
+        // it is not reachable from the LAN or the tailnet, and it is a random free port rather
+        // than 8554 so two hubs on one PC cannot collide.
+        const bool want_ffmpeg = !ffmpeg_path().empty();
+        int rtsp_port = want_ffmpeg ? free_loopback_port() : 0;
+        if (want_ffmpeg && rtsp_port == 0)
+            BOOST_LOG_TRIVIAL(warning) << "RemoteHub: no free loopback port for go2rtc's RTSP; quality variants will not start";
+        if (rtsp_port > 0) cfg << "rtsp:\n  listen: \"127.0.0.1:" << rtsp_port << "\"\n";
+        else               cfg << "rtsp:\n  listen: \"\"\n";
         // WebRTC media (Phase 2). Everything else the hub runs is loopback-only; this is the one
         // port that has to be reachable from the phone, because the media goes straight from
         // go2rtc to the phone rather than through the hub. The earlier note here said "no WebRTC
@@ -1911,6 +1991,23 @@ void HubServer::start_go2rtc()
         else
             cfg << "webrtc:\n  listen: \"\"\n";
         cfg << "srtp:\n  listen: \"\"\n";
+        // ffmpeg for the Quality variants. Two things have to be said explicitly.
+        //
+        // `bin:` - go2rtc otherwise looks for "ffmpeg" on PATH, and the whole point of bundling
+        // one is not to depend on what happens to be installed on the user's PC. An ffmpeg on
+        // PATH could also be any build at all, including one whose flags differ; naming our own
+        // exe makes the template below a statement about a known binary.
+        //
+        // `h264:` - go2rtc's built-in template is libx264, which the bundled LGPL build does not
+        // have (see ffmpeg_h264_template()). Without this override every variant would die at
+        // startup with "Unknown encoder 'libx264'" and the tile would go black.
+        const std::string ff = ffmpeg_path();
+        if (!ff.empty()) {
+            std::string ffy = ff;
+            for (auto& c : ffy) if (c == '\\') c = '/'; // YAML-safe, and ffmpeg accepts forward slashes
+            cfg << "ffmpeg:\n  bin: \"" << ffy << "\"\n"
+                << "  h264: \"" << ffmpeg_h264_template() << "\"\n";
+        }
     }
     if (!m_job) {
         HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
@@ -1930,6 +2027,12 @@ void HubServer::start_go2rtc()
     m_webrtc_port = webrtc_port;
     BOOST_LOG_TRIVIAL(info) << "RemoteHub: go2rtc pid " << m_go2rtc_pid << " on 127.0.0.1:" << port
                             << " (credential-only), WebRTC media on " << (webrtc_port ? std::to_string(webrtc_port) : std::string("off"));
+    {
+        const std::string ff = ffmpeg_path();
+        BOOST_LOG_TRIVIAL(info) << "RemoteHub: quality variants "
+                                << (ff.empty() ? "off (no ffmpeg found; MJPEG fps knob only)"
+                                               : "on via " + ff);
+    }
     if (webrtc_port > 0) firewall_state(true); // one PowerShell run on a detached thread; result cached
 #endif
 }
@@ -2004,12 +2107,26 @@ void HubServer::register_streams()
                 const std::string vurl = base + "/api/streams?name=" + name + "_" + q +
                                          "&src=" + percent_encode(variant_src(name, q));
                 std::thread([vurl]() {
-                    for (int attempt = 0; attempt < 3; ++attempt) {
+                    // A freshly started go2rtc answers its API before it will accept an *exec*
+                    // source: for the first ~5 s a PUT of an `ffmpeg:` (or `echo:`) stream comes
+                    // back `400 streams: source not supported`, while `rtsp:` is taken at once.
+                    // The source stream above therefore registers immediately and the variants
+                    // did not, which is exactly the window the hub registers in - so on a normal
+                    // start the variants were silently absent and every _med/_low tile went black.
+                    //
+                    // Twelve attempts at 1.5 s covers ~18 s, comfortably past that window (the
+                    // old three attempts covered 4.5 s and always fell inside it). A 400 lands in
+                    // on_error, not on_complete, so `ok` stays false and the loop does retry -
+                    // it simply ran out of attempts. Logged on final failure rather than failing
+                    // silently, because a missing variant is otherwise invisible until a viewer
+                    // opens the tile.
+                    for (int attempt = 0; attempt < 12; ++attempt) {
                         bool ok = false;
                         Http::put2(vurl).timeout_connect(2).timeout_max(5).on_complete([&ok](std::string, unsigned) { ok = true; }).perform_sync();
                         if (ok) return;
                         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
                     }
+                    BOOST_LOG_TRIVIAL(warning) << "RemoteHub: go2rtc kept refusing a quality variant; it will fall back to the source stream";
                 }).detach();
             }
         }

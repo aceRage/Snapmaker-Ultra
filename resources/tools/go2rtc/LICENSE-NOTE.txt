@@ -1,1 +1,9 @@
 go2rtc v1.9.14 (https://github.com/AlexxIT/go2rtc), MIT License. Bundled unmodified for RTSPS camera relay (Bambu X1/H2 LAN Liveview).
+
+ffmpeg.exe (when present) is an LGPL-3.0 FFmpeg build from BtbN/FFmpeg-Builds, release tag
+autobuild-2026-09-12-13-12, asset ffmpeg-N-126523-g884590dd4a-win64-lgpl.zip. Bundled unmodified
+and run as a separate process by the remote hub, to re-encode camera streams for the phone's
+Quality steps. Built with --disable-libx264 --disable-libx265 (no GPL components); its H.264
+encoder is libopenh264. Full licence text in FFMPEG-LICENSE.txt beside it. Source for the LGPL
+libraries: https://github.com/BtbN/FFmpeg-Builds and https://git.ffmpeg.org/ffmpeg.git (commit
+884590dd4a).
