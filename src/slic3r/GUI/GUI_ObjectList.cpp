@@ -17,6 +17,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/MeshRepair.hpp"
 #include "libslic3r/MeshRemesh.hpp"
+#include "libslic3r/MeshRound.hpp"
 #include "GLCanvas3D.hpp"
 #include "Selection.hpp"
 #include "PartPlate.hpp"
@@ -27,6 +28,7 @@
 #include "SingleChoiceDialog.hpp"
 #include "StepMeshDialog.hpp"
 #include "RemeshDialog.hpp"
+#include "RoundDialog.hpp"
 #include "QuadRemeshDialog.hpp"
 
 #include <boost/algorithm/string.hpp>
@@ -5884,6 +5886,157 @@ void ObjectList::repair_by_remesh()
         // Say when the flat-bottom option was asked for but could not be applied, so
         // "the base is still rounded" has an answer without opening the log.
         BOOST_LOG_TRIVIAL(info) << "repair_by_remesh: " << repaired << " repaired, " << failed
+                                << " failed, flat bottom kept on " << flat_kept << " and declined on "
+                                << flat_declined << " part(s)";
+        if (opts.keep_bottom_flat && flat_declined > 0)
+            msg += " " + GUI::format(_L("%1% part(s) had no flat bottom to protect."), flat_declined);
+        notify->push_notification(msg);
+    }
+}
+
+// Ultra: "Round all edges" - the Edit gizmo's interim, whole-mesh fillet.
+//
+// The real bevel works on a SELECTED edge chain and inserts exact geometry (the Edit
+// gizmo, phase 2). This is the blunt instrument that ships alongside it: it rounds
+// every edge of the part at once, by the morphological open/close round trip on the
+// signed distance field. See libslic3r/MeshRound.hpp for the algorithm.
+//
+// Structurally this is repair_by_remesh's twin - same selection walk, same dialog
+// shape, same per-part loop - because it IS the same round trip with a different
+// filter in the middle. It clears painted data the same way, through
+// clear_before_change_mesh(), because the mesh is re-extracted from a lattice and
+// every index changes.
+void ObjectList::round_all_edges(bool close_gizmos)
+{
+    if (!voxel_ops_available())
+        return;
+    GLGizmosManager& gizmos = wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager();
+    // The Edit gizmo's own button asks for this: it is itself a gizmo, so it would
+    // always trip the check below. Closing is the manager's job and a gizmo .cpp
+    // cannot reach it, so the request comes here instead - same as quad_remesh().
+    if (close_gizmos)
+        gizmos.reset_all_states();
+    if (!gizmos.check_gizmos_closed_except(GLGizmosManager::Undefined))
+        return;
+
+    std::vector<int> obj_idxs, vol_idxs;
+    get_selection_indexes(obj_idxs, vol_idxs);
+    if (obj_idxs.empty() && vol_idxs.empty())
+        return;
+
+    // The dialog's "that radius does not fit" warning and its triangle estimate are
+    // per-selection, so they come from the first part the run would touch - the same
+    // approach repair_by_remesh takes.
+    auto first_target = [&]() -> const ModelVolume* {
+        const int obj_idx = obj_idxs.empty() ? -1 : obj_idxs.front();
+        if (obj_idx < 0)
+            return nullptr;
+        const ModelObject* mo = object(obj_idx);
+        if (mo == nullptr)
+            return nullptr;
+        for (size_t i = 0; i < mo->volumes.size(); ++i) {
+            if (!vol_idxs.empty() && std::find(vol_idxs.begin(), vol_idxs.end(), int(i)) == vol_idxs.end())
+                continue;
+            if (mo->volumes[i]->is_model_part())
+                return mo->volumes[i];
+        }
+        return nullptr;
+    }();
+
+    double min_extent = 0., area = 0.;
+    size_t tris = 0;
+    if (first_target != nullptr) {
+        const indexed_triangle_set& its = first_target->mesh().its;
+        tris = its.indices.size();
+        BoundingBoxf3 bb;
+        for (const Vec3f& v : its.vertices)
+            bb.merge(v.cast<double>());
+        if (bb.defined)
+            min_extent = bb.size().minCoeff();
+        for (const Vec3i32& f : its.indices)
+            area += 0.5 * (its.vertices[f(1)] - its.vertices[f(0)]).cross(its.vertices[f(2)] - its.vertices[f(0)]).norm();
+    }
+
+    RoundOptions opts;
+    {
+        RoundDialog dlg(wxGetApp().mainframe, min_extent, tris, area);
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+        opts = dlg.options();
+    }
+
+    Plater* plater = wxGetApp().plater();
+    Plater::TakeSnapshot snapshot(plater, "Round all edges");
+    wxBusyCursor wait;
+
+    size_t total_before = 0, total_after = 0, flat_kept = 0, flat_declined = 0;
+    auto round_volume = [&](const ModelObject& mo, ModelVolume& mv) -> bool {
+        RoundReport rep;
+        indexed_triangle_set its = round_with_options(mv.mesh().its, opts, &round_by_voxels,
+                                                     volume_bed_direction(mo, mv), &rep);
+        if (its.indices.empty())
+            return false;
+        total_before += rep.triangles_before;
+        total_after  += rep.triangles_after;
+        if (rep.kept_bottom_flat) ++flat_kept;
+        if (rep.fell_back)        ++flat_declined;
+        BOOST_LOG_TRIVIAL(info) << "round_all_edges: '" << mv.name << "' r=" << rep.radius_used
+                                << " voxel=" << rep.voxel_used << " " << rep.triangles_before
+                                << " -> " << rep.triangles_after << " triangles, flat bottom "
+                                << (rep.kept_bottom_flat ? "kept" : (rep.fell_back ? "declined: " + rep.note : "off"));
+        mv.set_mesh(std::move(its));
+        mv.set_new_unique_id();
+        mv.calculate_convex_hull();
+        return true;
+    };
+
+    int rounded = 0, failed = 0;
+    auto process_object = [&](int obj_idx, const std::vector<int>& vols) {
+        ModelObject* mo = object(obj_idx);
+        if (mo == nullptr)
+            return;
+        // The mesh is rebuilt from a lattice, so every facet index changes and the
+        // painted data cannot follow. Same call Remesh makes, for the same reason.
+        plater->clear_before_change_mesh(obj_idx);
+        bool any = false;
+        for (size_t i = 0; i < mo->volumes.size(); ++i) {
+            if (!vols.empty() && std::find(vols.begin(), vols.end(), int(i)) == vols.end())
+                continue;
+            if (!mo->volumes[i]->is_model_part())
+                continue;
+            if (round_volume(*mo, *mo->volumes[i])) { ++rounded; any = true; }
+            else ++failed;
+        }
+        if (any) {
+            mo->invalidate_bounding_box();
+            mo->ensure_on_bed();
+            plater->changed_mesh(obj_idx);
+            plater->get_partplate_list().notify_instance_update(obj_idx, 0);
+            update_item_error_icon(obj_idx, -1);
+            update_info_items(obj_idx);
+        }
+    };
+
+    if (vol_idxs.empty()) {
+        for (int obj_idx : obj_idxs)
+            process_object(obj_idx, {});
+    } else if (!obj_idxs.empty()) {
+        process_object(obj_idxs.front(), vol_idxs);
+    }
+    plater->sidebar().obj_list()->update_plate_values_for_items();
+
+    NotificationManager* notify = plater->get_notification_manager();
+    if (notify != nullptr) {
+        std::string msg = failed == 0
+            ? GUI::format(_L("Rounded the edges of %1% part(s)."), rounded)
+            : GUI::format(_L("Rounded %1% part(s), %2% failed."), rounded, failed);
+        if (rounded > 0)
+            msg += " " + GUI::format(_L("Triangles: %1% -> %2%."), total_before, total_after);
+        // A failure here is almost always "the radius does not fit", which is worth
+        // saying outright - the alternative is a silent no-op.
+        if (failed > 0)
+            msg += " " + _L("A part smaller than twice the radius cannot be rounded.").ToStdString();
+        BOOST_LOG_TRIVIAL(info) << "round_all_edges: " << rounded << " rounded, " << failed
                                 << " failed, flat bottom kept on " << flat_kept << " and declined on "
                                 << flat_declined << " part(s)";
         if (opts.keep_bottom_flat && flat_declined > 0)
