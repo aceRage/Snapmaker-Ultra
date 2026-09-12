@@ -230,7 +230,20 @@ assertions):
 | **same seed twice** | bit-identical vertices and quads, for an explicit seed *and* for the default |
 | triangulate() | vertex set not duplicated, zero open edges by both the local pairing check and `its_num_open_edges`, no bridging spikes |
 
-Phase 1's `[MeshRemesh]` suite still passes unchanged (7 cases, 3537 assertions).
+Phase 1's `[MeshRemesh]` suite still passes unchanged (7 cases, 3537 assertions). Both together:
+14 cases, 28961 assertions, all passing.
+
+`libslic3r_gui` also builds and links clean with all five touched GUI files compiling without
+error or new warning.
+
+**One build-environment note for whoever runs this next.** The first `libslic3r_gui` attempt died
+with `error C1902: Program database manager mismatch` in an unrelated file
+(`GUI/filamentsync/FilamentColorMapBox.cpp`). That is the known mspdbsrv/PDB clash, not a code
+error: several agents were compiling in this tree at once and `/m:2` had two MSBuild nodes
+contending for the same PDB server. Rebuilding with `/m:1` fixed it with no source change. Also
+worth knowing: `TaskStop` on a foreground `cmake --build` kills the console session and the build
+dies silently without writing errors — relaunch detached with
+`Start-Process -FilePath <bat> -WindowStyle Hidden -PassThru` and tail the log instead.
 
 ## Deviations from the brief
 
