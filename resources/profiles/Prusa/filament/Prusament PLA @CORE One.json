@@ -16,7 +16,8 @@
         "Prusa CORE One 0.25 nozzle",
         "Prusa CORE One 0.3 nozzle",
         "Prusa CORE One 0.4 nozzle",
-        "Prusa CORE One 0.5 nozzle"
+        "Prusa CORE One 0.5 nozzle",
+        "Prusa CORE One L 0.4 nozzle"
     ],
     "fan_cooling_layer_time": [
         "40"

@@ -7,6 +7,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "slic3r/Utils/Http.hpp"
 #include "slic3r/Utils/PrintHostDevices.hpp"
+#include "slic3r/Utils/PrusaLinkStatus.hpp"
 
 #include <boost/log/trivial.hpp>
 
@@ -505,12 +506,23 @@ void list_host_targets(std::vector<HostTarget>& out)
     // speaks is decided by what it answers, not by the preset.
     PresetBundle* bundle = wxGetApp().preset_bundle;
     if (bundle && !bundle->use_bbl_network()) {
-        const std::string url = bundle->printers.get_edited_preset().config.opt_string("print_host");
-        if (!url.empty()) out.push_back({ "host", moonraker_base(url) });
+        const DynamicPrintConfig& cfg = bundle->printers.get_edited_preset().config;
+        const std::string         url = cfg.opt_string("print_host");
+        if (!url.empty()) {
+            // The preset says what it is: a PrusaLink or PrusaConnect preset is asked over its own
+            // REST API with the credentials it holds, everything else as a Moonraker printer (the
+            // fork has no host_type key for Moonraker, so that stays decided by what it answers).
+            const PrintHostDevices::Device d = PrintHostDevices::from_config(cfg);
+            if (PrusaLinkStatus::speaks_prusalink(d.host_type))
+                out.push_back({ "host", PrusaLinkStatus::base_url(url), d.host_type, d.auth_type,
+                                d.apikey, d.user, d.password });
+            else
+                out.push_back({ "host", moonraker_base(url), "", "", "", "", "" });
+        }
     }
     std::shared_ptr<PrintHost> connected;
     wxGetApp().get_connect_host(connected);
-    if (connected) out.push_back({ "connect", moonraker_base(connected->get_host()) });
+    if (connected) out.push_back({ "connect", moonraker_base(connected->get_host()), "", "", "", "", "" });
     // The model's own devices (<datadir>/hub/print_host_devices.json), under the ids /api/printers
     // gives them. Only the Moonraker-shaped ones are worth asking - an Elegoo Link box answers SDCP
     // over its own websocket and would just spend this call's timeout - so the rest are left with
@@ -521,9 +533,17 @@ void list_host_targets(std::vector<HostTarget>& out)
         // having probed them.
         PrintHostDevices::migrate_from_presets(*bundle);
         const std::string model_key = PrintHostDevices::current_model_key(*bundle);
-        for (const PrintHostDevices::Device& d : PrintHostDevices::devices(model_key))
-            if (PrintHostDevices::speaks_moonraker(d.host_type) && !d.address.empty())
-                out.push_back({ "ph:" + d.id, moonraker_base(d.address) });
+        for (const PrintHostDevices::Device& d : PrintHostDevices::devices(model_key)) {
+            if (d.address.empty()) continue;
+            if (PrintHostDevices::speaks_moonraker(d.host_type)) {
+                out.push_back({ "ph:" + d.id, moonraker_base(d.address), "", "", "", "", "" });
+            } else if (PrusaLinkStatus::speaks_prusalink(d.host_type)) {
+                // Its own base (no MQTT-port stripping: a PrusaLink box is addressed exactly as
+                // the preset holds it) and its own credentials, which the probe needs.
+                out.push_back({ "ph:" + d.id, PrusaLinkStatus::base_url(d.address), d.host_type,
+                                d.auth_type, d.apikey, d.user, d.password });
+            }
+        }
     } catch (...) {}
 }
 
@@ -573,12 +593,51 @@ static void fill_from_heaters(const json& status, json& p)
     if (!nozzles.empty()) p["nozzles"] = nozzles;
 }
 
+// A PrusaLink answer in the fields a card already reads. The state vocabulary is mapped to
+// Klipper's by PrusaLinkStatus::to_klipper_state, so the page, the buttons and the event watcher
+// need no PrusaLink-specific code: "printing" is "printing" whoever said it.
+static void fill_from_prusalink(const PrusaLinkStatus::Status& pl, json& p)
+{
+    p["print_status"] = pl.state;
+    p["can_pause"]    = pl.state == "printing";
+    p["can_resume"]   = pl.state == "paused";
+    p["can_stop"]     = pl.state == "printing" || pl.state == "paused";
+    p["stage"]        = pl.filename; // the job it is on, where fill_from_print_stats puts it
+    if (pl.state == "error")
+        p["print_error"] = { { "code", pl.raw_state }, { "message", std::string() } };
+    else
+        p["print_error"] = nullptr;
+    // The same temperature shape a Bambu entry and a Moonraker host carry: a Buddy board has one
+    // bed and one nozzle, so the nozzles array has exactly one entry when it reported one.
+    if (pl.has_bed) {
+        p["bed_temp"]   = pl.bed_temp;
+        p["bed_target"] = pl.bed_target;
+    }
+    if (pl.has_nozzle)
+        p["nozzles"] = json::array({ json { { "temp", pl.nozzle_temp }, { "target", pl.nozzle_target } } });
+    // What Moonraker never gave us and PrusaLink does: how far along it is, and how long is left.
+    // Under the names a Bambu and a Snapmaker-LAN entry already use, so the card's existing
+    // "62% - 24m left" line renders for a Prusa printer with no page change. Only ever set while it
+    // is actually mid-job and actually said so: a card that gets no percent shows none.
+    if ((pl.state == "printing" || pl.state == "paused") && pl.has_progress) {
+        p["printing"]    = true;
+        p["percent"]     = (int) (pl.progress + 0.5);
+        p["left_time_s"] = pl.has_time_remaining ? pl.time_remaining : 0;
+    }
+    // The raw pair as well, un-rounded, for anything that wants them (the app's /api/printers).
+    if (pl.has_progress)       p["progress"]       = pl.progress;
+    if (pl.has_time_remaining) p["time_remaining"] = pl.time_remaining;
+    if (pl.has_time_printing)  p["time_printing"]  = pl.time_printing;
+}
+
 // One address's answer, or the fact that it was not asked (the backoff).
 struct HostAnswer
 {
-    bool        asked { false };
-    json        status, stats;
-    std::string error;
+    bool                     asked { false };
+    json                     status, stats;
+    std::string              error;
+    bool                     prusalink { false }; // answered as a PrusaLink printer, not a Moonraker one
+    PrusaLinkStatus::Status  pl;
 };
 
 void describe_hosts(const std::vector<HostTarget>& targets, json& printers)
@@ -595,6 +654,21 @@ void describe_hosts(const std::vector<HostTarget>& targets, json& printers)
             HostAnswer a;
             if (t.base.empty() || !ask_again(t.base)) return a;
             a.asked = true;
+            if (PrusaLinkStatus::speaks_prusalink(t.host_type)) {
+                // Its own REST API, with the preset's credentials. Read-only: /api/v1/status, and
+                // /api/v1/job only while it says it is printing. Never a command.
+                PrusaLinkStatus::Auth auth;
+                auth.auth_type = t.auth_type;
+                auth.apikey    = t.apikey;
+                auth.user      = t.user;
+                auth.password  = t.password;
+                a.pl           = PrusaLinkStatus::probe(t.base, auth, 2);
+                a.prusalink    = a.pl.answered;
+                a.error        = a.pl.error;
+                if (!a.pl.answered && !a.pl.authorized)
+                    a.error = "the printer refused the API key or password in its preset";
+                return a;
+            }
             // Read-only: what the printer says it is doing and how warm it is (the objects the LAN
             // list asks a Snapmaker for; extruder1.. answer empty where there is no such nozzle).
             // Never a command.
@@ -620,16 +694,25 @@ void describe_hosts(const std::vector<HostTarget>& targets, json& printers)
             if (p.is_object() && p.value("id", std::string()) == t.id) { entry = &p; break; }
         if (!entry || t.base.empty()) continue;
         const std::string& error    = a.error;
-        const bool         answered = a.stats.is_object() && !a.stats.empty();
-        if (a.asked) remember_probe(t.base, answered, answered ? a.stats.value("state", std::string()) : std::string());
+        const bool         answered = a.prusalink || (a.stats.is_object() && !a.stats.empty());
+        const std::string  state    = a.prusalink ? a.pl.state :
+                                      (answered ? a.stats.value("state", std::string()) : std::string());
+        // The backoff cache is keyed on "this address answers a status API we speak", which a
+        // PrusaLink printer does - so it is polled every five seconds like a Moonraker one, and an
+        // address that answered neither is left alone for half a minute.
+        if (a.asked) remember_probe(t.base, answered, state);
         const bool is_device = t.id.compare(0, 3, "ph:") == 0; // a print-host device, not the preset
         if (answered) {
-            fill_from_print_stats(a.stats, *entry);
-            fill_from_heaters(a.status, *entry);
+            if (a.prusalink) {
+                fill_from_prusalink(a.pl, *entry);
+            } else {
+                fill_from_print_stats(a.stats, *entry);
+                fill_from_heaters(a.status, *entry);
+            }
             // A device card carries the same `status` string a Snapmaker card does; list_hosts left
             // it "unknown" for everything that was not probed.
             if (is_device) {
-                (*entry)["status"] = a.stats.value("state", std::string());
+                (*entry)["status"] = state;
                 (*entry)["online"] = true;
             }
         } else {

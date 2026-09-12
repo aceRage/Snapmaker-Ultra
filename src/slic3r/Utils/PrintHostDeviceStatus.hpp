@@ -25,8 +25,13 @@
 //    SnapmakerLan.cpp:456, and the same one SSWCP's machine filament info comes from). Where there
 //    is no `print_task_config`, the `extruder`/`extruder1`... objects still say how many tools the
 //    machine has, which is a slot list without materials in it.
-//  * Everything else (Duet, PrusaLink, Repetier, SimplyPrint, ...) is not probed: this fork has no
-//    client for their status APIs, and guessing would cost a timeout per address.
+//  * A PrusaLink / PrusaConnect printer (a Buddy board on an MK4/MK4S/MINI/CORE One, or the
+//    PrusaLink daemon in front of an MK3S) answers its own REST API: `/api/v1/status` gives the
+//    state and both heaters, `/api/v1/job` the file it is printing. See PrusaLinkStatus.hpp. It
+//    names no filaments at all - the API has no filament-identity story - so it comes back online
+//    with a state and an empty slot list.
+//  * Everything else (Duet, Repetier, SimplyPrint, ...) is not probed: this fork has no client for
+//    their status APIs, and guessing would cost a timeout per address.
 //
 // Blocking. Never call it from the GUI thread.
 

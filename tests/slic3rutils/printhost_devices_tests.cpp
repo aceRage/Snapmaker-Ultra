@@ -8,6 +8,7 @@
 
 #include "slic3r/Utils/PrintHostDevices.hpp"
 #include "slic3r/Utils/PrintHostDeviceStatus.hpp"
+#include "slic3r/Utils/PrusaLinkStatus.hpp"
 
 #include <boost/filesystem.hpp>
 #include <boost/nowide/fstream.hpp>
@@ -517,4 +518,116 @@ TEST_CASE("PrintHostDevices: the preset bridge writes the fields the send path r
 
     CHECK(normalize_address(" 192.168.1.41/ ") == "192.168.1.41");
     CHECK(normalize_address("HTTP://Printer.local/") == "http://printer.local");
+}
+
+TEST_CASE("PrusaLinkStatus: what a PrusaLink printer says it is doing", "[PrintHostDevices]")
+{
+    // No network here: parse_status is the half of probe() that turns the two REST answers into a
+    // Status, so the mapping is exercised without a Buddy board on somebody's desk. The bodies
+    // below are the shapes PrusaLink 2.1.2 answers on an MK4S.
+    using namespace Slic3r::PrusaLinkStatus;
+
+    SECTION("an idle printer: a state and two heaters, no job") {
+        const std::string body =
+            "{\"printer\":{\"state\":\"IDLE\",\"temp_nozzle\":24.7,\"target_nozzle\":0.0,"
+            " \"temp_bed\":23.9,\"target_bed\":0.0,\"axis_z\":10.0,\"flow\":100,\"speed\":100},"
+            " \"storage\":{\"path\":\"/usb/\",\"name\":\"usb\",\"read_only\":false}}";
+        const Status st = parse_status(body);
+        CHECK(st.answered);
+        CHECK(st.authorized);
+        CHECK(st.raw_state == "IDLE");
+        CHECK(st.state == "standby");
+        CHECK(st.has_bed);
+        CHECK(st.bed_temp == Approx(23.9));
+        CHECK(st.bed_target == Approx(0.0));
+        CHECK(st.has_nozzle);
+        CHECK(st.nozzle_temp == Approx(24.7));
+        CHECK_FALSE(st.has_progress);       // nothing is printing, so no percentage is invented
+        CHECK_FALSE(st.has_time_remaining);
+        CHECK(st.filename.empty());
+    }
+
+    SECTION("a printing one, status plus job: progress, time left and the file name") {
+        const std::string status =
+            "{\"printer\":{\"state\":\"PRINTING\",\"temp_nozzle\":215.0,\"target_nozzle\":215.0,"
+            " \"temp_bed\":60.1,\"target_bed\":60.0},"
+            " \"job\":{\"id\":34,\"progress\":62.0,\"time_remaining\":1440,\"time_printing\":2400}}";
+        // /api/v1/job is the only answer that names the file; the status one never does.
+        const std::string job =
+            "{\"id\":34,\"state\":\"PRINTING\",\"progress\":62.0,\"time_remaining\":1440,"
+            " \"time_printing\":2400,\"file\":{\"name\":\"CUBE~1.BGC\",\"display_name\":\"calibration cube.bgcode\","
+            " \"path\":\"/usb\",\"size\":91234}}";
+        const Status st = parse_status(status, job);
+        CHECK(st.answered);
+        CHECK(st.state == "printing");
+        CHECK(st.has_progress);
+        CHECK(st.progress == Approx(62.0));
+        CHECK(st.has_time_remaining);
+        CHECK(st.time_remaining == 1440);
+        CHECK(st.has_time_printing);
+        CHECK(st.time_printing == 2400);
+        CHECK(st.job_id == 34);
+        CHECK(st.filename == "calibration cube.bgcode"); // display_name wins over the 8.3 name
+        CHECK(st.has_nozzle);
+        CHECK(st.nozzle_target == Approx(215.0));
+    }
+
+    SECTION("a job with no display_name falls back to the on-disk one") {
+        const std::string status = "{\"printer\":{\"state\":\"PAUSED\"}}";
+        const std::string job    = "{\"state\":\"PAUSED\",\"file\":{\"name\":\"PART~1.GCO\"}}";
+        const Status      st     = parse_status(status, job);
+        CHECK(st.state == "paused");
+        CHECK(st.filename == "PART~1.GCO");
+    }
+
+    SECTION("the state vocabulary is PrusaLink's, mapped onto this API's") {
+        CHECK(to_klipper_state("IDLE") == "standby");
+        CHECK(to_klipper_state("READY") == "standby");
+        CHECK(to_klipper_state("PRINTING") == "printing");
+        CHECK(to_klipper_state("PAUSED") == "paused");
+        CHECK(to_klipper_state("FINISHED") == "complete");
+        CHECK(to_klipper_state("STOPPED") == "cancelled");
+        CHECK(to_klipper_state("ERROR") == "error");
+        CHECK(to_klipper_state("ATTENTION") == "error");
+        CHECK(to_klipper_state("BUSY") == "busy");
+        CHECK(to_klipper_state("printing") == "printing");      // case does not matter
+        CHECK(to_klipper_state("SOMETHING_NEW") == "something_new"); // never dropped, just lowered
+        CHECK(to_klipper_state("").empty());
+    }
+
+    SECTION("something that is not a PrusaLink printer") {
+        CHECK_FALSE(parse_status("{}").answered);
+        CHECK_FALSE(parse_status("<html>404</html>").answered);
+        CHECK_FALSE(parse_status("{\"state\":{\"text\":\"Operational\"}}").answered); // an OctoPrint box
+        CHECK_FALSE(parse_status("").answered);
+    }
+
+    SECTION("progress is clamped, negative times are dropped") {
+        const Status st = parse_status(
+            "{\"printer\":{\"state\":\"PRINTING\"},\"job\":{\"progress\":100.0001,\"time_remaining\":-1}}");
+        CHECK(st.has_progress);
+        CHECK(st.progress == Approx(100.0));
+        CHECK_FALSE(st.has_time_remaining); // PrusaLink sends -1 for "no estimate yet"
+    }
+
+    SECTION("which host types this client speaks, and how it addresses them") {
+        CHECK(speaks_prusalink("prusalink"));
+        CHECK(speaks_prusalink("prusaconnect"));
+        CHECK_FALSE(speaks_prusalink("octoprint"));
+        CHECK_FALSE(speaks_prusalink("elegoolink"));
+        CHECK_FALSE(speaks_prusalink(""));
+        CHECK(base_url("192.168.1.50") == "http://192.168.1.50");
+        CHECK(base_url("http://prusa.local/") == "http://prusa.local");
+        CHECK(base_url("https://connect.prusa3d.com") == "https://connect.prusa3d.com");
+        CHECK(base_url("").empty());
+    }
+
+    SECTION("can_probe now covers PrusaLink, and it still says it maps no filaments") {
+        CHECK(PrintHostDevices::can_probe("prusalink"));
+        CHECK(PrintHostDevices::can_probe("prusaconnect"));
+        CHECK(PrintHostDevices::can_probe("octoprint"));
+        CHECK_FALSE(PrintHostDevices::can_probe("elegoolink"));
+        // It reports a state but never a filament, and the dialog has to say so.
+        CHECK(PrintHostDevices::no_filament_note("prusalink").find("PrusaLink") != std::string::npos);
+    }
 }
