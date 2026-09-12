@@ -1855,6 +1855,17 @@ Vec3d GLGizmoCut3D::project_onto_cut_plane(const Vec3d& pos_world) const
 
 Transform3d GLGizmoCut3D::connector_rotation_m(const Vec3d& pos_object) const
 {
+    // PHASE 2: on a DRAWN cut the frame comes from the ruled strip's own normal at
+    // the connector's (s, w), composed after the plane's m_rotation_m exactly the way
+    // the sheet's is - so a connector stands perpendicular to the surface the cut
+    // will make, and its hole and its plug come out coaxial in the two halves.
+    if (draw_connectors_live()) {
+        double s = 0.0, w = 0.0;
+        if (draw_connector_sw(pos_object, s, w))
+            return m_rotation_m * draw_cut_surface_frame(m_draw_stroke, m_draw_params, s, w);
+        return m_rotation_m;
+    }
+
     if (!is_curved_surface() || m_curved_sheet.is_flat())
         return m_rotation_m;
     const Vec2d xy = connector_plane_xy(pos_object);
@@ -1871,6 +1882,16 @@ Transform3d GLGizmoCut3D::connector_rotation_m(const CutConnector& connector) co
 
 Vec3d GLGizmoCut3D::connector_pos_on_sheet(const Vec3d& pos_object) const
 {
+    // PHASE 2, Draw: nothing to lift. The sheet's version exists because a connector
+    // placed on the flat plane has to be raised to f(u,v) when the sheet is bent
+    // afterwards - the (u,v) is the state and the height is derived. A drawn
+    // connector's position comes from a raycast against the cut surface itself and is
+    // already ON it, and there is no "same (u,v), new height" relationship to restore
+    // when the stroke changes: the stroke moving is the surface moving, so the
+    // sensible thing is to leave the connector where the user put it.
+    if (draw_connectors_live())
+        return pos_object;
+
     if (!is_curved_surface() || m_curved_sheet.is_flat())
         return pos_object;
     const Vec2d  xy = connector_plane_xy(pos_object);
@@ -1897,6 +1918,19 @@ void GLGizmoCut3D::update_curved_sheet_raycaster()
 
 bool GLGizmoCut3D::unproject_on_curved_sheet(const Vec2d& mouse_position, Vec3d& pos, Vec3d& pos_world, bool respect_contours)
 {
+    // PHASE 2: in Draw mode the click has to hit the DRAWN surface - the translucent
+    // shell the user is looking at - rather than the flat plane, which on a drawn cut
+    // is not where the cut goes at all. This is the one entry point both add_connector()
+    // and dragging_connector() go through, which is why extending it here is the whole
+    // of the plumbing.
+    //
+    // A MISS DOES NOT FALL BACK TO THE PLANE, unlike the sheet's version. The sheet
+    // spans the plane and a click past its rim still means something sensible; the
+    // drawn surface is the cut and a click that misses it is a click on nothing, so
+    // putting a connector on the plane there would place it where the cut is not.
+    if (draw_connectors_live())
+        return unproject_on_draw_surface(mouse_position, pos, pos_world);
+
     if (!is_curved_surface() || m_curved_sheet.is_flat())
         return unproject_on_cut_plane(mouse_position, pos, pos_world, respect_contours);
 
@@ -2273,6 +2307,15 @@ bool GLGizmoCut3D::on_cut_char(int key_code, bool shift_down, bool ctrl_down)
     // gizmo open; with no stroke to clear it falls through and Esc closes the
     // gizmo as it always did.
     if (!ctrl_down && !shift_down && key_code == WXK_ESCAPE && is_draw_surface() && !m_connectors_editing) {
+        // PHASE 2: Esc leaves EDIT POINTS first. The line is the thing the user has
+        // just spent effort on, so the escalation is "stop editing" before "throw the
+        // line away" - one more Esc does the latter, which is what it always did.
+        if (m_draw_editing) {
+            m_draw_editing = false;
+            m_draw_hover_pt = m_draw_drag_pt = -1;
+            m_parent.set_as_dirty();
+            return true;
+        }
         if (m_draw_capturing) {
             // Mid-stroke: abandon the line being drawn and put back the one that
             // was there before the press (push_draw_undo() stored it).
@@ -2534,6 +2577,13 @@ void GLGizmoCut3D::render_curved_surface_inputs()
         m_draw_stroke.clear();
         clear_draw_undo();
         m_draw_capturing = false;
+        // PHASE 2: and no handles, for the line that no longer exists.
+        m_draw_editing = false;
+        m_draw_hover_pt = m_draw_drag_pt = -1;
+        m_draw_points.clear();
+        m_draw_frame_flips = false;
+        m_draw_surface_raycaster.reset();
+        m_draw_surface_pick_dirty = true;
         invalidate_draw_stroke();
         invalidate_curved_sheet();
     }
@@ -2877,15 +2927,453 @@ void GLGizmoCut3D::refresh_draw_stroke()
     m_draw_params.depth       = double(m_draw_depth);
     m_draw_params.thickness   = double(m_cut_thickness);
     m_draw_params.thickness_offset = cut_thickness_offset();
+    m_draw_params.angle_deg   = double(m_draw_angle);
 
     m_draw_stroke.finish(DrawCutStroke::DefaultSpacing, double(m_draw_smoothing));
 
-    double kappa = 0.0;
-    m_draw_folds = m_draw_stroke.valid() && draw_cut_strip_folds(m_draw_stroke, m_draw_params.extension, &kappa);
+    // PHASE 2 closes phase 1's deviation #7: push the smoothed path back onto the
+    // model. draw_cut_smooth() cannot - it lives in libslic3r, where there is no
+    // raycaster - but the gizmo has one, so the line and the surface normals it
+    // carries really belong to the surface rather than to a chord's sag inside it.
+    reproject_draw_stroke_on_mesh();
 
+    // THE HOLONOMY CHECK, which only matters once there IS an angle. A closed stroke
+    // whose outward binormal does not close up on itself has no consistent outward
+    // side, so a draft would flare one way round one arc of the loop and the other
+    // way round the rest. Fall back to 0 and say why - the research spec's
+    // "warn and fall back to theta = 0".
+    m_draw_frame_flips = m_draw_stroke.valid() && m_draw_params.angle_deg != 0.0 &&
+                         draw_cut_frame_holonomy_flips(m_draw_stroke);
+    if (m_draw_frame_flips)
+        m_draw_params.angle_deg = 0.0;
+
+    // The fold guard now needs the angle AND the depth: a tilted ruling reaches
+    // sideways by depth * sin(angle), and for a through-all cut that is an order of
+    // magnitude more than the Extension ever is.
+    double kappa = 0.0;
+    m_draw_folds = m_draw_stroke.valid() &&
+                   draw_cut_strip_folds(m_draw_stroke, m_draw_params.extension, &kappa,
+                                        m_draw_params.angle_deg, draw_cut_depth_reach());
+
+    sync_draw_points();
     update_draw_empty_sides();
+    update_draw_connector_warnings();
     invalidate_draw_stroke();
+    m_draw_surface_pick_dirty = true;
     m_parent.set_as_dirty();
+}
+
+// The reach the cut will actually use, in mm. Through-all derives it from the
+// object's bounding box exactly the way draw_cut_cutter_solid() does, so the fold
+// guard and the connector domain test measure against the number the cutter uses.
+double GLGizmoCut3D::draw_cut_depth_reach() const
+{
+    if (!m_draw_params.through_all)
+        return std::max(0.01, double(m_draw_depth));
+    const double diag = m_bounding_box.defined ? m_bounding_box.size().norm() : 100.0;
+    return 1.05 * diag + 1.0;
+}
+
+// Re-project the finished path onto the model - PHASE 2, closing phase 1's
+// deviation #7.
+//
+// Smoothing moves a sample toward the average of its neighbours, which on a convex
+// face pulls it INTO the material and on a concave one lifts it off. Phase 1 could
+// leave that (a couple of passes is within the chord sag) because nothing read the
+// normals for anything but the cut direction at angle 0. Phase 2 reads them for the
+// draft angle and for every connector frame, and Edit points lets the user drag a
+// point wherever they like - so the path has to be back on the surface first.
+//
+// MeshRaycaster::get_closest_point() against the cached instance mesh, which is
+// already in the PLANE frame - the frame the stroke lives in - so nothing is
+// transformed either way.
+void GLGizmoCut3D::reproject_draw_stroke_on_mesh()
+{
+    if (!m_draw_stroke.valid())
+        return;
+    if (!update_draw_raycaster() || !m_draw_raycaster)
+        return;
+
+    std::vector<DrawCutSample> path = m_draw_stroke.path();
+    bool moved = false;
+    for (DrawCutSample& smp : path) {
+        Vec3f normal = Vec3f::Zero();
+        const Vec3f closest = m_draw_raycaster->get_closest_point(smp.pos.cast<float>(), &normal);
+        const Vec3d to = closest.cast<double>();
+        if ((to - smp.pos).squaredNorm() > 1e-12) {
+            smp.pos = to;
+            moved = true;
+        }
+        const Vec3d n = normal.cast<double>();
+        if (n.squaredNorm() > 1e-12 && (n.normalized() - smp.normal).squaredNorm() > 1e-12) {
+            smp.normal = n.normalized();
+            moved = true;
+        }
+    }
+    if (moved)
+        m_draw_stroke.set_path(path);
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 2: LINE EDITING.
+//
+// After the stroke ends its resampled points become draggable handles, the way the
+// curved sheet's control points are: hover highlights, drag moves, right-click
+// deletes, Shift+click on a segment inserts. Three things make this different from
+// the sheet's grid and each is the reason for a line of code below:
+//
+//  1. The sheet's control points are a FIXED grid with a fixed count - dragging one
+//     changes a height and nothing else. A stroke's points are a LIST, and insert
+//     and delete change its length, so the whole line has to be re-finished after
+//     every edit or the resampling and the open/closed decision go stale.
+//
+//  2. A sheet control point moves along ONE axis (the plane normal). A stroke point
+//     moves ON THE SURFACE, so the drag is a RAYCAST, not a plane projection - which
+//     is also what keeps the surface normal it carries correct, and the normal is
+//     what the draft angle is measured from.
+//
+//  3. The edited points are the RESAMPLED path, not the raw capture. Feeding them
+//     back in as the raw samples and re-running finish() is what keeps the line
+//     evenly spaced after an edit - otherwise a dragged point leaves one long span
+//     and one short one either side of it, and the ruling density follows.
+// ---------------------------------------------------------------------------
+
+void GLGizmoCut3D::sync_draw_points()
+{
+    // The handles ARE the finished path. Rebuilding them from it on every refresh
+    // keeps them in step with smoothing, with the re-projection above, and with an
+    // undo - and means there is exactly one place the line lives.
+    //
+    // NOT rebuilt during a drag: the drag writes m_draw_points directly and commits
+    // on release, so re-deriving them mid-gesture would snap the point being
+    // dragged back to wherever the last commit left it.
+    if (m_draw_drag_pt >= 0)
+        return;
+    m_draw_points       = m_draw_stroke.path();
+}
+
+void GLGizmoCut3D::commit_draw_points()
+{
+    if (m_draw_points.size() < 2)
+        return;
+
+    // The edited points become the RAW samples and finish() runs over them. That is
+    // what re-resamples the line (so a dragged point does not leave a long span next
+    // to a short one), re-smooths it, and re-decides open vs closed - a point dragged
+    // so the two ends now meet really does close the loop, which is the behaviour a
+    // user editing a line expects.
+    //
+    // A CLOSED stroke needs its closing span expressed, because finish() decides
+    // closed from the gap between the first and the last sample and the path is
+    // stored OPEN (no duplicate first point at the end). Without this an edit would
+    // silently open every loop.
+    const bool was_closed = m_draw_stroke.is_closed();
+    DrawCutStroke edited;
+    for (const DrawCutSample& s : m_draw_points)
+        edited.append(s.pos, s.normal, s.facet);
+    if (was_closed)
+        edited.append(m_draw_points.front().pos, m_draw_points.front().normal, m_draw_points.front().facet);
+
+    m_draw_stroke = edited;
+    refresh_draw_stroke();
+}
+
+Vec3d GLGizmoCut3D::draw_point_world(int i) const
+{
+    if (i < 0 || size_t(i) >= m_draw_points.size())
+        return Vec3d::Zero();
+    return m_plane_center + m_rotation_m * m_draw_points[size_t(i)].pos;
+}
+
+int GLGizmoCut3D::draw_point_at(const Vec2d& mouse_position) const
+{
+    if (m_draw_points.empty())
+        return -1;
+
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    // The same fixed screen-space pick radius the sheet's control points use, so a
+    // handle is grabbable when the line is dense and the view is zoomed out.
+    const double pick_px2 = 14.0 * 14.0;
+
+    int    best    = -1;
+    double best_d2 = pick_px2;
+    for (size_t i = 0; i < m_draw_points.size(); ++ i) {
+        const Slic3r::Point p = CameraUtils::project(camera, draw_point_world(int(i)));
+        const double d2 = (Vec2d(double(p.x()), double(p.y())) - mouse_position).squaredNorm();
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best    = int(i);
+        }
+    }
+    return best;
+}
+
+int GLGizmoCut3D::draw_segment_at(const Vec2d& mouse_position) const
+{
+    const size_t n = m_draw_points.size();
+    if (n < 2)
+        return -1;
+
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    const double pick_px2 = 12.0 * 12.0;
+
+    // A closed stroke has one more segment than it has points: the closing span.
+    const size_t segs = m_draw_stroke.is_closed() ? n : n - 1;
+
+    int    best    = -1;
+    double best_d2 = pick_px2;
+    for (size_t i = 0; i < segs; ++ i) {
+        const Slic3r::Point pa = CameraUtils::project(camera, draw_point_world(int(i)));
+        const Slic3r::Point pb = CameraUtils::project(camera, draw_point_world(int((i + 1) % n)));
+        const Vec2d a(double(pa.x()), double(pa.y()));
+        const Vec2d b(double(pb.x()), double(pb.y()));
+        const Vec2d ab = b - a;
+        const double len2 = ab.squaredNorm();
+        if (len2 < 1e-9)
+            continue;
+        // The nearest point on the SEGMENT, clamped - not on the infinite line, or a
+        // click well past the end of a short segment would claim it.
+        const double t = std::clamp((mouse_position - a).dot(ab) / len2, 0.0, 1.0);
+        const double d2 = (a + t * ab - mouse_position).squaredNorm();
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best    = int(i);
+        }
+    }
+    return best;
+}
+
+bool GLGizmoCut3D::draw_point_reproject(int i, const Vec2d& mouse_position)
+{
+    if (i < 0 || size_t(i) >= m_draw_points.size())
+        return false;
+    if (!update_draw_raycaster() || !m_draw_raycaster)
+        return false;
+
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    // The pick mesh is in the PLANE frame, so this is the transform that takes it to
+    // the world - the same one draw_sample_at() uses, and the hit comes back in the
+    // plane frame, which is where the point lives.
+    const Transform3d plane_to_world = translation_transform(m_plane_center) * m_rotation_m;
+
+    Vec3f  hit, normal;
+    size_t facet = 0;
+    // A MISS DOES NOT MOVE THE POINT. Dragging off the silhouette must leave the
+    // line where it was rather than flinging the point to wherever the ray happened
+    // to end - which is the same "a miss is skipped, not fatal" rule capture follows.
+    if (!m_draw_raycaster->unproject_on_mesh(mouse_position, plane_to_world, camera, hit, normal, nullptr, &facet))
+        return false;
+
+    DrawCutSample& s = m_draw_points[size_t(i)];
+    s.pos    = hit.cast<double>();
+    s.normal = normal.cast<double>().normalized();
+    s.facet  = facet;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 2: CONNECTORS ON THE DRAWN SURFACE.
+//
+// The curved cut's phase 4 already generalised the connector frame from "one
+// shared m_rotation_m" to "a rotation built from the local surface normal", and it
+// did so IN THE CONNECTOR PATH rather than in the sheet - which is why nothing in
+// process_connector_cut() has to know about either surface. All Draw needs is the
+// same three answers against the ruled strip instead of the height field:
+//
+//   where is the surface under this click  -> unproject_on_draw_surface()
+//   what frame does it have there          -> draw_cut_surface_frame(), via
+//                                             connector_rotation_m()
+//   is the patch there any good            -> update_draw_connector_warnings()
+//
+// WHY THEY SURVIVE THE SPLIT AND THE KERF, which is the thing worth stating
+// because it is not obvious: a connector's body is subtracted from one half and
+// added to the other by process_connector_cut(), which works off the connector's
+// own pos and rotation_m and knows nothing about the cut surface. Both halves are
+// produced by ONE boolean against ONE cutter, so the faces they present to each
+// other are the same surface - and a connector standing perpendicular to that
+// surface therefore meets both of them squarely. The kerf moves both faces along
+// the SAME strip normal (draw_cut_cutter_solid offsets along -binormal / -sweep,
+// one field for the whole strip), so the hole and the plug stay coaxial: the gap
+// opens along the connector's own axis, which is the direction it is designed to
+// come apart in anyway.
+//
+// WHICH KINDS. Plug / Dowel / Snap are solids of revolution about the local normal
+// and work unchanged. The FLEXI kinds are gated by the existing per-kind footprint
+// check, and on a swept surface that check is stricter than it is on a sheet for a
+// real reason: a ruled strip is DEVELOPABLE along its rules (a straight ruling has
+// zero curvature that way) but can bend arbitrarily hard ACROSS them, which is
+// exactly the direction a hinge's knuckle run or a thread's pitch line lies along
+// when the connector is placed on a curving stroke. So Hinge and Thread get the
+// same curved_cut_patch_is_flat_enough()-shaped warning, computed from the
+// cross-rule curvature only (draw_cut_surface_curvature_radius does that), and a
+// stroke drawn straight enough passes it. Nothing is refused that the curved cut
+// would allow.
+// ---------------------------------------------------------------------------
+
+bool GLGizmoCut3D::draw_connectors_live() const
+{
+    return is_draw_surface() && m_draw_stroke.valid();
+}
+
+void GLGizmoCut3D::update_draw_surface_raycaster()
+{
+    if (!m_draw_surface_pick_dirty && m_draw_surface_raycaster)
+        return;
+
+    m_draw_surface_mesh.clear();
+    m_draw_surface_raycaster.reset();
+    m_draw_surface_pick_dirty = false;
+
+    if (!m_draw_stroke.valid())
+        return;
+
+    // THE CUTTER SHELL IS THE PICK TARGET, because it is what the user can see: the
+    // translucent surface render_draw_stroke() puts up is this same solid, so a
+    // click lands where the eye says it will. Built at the cut's own reach (not the
+    // preview's clamped one) so a connector can be placed anywhere on the surface
+    // the cut will use, including well inside the part.
+    BoundingBoxf3 bbox;
+    indexed_triangle_set mesh;
+    const indexed_triangle_set* src = nullptr;
+    if (!m_draw_pick_its.empty())
+        src = &m_draw_pick_its;
+    else if (curved_instance_mesh_in_plane(mesh))
+        src = &mesh;
+    if (src != nullptr)
+        for (const Vec3f& v : src->vertices)
+            bbox.merge(v.cast<double>());
+
+    indexed_triangle_set cutter = draw_cut_cutter_solid(m_draw_stroke, m_draw_params, bbox);
+    if (cutter.empty())
+        return;
+    // To the WORLD, the way update_curved_sheet_raycaster() takes the sheet there,
+    // so the raycaster's own transform is the identity at use.
+    its_transform(cutter, translation_transform(m_plane_center) * m_rotation_m);
+    m_draw_surface_mesh = TriangleMesh(std::move(cutter));
+    if (m_draw_surface_mesh.empty())
+        return;
+    m_draw_surface_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(m_draw_surface_mesh));
+}
+
+bool GLGizmoCut3D::unproject_on_draw_surface(const Vec2d& mouse_position, Vec3d& pos, Vec3d& pos_world)
+{
+    if (!draw_connectors_live())
+        return false;
+
+    update_draw_surface_raycaster();
+    if (!m_draw_surface_raycaster)
+        return false;
+
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    Vec3f hit_f, normal_f;
+    if (!m_draw_surface_raycaster->unproject_on_mesh(mouse_position, Transform3d::Identity(), camera, hit_f, normal_f))
+        return false;
+
+    const Vec3d hit = hit_f.cast<double>();
+
+    // NO CONTOUR TEST HERE, and that is deliberate. The curved sheet's version
+    // projects the hit back down onto the plane and asks the object clipper whether
+    // it is inside the cut's cross-section, because the sheet spans the whole plane
+    // and most of it is outside the part. The drawn cutter is not like that: it IS
+    // the cut surface and nothing else, so every point of it is on the cut. What
+    // replaces the test is the (s, w) domain check in update_draw_connector_warnings(),
+    // which asks the question that actually matters here - is the connector clear of
+    // the strip's own rims.
+    const CommonGizmosDataObjects::SelectionInfo* sel = m_c->selection_info();
+    Vec3d hit_d = hit;
+    if (sel && sel->model_object() && sel->get_active_instance() >= 0) {
+        hit_d -= sel->model_object()->instances[sel->get_active_instance()]->get_offset();
+        hit_d.z() -= double(sel->get_sla_shift());
+    }
+
+    pos       = hit_d;
+    pos_world = hit;
+    return true;
+}
+
+bool GLGizmoCut3D::draw_connector_sw(const Vec3d& pos_object, double& s, double& w) const
+{
+    s = w = 0.0;
+    if (!m_draw_stroke.valid())
+        return false;
+
+    // The connector's position is in the OBJECT's frame; the stroke is in the cut
+    // PLANE's. connector_plane_xy() does the same hop for the sheet, but it throws
+    // away z - which a ruled surface cannot afford, because the surface is not a
+    // height field over the plane. So the full local point is carried through.
+    const CommonGizmosDataObjects::SelectionInfo* sel = m_c->selection_info();
+    Vec3d world = pos_object;
+    if (sel && sel->model_object() && sel->get_active_instance() >= 0) {
+        world += sel->model_object()->instances[sel->get_active_instance()]->get_offset();
+        world.z() += double(sel->get_sla_shift());
+    }
+    const Vec3d local = m_rotation_m.inverse() * (world - m_plane_center);
+    return draw_cut_surface_project(m_draw_stroke, m_draw_params, local, s, w);
+}
+
+void GLGizmoCut3D::update_draw_connector_warnings()
+{
+    m_draw_tilted_connectors = m_draw_unflat_connectors = m_draw_offsurface_connectors = 0;
+    if (!draw_connectors_live())
+        return;
+    const CommonGizmosDataObjects::SelectionInfo* sel = m_c->selection_info();
+    const ModelObject* mo = sel ? sel->model_object() : nullptr;
+    if (mo == nullptr)
+        return;
+
+    const double reach = draw_cut_depth_reach();
+
+    for (const CutConnector& connector : mo->cut_connectors) {
+        double s = 0.0, w = 0.0;
+        if (!draw_connector_sw(connector.pos, s, w))
+            continue;
+
+        const double extent = connector_extent(connector);
+
+        // OFF THE SURFACE: the (s, w) domain test, the Draw analogue of the curved
+        // cut's (u,v)-in-contour check. A connector whose body hangs off the strip's
+        // rim is only half made by the split, which is a silent wrong result rather
+        // than a visible one - so it is worth counting and saying.
+        if (!draw_cut_surface_contains(m_draw_stroke, m_draw_params, s, w, extent, reach))
+            ++ m_draw_offsurface_connectors;
+
+        if (draw_cut_surface_tilt_deg(m_draw_stroke, m_draw_params, s, w) > CurvedConnectorTiltWarnDeg)
+            ++ m_draw_tilted_connectors;
+
+        // Only the STRAIGHT-featured flexi kinds care, exactly as on the sheet: a
+        // plug, a dowel or a snap is a solid of revolution about the local normal and
+        // sits fine on a curving patch. A hinge's knuckle run and a thread's pitch
+        // line are generated as if for a plane, and the direction they lie along is
+        // the ACROSS-rules one - the only direction a ruled strip can curve in.
+        if (connector.attribs.type == CutConnectorType::FlexiJoint &&
+            (connector.flexi.kind == FlexiJointKind::Hinge || connector.flexi.kind == FlexiJointKind::Thread) &&
+            !draw_cut_patch_is_flat_enough(m_draw_stroke, m_draw_params, s, w, extent))
+            ++ m_draw_unflat_connectors;
+    }
+}
+
+void GLGizmoCut3D::render_draw_point_handles()
+{
+    if (!m_draw_editing || m_draw_points.empty())
+        return;
+
+    // The handles have to be visible THROUGH the part - a closed loop's far side is
+    // behind the model, and a handle you cannot see is a handle you cannot grab.
+    // Same depth clear render_curved_control_points() uses for the same reason.
+    glsafe(::glClear(GL_DEPTH_BUFFER_BIT));
+
+    const Camera&     camera      = wxGetApp().plater()->get_camera();
+    const Transform3d view_matrix = camera.get_view_matrix();
+    const double      mean_size   = get_grabber_mean_size(m_bounding_box);
+    const double      size        = 0.32 * get_half_size(mean_size);
+
+    for (size_t i = 0; i < m_draw_points.size(); ++ i) {
+        const bool hovered = (int(i) == m_draw_hover_pt) || (int(i) == m_draw_drag_pt);
+        const ColorRGBA color = hovered ? ColorRGBA::ORANGE() : GRABBER_COLOR;
+        render_model(m_sphere.model, color,
+                     view_matrix * translation_transform(draw_point_world(int(i))) *
+                         scale_transform(size));
+    }
 }
 
 void GLGizmoCut3D::update_draw_empty_sides()
@@ -2916,6 +3404,16 @@ void GLGizmoCut3D::clear_draw_stroke(bool push_undo)
     m_draw_last_mouse = Vec2d::Zero();
     m_draw_upper_empty = m_draw_lower_empty = false;
     m_draw_folds       = false;
+    // PHASE 2: the handles belong to a line that no longer exists, and leaving
+    // Edit points on with nothing to edit is a mode the user cannot get out of by
+    // doing the obvious thing (drawing a new line, which editing mode refuses).
+    m_draw_editing     = false;
+    m_draw_hover_pt = m_draw_drag_pt = -1;
+    m_draw_points.clear();
+    m_draw_frame_flips = false;
+    m_draw_tilted_connectors = m_draw_unflat_connectors = m_draw_offsurface_connectors = 0;
+    m_draw_surface_pick_dirty = true;
+    m_draw_surface_raycaster.reset();
     invalidate_draw_stroke();
     m_parent.set_as_dirty();
 }
@@ -2987,6 +3485,113 @@ bool GLGizmoCut3D::draw_on_mouse(const wxMouseEvent& mouse_event)
         return false;
 
     const Vec2d mouse_pos(mouse_event.GetX(), mouse_event.GetY());
+
+    // ---------------------------------------------------------------------
+    // PHASE 2: EDIT POINTS. Claimed BEFORE the capture branch, because in editing
+    // mode a left-drag on the model must move a handle rather than start a new
+    // stroke - the two gestures are the same gesture and only the mode tells them
+    // apart. Everything else (Esc, Ctrl+Z, the panel) is unchanged.
+    // ---------------------------------------------------------------------
+    if (m_draw_editing && m_draw_stroke.valid() && !m_draw_capturing) {
+        if (m_draw_drag_pt >= 0) {
+            if (mouse_event.Dragging()) {
+                if (draw_point_reproject(m_draw_drag_pt, mouse_pos)) {
+                    // The CUTTER PREVIEW updates live, which is the point of the
+                    // exercise: the shell is rebuilt from the edited points on every
+                    // motion event rather than on release. It is one
+                    // draw_cut_cutter_solid() call over a few hundred samples, which
+                    // is the same cost a slider drag already pays.
+                    //
+                    // The stroke itself is NOT re-finished here - that would resample
+                    // mid-drag and walk the point out from under the cursor. The
+                    // preview reads the points directly (see update_draw_preview_models).
+                    invalidate_draw_stroke();
+                    m_parent.set_as_dirty();
+                }
+                return true;
+            }
+            if (mouse_event.LeftUp() || mouse_event.Leaving()) {
+                m_draw_drag_pt = -1;
+                // ONE UNDO ENTRY PER EDIT, and it was pushed on the press - the same
+                // "push before the change" rule the stroke and the sheet both follow.
+                commit_draw_points();
+                m_parent.set_as_dirty();
+                return true;
+            }
+            return true;
+        }
+
+        if (mouse_event.Moving()) {
+            const int hover = draw_point_at(mouse_pos);
+            if (hover != m_draw_hover_pt) {
+                m_draw_hover_pt = hover;
+                m_parent.set_as_dirty();
+            }
+            return hover >= 0;
+        }
+
+        // RIGHT-CLICK DELETES a point. Guarded on keeping enough points to still be a
+        // line: MinSamples is the floor finish() enforces, and deleting below it
+        // would turn a good line into an error message with no way back but undo.
+        if (mouse_event.RightDown()) {
+            const int pt = draw_point_at(mouse_pos);
+            if (pt >= 0 && m_draw_points.size() > size_t(DrawCutStroke::MinSamples)) {
+                Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Delete cut line point"), UndoRedo::SnapshotType::GizmoAction);
+                push_draw_undo();
+                m_draw_points.erase(m_draw_points.begin() + pt);
+                m_draw_hover_pt = -1;
+                commit_draw_points();
+                m_parent.set_as_dirty();
+                return true;
+            }
+            // A right-click that hit no point falls through to the plane-flip gesture
+            // the gizmo already has, rather than being swallowed here.
+            return false;
+        }
+
+        if (mouse_event.LeftDown() && !mouse_event.CmdDown() && !mouse_event.AltDown()) {
+            // SHIFT+CLICK ON A SEGMENT INSERTS a point, at the click, re-projected
+            // onto the model - so the new point is on the surface with the surface's
+            // own normal, not on the chord between its neighbours.
+            if (mouse_event.ShiftDown()) {
+                const int seg = draw_segment_at(mouse_pos);
+                if (seg >= 0) {
+                    Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Insert cut line point"), UndoRedo::SnapshotType::GizmoAction);
+                    push_draw_undo();
+                    // Seed it on the chord, then let the raycast put it on the surface.
+                    const size_t a = size_t(seg);
+                    const size_t b = (a + 1) % m_draw_points.size();
+                    DrawCutSample mid;
+                    mid.pos    = 0.5 * (m_draw_points[a].pos + m_draw_points[b].pos);
+                    mid.normal = (m_draw_points[a].normal + m_draw_points[b].normal).normalized();
+                    mid.facet  = m_draw_points[a].facet;
+                    m_draw_points.insert(m_draw_points.begin() + int(b == 0 ? m_draw_points.size() : b), mid);
+                    const int inserted = int(b == 0 ? m_draw_points.size() - 1 : b);
+                    draw_point_reproject(inserted, mouse_pos);
+                    m_draw_hover_pt = inserted;
+                    commit_draw_points();
+                    m_parent.set_as_dirty();
+                    return true;
+                }
+                return false;
+            }
+
+            const int pt = draw_point_at(mouse_pos);
+            if (pt >= 0) {
+                Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Move cut line point"), UndoRedo::SnapshotType::GizmoAction);
+                push_draw_undo();
+                m_draw_drag_pt  = pt;
+                m_draw_hover_pt = pt;
+                return true;
+            }
+            // A click on nothing in editing mode does NOT start a new stroke: that
+            // would throw away the line the user is editing on a stray click. Leaving
+            // editing mode is the deliberate way back to drawing.
+            return false;
+        }
+
+        return false;
+    }
 
     if (m_draw_capturing) {
         if (mouse_event.Dragging()) {
@@ -3079,13 +3684,20 @@ void GLGizmoCut3D::update_draw_preview_models()
     // once there is one - as a narrow strip of quads lying on the surface, one
     // quad per span, widened along the surface normal crossed with the tangent so
     // the strip hugs the face rather than standing off it.
-    const std::vector<DrawCutSample>& pts = m_draw_stroke.path().empty() ? m_draw_stroke.samples()
-                                                                        : m_draw_stroke.path();
+    // PHASE 2: while a point is being DRAGGED the edited points are the truth - the
+    // stroke has not been re-finished yet (that happens on release, so a resample
+    // mid-drag does not walk the point out from under the cursor), so both the ribbon
+    // and the cutter shell below read m_draw_points instead. That is what makes the
+    // preview update live under the drag.
+    const bool dragging_pt = m_draw_drag_pt >= 0 && m_draw_points.size() >= 2;
+    const std::vector<DrawCutSample>& pts = dragging_pt ? m_draw_points
+                                          : m_draw_stroke.path().empty() ? m_draw_stroke.samples()
+                                                                         : m_draw_stroke.path();
     if (pts.size() >= 2) {
         // Half width scaled to the part, so the line reads the same on a 10 mm
         // trinket and a 200 mm print.
         const double half_w = std::max(0.15, 0.004 * get_grabber_mean_size(m_bounding_box));
-        const bool   closed = !m_draw_stroke.path().empty() && m_draw_stroke.is_closed();
+        const bool   closed = (dragging_pt || !m_draw_stroke.path().empty()) && m_draw_stroke.is_closed();
 
         indexed_triangle_set its;
         const size_t n = pts.size();
@@ -3126,7 +3738,17 @@ void GLGizmoCut3D::update_draw_preview_models()
 
     // THE CUTTER SHELL, i.e. the preview of the cut surface. Built from exactly the
     // same call the cut will make, so this is the surface, not a picture of it.
-    if (m_draw_stroke.valid()) {
+    // PHASE 2: mid-drag the shell is built from a stroke made of the EDITED points,
+    // so the surface the user sees follows the handle they are holding. It is set_path
+    // rather than a fresh finish() for the same reason the ribbon reads the points
+    // directly: re-resampling mid-drag would move the point out from under the cursor.
+    // The path is the same LENGTH as the stroke's whenever nothing was inserted or
+    // deleted, which is the only case a drag can reach.
+    DrawCutStroke shell_stroke = m_draw_stroke;
+    if (dragging_pt && m_draw_points.size() == m_draw_stroke.path().size())
+        shell_stroke.set_path(m_draw_points);
+
+    if (shell_stroke.valid()) {
         BoundingBoxf3 bbox;
         if (!m_draw_pick_its.empty())
             for (const Vec3f& v : m_draw_pick_its.vertices)
@@ -3149,7 +3771,7 @@ void GLGizmoCut3D::update_draw_preview_models()
         DrawCutParams shown = m_draw_params;
         if (shown.through_all && bbox.defined) {
             double need = 0.0;
-            for (const DrawCutSample& smp : m_draw_stroke.path()) {
+            for (const DrawCutSample& smp : shell_stroke.path()) {
                 // The furthest corner of the box from this sample. Whatever direction
                 // the ray takes, it is outside the box by then - so the shell still
                 // covers the whole part and only the empty-space tail is cut off.
@@ -3160,7 +3782,7 @@ void GLGizmoCut3D::update_draw_preview_models()
             shown.depth       = std::max(1.0, need);
         }
 
-        const indexed_triangle_set cutter = draw_cut_cutter_solid(m_draw_stroke, shown, bbox);
+        const indexed_triangle_set cutter = draw_cut_cutter_solid(shell_stroke, shown, bbox);
         if (!cutter.empty())
             m_draw_cutter_model.init_from(cutter);
     }
@@ -3199,8 +3821,12 @@ void GLGizmoCut3D::render_draw_stroke()
         }
     }
 
-    if (!m_draw_ribbon_model.is_initialized())
+    if (!m_draw_ribbon_model.is_initialized()) {
+        // Still draw the handles: a line with no ribbon (a stroke too short to
+        // resample) is one the user may still want to fix by dragging a point.
+        render_draw_point_handles();
         return;
+    }
 
     // (2) THE RIBBON, twice.
     //
@@ -3250,6 +3876,10 @@ void GLGizmoCut3D::render_draw_stroke()
         if (curr_shader != nullptr)
             curr_shader->start_using();
     }
+
+    // PHASE 2: the editable points, on top of everything, with the depth buffer
+    // cleared so a closed loop's far handles are grabbable too.
+    render_draw_point_handles();
 }
 
 // --- panel ----------------------------------------------------------------
@@ -3300,6 +3930,31 @@ void GLGizmoCut3D::render_draw_surface_inputs()
         m_imgui->tooltip(_u8L("How far the cut surface reaches past the line. An open line needs enough of this to reach across the part, or the cut will not separate it.").c_str(),
                          ImGui::GetFontSize() * 20.f);
 
+    // PHASE 2: THE DRAFT ANGLE. Only Surface normal can use it - the constant
+    // directions are one direction at every sample by definition, which is exactly
+    // what a per-sample tilt is not - so the slider greys out for them rather than
+    // sitting there doing nothing.
+    const bool angle_usable = DrawCutDirection(m_draw_direction) == DrawCutDirection::SurfaceNormal;
+    m_imgui->disabled_begin(!angle_usable);
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Angle") + ": ");
+    ImGui::SameLine(m_label_width);
+    ImGui::PushItemWidth(m_control_width * 0.7f);
+    if (ImGui::SliderFloat("##draw_angle", &m_draw_angle, float(-DrawCutMaxAngleDeg), float(DrawCutMaxAngleDeg), "%.0f deg"))
+        refresh_draw_stroke();
+    ImGui::PopItemWidth();
+    m_imgui->disabled_end();
+    if (ImGui::IsItemHovered())
+        // THE ONE THING ABOUT THIS FEATURE THAT IS NOT SELF-EVIDENT ON SCREEN, which
+        // is why the research spec asks for it to be said here: which way the sign
+        // goes. Positive flares out, so the piece lifts away; negative undercuts, so
+        // it locks in.
+        m_imgui->tooltip(_u8L("Tilts the cut surface away from the face the line was drawn on. "
+                              "Positive flares the cut outward, so the piece the line goes around gets wider going in and lifts out. "
+                              "Negative undercuts it, so the piece locks in place and cannot be pulled straight out. "
+                              "Only available with Direction = Surface normal.").c_str(),
+                         ImGui::GetFontSize() * 20.f);
+
     // Depth: through all by default, which is the reach a cut usually wants.
     ImGui::AlignTextToFramePadding();
     m_imgui->text(_L("Depth") + ": ");
@@ -3333,6 +3988,28 @@ void GLGizmoCut3D::render_draw_surface_inputs()
         m_imgui->tooltip(_u8L("Averages the line and its surface normals. A hand-drawn line picks up every facet it crossed; a little of this takes the kinks out of the cut surface.").c_str(),
                          ImGui::GetFontSize() * 20.f);
 
+    // PHASE 2: EDIT POINTS. A toggle rather than a modifier key, because the two
+    // gestures collide - a left-drag on the model is "draw a new line" in one mode
+    // and "move this point" in the other, and there is no way to tell them apart
+    // from the event alone.
+    m_imgui->disabled_begin(!m_draw_stroke.valid());
+    bool editing = m_draw_editing;
+    if (m_imgui->bbl_checkbox(_L("Edit points"), editing)) {
+        m_draw_editing = editing && m_draw_stroke.valid();
+        m_draw_hover_pt = m_draw_drag_pt = -1;
+        if (m_draw_editing)
+            sync_draw_points();
+        m_parent.set_as_dirty();
+    }
+    m_imgui->disabled_end();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_u8L("Turn the line's points into handles you can move. "
+                              "Drag a handle to move it along the surface, right-click one to delete it, "
+                              "and Shift+click a segment to add one. Each edit is a separate undo step.").c_str(),
+                         ImGui::GetFontSize() * 20.f);
+
+    ImGui::SameLine();
+
     m_imgui->disabled_begin(m_draw_stroke.empty());
     if (m_imgui->button(_L("Clear line"), _L("Remove the drawn line"))) {
         Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Clear draw cut line"), UndoRedo::SnapshotType::GizmoAction);
@@ -3341,7 +4018,10 @@ void GLGizmoCut3D::render_draw_surface_inputs()
     m_imgui->disabled_end();
 
     ImGui::PushTextWrapPos(m_editing_window_width);
-    m_imgui->text(_L("Drag on the model to draw the cut line. Esc clears it; Ctrl+Z and Ctrl+Y step through your lines."));
+    if (m_draw_editing)
+        m_imgui->text(_L("Drag a handle to move it; right-click one to delete it; Shift+click a segment to add one."));
+    else
+        m_imgui->text(_L("Drag on the model to draw the cut line. Esc clears it; Ctrl+Z and Ctrl+Y step through your lines."));
 
     if (m_draw_stroke.empty())
         m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT, _L("Draw a line on the model."));
@@ -3376,8 +4056,37 @@ void GLGizmoCut3D::render_draw_surface_inputs()
             m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
                                   _L("The stroke does not separate the part - increase Extension or draw the line right across it."));
         if (m_draw_folds)
+            // PHASE 2: the Angle is now a way to cause this too, and at through-all
+            // depth it is much the likelier of the two - the sideways reach is
+            // depth * sin(angle), which dwarfs the Extension. Say both.
             m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
-                                  _L("The line turns tighter than the Extension reaches, so the cut surface folds there. Reduce Extension."));
+                                  m_draw_params.angle_deg != 0.0
+                                  ? _L("The line turns tighter than the cut surface reaches sideways, so the surface folds there. Reduce the Angle, the Extension or the Depth.")
+                                  : _L("The line turns tighter than the Extension reaches, so the cut surface folds there. Reduce Extension."));
+
+        // PHASE 2: the holonomy fallback. Said plainly, because the symptom without
+        // it ("the draft went the wrong way round half my loop") is baffling.
+        if (m_draw_frame_flips)
+            m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                                  _L("This loop has no consistent outside, so the Angle has been ignored. Draw a simpler loop, or use Direction = Axis or View."));
+
+        // PHASE 2: the connector advisories, the analogues of the curved cut's.
+        if (m_draw_offsurface_connectors > 0)
+            m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                                  format_wxstr(_L("%1% connector(s) are not clear of the cut surface's edge; "
+                                                  "the split may only make part of them. Move them further onto the surface."),
+                                               m_draw_offsurface_connectors));
+        if (m_draw_tilted_connectors > 0)
+            m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                                  format_wxstr(_L("%1% connector(s) stand more than %2%° off the cut direction; "
+                                                  "they will print at an angle and may need supports."),
+                                               m_draw_tilted_connectors, int(CurvedConnectorTiltWarnDeg)));
+        if (m_draw_unflat_connectors > 0)
+            m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                                  format_wxstr(_L("%1% Hinge/Thread connector(s) sit where the drawn surface curves too tightly "
+                                                  "for their straight features to mate. Straighten the line under them "
+                                                  "or use a Plug, Dowel or Snap instead."),
+                                               m_draw_unflat_connectors));
     }
     ImGui::PopTextWrapPos();
 }
@@ -3719,6 +4428,17 @@ void GLGizmoCut3D::on_set_state()
     m_draw_last_mouse  = Vec2d::Zero();
     m_draw_upper_empty = m_draw_lower_empty = false;
     m_draw_folds       = false;
+    // PHASE 2 state goes the same way, and for the same reason: the Angle is a
+    // property of ONE cut (leaving it set would silently draft the next object's),
+    // and Edit points with no line is a mode with no way out.
+    m_draw_angle       = 0.f;
+    m_draw_frame_flips = false;
+    m_draw_editing     = false;
+    m_draw_hover_pt = m_draw_drag_pt = -1;
+    m_draw_points.clear();
+    m_draw_tilted_connectors = m_draw_unflat_connectors = m_draw_offsurface_connectors = 0;
+    m_draw_surface_raycaster.reset();
+    m_draw_surface_pick_dirty = true;
     invalidate_draw_pick_mesh();
     invalidate_draw_stroke();
     m_upper_visibility = m_lower_visibility = SideVisibility::Visible;

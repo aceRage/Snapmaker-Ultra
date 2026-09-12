@@ -373,6 +373,34 @@ class GLGizmoCut3D : public GLGizmoBase
     // Advisory: the ruled strip folds near a corner tighter than the Extension.
     bool            m_draw_folds{ false };
 
+    // --- DRAW CUT (phase 2) ------------------------------------------------
+    // THE DRAFT ANGLE, in degrees, signed: positive flares the cut outward (the
+    // plug widens going in and lifts out), negative undercuts it. Only Surface
+    // normal uses it - the constant directions are one direction by definition.
+    float           m_draw_angle{ 0.f };
+    // Advisory: a closed stroke whose binormal field does not close on itself, so
+    // "outward" is not consistent round the loop and a draft angle would flare one
+    // way on one part of it. The angle is forced to 0 and the panel says why.
+    bool            m_draw_frame_flips{ false };
+
+    // LINE EDITING. When on, the finished stroke's resampled points become
+    // draggable handles: hover, drag along the surface (re-raycast every motion, so
+    // the point rides the model rather than sliding on a plane), right-click to
+    // delete, Shift+click on a segment to insert. The same gesture vocabulary the
+    // curved sheet's control points use, against the stroke instead of the grid.
+    bool            m_draw_editing{ false };
+    int             m_draw_hover_pt{ -1 };
+    int             m_draw_drag_pt{ -1 };
+    // The stroke's points as EDITABLE points: the resampled path, which is what the
+    // handles show and what an edit rewrites. finish() re-runs over these (they
+    // become the raw samples), so an edited stroke stays resampled and stays closed.
+    // Kept separate from m_draw_stroke's own raw samples so an edit does not have to
+    // re-derive them from a path that smoothing has already moved.
+    // The handles are drawn with the gizmo's shared m_sphere, so there is no model of
+    // their own to keep - and no dirty flag either: sync_draw_points() is a vector
+    // copy, cheap enough to do on every refresh rather than track.
+    std::vector<DrawCutSample> m_draw_points;
+
     // The gizmo-local undo stack carries strokes as well as sheets. One entry per
     // completed stroke, per Clear, and before a lossy parameter change - the same
     // granularity the sheet uses, and consumed by the same on_cut_char() hook.
@@ -422,6 +450,54 @@ class GLGizmoCut3D : public GLGizmoBase
     // silently re-aim the cut to wherever the camera has since been orbited.
     void   latch_draw_view_dir();
     void   update_draw_preview_models();
+
+    // --- phase 2: line editing ---------------------------------------------
+    // Rebuild m_draw_points from the finished stroke (the resampled path), which is
+    // what the handles are drawn from and what an edit rewrites.
+    void   sync_draw_points();
+    // Push m_draw_points back into the stroke and re-finish it, so an edited line
+    // stays resampled, stays smoothed and keeps its open/closed decision.
+    void   commit_draw_points();
+    // The world position of editable point i (the plane frame taken out to the
+    // world), for rendering and for picking.
+    Vec3d  draw_point_world(int i) const;
+    // The point under the mouse, or -1. Screen-space, the same
+    // project-and-compare-in-pixels test the sheet's control points use.
+    int    draw_point_at(const Vec2d& mouse_position) const;
+    // The SEGMENT under the mouse, or -1: the index of the point the new point
+    // would be inserted AFTER. Shift+click uses this.
+    int    draw_segment_at(const Vec2d& mouse_position) const;
+    // Re-project a dragged point onto the model with a raycast, so it rides the
+    // surface. False when the ray missed, in which case the point does not move.
+    bool   draw_point_reproject(int i, const Vec2d& mouse_position);
+    void   render_draw_point_handles();
+    // Push the smoothed path back onto the mesh with the GUI's raycaster - the
+    // phase-1 deviation (#7) this closes. Headless there is no raycaster, so
+    // draw_cut_smooth() leaves the samples where the average put them; here there
+    // is one, so the ribbon really lies on the surface after smoothing.
+    void   reproject_draw_stroke_on_mesh();
+
+    // --- phase 2: connectors on the drawn surface --------------------------
+    // True when a connector click / drag should land on the DRAWN surface rather
+    // than on the plane: Draw mode, a usable stroke, connectors being edited.
+    bool   draw_connectors_live() const;
+    // The (s, w) of a connector position (in OBJECT coordinates, the frame
+    // CutConnector::pos uses), and whether it projected at all.
+    bool   draw_connector_sw(const Vec3d& pos_object, double& s, double& w) const;
+    // The reach the cut will use for the current params - through-all's derived
+    // reach, or the Depth slider. The (s,w) domain test needs it.
+    double draw_cut_depth_reach() const;
+    // The raycaster over the CUTTER SHELL, so a connector click hits the surface
+    // the user can see. Rebuilt whenever the shell is.
+    void   update_draw_surface_raycaster();
+    bool   unproject_on_draw_surface(const Vec2d& mouse_position, Vec3d& pos, Vec3d& pos_world);
+    void   update_draw_connector_warnings();
+    TriangleMesh                   m_draw_surface_mesh;
+    std::unique_ptr<MeshRaycaster> m_draw_surface_raycaster;
+    bool                           m_draw_surface_pick_dirty{ true };
+    int                            m_draw_tilted_connectors{ 0 };
+    int                            m_draw_unflat_connectors{ 0 };
+    int                            m_draw_offsurface_connectors{ 0 };
 
     // (3) CUT THICKNESS ("kerf"), for BOTH Flat and Curved: a band of material
     // centred on the cut surface is removed, so the two halves come apart with a
