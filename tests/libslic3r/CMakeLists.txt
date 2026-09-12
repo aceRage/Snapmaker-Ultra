@@ -49,6 +49,7 @@ add_executable(${_TEST_NAME}_tests
 	test_slice_compare.cpp
 	test_stl.cpp
 	test_support_set.cpp
+	test_mesh_edit.cpp
 	test_mesh_sculpt.cpp
 	test_mesh_remesh.cpp
 	test_meshboolean.cpp
