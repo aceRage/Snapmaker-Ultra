@@ -185,6 +185,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Gizmos/FacetPicker.hpp
     GUI/Gizmos/GLGizmoSeam.cpp
     GUI/Gizmos/GLGizmoSeam.hpp
+    GUI/Gizmos/GLGizmoEdit.cpp
+    GUI/Gizmos/GLGizmoEdit.hpp
     GUI/Gizmos/GLGizmoSculpt.cpp
     GUI/Gizmos/GLGizmoSculpt.hpp
     GUI/Gizmos/GLGizmoSimplify.cpp
