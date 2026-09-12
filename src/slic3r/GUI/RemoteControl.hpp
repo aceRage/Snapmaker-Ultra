@@ -71,12 +71,17 @@ void describe_bambu(MachineObject* m, nlohmann::json& p);
 // the GUI thread (the preset and the connected host live there), probed off it.
 struct HostTarget
 {
-    std::string id;   // "host" | "connect"
+    std::string id;   // "host" | "connect" | "ph:<device id>"
     std::string base; // http://<address>, ready for /printer/...
+    // A PrusaLink / PrusaConnect device is asked over its own REST API instead of Moonraker's,
+    // with the credentials its preset holds (a Buddy board answers 401 to everything without
+    // them). Empty host_type = ask as a Moonraker printer, which is what every other target is.
+    std::string host_type;
+    std::string auth_type, apikey, user, password;
 };
 void list_host_targets(std::vector<HostTarget>& out);
 
-// Request thread, never the GUI one: ask each Moonraker printer what it is doing and fill the same
+// Request thread, never the GUI one: ask each printer what it is doing and fill the same
 // control fields into its entry of the printers array, plus the temperatures a Bambu entry carries
 // (bed_temp, bed_target, nozzles) when the printer reports them. A printer that does not answer
 // keeps its buttons off and gets no temperatures. Safe to call with an empty list.

@@ -1,6 +1,7 @@
 #include "PrintHostDeviceStatus.hpp"
 
 #include "Http.hpp"
+#include "PrusaLinkStatus.hpp"
 
 #include <boost/log/trivial.hpp>
 
@@ -107,9 +108,9 @@ static std::string arr_str(const json& a, size_t i)
 
 bool can_probe(const std::string& host_type_key)
 {
-    // Exactly the host types RemoteControl already probes. Adding one here means writing a client
-    // for its status API; there is no generic "ask a print host how it is" in this codebase.
-    return speaks_moonraker(host_type_key);
+    // The host types this fork has a status client for. Adding one here means writing that client;
+    // there is no generic "ask a print host how it is" in this codebase.
+    return speaks_moonraker(host_type_key) || PrusaLinkStatus::speaks_prusalink(host_type_key);
 }
 
 std::string no_filament_note(const std::string& host_type_key)
@@ -118,6 +119,13 @@ std::string no_filament_note(const std::string& host_type_key)
         // Measured against the fork's own client, not guessed: see the header.
         return "Elegoo Link reports no filament or slot data (its SDCP client asks only for the "
                "print status), so there is nothing to map. The plate is sent exactly as it was sliced.";
+    if (PrusaLinkStatus::speaks_prusalink(host_type_key))
+        // Measured against the API, not guessed: PrusaLink's /api/v1/status reports the printer's
+        // state and its two heaters, and /api/v1/job the file it is on. Neither says what filament
+        // is loaded - a Buddy board has no filament-identity story at all (the MMU's slots are not
+        // in this API), so there is nothing to map.
+        return "PrusaLink reports the printer's state and temperatures but not what filament is "
+               "loaded, so there is nothing to map. The plate is sent exactly as it was sliced.";
     if (speaks_moonraker(host_type_key))
         return "This printer answered, but did not say what is loaded in it. The plate is sent "
                "exactly as it was sliced.";
@@ -198,6 +206,31 @@ static Status fill_from_status(const json& status, const std::string& host_type_
     return st;
 }
 
+// A PrusaLink / PrusaConnect printer, through the client that speaks its REST API. It answers the
+// state (and the temperatures and the job, which this dialog has no field for) but never names a
+// filament, so the slot list stays empty and `note` says why.
+static Status probe_prusalink(const Device& d, int timeout_s)
+{
+    Status                 st;
+    PrusaLinkStatus::Auth  auth;
+    auth.auth_type = d.auth_type;
+    auth.apikey    = d.apikey;
+    auth.user      = d.user;
+    auth.password  = d.password;
+    const PrusaLinkStatus::Status pl = PrusaLinkStatus::probe(d.address, auth, timeout_s);
+    st.probed = true;
+    st.error  = pl.error;
+    if (!pl.answered) {
+        st.note = pl.authorized ? ("this printer did not answer" + (pl.error.empty() ? std::string() : (": " + pl.error))) :
+                                  "this printer refused the API key or password in its preset.";
+        return st;
+    }
+    st.online = true;
+    st.state  = pl.state;
+    st.note   = no_filament_note(d.host_type);
+    return st;
+}
+
 Status probe(const Device& d, int timeout_s)
 {
     Status st;
@@ -210,6 +243,8 @@ Status probe(const Device& d, int timeout_s)
         return st;
     }
     st.probed = true;
+    if (PrusaLinkStatus::speaks_prusalink(d.host_type))
+        return probe_prusalink(d, timeout_s);
     const std::string base = moonraker_base(d.address);
     if (base.empty()) {
         st.note = no_filament_note(d.host_type);
