@@ -291,6 +291,13 @@ What it asserts:
 
 `test_webrtc.py`'s rtsp assertion was updated as described in §3.2.
 
+**One trap worth knowing when gating this by hand.** A go2rtc started from the *worktree's*
+`resources/tools/go2rtc/go2rtc.exe` holds that file open, and Windows will then fail the build's
+install/copy step into that tree — silently, as a killed `cmd.exe` with no error in the log. Run
+throwaway go2rtc instances from the **staged** copy or a scratch dir, never from the worktree, and
+kill them when finished. `test_quality.py` itself is safe: it drives the hub's own go2rtc out of
+the scratch *install*, and its teardown quits only the hub it started.
+
 ## 7. Click-tests (owner)
 
 To be run on the emulator against an install of this branch:
