@@ -20,8 +20,13 @@
 // PrintObject), the wipe tower (a separate structure on Print), and infill and inner perimeters
 // (never read - everything radially inward of the outer loop is filled in anyway).
 //
-// The loft itself is the existing Slic3r::slices_to_mesh (SlicesToTriangleMesh.cpp), which is
-// not SLA-specific despite its only current caller being Format/SL1.cpp.
+// The loft: each layer becomes its own CLOSED PRISM over its [bottom_z, print_z] band - bottom
+// cap, vertical walls, top cap, all three generated from the same contour points - and the prisms
+// are stacked and welded on exact vertex equality. This is what makes the bake watertight on
+// non-prismatic geometry. The existing Slic3r::slices_to_mesh is deliberately NOT used: it
+// triangulates the caps from Clipper diffs of consecutive layers, which puts intersection
+// vertices on wall edges that have no vertex there (T-junctions), and its own FIXME says the
+// result has cracks. See SliceBake.cpp for the construction and the spec for the measurements.
 //
 // Deterministic: the layer loop is ordered, the per-layer union is Clipper's (itself
 // deterministic for a fixed input ordering), and nothing is hashed or threaded across layers in
@@ -118,9 +123,10 @@ indexed_triangle_set slice_bake_to_mesh(const PrintObject       &object,
 bool slice_bake_available(const PrintObject &object);
 
 // A rough triangle count for the dialog's "this will be big" line, without running the bake.
-// The loft emits, per layer, two triangles per boundary point for the wall strip plus the
-// free-top/overhang caps; two per point is the term that dominates, so this counts the outer-wall
-// points of every layer in the subset and doubles it. Labelled as an estimate wherever shown.
+// Each layer becomes a closed prism: two wall triangles per boundary point, plus a bottom and a
+// top cap of about n-2 triangles each over the same n points - roughly FOUR per point in total.
+// So this counts the outer-wall points of every layer in the subset and multiplies by four.
+// Labelled as an estimate wherever shown, since the cap term depends on the tesselation.
 size_t slice_bake_estimate_triangles(const PrintObject &object, const SliceBakeOptions &opts);
 
 } // namespace Slic3r

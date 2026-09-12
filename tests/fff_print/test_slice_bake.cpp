@@ -16,6 +16,7 @@
 #include <catch2/catch.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -187,87 +188,190 @@ std::vector<Points> outer_wall_points(const Layer &layer)
     return out;
 }
 
-// How far a layer's outer wall departs from a straight-sided rectangle, in mm.
+// How far a layer's outer wall departs from its NOMINAL wall plane, in mm.
 //
-// The models here are axis-aligned squares, so an unfuzzed wall is a rectangle and every point
-// lies on one of its four sides. Take the wall's own bounding box (its inset from the slice
-// depends on the profile's line width, so the rectangle is not known a priori) and measure each
-// point's distance to the nearer side in the axis it is NOT running along. Corners contribute
-// zero either way.
+// The models here are axis-aligned squares, so an unfuzzed wall is a rectangle with four sides,
+// each of which is a plane x = const or y = const. The deviation of a wall point is its signed
+// distance to the plane of the side it belongs to.
 //
-// Returned as {mean, max}. An unfuzzed rectangle gives ~0 for both; a wall carrying 0.3 mm of
-// fuzz gives a mean around half the thickness and a max near it.
+// The nominal plane is the MEDIAN of the points on that side, not the extreme. That distinction
+// is the whole point of this rewrite: taking the bounding box puts the plane at the outermost
+// fuzz excursion (+thickness), so an inward excursion (-thickness) reads as 2x thickness away
+// from it, and the measured max is 2T rather than T. The median sits on the un-fuzzed wall line,
+// which is where the geometry actually is, so the measured max is bounded by the fuzz amplitude
+// itself plus the half line width by which the re-slice's centreline can wander.
+//
+// Assignment to a side is by which of the four the point is nearest, using a first pass over the
+// bounding box purely to know roughly where the sides are. A corner point is ambiguous and is
+// dropped (its distance to both of its sides is near zero either way, so it carries no signal).
+//
+// Returned as {mean, max} of |signed distance|. An unfuzzed rectangle gives ~0 for both.
 struct Deviation { double mean = 0.; double max = 0.; size_t n = 0; };
+
+// The per-point signed deviations from the nominal wall planes, in wall order. Side 0 = x_min,
+// 1 = x_max, 2 = y_min, 3 = y_max; a point too near a corner gets side -1 and is skipped.
+struct WallSamples
+{
+    std::vector<double> dev;    // signed distance to the point's own nominal plane, outward +
+    std::vector<int>    side;
+};
+
+WallSamples wall_samples(const std::vector<Points> &walls, double corner_margin = 1.0)
+{
+    WallSamples out;
+    double x_min = 1e30, x_max = -1e30, y_min = 1e30, y_max = -1e30;
+    std::vector<Vec2d> pts;
+    for (const Points &w : walls)
+        for (const Point &pt : w) {
+            const double x = unscaled(double(pt.x())), y = unscaled(double(pt.y()));
+            pts.emplace_back(x, y);
+            x_min = std::min(x_min, x); x_max = std::max(x_max, x);
+            y_min = std::min(y_min, y); y_max = std::max(y_max, y);
+        }
+    if (pts.size() < 8 || x_max - x_min < 1. || y_max - y_min < 1.)
+        return out;
+
+    // Assign each point to the side it is nearest, dropping the corners.
+    std::vector<int> side(pts.size(), -1);
+    std::vector<double> on[4];
+    for (size_t i = 0; i < pts.size(); ++i) {
+        const double d[4] = { pts[i].x() - x_min, x_max - pts[i].x(),
+                              pts[i].y() - y_min, y_max - pts[i].y() };
+        int    best = 0;
+        double bestd = d[0];
+        for (int k = 1; k < 4; ++k)
+            if (d[k] < bestd) { bestd = d[k]; best = k; }
+        // Near a corner two sides are both close; require the runner-up to be clearly further.
+        double second = 1e30;
+        for (int k = 0; k < 4; ++k)
+            if (k != best) second = std::min(second, d[k]);
+        if (second < corner_margin)
+            continue;
+        side[i] = best;
+        on[best].push_back(best < 2 ? pts[i].x() : pts[i].y());
+    }
+
+    // The nominal plane of each side is the median of its own points.
+    double plane[4] = {0., 0., 0., 0.};
+    for (int k = 0; k < 4; ++k) {
+        if (on[k].empty())
+            return out;
+        std::sort(on[k].begin(), on[k].end());
+        plane[k] = on[k][on[k].size() / 2];
+    }
+
+    for (size_t i = 0; i < pts.size(); ++i) {
+        if (side[i] < 0)
+            continue;
+        const int k = side[i];
+        const double c = k < 2 ? pts[i].x() : pts[i].y();
+        // Outward is -x for side 0 and -y for side 2, +x / +y for 1 and 3.
+        const double signed_dev = (k == 0 || k == 2) ? (plane[k] - c) : (c - plane[k]);
+        out.dev.push_back(signed_dev);
+        out.side.push_back(k);
+    }
+    return out;
+}
 
 Deviation wall_deviation(const std::vector<Points> &walls)
 {
-    double x_min = 1e30, x_max = -1e30, y_min = 1e30, y_max = -1e30;
-    size_t n = 0;
-    for (const Points &w : walls)
-        for (const Point &pt : w) {
-            const double x = unscaled(double(pt.x())), y = unscaled(double(pt.y()));
-            x_min = std::min(x_min, x); x_max = std::max(x_max, x);
-            y_min = std::min(y_min, y); y_max = std::max(y_max, y);
-            ++n;
-        }
+    const WallSamples s = wall_samples(walls);
     Deviation d;
-    if (n < 8 || x_max - x_min < 1. || y_max - y_min < 1.)
+    if (s.dev.empty())
         return d;
-
     double sum = 0., mx = 0.;
-    for (const Points &w : walls)
-        for (const Point &pt : w) {
-            const double x = unscaled(double(pt.x())), y = unscaled(double(pt.y()));
-            const double dx = std::max(0., std::min(x - x_min, x_max - x));
-            const double dy = std::max(0., std::min(y - y_min, y_max - y));
-            const double dev = std::min(dx, dy);
-            sum += dev;
-            mx   = std::max(mx, dev);
-        }
-    d.mean = sum / double(n);
+    for (double v : s.dev) {
+        sum += std::abs(v);
+        mx   = std::max(mx, std::abs(v));
+    }
+    d.mean = sum / double(s.dev.size());
     d.max  = mx;
-    d.n    = n;
+    d.n    = s.dev.size();
     return d;
 }
 
 Deviation wall_deviation(const Layer &layer) { return wall_deviation(outer_wall_points(layer)); }
 
-// A layer's outer wall resampled as a radial profile: for each of `k` evenly spaced angles about
-// the wall's centre, the distance from the centre to the wall.
+// A layer's outer wall as a DEVIATION profile: the signed distance from the nominal wall plane,
+// sampled at `k` evenly spaced positions around the rectangle's perimeter.
 //
-// This is the comparison scenario (b) needs. Two layers inside the same 0.3 mm source band came
-// from the SAME baked geometry, so their profiles must match closely; two layers in different
-// bands came from different fuzz and must not. Comparing raw point lists would fail on point
-// count alone, which says nothing about shape.
-std::vector<double> radial_profile(const Layer &layer, size_t k = 180)
+// This replaces the centroid-to-wall radial profile the first draft used. On a square section a
+// centroid radius swings by about +/-2 mm between the middle of a side and a corner - seven times
+// the 0.3 mm fuzz being looked for - so two layers with completely different fuzz still produced
+// near-identical profiles, and the in-band vs cross-band contrast was invisible (0.546 vs 0.554).
+// Measuring the deviation from the LOCAL wall plane removes that geometric term entirely: an
+// unfuzzed square profiles as all zeros, and what is left in the profile is the fuzz and nothing
+// else.
+//
+// The parameter is the point's position along the perimeter of the nominal rectangle, so two
+// layers cut from the same baked band land their samples in the same bins even though their
+// point counts differ.
+std::vector<double> band_profile(const Layer &layer, size_t k = 240)
 {
     const std::vector<Points> walls = outer_wall_points(layer);
+    double x_min = 1e30, x_max = -1e30, y_min = 1e30, y_max = -1e30;
     std::vector<Vec2d> pts;
     for (const Points &w : walls)
-        for (const Point &p : w)
-            pts.emplace_back(unscaled(double(p.x())), unscaled(double(p.y())));
-    if (pts.size() < 8)
+        for (const Point &pt : w) {
+            const double x = unscaled(double(pt.x())), y = unscaled(double(pt.y()));
+            pts.emplace_back(x, y);
+            x_min = std::min(x_min, x); x_max = std::max(x_max, x);
+            y_min = std::min(y_min, y); y_max = std::max(y_max, y);
+        }
+    if (pts.size() < 8 || x_max - x_min < 1. || y_max - y_min < 1.)
         return {};
 
-    Vec2d c(0., 0.);
-    for (const Vec2d &p : pts) c += p;
-    c /= double(pts.size());
+    const WallSamples s = wall_samples(walls);
+    if (s.dev.empty())
+        return {};
 
-    // Nearest sample per angular bin. A bin with no sample inherits its neighbour, which is safe
-    // at k=180 on a wall with hundreds of points.
-    std::vector<double> prof(k, -1.);
-    for (const Vec2d &p : pts) {
-        const Vec2d d = p - c;
-        double a = std::atan2(d.y(), d.x());
-        if (a < 0.) a += 2. * PI;
-        const size_t bin = std::min(k - 1, size_t(a / (2. * PI) * double(k)));
-        const double r = d.norm();
-        if (prof[bin] < 0.) prof[bin] = r;
-        else                prof[bin] = 0.5 * (prof[bin] + r); // average duplicates in a bin
+    // Re-walk the points in the same order wall_samples did, to recover each sample's XY and so
+    // its perimeter position. wall_samples skips corner points, so the walk has to skip the same
+    // ones - it is driven by the side vector it returned.
+    const double w = x_max - x_min, h = y_max - y_min;
+    const double perim = 2. * (w + h);
+    std::vector<double> sum(k, 0.);
+    std::vector<int>    cnt(k, 0);
+
+    size_t si = 0;
+    for (size_t i = 0; i < pts.size() && si < s.dev.size(); ++i) {
+        // wall_samples emitted one entry per non-corner point, in this same order; a point that
+        // was dropped has no entry, and the two walks stay in step because the side assignment
+        // is a pure function of the point.
+        const double d[4] = { pts[i].x() - x_min, x_max - pts[i].x(),
+                              pts[i].y() - y_min, y_max - pts[i].y() };
+        int    best = 0;
+        double bestd = d[0];
+        for (int q = 1; q < 4; ++q)
+            if (d[q] < bestd) { bestd = d[q]; best = q; }
+        double second = 1e30;
+        for (int q = 0; q < 4; ++q)
+            if (q != best) second = std::min(second, d[q]);
+        if (second < 1.0)
+            continue;   // dropped by wall_samples too
+
+        // Perimeter position: side 2 (y_min) runs +x from the origin corner, then side 1 (x_max)
+        // runs +y, then side 3 (y_max) runs -x, then side 0 (x_min) runs -y.
+        double t = 0.;
+        switch (best) {
+        case 2: t = (pts[i].x() - x_min); break;
+        case 1: t = w + (pts[i].y() - y_min); break;
+        case 3: t = w + h + (x_max - pts[i].x()); break;
+        default: t = 2. * w + h + (y_max - pts[i].y()); break;
+        }
+        const size_t bin = std::min(k - 1, size_t(std::max(0., t) / perim * double(k)));
+        sum[bin] += s.dev[si];
+        ++cnt[bin];
+        ++si;
     }
+
+    std::vector<double> prof(k, 0.);
     for (size_t i = 0; i < k; ++i)
-        if (prof[i] < 0.)
-            prof[i] = prof[(i + k - 1) % k] >= 0. ? prof[(i + k - 1) % k] : 0.;
+        prof[i] = cnt[i] > 0 ? sum[i] / double(cnt[i]) : 0.;
+    // A bin with no sample inherits its neighbour rather than reading as a 0 mm deviation.
+    for (size_t i = 0; i < k; ++i)
+        if (cnt[i] == 0)
+            prof[i] = prof[(i + k - 1) % k];
     return prof;
 }
 
@@ -397,17 +501,32 @@ TEST_CASE("slice bake: 0.3 mm fuzzy skin survives a 0.12 mm re-slice of the bake
     INFO("re-sliced (0.12 mm, fuzzy OFF) deviation: overall max " << max_dev
          << ", mean per-layer max " << mean_max << " (fuzzy thickness was 0.3)");
 
-    // The spec's bound: the re-slice's own walls deviate from the ideal cube outline by up to
-    // about the fuzzy thickness. Below 0.15 mm the texture did not survive the bake; above
-    // 0.45 mm the bake invented geometry the source did not have.
-    CHECK(max_dev > 0.15);
-    CHECK(max_dev < 0.45);
+    // The bound, derived rather than fitted.
+    //
+    // The source's fuzz displaces the outer wall CENTRELINE by noise * fuzzy_skin_thickness, and
+    // the classic noise is uniform on [-1, +1], so the centreline excursion is at most T = 0.3 mm
+    // either side of the nominal wall plane. The bake offsets that centreline outward by the
+    // path's own width/2, a CONSTANT, which shifts the whole wall out without changing its
+    // amplitude. The re-slice then cuts that surface and lays its own external perimeter half a
+    // line width inside it - again a constant shift. Both constants are absorbed by measuring
+    // against the median wall plane, so what is left is the fuzz amplitude T, plus at most half a
+    // line width w/2 of slack for where the re-slice's own centreline lands on a corner or on a
+    // step between two baked bands.
+    //
+    //     max deviation <= T + w/2 = 0.3 + 0.42/2 = 0.51 mm
+    //
+    // and it must be at least half the amplitude, or the texture did not survive the bake at all.
+    const double T = 0.3, w_nominal = 0.42;
+    const double bound = T + 0.5 * w_nominal;
+    INFO("bound: fuzz thickness " << T << " + half line width " << (0.5 * w_nominal) << " = " << bound);
+    CHECK(max_dev > 0.5 * T);
+    CHECK(max_dev < bound);
 
     // ---- 4b. the deviation profile along Z is piecewise-constant in 0.3 mm bands -------------
     // This is the half that proves the texture came from the SOURCE's 0.3 mm layers rather than
     // from noise the re-slice invented. Two 0.12 mm layers whose Z falls inside one 0.3 mm source
     // band were cut from the same baked band, so their walls are the same closed curve and their
-    // radial profiles agree to a hair. Two layers straddling a band boundary were cut from
+    // deviation profiles agree to a hair. Two layers straddling a band boundary were cut from
     // DIFFERENT source layers, each with its own independent fuzz, so their profiles differ by
     // something on the order of the fuzz itself.
     //
@@ -419,7 +538,7 @@ TEST_CASE("slice bake: 0.3 mm fuzzy skin survives a 0.12 mm re-slice of the bake
     double                       prev_z = -1.;
     for (size_t i = 20; i + 20 < re->layer_count(); ++i) {
         const Layer *layer = re->get_layer(int(i));
-        const std::vector<double> prof = radial_profile(*layer);
+        const std::vector<double> prof = band_profile(*layer);
         if (prof.empty()) { prev_prof.clear(); continue; }
         if (! prev_prof.empty()) {
             // Which source band each layer's MIDDLE falls in. Using the middle rather than
@@ -446,14 +565,29 @@ TEST_CASE("slice bake: 0.3 mm fuzzy skin survives a 0.12 mm re-slice of the bake
     };
     const double in_mean    = mean_of(in_band);
     const double cross_mean = mean_of(cross_band);
-    INFO("radial-profile RMS difference between adjacent 0.12 mm layers: within a 0.3 mm band "
+    INFO("wall-deviation profile RMS difference between adjacent 0.12 mm layers: within a 0.3 mm band "
          << in_mean << " mm (" << in_band.size() << " pairs), across a band boundary "
          << cross_mean << " mm (" << cross_band.size() << " pairs)");
 
-    // Adjacent layers inside one band are near-identical in absolute terms...
-    CHECK(in_mean < 0.05);
-    // ...and the jump at a band boundary is several times larger. A 3x ratio is well clear of
-    // the resampling noise while leaving room for the bands that happen to fuzz similarly.
+    // Adjacent layers inside one band were cut from the SAME baked prism, so the only thing that
+    // can differ between their profiles is where the re-slice happened to put its own wall points
+    // - the two layers sample one identical curve at different parameters.
+    //
+    // The size of that resampling term is set by the bin width, not by the geometry. The profile
+    // has 240 bins over an ~80 mm perimeter, so a bin is about 0.33 mm wide, and inside one bin
+    // the fuzzed wall can swing by the fuzz slope over that distance. The fuzz is sampled every
+    // fuzzy_skin_point_distance = 0.8 mm with an amplitude of +/-T, so over a third of a sample
+    // spacing the wall moves by roughly (0.33 / 0.8) * T ~ 0.4 T, and two independent samplings
+    // of it differ in RMS by a fraction of that. Half the fuzz amplitude is the ceiling:
+    //
+    //     in-band RMS <= 0.5 * T = 0.15 mm
+    //
+    // The load-bearing assertion is the CONTRAST below, not this one - this only confirms the
+    // in-band figure is small in absolute terms rather than merely smaller than the cross-band.
+    CHECK(in_mean < 0.5 * T);
+    // ...and the jump at a band boundary is several times larger, because the two layers were cut
+    // from source layers whose fuzz is independent. A 3x ratio is well clear of the resampling
+    // noise while leaving room for the bands that happen to fuzz similarly.
     CHECK(cross_mean > 3. * in_mean);
 }
 
@@ -635,4 +769,47 @@ TEST_CASE("slice bake: closing the gaps does not break watertightness", "[slice_
     const indexed_triangle_set open_mesh = slice_bake_to_mesh(*object, plain);
     INFO("volume open " << mesh_volume(open_mesh) << " closed " << mesh_volume(mesh));
     CHECK(mesh_volume(mesh) >= mesh_volume(open_mesh) * 0.98);
+}
+
+// =============================================================================================
+// Timing: a 100 mm part at 0.2 mm
+// =============================================================================================
+//
+// The spec asks for a figure on a benchy-class part, i.e. ~100 mm tall at the default layer
+// height: 500 layers, which is where the bake's cost actually lives. It reports the wall time and
+// the triangle count rather than asserting a number, because both are machine-dependent; the only
+// assertion is a generous ceiling that catches an accidental quadratic, not a slow PC.
+TEST_CASE("slice bake: a 100 mm part at 0.2 mm bakes in reasonable time", "[slice_bake]")
+{
+    Print print;
+    Model model;
+    const PrintObject *object = slice_one(print, model, TriangleMesh(its_make_cube(100., 100., 100.)),
+                                          bake_config(0.2, false), "cube100");
+
+    SliceBakeOptions opts;
+    SliceBakeReport  rep;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const indexed_triangle_set mesh = slice_bake_to_mesh(*object, opts, &rep);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+
+    REQUIRE(! mesh.indices.empty());
+
+    const double open_t0 = secs;
+    const auto   t2      = std::chrono::steady_clock::now();
+    const size_t open    = its_num_open_edges(mesh);
+    const double check_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
+
+    // BENCHMARK is the line to read out of the test log.
+    WARN("BENCHMARK 100 mm cube @ 0.2 mm: " << rep.layers_baked << " layers, "
+         << rep.triangles << " triangles, " << rep.vertices << " vertices, bake "
+         << open_t0 << " s, watertightness check " << check_s << " s, open edges " << open);
+
+    CHECK(open == 0);
+    CHECK(rep.layers_baked == 500);
+    // A generous ceiling: the bake is a Clipper union per layer plus a linear loft, so 500 layers
+    // of a trivial footprint should be a small number of seconds. 60 s only fires on an
+    // algorithmic regression.
+    CHECK(secs < 60.);
 }

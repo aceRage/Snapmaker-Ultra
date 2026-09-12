@@ -6,12 +6,15 @@
 #include "Layer.hpp"
 #include "Print.hpp"
 #include "SlicesToTriangleMesh.hpp"
+#include "Tesselate.hpp"
 #include "TriangleMesh.hpp"
 
 #include <boost/log/trivial.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <utility>
 
 namespace Slic3r {
 
@@ -142,6 +145,164 @@ bool layer_has_outer_wall(const Layer &layer)
     return false;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The loft: one closed prism per layer
+// ---------------------------------------------------------------------------------------------
+//
+// Why not Slic3r::slices_to_mesh, which this bake used first: that loft triangulates the caps
+// between consecutive layers from CLIPPER DIFFS (diff_ex(lower, upper) and diff_ex(upper, lower))
+// while the vertical walls come from the layer polygons themselves. A diff introduces
+// intersection vertices on edges the wall strip has no vertex on, so the two meshes meet along
+// edges split on one side and whole on the other - T-junctions, which its_merge_vertices cannot
+// weld because the vertices genuinely are not coincident. Its own FIXME says as much
+// ("there will be cracks in the output"). A prismatic cube never differs layer to layer and so
+// came out clean; a fuzzed cube produced 20,264 open edges and a cylinder 15,245.
+//
+// What is built instead: each layer is its own CLOSED prism - bottom cap, vertical walls, top cap
+// - and every one of the three is generated from the SAME contour point set, so the prism is
+// watertight on its own, by construction, with no diff and no tolerance anywhere. Stacking the
+// prisms and welding exactly-coincident vertices then gives a mesh whose only remaining internal
+// structure is a pair of coplanar, oppositely-wound cap faces between neighbouring layers. Those
+// pairs are matched (each is somebody's top and somebody's bottom), so every edge still has an
+// even number of incident faces and the result is closed: its_num_open_edges() == 0.
+//
+// The cost is the coplanar internal faces where two layers overlap. They are the price of never
+// needing a diff, and nothing downstream minds: a closed mesh is a closed mesh to TriangleMesh's
+// statistics, to the repair path, and to the slicer, which cuts the same contours either way.
+//
+// The cap triangulation is the existing GLU tesselator. It emits its vertices verbatim from the
+// coordinates handed in - the same unscale<double>() the wall vertices use - so a cap vertex can
+// be matched back to its contour point by exact double equality. The one case that would not
+// match is a tessCombine vertex, which GLU only produces for a self-intersecting contour; the
+// union_ex output here is not self-intersecting, and if one ever appeared it is counted into
+// report.note rather than silently welded to the wrong place.
+
+// Exact-match table from an unscaled XY (as the tesselator emits it) to the pair of mesh vertex
+// indices for that point at the band's bottom and top Z.
+struct PrismVertices
+{
+    std::map<std::pair<double, double>, std::pair<int, int>> index;
+    size_t unmatched = 0;
+};
+
+// Append the two vertices (lo, hi) for every point of `poly` and record them in `pv`.
+// Returns the index of the first LO vertex; the walls are emitted over that contiguous run.
+int append_ring_vertices(indexed_triangle_set &mesh, PrismVertices &pv, const Polygon &poly,
+                         double z_lo, double z_hi)
+{
+    const int first_lo = int(mesh.vertices.size());
+    const int n        = int(poly.points.size());
+    // Both runs are contiguous: lo vertices [first_lo, first_lo+n), hi [first_lo+n, +2n).
+    for (const Point &p : poly.points)
+        mesh.vertices.emplace_back(to_3d(unscaled(p).cast<float>().eval(), float(z_lo)));
+    for (const Point &p : poly.points)
+        mesh.vertices.emplace_back(to_3d(unscaled(p).cast<float>().eval(), float(z_hi)));
+
+    for (int i = 0; i < n; ++i) {
+        const Point &p = poly.points[size_t(i)];
+        // unscale<double> is exactly what the tesselator will apply to the same Point.
+        pv.index.emplace(std::make_pair(unscale<double>(p.x()), unscale<double>(p.y())),
+                         std::make_pair(first_lo + i, first_lo + n + i));
+    }
+    return first_lo;
+}
+
+// The vertical wall of one ring, over the two contiguous vertex runs append_ring_vertices laid
+// down. One winding rule serves both a contour and a hole: the ring's own traversal direction
+// already carries the orientation. Walking a CCW contour's bottom edge in +x gives
+// (lo_i, lo_j, hi_j) the normal x cross z = -y, which points out of the part; a hole runs CW, so
+// the same expression evaluates to the opposite side, which is again out of the material. This
+// is the rule Slic3r::wall_strip uses, and it is right for the same reason.
+void append_ring_walls(indexed_triangle_set &mesh, int first_lo, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        const int j    = (i + 1) % n;
+        const int lo_i = first_lo + i,     lo_j = first_lo + j;
+        const int hi_i = first_lo + n + i, hi_j = first_lo + n + j;
+        mesh.indices.emplace_back(lo_i, lo_j, hi_j);
+        mesh.indices.emplace_back(lo_i, hi_j, hi_i);
+    }
+}
+
+// Turn the tesselator's flat triangle soup for `slice` into indexed faces over the vertices
+// already appended for that slice. `top` picks the hi vertex run (and the up-facing winding);
+// otherwise the lo run and the down-facing one.
+void append_cap(indexed_triangle_set &mesh, PrismVertices &pv, const ExPolygons &slice,
+                double z, bool top)
+{
+    // NORMALS_UP for a top cap, NORMALS_DOWN for a bottom one: the tesselator already emits the
+    // triangle in the right order, so the winding below just follows it.
+    const std::vector<Vec3d> tri = triangulate_expolygons_3d(slice, z, top ? NORMALS_UP : NORMALS_DOWN);
+    for (size_t i = 0; i + 2 < tri.size(); i += 3) {
+        int idx[3];
+        bool ok = true;
+        for (int k = 0; k < 3; ++k) {
+            auto it = pv.index.find(std::make_pair(tri[i + size_t(k)].x(), tri[i + size_t(k)].y()));
+            if (it == pv.index.end()) {
+                ok = false;
+                break;
+            }
+            idx[k] = top ? it->second.second : it->second.first;
+        }
+        if (! ok) {
+            // A tessCombine vertex: only possible on self-intersecting input. Drop the triangle
+            // rather than invent a vertex the walls do not have (which is precisely the crack
+            // this loft exists to avoid) and count it.
+            ++pv.unmatched;
+            continue;
+        }
+        if (idx[0] == idx[1] || idx[1] == idx[2] || idx[0] == idx[2])
+            continue; // degenerate, e.g. a zero-area sliver
+        mesh.indices.emplace_back(idx[0], idx[1], idx[2]);
+    }
+}
+
+// One layer -> one closed prism, appended to `mesh`.
+void append_layer_prism(indexed_triangle_set &mesh, const ExPolygons &slice,
+                        double z_lo, double z_hi, size_t &unmatched)
+{
+    if (slice.empty() || z_hi <= z_lo)
+        return;
+
+    PrismVertices pv;
+    for (const ExPolygon &ex : slice) {
+        if (ex.contour.points.size() >= 3) {
+            const int first = append_ring_vertices(mesh, pv, ex.contour, z_lo, z_hi);
+            append_ring_walls(mesh, first, int(ex.contour.points.size()));
+        }
+        for (const Polygon &hole : ex.holes) {
+            if (hole.points.size() < 3)
+                continue;
+            const int first = append_ring_vertices(mesh, pv, hole, z_lo, z_hi);
+            append_ring_walls(mesh, first, int(hole.points.size()));
+        }
+    }
+    append_cap(mesh, pv, slice, z_lo, false);
+    append_cap(mesh, pv, slice, z_hi, true);
+    unmatched += pv.unmatched;
+}
+
+// The whole stack. Serial and ordered, so the vertex and face order is a pure function of the
+// input - the determinism the bake asserts.
+indexed_triangle_set prisms_to_mesh(const std::vector<ExPolygons> &slices,
+                                    const std::vector<double>     &bottom_z,
+                                    const std::vector<double>     &top_z,
+                                    size_t                        &unmatched)
+{
+    indexed_triangle_set mesh;
+    for (size_t i = 0; i < slices.size(); ++i)
+        append_layer_prism(mesh, slices[i], bottom_z[i], top_z[i], unmatched);
+
+    // Weld only EXACTLY coincident vertices: neighbouring prisms share a Z plane and, wherever
+    // their contours share a point, that point's float coordinates are bit-identical (both sides
+    // went through the same unscaled().cast<float>()). Nothing here is a tolerance merge, so a
+    // weld can never pull two distinct contour points together and puncture the mesh.
+    its_merge_vertices(mesh);
+    its_remove_degenerate_faces(mesh);
+    its_compactify_vertices(mesh);
+    return mesh;
+}
+
 void clamp_range(const PrintObject &object, const SliceBakeOptions &opts, size_t &begin, size_t &end)
 {
     const size_t n = object.layer_count();
@@ -179,10 +340,10 @@ size_t slice_bake_estimate_triangles(const PrintObject &object, const SliceBakeO
                     points += pl.points.size();
             }
     }
-    // Two wall-strip triangles per boundary point, and the caps add roughly as many again over
-    // the whole part on a shape whose footprint changes layer to layer. Deliberately a plain
-    // doubling: a figure shown as "about N" must not pretend to know the tesselation.
-    return points * 2;
+    // Two wall triangles per boundary point, plus a bottom and a top cap of about n-2 each over
+    // the same n points: four per point. Deliberately a plain multiplication - a figure shown as
+    // "about N" must not pretend to know the tesselation.
+    return points * 4;
 }
 
 std::vector<ExPolygons> slice_bake_layer_regions(const PrintObject       &object,
@@ -282,21 +443,13 @@ indexed_triangle_set slice_bake_to_mesh(const PrintObject       &object,
     if (progress && ! progress(55))
         throw SliceBakeCancelled();
 
-    // The loft assigns slice 0 the band [zmin, grid[0]] and slice i>0 the band
-    // [grid[i-1], grid[i]], so grid[i] is the TOP of slice i. A printed layer occupies
-    // [bottom_z, print_z], which makes grid[i] = the layer's own print_z and zmin = the first
-    // baked layer's bottom_z an exact reproduction of the printed stack.
-    //
-    // The real print_z values are used rather than the constant-height convenience overload
-    // because they are right in the two cases that overload gets wrong: a variable or adaptive
-    // layer height, and a layer subset that does not start at the bed.
-    const double zmin = bottom_z.front();
-    std::vector<float> grid;
-    grid.reserve(z.size());
-    for (double v : z)
-        grid.push_back(float(v));
-
-    indexed_triangle_set mesh = slices_to_mesh(slices, zmin, grid);
+    // Each printed layer occupies [bottom_z, print_z] and becomes one closed prism spanning
+    // exactly that band, so a variable or adaptive layer height and a subset that does not start
+    // at the bed both come out right without a uniform grid having to be derived.
+    size_t unmatched = 0;
+    indexed_triangle_set mesh = prisms_to_mesh(slices, bottom_z, z, unmatched);
+    if (unmatched > 0)
+        rep.note = std::to_string(unmatched) + " cap triangle(s) dropped on self-intersecting input";
 
     if (progress && ! progress(85))
         throw SliceBakeCancelled();
