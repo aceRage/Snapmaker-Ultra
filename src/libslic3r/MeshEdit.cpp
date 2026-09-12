@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <limits>
 #include <map>
 #include <set>
@@ -821,12 +823,23 @@ void fill_open_loops(indexed_triangle_set &out, size_t &patches, const std::set<
         }
     }
 
+    // The successor is taken only where the UNDIRECTED edge really is short of a facet.
+    // The directed test alone ("this direction has no reverse partner") also fires on an
+    // edge that has both its facets wound the same way, which the bevel's producers do
+    // on every corner edge - and filling that adds a third facet rather than closing
+    // anything. Winding is settled globally by orient_consistently() after the build, so
+    // the only question here is what is genuinely MISSING.
+    std::map<std::pair<int, int>, int> undirected;
+    for (const auto &d : directed) {
+        const int u = d.first.first, v = d.first.second;
+        undirected[u < v ? std::make_pair(u, v) : std::make_pair(v, u)] += d.second;
+    }
     std::map<int, int> next;
     for (const auto &d : directed) {
-        auto      it   = directed.find(std::make_pair(d.first.second, d.first.first));
-        const int back = it == directed.end() ? 0 : it->second;
-        if (d.second > back)
-            next.emplace(d.first.first, d.first.second);
+        const int u = d.first.first, v = d.first.second;
+        auto      it = undirected.find(u < v ? std::make_pair(u, v) : std::make_pair(v, u));
+        if (it != undirected.end() && it->second == 1)
+            next.emplace(u, v);
     }
 
     std::set<int> visited;
@@ -906,6 +919,93 @@ void fill_open_loops(indexed_triangle_set &out, size_t &patches, const std::set<
         }
         ++patches;
     }
+}
+
+// Make every facet agree with its neighbours about which way is out, by flooding an
+// orientation across the mesh from one seed and flipping whatever disagrees, then
+// flipping the whole result if the seed happened to face inward.
+//
+// WHY THIS IS HERE, measured. The bevel assembles its surface from three independent
+// producers - the rewritten sides (ear-clipped against their own face normal), the
+// strips (wound by emit_quad() against the mean of the two incident face normals) and
+// the caps and corner patches. Each is individually correct and they do NOT agree with
+// each other: the pair of facets meeting on a strip's END edge, where a side's chord
+// runs into the strip's last band, came out traversing that edge in the SAME direction.
+// Undirected, the edge has its two facets and is_closed_manifold() is satisfied; wound,
+// it is inconsistent, and its_num_open_edges() - which watertight() uses - counts it as
+// open. The probe said this unambiguously: at a chamfer corner the three edges read
+// (8,9)=2/0, (8,24)=0/2, (9,24)=2/0, two facets each and none of them opposing.
+//
+// Chasing it back into the producers was the wrong shape of fix. Each one derives its
+// winding from a normal, and at a corner the reference vectors are near-degenerate
+// precisely where the agreement matters - the same trap the end caps fell into. The
+// mutual agreement is a property of the assembled surface, so it is settled on the
+// assembled surface, once, by the standard flood: on a closed manifold it is exact, it
+// needs no geometry at all beyond the final inside/outside test, and it cannot be
+// fooled by a degenerate reference. A patch or a strip that is locally wound "wrong" is
+// no longer a bug to hunt.
+//
+// Deterministic: the facets are visited in index order from facet 0, and the final
+// global flip is decided by the signed volume, so the same input gives the same output.
+void orient_consistently(indexed_triangle_set &its)
+{
+    if (its.indices.empty())
+        return;
+    // Undirected edge -> the (up to two) facets on it.
+    std::map<std::pair<int, int>, std::vector<size_t>> faces_of;
+    for (size_t f = 0; f < its.indices.size(); ++f) {
+        const Vec3i32 &t = its.indices[f];
+        for (int s = 0; s < 3; ++s) {
+            const int u = t[s], v = t[(s + 1) % 3];
+            faces_of[u < v ? std::make_pair(u, v) : std::make_pair(v, u)].push_back(f);
+        }
+    }
+
+    std::vector<uint8_t> done(its.indices.size(), 0);
+    std::vector<size_t>  stack;
+    for (size_t seed = 0; seed < its.indices.size(); ++seed) {
+        if (done[seed])
+            continue;
+        done[seed] = 1;
+        stack.push_back(seed);
+        while (!stack.empty()) {
+            const size_t f = stack.back();
+            stack.pop_back();
+            const Vec3i32 t = its.indices[f];
+            for (int s = 0; s < 3; ++s) {
+                const int u = t[s], v = t[(s + 1) % 3];
+                auto      it = faces_of.find(u < v ? std::make_pair(u, v) : std::make_pair(v, u));
+                if (it == faces_of.end())
+                    continue;
+                for (size_t g : it->second) {
+                    if (g == f || done[g])
+                        continue;
+                    // f runs u -> v, so g must run v -> u. If it runs u -> v too, flip it.
+                    const Vec3i32 &tg = its.indices[g];
+                    bool           same = false;
+                    for (int k = 0; k < 3; ++k)
+                        if (tg[k] == u && tg[(k + 1) % 3] == v) { same = true; break; }
+                    if (same)
+                        std::swap(its.indices[g](1), its.indices[g](2));
+                    done[g] = 1;
+                    stack.push_back(g);
+                }
+            }
+        }
+    }
+
+    // The flood only makes the facets agree; it cannot know which way is out. Decide
+    // that from the signed volume, which is positive for an outward-facing closed shell.
+    double vol6 = 0.;
+    for (const Vec3i32 &t : its.indices) {
+        const Vec3f &a = its.vertices[t[0]];
+        const Vec3f &b = its.vertices[t[1]];
+        const Vec3f &c = its.vertices[t[2]];
+        vol6 += double(a.dot(b.cross(c)));
+    }
+    if (vol6 < 0.)
+        for (Vec3i32 &t : its.indices)
+            std::swap(t(1), t(2));
 }
 
 } // namespace
@@ -1281,6 +1381,45 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
 
     // rail[(edge, side, vertex)] -> index of the inserted point.
     std::map<std::tuple<int, int, int>, int> rail;
+
+    // ...and the same points keyed by POSITION, per original vertex, which is what
+    // makes two sides meeting at a bevelled vertex reference ONE rail point instead
+    // of a pair of twins.
+    //
+    // Why the (edge, side, vertex) key alone is not enough. Take the cube corner
+    // where the edges along X, Y and Z meet, with the three faces XY, YZ, ZX. The
+    // rail of the X edge measured in face XY is v + w*Y; the rail of the Z edge
+    // measured in face YZ is ALSO v + w*Y - a different edge and a different side,
+    // the same point. Each corner therefore produced three such twin pairs and the
+    // all-12 cube twenty-four (measured: coincident_dups=24, verts 136 -> 104
+    // across its_merge_vertices()). The filler then stitched the zero-area slivers
+    // BETWEEN the twins, reached the right patch count for that topology, and the
+    // merge welded the twins and collapsed every patch it had just made.
+    //
+    // So the dedupe has to happen at INSERTION, before anything is triangulated:
+    // the strips, the rewritten sides and the corner loops must all name the same
+    // index for the same point, or they do not share an edge and the surface is not
+    // closed. Merging afterwards is too late - by then the topology has been built
+    // around the duplicates.
+    //
+    // Keyed by a quantised position rather than by exact float equality: the two
+    // computations that land on one point run through different face normals and
+    // different cross products, so they agree to a few ULPs rather than bitwise.
+    // The quantisation is coarse against that error (1e-4 mm) and fine against any
+    // real separation (the solve keeps a width well above it), and it is applied to
+    // a value that is deterministic, so the same input still gives the same output
+    // bit for bit. The key is per ORIGINAL VERTEX as well as per position, so two
+    // genuinely distinct corners of a tiny feature can never collide across the mesh.
+    std::map<std::pair<int, std::tuple<int64_t, int64_t, int64_t>>, int> rail_by_pos;
+    auto pos_key = [](const Vec3f &p) {
+        // llround, not a truncating cast: a cast rounds toward zero, so two values
+        // straddling zero by an ULP land in different buckets.
+        const double q = 1.0e4;
+        return std::make_tuple(int64_t(std::llround(double(p.x()) * q)),
+                               int64_t(std::llround(double(p.y()) * q)),
+                               int64_t(std::llround(double(p.z()) * q)));
+    };
+
     auto rail_of = [&](int e, int side, int v) -> int {
         const auto key = std::make_tuple(e, side, v);
         auto       it  = rail.find(key);
@@ -1298,9 +1437,19 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         const Vec2i32 ev = topo.edge_vertices[e];
         const int     u  = ev(0) == v ? ev(1) : ev(0);
         const Vec3f   t  = in_plane_normal(its, topo, on_side, v, u);
-        const int     nv = int(out.vertices.size());
-        out.vertices.emplace_back(its.vertices[v] + width_of.at(e) * t);
+        const Vec3f   p  = its.vertices[v] + width_of.at(e) * t;
+
+        const auto pkey = std::make_pair(v, pos_key(p));
+        auto       pit  = rail_by_pos.find(pkey);
+        if (pit != rail_by_pos.end()) {
+            // Another (edge, side) already inserted this exact point. Share it.
+            rail.emplace(key, pit->second);
+            return pit->second;
+        }
+        const int nv = int(out.vertices.size());
+        out.vertices.emplace_back(p);
         rail.emplace(key, nv);
+        rail_by_pos.emplace(pkey, nv);
         return nv;
     };
 
@@ -1443,6 +1592,17 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
     }
 
     // --- the strips ------------------------------------------------------------
+    //
+    // The open END of every strip, recorded as the strip actually wound it, so the
+    // corner patches below are built from the edges that are genuinely there rather
+    // than hunted for afterwards. Keyed (vertex, edge): the ring of rail points the
+    // strip of `edge` leaves exposed at `vertex`, from its side-0 rail to its
+    // side-1 rail (two entries for a chamfer, `rings + 1` for a round).
+    // Only the POINTS are needed, not their order: the corner walk below uses them
+    // as seeds into the assembled mesh's own open boundary, and takes the direction
+    // from there rather than from the strip.
+    std::map<std::pair<int, int>, std::vector<int>> strip_end_ring;
+
     for (const auto &kv : width_of) {
         const int     e  = kv.first;
         const float   w  = kv.second;
@@ -1552,8 +1712,16 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
             capped_vertices.insert(v);
         };
 
+        // Hand the strip's two open ends to the corner fill. A chamfer's end is the
+        // rail pair; a round's is its whole arc ring.
+        auto note_ends = [&](const std::vector<int> &ring_a, const std::vector<int> &ring_b) {
+            strip_end_ring[std::make_pair(a, e)] = ring_a;
+            strip_end_ring[std::make_pair(b, e)] = ring_b;
+        };
+
         if (rings <= 1) {
             emit_quad(a0, a1, b1, b0);
+            note_ends({a0, a1}, {b0, b1});
             cap_end(a, a0, a1);
             cap_end(b, b0, b1);
             continue;
@@ -1567,6 +1735,7 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         const float bl  = bis.norm();
         if (!(interior > 1e-3f) || interior > float(M_PI) - 1e-3f || bl < 1e-9f) {
             emit_quad(a0, a1, b1, b0);   // degenerate angle: the chamfer is right
+            note_ends({a0, a1}, {b0, b1});
             cap_end(a, a0, a1);
             cap_end(b, b0, b1);
             continue;
@@ -1617,6 +1786,7 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         const std::vector<int> ring_b = arc_points(b, b0, b1);
         for (size_t s = 0; s + 1 < ring_a.size(); ++s)
             emit_quad(ring_a[s], ring_a[s + 1], ring_b[s + 1], ring_b[s]);
+        note_ends(ring_a, ring_b);
 
         // The round profile's end cap is a fan from the vertex over the whole
         // ring, for the same reason the chamfer's is a single triangle.
@@ -1637,22 +1807,36 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
     // sides leave a hole between them - on a cube with all 12 edges bevelled, the
     // eight classic three-sided corners.
     //
-    // These are found from the mesh that has actually been built, not predicted
-    // from the original one-ring: collect the edges that are genuinely open (used
-    // by exactly one facet), stitch them into loops and fill each one. An edge
-    // that was never torn is never open, so it is never touched, and a hole that
-    // does exist is filled exactly once whatever produced it. Robust by
-    // construction rather than by case analysis.
-    // A STAGE PROBE, for whoever finishes the multi-edge cases. The final dump
-    // below reports the mesh after the merge, which is too late to tell apart the
-    // three things that can go wrong here; this one reports the same counts just
-    // before the fill and just after it, so a failure can be attributed to the
-    // strips, to the filler, or to the merge. `coincident_dups` is what the merge
-    // is about to weld - the all-12 cube carries 24 of them, and that is the trail
-    // the remaining defect is on. (Welding BEFORE the fill was tried: it does clear
-    // the duplicates and takes the chamfered box from nonmanifold=6 to 2, but it
-    // leaves the cube's filler stitching 20 loops where 8 are wanted, so it is not
-    // the whole answer and is not in the tree.)
+    // ONE LOOP PER CORNER, built from the strips' own end edges. Each bevelled edge
+    // at `v` left an open end there (its rail pair for a chamfer, its whole arc ring
+    // for a round), and those ends were recorded in `strip_end_ring` as they were
+    // emitted. Because the rails are now shared by position, two edges adjacent
+    // around `v` TERMINATE ON THE SAME RAIL - the point offset into the face they
+    // have in common - so the ends chain terminal-to-terminal into exactly one
+    // closed ring, which is the patch boundary. Walking that ring is the
+    // construction; there is nothing to search for.
+    //
+    // This replaces hunting for open boundary runs after the fact, and the reason is
+    // measured rather than aesthetic. The old filler counted directed edges over the
+    // whole assembled mesh and stitched whatever came back unmatched. With duplicate
+    // rails that found the zero-area slivers BETWEEN each pair of twins - the right
+    // number of patches (8) for a topology the following its_merge_vertices() then
+    // destroyed, welding the twins and collapsing every patch onto its neighbour
+    // (nonmanifold=24). Welding first instead does clear the duplicates, but then a
+    // corner presents its several boundary runs to the filler as SEPARATE loops and
+    // the cube came back with 20 of them and open=84. Neither ordering can work,
+    // because the information the filler needs - which runs belong to which corner -
+    // is not in the edge counts at all. It is in which strip left which end open,
+    // and that is known at the moment the strip is built.
+    //
+    // A STAGE PROBE. The final dump below reports the mesh after the merge, which is
+    // too late to tell apart the three things that can go wrong here; this one
+    // reports the same counts just before the fill and just after it, so a failure
+    // can be attributed to the strips, to the corner build, or to the merge.
+    // `coincident_dups` is what the merge would have to weld: it was 24 on the
+    // all-12 cube while the rails were keyed per (edge, side), and the whole point
+    // of sharing them by position is that it is now 0 - if it ever comes back
+    // non-zero, the dedupe is what regressed, not the fill.
 #ifdef MESHEDIT_BEVEL_DIAG
     auto stage_probe = [&](const char *when) {
         std::map<std::pair<int, int>, int> d;
@@ -1680,6 +1864,260 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
     };
     stage_probe("pre-fill");
 #endif
+
+    // ONE CORNER AT A TIME, and every hole that corner owns.
+    //
+    // The measured reason it is a set of holes rather than one. A chamfered corner is
+    // a single triangle between its three rails, and that is what the first version
+    // of this assumed. A ROUNDED corner is not: each rewritten side still closes its
+    // own cut with a straight CHORD between its two rails, while the strip that runs
+    // between those same two rails follows the ARC - so every pair of rails is joined
+    // twice, by a chord and by an arc, and the corner's boundary graph gives each rail
+    // degree four (measured, N = 4 on the all-12 cube: deg=4, and a longest-cycle walk
+    // came back with 9 of the 12 points). The region to close is therefore the chord
+    // triangle in the middle plus one lens between each chord and its arc: four loops,
+    // not one, and no single cycle spans them.
+    //
+    // So the walk does not try to be clever about which loop is "the" corner. It takes
+    // every open loop whose points all belong to this corner - the rails and arc
+    // points its own strips left exposed, plus the original vertex when a side kept it
+    // - fills each, and counts the whole corner as ONE corner patch. That is what a
+    // corner patch means to the caller and to the panel: the geometry that closes one
+    // corner, however many triangles and loops it takes.
+    //
+    // Restricting to the corner's own points is what the old global filler could not
+    // do, and it is the entire fix. It never had to decide which of several boundary
+    // runs belonged together - a question the edge counts cannot answer - because the
+    // strips record, as they are built, which points they left open at which vertex.
+    std::set<int> patched_from;      // boundary points already consumed by a patch
+    for (const auto &va : edges_at_vertex) {
+        const int               v  = va.first;
+        const std::vector<int> &es = va.second;
+        if (es.size() < 2)
+            continue;               // the end-cap case, already closed
+        if (capped_vertices.count(v) > 0)
+            continue;               // never patch over a cap
+
+        // This corner's own points: everything its strips left exposed, and the
+        // original vertex, which is still on the boundary whenever only SOME of the
+        // sides at `v` dropped it. That is the case a rim chain on a chamfered box
+        // presents at every corner - two bevelled edges, two top-plane rails that do
+        // not coincide, and `v` itself bridging them across the two chamfer faces.
+        std::set<int> own;
+        for (int e : es) {
+            auto it = strip_end_ring.find(std::make_pair(v, e));
+            if (it == strip_end_ring.end())
+                continue;
+            for (int idx : it->second)
+                own.insert(idx);
+        }
+        if (own.empty())
+            continue;
+        own.insert(v);
+
+        // Which of this corner's open edges are the STRIP's own - a consecutive pair of
+        // one arc ring, or a chamfer's rail pair. The rest are CHORDS: the straight cut
+        // a rewritten side made across its corner between those same two rails.
+        //
+        // The distinction decides the ORDER the holes are filled in, and getting it
+        // wrong yields a closed mesh with the wrong volume rather than an obvious
+        // failure - which is why it is taken from recorded data rather than guessed from
+        // geometry. A rounded corner's four holes are the three lenses (one chord plus
+        // one arc run) and the chord triangle between them, and those tile the opening
+        // exactly once. Fill a lens and its chord is consumed. Fill the chord triangle
+        // FIRST and all three chords go at once, after which the only cycle left is the
+        // whole arc ring, whose fan then covers the chord triangle a second time -
+        // still closed, still manifold, but with a sliver of void sealed inside and the
+        // corner's volume wrong. So a cycle carrying a strip edge is always preferred:
+        // the lenses go first and the chord triangle is closed by them.
+        std::set<std::pair<int, int>> strip_edge;
+        for (int e : es) {
+            auto it = strip_end_ring.find(std::make_pair(v, e));
+            if (it == strip_end_ring.end())
+                continue;
+            const std::vector<int> &ring = it->second;
+            for (size_t i = 0; i + 1 < ring.size(); ++i) {
+                const int p = ring[i], q = ring[i + 1];
+                strip_edge.insert(p < q ? std::make_pair(p, q) : std::make_pair(q, p));
+            }
+        }
+
+        // Fill until nothing of this corner is open. Each pass re-reads the boundary
+        // from the mesh, because the previous pass changed it. The bound is the number
+        // of holes a corner can have, which is one per incident side plus one.
+        bool   any = false;
+        size_t guard = own.size() + 4;
+        while (guard-- > 0) {
+            // The open boundary restricted to this corner: an UNDIRECTED edge carried by
+            // exactly one facet, both of whose endpoints are this corner's own.
+            //
+            // Undirected, and that is the correction that mattered. The directed test -
+            // a direction with no reverse partner - reads an edge that already has its
+            // two facets as open whenever those two disagree about which way is out, and
+            // the three producers here did disagree on exactly the corner edges. So the
+            // directed test invented a hole where the surface was already complete, a
+            // patch was laid over it, and the patch did not fix the disagreement either,
+            // so the next pass found the same "hole" again: two identical triangles and
+            // four facets on the edge. The probe named it outright - (8,9)=2/0,
+            // (8,24)=0/2, (9,24)=2/0, two facets each and not one of them opposing.
+            // Winding is now settled globally by orient_consistently() after the build,
+            // so here the only question is whether a facet is MISSING, which is what
+            // counting facets per undirected edge answers.
+            std::map<std::pair<int, int>, int> d;
+            for (const Vec3i32 &f : out.indices)
+                for (int s = 0; s < 3; ++s) {
+                    const int u = f[s], w2 = f[(s + 1) % 3];
+                    ++d[u < w2 ? std::make_pair(u, w2) : std::make_pair(w2, u)];
+                }
+            std::map<int, std::vector<int>> adj;
+            std::set<std::pair<int, int>>   border;   // the open edges, sorted, as seeds
+            for (const auto &kv : d) {
+                if (kv.second != 1)
+                    continue;       // already has both its facets
+                const int p = kv.first.first, q = kv.first.second;
+                if (own.count(p) == 0 || own.count(q) == 0)
+                    continue;       // not this corner's edge
+                adj[p].push_back(q);
+                adj[q].push_back(p);
+                border.insert(std::make_pair(p, q));
+            }
+            if (adj.empty())
+                break;              // this corner is closed
+#ifdef MESHEDIT_BEVEL_DIAG
+            // How many facets each of this corner's open edges carries. One means a
+            // genuine hole; the trail that led here was this line reading two.
+            std::fprintf(stderr, "  PASS v=%d tris=%zu open_edges=%zu\n", v,
+                         out.indices.size(), border.size());
+#endif
+
+            // ONE HOLE PER PASS, as the MINIMAL cycle through a chosen open edge.
+            //
+            // Not a free walk. At a rail of a rounded corner four open edges meet, so
+            // "step to any neighbour that is not where I came from" has a real choice to
+            // make at every rail and no local information to make it with - it cuts out
+            // of one hole into the next and comes back with a cycle that is not the
+            // boundary of anything (measured: 9 points of a 12-point ring). What IS
+            // well defined is the smallest cycle through a GIVEN edge, and that is
+            // exactly one hole's boundary: take the edge out of the graph and find the
+            // shortest path between its two endpoints. Breadth-first, so shortest, and
+            // ties broken by the lower index so the result does not depend on the order
+            // the map happened to be built in.
+            //
+            // The seed edge is a strip edge whenever the corner still has one open, for
+            // the ordering reason above.
+            std::pair<int, int> seed(-1, -1);
+            for (const auto &b : border) {
+                if (seed.first < 0)
+                    seed = b;                           // fallback: the lowest chord
+                if (strip_edge.count(b) > 0) { seed = b; break; }
+            }
+            if (seed.first < 0)
+                break;
+
+            std::vector<int> loop;
+            {
+                const int              src = seed.second, dst = seed.first;
+                std::map<int, int>     came;            // point -> where it was reached from
+                std::deque<int>        q2;
+                q2.push_back(src);
+                came[src] = src;
+                bool found = false;
+                while (!q2.empty() && !found) {
+                    const int cur = q2.front();
+                    q2.pop_front();
+                    auto it = adj.find(cur);
+                    if (it == adj.end())
+                        continue;
+                    std::vector<int> nbrs = it->second;
+                    std::sort(nbrs.begin(), nbrs.end());
+                    for (int nb : nbrs) {
+                        // The seed edge itself is removed from the graph, so the path
+                        // found is the OTHER way round and the cycle is a real one.
+                        if ((cur == src && nb == dst) || (cur == dst && nb == src))
+                            continue;
+                        if (came.count(nb) > 0)
+                            continue;
+                        came[nb] = cur;
+                        if (nb == dst) { found = true; break; }
+                        q2.push_back(nb);
+                    }
+                }
+                if (found) {
+                    for (int cur = dst; ; cur = came.at(cur)) {
+                        loop.push_back(cur);
+                        if (cur == src)
+                            break;
+                    }
+                    // loop now runs dst -> ... -> src; closing it uses the seed edge.
+                }
+            }
+            if (loop.size() < 3)
+                break;              // nothing walkable: leave the rest to the filler
+#ifdef MESHEDIT_BEVEL_DIAG
+            std::fprintf(stderr, "BEVELDIAG(corner) v=%d edges=%zu own=%zu loop=%zu\n",
+                         v, es.size(), own.size(), loop.size());
+#endif
+
+            // No winding decision here: orient_consistently() settles the whole surface
+            // after the build, so a patch only has to be the right SHAPE. That is the
+            // point of doing it globally - three producers that each pick a winding from
+            // their own normal reference cannot be made to agree locally at a corner,
+            // where every such reference is near-degenerate.
+            for (int idx : loop)
+                patched_from.insert(idx);
+            any = true;
+
+            // A three-sided hole IS a triangle - the chamfered cube corner, and the
+            // lens between a chord and a one-segment arc - so it is emitted as one
+            // rather than as a centroid plus three slivers, which would put a vertex
+            // inside the solid and move the volume the closed form is compared against.
+            if (loop.size() == 3) {
+                out.indices.emplace_back(loop[0], loop[1], loop[2]);
+                continue;
+            }
+            // Four or more: fan from the centroid, which stays valid for the
+            // saddle-shaped polygon a lens or a rim corner is, where a fan from one of
+            // its own vertices would fold.
+            Vec3f centroid = Vec3f::Zero();
+            for (int idx : loop)
+                centroid += out.vertices[idx];
+            centroid /= float(loop.size());
+            const int cv = int(out.vertices.size());
+            out.vertices.emplace_back(centroid);
+            // Same rule, applied to every wedge of the fan: the loop is already in the
+            // direction the patch must run, so (cv, p, q) traverses p -> q and the
+            // border's q -> p opposes it.
+            for (size_t i = 0; i < loop.size(); ++i) {
+                const int p = loop[i], q = loop[(i + 1) % loop.size()];
+                if (p == q)
+                    continue;
+                out.indices.emplace_back(cv, p, q);
+            }
+        }
+        if (any)
+            ++res.corner_patches;   // one corner, one patch, whatever it took to close
+    }
+
+    // Anything the corner walk could not close as a clean cycle - a vertex whose
+    // strips do not chain, which the constructions above are not expected to produce
+    // but which a pathological input could - still goes to the generic filler, so an
+    // unclosed hole is a filled hole rather than a refusal. A corner the walk DID
+    // patch needs no protecting from it: the patch leaves no open edge there, so the
+    // filler's directed-edge count never reports that region at all. (The capped-
+    // vertex skip is still needed, and still only for the end caps, whose hole is
+    // genuinely larger than the cap that closes it.)
+#ifdef MESHEDIT_BEVEL_DIAG
+    stage_probe("post-corners");
+#endif
+    // The generic filler, now only a fallback: it runs on whatever is STILL open after
+    // the corner walk, which for the cases the walk handles is nothing at all. It is
+    // deliberately not given the patched points as a skip set - a patch closes the
+    // edges it covers, so the filler's own directed-edge count no longer reports them,
+    // and suppressing by point would instead stop it closing a leftover run that
+    // happens to touch a patched rail. (The skip set is still needed for the end caps,
+    // whose hole is genuinely wider than the cap that closes it.) What used to make
+    // this double-cover was a wrongly wound patch, and that is now decided from the
+    // bordering facets' normals rather than from a strip's own choice of winding.
     fill_open_loops(out, res.corner_patches, capped_vertices);
 #ifdef MESHEDIT_BEVEL_DIAG
     stage_probe("post-fill,pre-merge");
@@ -1689,6 +2127,14 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
     its_merge_vertices(out);
     its_remove_degenerate_faces(out);
     its_compactify_vertices(out);
+
+    // Make the three producers agree about which way is out. Each is internally right
+    // and they are mutually inconsistent - see orient_consistently() for the measurement
+    // - and this is where that is settled: after the topology is final, before anything
+    // asks whether the result is watertight. It has to run AFTER the merge, because the
+    // flood walks facet adjacency and two coincident but unwelded vertices are not
+    // adjacent.
+    orient_consistently(out);
 
     if (out.indices.empty() || !is_closed_manifold(out)) {
         // Define MESHEDIT_BEVEL_DIAG (at the top of this file, or on the compiler
