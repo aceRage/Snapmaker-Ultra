@@ -291,10 +291,27 @@ What it asserts:
 
 `test_webrtc.py`'s rtsp assertion was updated as described in §3.2.
 
-**Building this branch.** Nothing here changes the build's memory profile, but the worktree build
-was killed twice by `error C3859` / `C1076` (PCH virtual-memory exhaustion) while other builds ran
-on the same PC — at `/m:4`, and again at `/m:2` with ~7 GB free and 55 foreign `cl.exe` alive. It is
-contention, not anything in this change. If it bites, drop to `/m:1` rather than hunting the code.
+**Building this branch.** Nothing here changes the build's memory profile, but getting a complete
+build on this PC took several attempts, for two reasons worth recording.
+
+1. **Run the build detached.** Six builds ran on this machine today. A `cmake --build` launched
+   through an agent's shell tool is killed with its whole msbuild process tree when that tool's
+   timeout expires, and the signature is misleading: MSBuild reports **exit -1 with no error line
+   at all**, part-way through `libslic3r`, looking exactly like a compiler crash. Launch it with
+   PowerShell `Start-Process ... -RedirectStandardOutput ... -PassThru` instead, and poll the log.
+   Note also that `-1` is **not** caught by `if errorlevel 1`, so a script testing only that falls
+   through to `cmake --install` and fails there on a missing `EdgeSlicer.dll` - which reads as an
+   install bug rather than a build that never finished. Test `if not "%ERRORLEVEL%"=="0"`, and
+   check the exe exists before installing. A half-built tree also leaves `libslic3r.pdb` without
+   `libslic3r.lib`, after which the GUI targets are silently skipped and the build "succeeds"
+   having produced no exe.
+
+2. **Take the build lock, and use the compile cache.** Wrap the launch in
+   `sh <snorca_hubtest>/with_build_lock.sh <cmd>` so it does not contend with other agents'
+   builds, and configure with
+   `-DCMAKE_VS_GLOBALS="CLToolExe=sccache.exe;CLToolPath=...;TrackFileAccess=false;UseMultiToolTask=true;EnforceProcessCountAcrossBuilds=true"`.
+   Under contention the build also hit genuine `C3859`/`C1076` (PCH virtual-memory exhaustion) at
+   `/m:4` and `/m:2`; the lock is what actually fixes that, `/m:1` only narrows the window.
 
 **One trap worth knowing when gating this by hand.** A go2rtc started from the *worktree's*
 `resources/tools/go2rtc/go2rtc.exe` holds that file open, and Windows will then fail the build's
