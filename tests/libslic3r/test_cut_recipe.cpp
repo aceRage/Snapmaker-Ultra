@@ -26,6 +26,8 @@
 #include <libslic3r/CurvedCut.hpp>
 #include <libslic3r/DrawCut.hpp>
 #include <libslic3r/CutUtils.hpp>
+// translation_transform(), for composing the cut matrix the gizmo composes.
+#include <libslic3r/Geometry.hpp>
 #include <libslic3r/Format/bbs_3mf.hpp>
 #include <libslic3r/Model.hpp>
 #include <libslic3r/PresetBundle.hpp>
@@ -481,7 +483,7 @@ TEST_CASE("Deft: a cut re-performed from a loaded recipe reproduces the same hal
 
             const ModelObjectCutAttributes attrs =
                 ModelObjectCutAttribute::KeepUpper | ModelObjectCutAttribute::KeepLower;
-            const Transform3d cut_matrix = translation_transform(r.plane_center) * r.rotation_m;
+            const Transform3d cut_matrix = Geometry::translation_transform(r.plane_center) * r.rotation_m;
 
             Cut cut(mo, 0, cut_matrix, attrs);
             ModelObjectPtrs res;
