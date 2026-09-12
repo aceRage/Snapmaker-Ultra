@@ -357,6 +357,21 @@ void DrawCutStroke::compute_binormals()
     }
 }
 
+void DrawCutStroke::set_path(const std::vector<DrawCutSample>& path)
+{
+    // Same length or nothing: the open/closed decision and the error state were made
+    // for a path of this size, and a caller that wants a different line has to go
+    // back through finish().
+    if (path.size() != m_path.size())
+        return;
+    m_path = path;
+    for (DrawCutSample& s : m_path)
+        s.normal = safe_normalize(s.normal, Vec3d::UnitZ());
+    // The binormals are derived from the positions and the normals, so they are
+    // stale the moment either changes.
+    compute_binormals();
+}
+
 Vec3d DrawCutStroke::binormal(size_t i) const
 {
     return i < m_binormal.size() ? m_binormal[i] : Vec3d::UnitX();
@@ -450,13 +465,114 @@ bool draw_cut_self_crossing(const DrawCutStroke& stroke)
     return false;
 }
 
-bool draw_cut_strip_folds(const DrawCutStroke& stroke, double extension, double* worst_kappa)
+// ---------------------------------------------------------------------------
+// The cut direction, and the draft angle. PHASE 2.
+// ---------------------------------------------------------------------------
+
+Vec3d draw_cut_inward_dir(const DrawCutStroke& stroke, const DrawCutParams& params, size_t i)
+{
+    switch (params.direction) {
+    case DrawCutDirection::View:  return safe_normalize(params.view_dir, -Vec3d::UnitZ());
+    case DrawCutDirection::AxisX: return -Vec3d::UnitX();
+    case DrawCutDirection::AxisY: return -Vec3d::UnitY();
+    case DrawCutDirection::AxisZ: return -Vec3d::UnitZ();
+    default: break;
+    }
+
+    if (i >= stroke.path().size())
+        return -Vec3d::UnitZ();
+
+    const Vec3d inward = -stroke.path()[i].normal;
+
+    // THE DRAFT ANGLE. A rotation of the inward normal TOWARD THE OUTWARD BINORMAL,
+    // in the plane those two span:
+    //
+    //   d = cos(theta) * (-n) + sin(theta) * b
+    //
+    // b is unit and perpendicular to n by construction (it is t x n with the sign
+    // fixed), so d is unit without renormalising and the ruling stays a straight
+    // line - which is what keeps the strip a RULED surface and keeps
+    // draw_cut_surface_point() a lerp rather than an integration.
+    //
+    // theta == 0 returns -n bit for bit, which is phase 1's behaviour: the clamp
+    // below and the multiply by sin(0) == 0 both vanish, and cos(0) == 1.
+    const double theta = std::clamp(params.angle_deg, -DrawCutMaxAngleDeg, DrawCutMaxAngleDeg) * M_PI / 180.0;
+    if (std::abs(theta) < 1e-12)
+        return inward;
+
+    const Vec3d b = stroke.binormal(i);
+    // A degenerate binormal (t parallel to n) leaves nothing to tilt toward. Fall
+    // back to the untilted ray rather than producing a direction that is not a
+    // rotation of it.
+    if (std::abs(b.dot(inward)) > 0.999)
+        return inward;
+
+    // POSITIVE theta LEANS THE RULING OUTWARD, away from the loop's interior, so
+    // going IN along d the surface moves away from the stroke's outward side - the
+    // plug widens with depth and lifts out. Negative leans it inward and the plug
+    // narrows with depth, which is the undercut.
+    return safe_normalize(std::cos(theta) * inward + std::sin(theta) * b, inward);
+}
+
+bool draw_cut_frame_holonomy_flips(const DrawCutStroke& stroke)
+{
+    if (!stroke.is_closed())
+        return false; // an open stroke has no loop to come back round.
+
+    const size_t n = stroke.path().size();
+    if (n < 3)
+        return false;
+
+    // compute_binormals() orients a closed loop's field from the CENTROID rather
+    // than by transport, which is what makes it winding-independent - but it also
+    // means the field can be locally inconsistent where the loop is not star-shaped
+    // about its centroid, or where it runs over a surface that turns the tangent
+    // plane right over (a stroke round the waist of a twisted band). The symptom is
+    // adjacent binormals pointing opposite ways, and a draft angle applied across
+    // such a seam flares one way on one side of it and the other way on the other.
+    //
+    // That is the holonomy the spec asks about, measured where it can actually be
+    // seen: a sign flip between neighbours, going all the way round including the
+    // closing span.
+    for (size_t i = 0; i < n; ++ i)
+        if (stroke.binormal(i).dot(stroke.binormal((i + 1) % n)) < 0.0)
+            return true;
+    return false;
+}
+
+bool draw_cut_strip_folds(const DrawCutStroke& stroke, double extension, double* worst_kappa,
+                          double angle_deg, double depth)
 {
     const std::vector<DrawCutSample>& p = stroke.path();
     const size_t n = p.size();
     if (worst_kappa != nullptr)
         *worst_kappa = 0.0;
-    if (n < 3 || extension <= 0.0)
+
+    // THE REACH THE FOLD TEST HAS TO USE, which is where phase 2 differs.
+    //
+    // At angle 0 the ruling is the inward NORMAL: pushing out by E along it moves
+    // the rail straight out of the surface and not a millimetre sideways, so the
+    // only lateral reach is E itself on the outward side, and phase 1's
+    // `E * kappa > 1` is the whole story.
+    //
+    // At angle theta the ruling LEANS SIDEWAYS by sin(theta). The outward rail is
+    // then E * |sin theta| to one side and the inward rail D * |sin theta| to the
+    // other - and D is the DEPTH, which through-all makes the bounding-box
+    // diagonal. That is the reach that folds a concave stroke at a large angle,
+    // and it can be an order of magnitude larger than E.
+    //
+    // Only Surface normal tilts; the constant directions ignore the angle
+    // (draw_cut_inward_dir does), so their reach is phase 1's.
+    const double theta = std::clamp(angle_deg, -DrawCutMaxAngleDeg, DrawCutMaxAngleDeg) * M_PI / 180.0;
+    const double lean  = std::abs(std::sin(theta));
+    // E on the outward side (phase 1's reach, which does not depend on the lean -
+    // the outward rail is pushed back by E along the ruling whichever way it points,
+    // and at theta == 0 that is the ONLY reach there is), against D * sin(theta) on
+    // the inward side. E's own lateral component is E * sin(theta) <= E, so it never
+    // wins and does not need a term of its own.
+    const double reach = std::max(std::max(0.0, extension), std::max(0.0, depth) * lean);
+
+    if (n < 3 || reach <= 0.0)
         return false;
 
     double worst = 0.0;
@@ -491,34 +607,33 @@ bool draw_cut_strip_folds(const DrawCutStroke& stroke, double extension, double*
         // centre, so "the centre is on the outward side" is turn . b > 0... with
         // b the OUTWARD binormal, which for a closed loop points away from the
         // interior. A circle therefore scores zero here, which is correct.
+        //
+        // PHASE 2 ADDS THE OTHER SIGN, and it is the angle that puts it there. Once
+        // theta is non-zero the INWARD rail leans the opposite way by D * sin(theta),
+        // so a corner whose turn centre is on the INWARD side - a CONVEX corner, the
+        // one phase 1 correctly ignored because nothing reached that way - now has a
+        // rail walking toward a centre 1/kappa away with D * |sin theta| of reach to
+        // do it in. A loop drawn round a small boss and drafted 30 degrees through a
+        // thick part folds exactly there.
+        //
+        // So: the outward side is scored whenever there is any reach at all (E
+        // always is), and the inward side only once the ruling leans.
         const Vec3d turn = (c - b).normalized() - (b - a).normalized();
-        if (turn.dot(stroke.binormal(i % n)) > 0.0)
+        const double toward_out = turn.dot(stroke.binormal(i % n));
+        if (toward_out > 0.0)
+            worst = std::max(worst, kappa);
+        else if (lean > 1e-9 && toward_out < 0.0)
             worst = std::max(worst, kappa);
     }
 
     if (worst_kappa != nullptr)
         *worst_kappa = worst;
-    return extension * worst > 1.0;
+    return reach * worst > 1.0;
 }
 
 // ---------------------------------------------------------------------------
 // The cutter solid
 // ---------------------------------------------------------------------------
-
-// The inward ray at path sample i, unit length, pointing INTO the part.
-static Vec3d inward_dir(const DrawCutStroke& stroke, const DrawCutParams& params, size_t i)
-{
-    switch (params.direction) {
-    case DrawCutDirection::View:  return safe_normalize(params.view_dir, -Vec3d::UnitZ());
-    case DrawCutDirection::AxisX: return -Vec3d::UnitX();
-    case DrawCutDirection::AxisY: return -Vec3d::UnitY();
-    case DrawCutDirection::AxisZ: return -Vec3d::UnitZ();
-    default: break;
-    }
-    // Surface normal, angle 0: straight in along the INWARD normal. Phase 2
-    // rotates this toward the binormal by the draft angle.
-    return -stroke.path()[i].normal;
-}
 
 indexed_triangle_set draw_cut_cutter_solid(const DrawCutStroke& stroke,
                                            const DrawCutParams& params,
@@ -601,7 +716,7 @@ indexed_triangle_set draw_cut_cutter_solid(const DrawCutStroke& stroke,
     // wherever the stroke turns and the resulting solid self-intersects.
     Vec3d sweep = Vec3d::Zero();
     for (size_t i = 0; i < n; ++ i) {
-        const Vec3d d  = inward_dir(stroke, params, i);
+        const Vec3d d  = draw_cut_inward_dir(stroke, params, i);
         Vec3d       sn = stroke.tangent(i).cross(d);
         if (sn.norm() < 1e-9)
             continue;
@@ -629,15 +744,15 @@ indexed_triangle_set draw_cut_cutter_solid(const DrawCutStroke& stroke,
         // Leading end, extended BACKWARDS along the tangent so the surface reaches
         // past the silhouette on that side.
         const Vec3d t0 = stroke.tangent(0);
-        push_rail(p.front().pos - ext * t0, t0, inward_dir(stroke, params, 0), stroke.binormal(0));
+        push_rail(p.front().pos - ext * t0, t0, draw_cut_inward_dir(stroke, params, 0), stroke.binormal(0));
     }
 
     for (size_t i = 0; i < n; ++ i)
-        push_rail(p[i].pos, stroke.tangent(i), inward_dir(stroke, params, i), stroke.binormal(i));
+        push_rail(p[i].pos, stroke.tangent(i), draw_cut_inward_dir(stroke, params, i), stroke.binormal(i));
 
     if (!closed) {
         const Vec3d tN = stroke.tangent(n - 1);
-        push_rail(p.back().pos + ext * tN, tN, inward_dir(stroke, params, n - 1), stroke.binormal(n - 1));
+        push_rail(p.back().pos + ext * tN, tN, draw_cut_inward_dir(stroke, params, n - 1), stroke.binormal(n - 1));
     }
 
     const size_t m = rails.size();
@@ -765,6 +880,408 @@ indexed_triangle_set draw_cut_cutter_solid(const DrawCutStroke& stroke,
             std::swap(t(1), t(2));
 
     return its;
+}
+
+// ---------------------------------------------------------------------------
+// The drawn surface as a surface: (s, w) -> point, normal, frame. PHASE 2.
+//
+// What connectors stand on. The curved cut's connector frame comes from the
+// sheet's local normal; the drawn cut's comes from the ruled strip's, and the
+// only real work is turning an arc length s into "which span, how far along it".
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Cumulative arc length of the finished path, span by span. For a CLOSED stroke
+// the closing span (last -> first) is included as the final entry, so the table
+// has n + 1 entries and back() is the full circumference; for an open one it has
+// n entries and back() is the length.
+std::vector<double> path_arc_table(const DrawCutStroke& stroke)
+{
+    const std::vector<DrawCutSample>& p = stroke.path();
+    const size_t n = p.size();
+    std::vector<double> acc;
+    if (n == 0)
+        return acc;
+    acc.reserve(n + 1);
+    acc.push_back(0.0);
+    for (size_t i = 1; i < n; ++ i)
+        acc.push_back(acc.back() + (p[i].pos - p[i - 1].pos).norm());
+    if (stroke.is_closed())
+        acc.push_back(acc.back() + (p[0].pos - p[n - 1].pos).norm());
+    return acc;
+}
+
+// Locate arc length `s` in the table: the span index and the 0..1 parameter along
+// it. A closed stroke WRAPS (s is taken modulo the circumference); an open one
+// CLAMPS to its two ends, so a connector dragged past the end of the line stays on
+// the last span rather than vanishing.
+void locate_arc(const DrawCutStroke& stroke, const std::vector<double>& acc, double s,
+                size_t& span, double& t)
+{
+    const size_t n = stroke.path().size();
+    span = 0;
+    t    = 0.0;
+    if (acc.size() < 2 || n < 2)
+        return;
+
+    const double total = acc.back();
+    if (total < 1e-12)
+        return;
+
+    double d = s;
+    if (stroke.is_closed()) {
+        d = std::fmod(d, total);
+        if (d < 0.0)
+            d += total;
+    }
+    else
+        d = std::clamp(d, 0.0, total);
+
+    // The last table entry is the END of the last span, so the search stops one
+    // short of it.
+    size_t i = 0;
+    while (i + 2 < acc.size() && acc[i + 1] <= d)
+        ++ i;
+    const double span_len = acc[i + 1] - acc[i];
+    span = i;
+    t    = span_len > 1e-12 ? std::clamp((d - acc[i]) / span_len, 0.0, 1.0) : 0.0;
+}
+
+// The stroke point, its ruling direction and its tangent at arc length s, all
+// lerped across the span s falls in. The ruling is lerped AS A DIRECTION and
+// renormalised, which is what keeps the surface continuous where the underlying
+// normals turn.
+void surface_frame_pieces(const DrawCutStroke& stroke, const DrawCutParams& params, double s,
+                          Vec3d& pos, Vec3d& dir, Vec3d& tan)
+{
+    const std::vector<DrawCutSample>& p = stroke.path();
+    const size_t n = p.size();
+    pos = Vec3d::Zero();
+    dir = -Vec3d::UnitZ();
+    tan = Vec3d::UnitX();
+    if (n == 0)
+        return;
+    if (n == 1) {
+        pos = p[0].pos;
+        dir = draw_cut_inward_dir(stroke, params, 0);
+        tan = stroke.tangent(0);
+        return;
+    }
+
+    const std::vector<double> acc = path_arc_table(stroke);
+    size_t span = 0;
+    double t = 0.0;
+    locate_arc(stroke, acc, s, span, t);
+
+    const size_t i = span % n;
+    const size_t j = (span + 1) % n;
+
+    pos = (1.0 - t) * p[i].pos + t * p[j].pos;
+    dir = safe_normalize((1.0 - t) * draw_cut_inward_dir(stroke, params, i) +
+                         t * draw_cut_inward_dir(stroke, params, j),
+                         draw_cut_inward_dir(stroke, params, i));
+    tan = safe_normalize((1.0 - t) * stroke.tangent(i) + t * stroke.tangent(j), stroke.tangent(i));
+}
+
+// THE STRIP'S NORMAL, with its sign pinned the way the cutter's `sweep` pins it.
+//
+// t x d has an arbitrary per-sample sign - it flips with the drag direction and
+// across an inflection - so it cannot be used raw for a frame a connector stands
+// on: two connectors a few millimetres apart would point opposite ways. The
+// cutter solid already solved this by summing a coherent field over the whole
+// stroke and using ONE direction; the same sum is the reference here, so the
+// connector frame and the cutter agree on which side is which.
+Vec3d strip_reference_normal(const DrawCutStroke& stroke, const DrawCutParams& params)
+{
+    const size_t n = stroke.path().size();
+    Vec3d sum = Vec3d::Zero();
+    for (size_t i = 0; i < n; ++ i) {
+        Vec3d sn = stroke.tangent(i).cross(draw_cut_inward_dir(stroke, params, i));
+        if (sn.norm() < 1e-9)
+            continue;
+        sn.normalize();
+        if (!sum.isZero() && sn.dot(sum) < 0.0)
+            sn = -sn;
+        sum += sn;
+    }
+    return safe_normalize(sum, Vec3d::UnitY());
+}
+
+} // namespace
+
+Vec3d draw_cut_surface_point(const DrawCutStroke& stroke, const DrawCutParams& params, double s, double w)
+{
+    if (!stroke.valid())
+        return Vec3d::Zero();
+    Vec3d pos, dir, tan;
+    surface_frame_pieces(stroke, params, s, pos, dir, tan);
+    // w is measured ALONG the ruling from the stroke, positive into the part -
+    // exactly the parameter the cutter's rails use (out at -extension, in at
+    // +depth), so a point built here lies on the surface the boolean will use.
+    return pos + w * dir;
+}
+
+Vec3d draw_cut_surface_normal(const DrawCutStroke& stroke, const DrawCutParams& params, double s, double w)
+{
+    (void) w; // the ruling is straight, so the normal does not vary along it.
+    if (!stroke.valid())
+        return Vec3d::UnitZ();
+
+    Vec3d pos, dir, tan;
+    surface_frame_pieces(stroke, params, s, pos, dir, tan);
+    Vec3d nrm = tan.cross(dir);
+    if (nrm.norm() < 1e-9)
+        return strip_reference_normal(stroke, params);
+    nrm.normalize();
+
+    // THE SIGN, AND WHY A SINGLE GLOBAL REFERENCE CANNOT SUPPLY IT.
+    //
+    // t x d flips with the drag direction and across an inflection, so it cannot be
+    // used raw - two connectors a millimetre apart would point opposite ways. The
+    // cutter solid pins its `sweep` by summing the field over the whole stroke and
+    // taking ONE direction, and the first version here copied that.
+    //
+    // That is right for the cutter's sweep (one direction for one slab) and WRONG
+    // here. On a CLOSED loop the strip's normal genuinely rotates through a full
+    // turn - on a circular plug it is the radial direction, pointing a different way
+    // at every sample - so the sum cancels to nearly nothing and whatever survives
+    // is noise. Pinning to it flips the frame on roughly half the loop, which is
+    // precisely the discontinuity the pinning existed to prevent.
+    //
+    // The reference has to be LOCAL, and there is already a local field with a
+    // consistent sign: the OUTWARD BINORMAL. compute_binormals() orients it away
+    // from the loop's interior for a closed stroke and transports it for an open
+    // one, so it is continuous by construction and winding-independent. Pinning the
+    // strip normal to point the same way as the binormal makes the frame's +Z the
+    // direction "out of the plug", continuously, all the way round.
+    const Vec3d local_ref = [&]() {
+        const std::vector<DrawCutSample>& p = stroke.path();
+        const size_t n = p.size();
+        if (n == 0)
+            return Vec3d(Vec3d::UnitY());
+        // The binormal at the sample s falls nearest, which is all the precision a
+        // sign decision needs.
+        const std::vector<double> acc = path_arc_table(stroke);
+        size_t span = 0;
+        double t = 0.0;
+        locate_arc(stroke, acc, s, span, t);
+        return stroke.binormal((t < 0.5 ? span : span + 1) % n);
+    }();
+
+    if (nrm.dot(local_ref) < 0.0)
+        nrm = -nrm;
+    return nrm;
+}
+
+Transform3d draw_cut_surface_frame(const DrawCutStroke& stroke, const DrawCutParams& params,
+                                   double s, double w, double z_angle)
+{
+    if (!stroke.valid())
+        return Transform3d::Identity();
+
+    const Vec3d n = draw_cut_surface_normal(stroke, params, s, w);
+
+    // Local X: the PLANE's own X projected onto the tangent plane - the same
+    // construction curved_cut_sheet_frame() uses, including the same degenerate
+    // guard. Keeping the construction identical is what makes a connector's
+    // Rotation mean the same thing in both modes.
+    Vec3d x = Vec3d::UnitX() - Vec3d::UnitX().dot(n) * n;
+    if (x.norm() < 1e-6) {
+        // The surface normal is (nearly) the plane's X, so X projects to nothing.
+        // Use the plane's Y instead, which cannot also be degenerate.
+        x = Vec3d::UnitY() - Vec3d::UnitY().dot(n) * n;
+    }
+    x = safe_normalize(x, Vec3d::UnitX());
+    const Vec3d y = n.cross(x);
+
+    Matrix3d m;
+    m.col(0) = x;
+    m.col(1) = y;
+    m.col(2) = n;
+
+    Transform3d frame = Transform3d::Identity();
+    frame.linear() = m;
+    if (std::abs(z_angle) > 1e-12)
+        frame.rotate(Eigen::AngleAxisd(z_angle, Vec3d::UnitZ()));
+    return frame;
+}
+
+bool draw_cut_surface_project(const DrawCutStroke& stroke, const DrawCutParams& params,
+                              const Vec3d& p, double& s, double& w, double* distance)
+{
+    s = w = 0.0;
+    if (distance != nullptr)
+        *distance = 0.0;
+    if (!stroke.valid())
+        return false;
+
+    const std::vector<DrawCutSample>& path = stroke.path();
+    const size_t n = path.size();
+    const std::vector<double> acc = path_arc_table(stroke);
+    if (acc.size() < 2)
+        return false;
+
+    // A sweep over the spans, closest-point on each ruling. The strip is a ruled
+    // surface, so per span the nearest point is found by projecting onto the span's
+    // own plane - but the spans are short (the resample spacing is 1 mm) and the
+    // exact per-span optimum buys nothing over "check both ends of the span and
+    // interpolate", so this walks the SAMPLES and refines between the best two.
+    //
+    // For each sample the ruling is a line through p_i along d_i; the nearest point
+    // on that line is the plain projection, and the distance to it is what picks
+    // the winner.
+    double best_d2 = std::numeric_limits<double>::max();
+    size_t best_i  = 0;
+    double best_w  = 0.0;
+    for (size_t i = 0; i < n; ++ i) {
+        const Vec3d d = draw_cut_inward_dir(stroke, params, i);
+        const Vec3d v = p - path[i].pos;
+        const double wi = v.dot(d);
+        const double d2 = (v - wi * d).squaredNorm();
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best_i  = i;
+            best_w  = wi;
+        }
+    }
+
+    // Refine along the stroke: try the two neighbouring spans at a few subdivisions
+    // and keep the best. Cheap, and it matters because a connector placed by a
+    // click has to land where the user saw the surface, not a sample away from it.
+    const size_t span_count = stroke.is_closed() ? n : (n > 0 ? n - 1 : 0);
+    double best_s = best_i < acc.size() ? acc[best_i] : 0.0;
+    if (span_count > 0) {
+        // The two spans meeting at the winning SAMPLE. A closed stroke wraps at both
+        // ends; an open one CLAMPS - wrapping the last sample round to span 0 would
+        // refine at the wrong end of the line entirely, which on a long open stroke
+        // puts the connector's frame somewhere it has never been.
+        const size_t prev_span = stroke.is_closed() ? (best_i + n - 1) % n
+                                                    : (best_i > 0 ? best_i - 1 : 0);
+        const size_t next_span = stroke.is_closed() ? (best_i % span_count)
+                                                    : std::min(best_i, span_count - 1);
+        for (size_t span : { prev_span, next_span }) {
+            if (span + 1 >= acc.size())
+                continue;
+            const double s0 = acc[span], s1 = acc[span + 1];
+            const int steps = 8;
+            for (int k = 0; k <= steps; ++ k) {
+                const double ss = s0 + (s1 - s0) * double(k) / double(steps);
+                Vec3d pos, dir, tan;
+                surface_frame_pieces(stroke, params, ss, pos, dir, tan);
+                const Vec3d v = p - pos;
+                const double ww = v.dot(dir);
+                const double d2 = (v - ww * dir).squaredNorm();
+                if (d2 < best_d2) {
+                    best_d2 = d2;
+                    best_s  = ss;
+                    best_w  = ww;
+                }
+            }
+        }
+    }
+
+    s = best_s;
+    w = best_w;
+    if (distance != nullptr)
+        *distance = std::sqrt(best_d2);
+    return true;
+}
+
+bool draw_cut_surface_contains(const DrawCutStroke& stroke, const DrawCutParams& params,
+                               double s, double w, double margin, double depth_reach)
+{
+    if (!stroke.valid())
+        return false;
+
+    const double m = std::max(0.0, margin);
+
+    // The ruled span the cutter actually builds: out at -extension, in at +depth.
+    // A connector has to sit `margin` clear of both rims, or its body hangs off the
+    // surface and the split leaves it half-made.
+    const double lo = -std::max(0.0, params.extension) + m;
+    const double hi = std::max(0.0, depth_reach) - m;
+    if (lo > hi || w < lo || w > hi)
+        return false;
+
+    if (stroke.is_closed())
+        return true; // s wraps, so there is no end to fall off.
+
+    const std::vector<double> acc = path_arc_table(stroke);
+    if (acc.size() < 2)
+        return false;
+    // The cutter extends an open stroke by Extension along the tangent at each end,
+    // so the surface really does reach that far - but a connector on the extension
+    // is standing on surface that is outside the part, so the usable domain is the
+    // STROKE's own span with the margin taken off each end.
+    return s >= m && s <= acc.back() - m;
+}
+
+double draw_cut_surface_curvature_radius(const DrawCutStroke& stroke, const DrawCutParams& params, double s, double w)
+{
+    constexpr double Flat = 1e6;
+    if (!stroke.valid())
+        return Flat;
+
+    // ACROSS THE RULES only. Along a rule the strip is a straight line, so its
+    // curvature there is exactly zero and its radius infinite - a ruled surface is
+    // developable that way. What can bend is the walk ALONG the stroke, and that is
+    // what a hinge's knuckle run or a thread's pitch line has to sit on.
+    //
+    // Three points at (s - h, w), (s, w), (s + h, w) on the surface itself - not on
+    // the stroke - because the draft angle and the depth both change how fast the
+    // surface turns as you move out along the ruling: an outward-drafted strip
+    // opens out, so its far edge is flatter than the stroke that generated it.
+    const std::vector<double> acc = path_arc_table(stroke);
+    if (acc.size() < 2 || acc.back() < 1e-9)
+        return Flat;
+
+    // THE STEP HAS TO STRADDLE SEVERAL SAMPLES, and this is the trap. The path is a
+    // POLYGON - a 1 mm resample of whatever the user drew - so three points taken a
+    // fraction of a millimetre apart land on one or two of its straight facets and
+    // the circumradius through them measures the FACETING, not the shape. On a 6 mm
+    // ring a step of 0.59 mm reads a radius of 3.7 mm, which is wrong by a third and
+    // wrong in the direction that matters (it would warn about connectors that are
+    // fine).
+    //
+    // So the step is at least a few resample spacings - 4 mm here, which is four
+    // samples at the default - as well as a fraction of the total length. On a
+    // curve tight enough for the flat-patch warning to be interesting, that is still
+    // a small arc; on a gentle one the answer is "flat" either way.
+    const double h = std::max(4.0 * DrawCutStroke::DefaultSpacing, acc.back() / 64.0);
+
+    const Vec3d a = draw_cut_surface_point(stroke, params, s - h, w);
+    const Vec3d b = draw_cut_surface_point(stroke, params, s,     w);
+    const Vec3d c = draw_cut_surface_point(stroke, params, s + h, w);
+
+    const double ab = (b - a).norm(), bc = (c - b).norm(), ca = (a - c).norm();
+    if (ab < 1e-9 || bc < 1e-9 || ca < 1e-9)
+        return Flat;
+    const double area = 0.5 * (b - a).cross(c - a).norm();
+    if (area < 1e-12)
+        return Flat;
+    // The circumradius through the three points.
+    return std::min(Flat, (ab * bc * ca) / (4.0 * area));
+}
+
+bool draw_cut_patch_is_flat_enough(const DrawCutStroke& stroke, const DrawCutParams& params,
+                                   double s, double w, double extent)
+{
+    if (extent <= 0.0)
+        return true;
+    return draw_cut_surface_curvature_radius(stroke, params, s, w) >= CurvedConnectorFlatPatchFactor * extent;
+}
+
+double draw_cut_surface_tilt_deg(const DrawCutStroke& stroke, const DrawCutParams& params, double s, double w)
+{
+    if (!stroke.valid())
+        return 0.0;
+    const Vec3d n = draw_cut_surface_normal(stroke, params, s, w);
+    // The angle between the surface normal and the plane's +Z, taken to the nearer
+    // of the two poles: a normal pointing at -Z is the same tilt as one pointing at
+    // +Z as far as printing is concerned, and which of the two the sign lands on is
+    // an artefact of the drag direction.
+    return std::acos(std::clamp(std::abs(n.z()), 0.0, 1.0)) * 180.0 / M_PI;
 }
 
 // ---------------------------------------------------------------------------
