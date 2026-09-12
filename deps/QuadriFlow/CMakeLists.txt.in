@@ -132,9 +132,12 @@ target_include_directories(quadriflow PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/3rd/pss>
     $<INSTALL_INTERFACE:include/quadriflow>
 )
+# Eigen and Boost are build-time only: the consumer (libslic3r) already carries both on its
+# own include path, and exporting absolute paths here bakes the build tree's location into
+# the installed package (the first build exported a since-deleted worktree's Eigen dir).
 target_include_directories(quadriflow SYSTEM PUBLIC
-    ${EIGEN3_INCLUDE_DIR}
-    ${Boost_INCLUDE_DIRS}
+    $<BUILD_INTERFACE:${EIGEN3_INCLUDE_DIR}>
+    $<BUILD_INTERFACE:${Boost_INCLUDE_DIRS}>
 )
 target_link_libraries(quadriflow PUBLIC quadriflow_lemon)
 
