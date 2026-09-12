@@ -1,0 +1,8 @@
+{
+    "type": "filament",
+    "name": "Elegoo PLA Matte @base CC2",
+    "inherits": "Elegoo PLA @base CC2",
+    "from": "system",
+    "filament_id": "OFsB2lxm",
+    "instantiation": "false"
+}

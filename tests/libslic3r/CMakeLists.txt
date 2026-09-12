@@ -26,6 +26,8 @@ add_executable(${_TEST_NAME}_tests
 	test_dual_nozzle_group.cpp
 	test_elephant_foot_compensation.cpp
 	test_fill_bed_pack.cpp
+	test_elegoo_cc2_profiles.cpp
+	test_elegoo_cc2_toolchange.cpp
 	test_flexi_joint.cpp
 	test_fuzzy_skin.cpp
 	test_geometry.cpp
