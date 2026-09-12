@@ -101,9 +101,9 @@ void CopyrightsDialog::fill_entries()
         // re-encodes it for the phone's Quality steps. Their licence texts ship beside them.
         { "FFmpeg (LGPL build)",                            "",      "https://ffmpeg.org" },
         { "glad (Multi-Language GL Loader-Generator)",      "",      "https://github.com/Dav1dde/glad" },
-        { "go2rtc",                                         "",      "https://github.com/AlexxIT/go2rtc" },
         { "GLFW",                                           "",      "https://www.glfw.org" },
         { "GNU gettext",                                    "",      "https://www.gnu.org/software/gettext" },
+        { "go2rtc",                                         "",      "https://github.com/AlexxIT/go2rtc" },
         { "ImGUI",                                          "",      "https://github.com/ocornut/imgui" },
         { "ImGuizmo",                                       "",      "https://github.com/CedricGuillemet/ImGuizmo" },
         { "Libigl",                                         "",      "https://libigl.github.io" },

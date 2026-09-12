@@ -135,6 +135,33 @@ So the listener is now bound **when, and only when, there is an ffmpeg to need i
 deleted: it now asserts srtp is empty and rtsp is **either empty or loopback-only**, which is the
 property actually worth pinning.
 
+### 3.2b A variant source may not contain a space
+
+The second bug that would have shipped a black tile, and like §3.2 it was invisible in review.
+
+go2rtc refuses a stream registration whose source string contains a space:
+
+```
+400 streams: source with spaces may be insecure
+```
+
+So the natural way to write the extra encoder arguments —
+`#raw=-r 10 -b:v 600k -maxrate 600k -g:v 20` — registers **nothing at all**. The variant then does
+not exist, the phone asks for a name that 404s, and the tile is black.
+
+Nothing in the hub would have told anyone: the registration PUT is fire-and-forget on a detached
+thread with no error path, so the 400 reaches no log and no user. It surfaced only by driving a
+real go2rtc with the exact strings the hub writes.
+
+Each argument is therefore its own `#raw=` segment, one token per segment:
+
+```
+ffmpeg:<name>#video=h264#width=854#raw=-r#raw=10#raw=-b:v#raw=600k#raw=-maxrate#raw=600k#raw=-g:v#raw=20
+```
+
+go2rtc accepts this and builds the identical ffmpeg command line. The gate asserts the absence of
+spaces directly, so the readable-but-broken form cannot come back.
+
 ### 3.3 The variants, tuned
 
 `variant_src()`, per the brief's targets:
@@ -144,9 +171,11 @@ property actually worth pinning.
 | `_med` | 1280x720 | 15 fps | 1.5 Mbps | `-g:v 30` = 2 s |
 | `_low` | 854x480 | 10 fps | 0.6 Mbps | `-g:v 20` = 2 s |
 
+written as one `#raw=` segment per token (§3.2b):
+
 ```
-ffmpeg:<name>#video=h264#width=1280#raw=-r 15 -b:v 1500k -maxrate 1500k -g:v 30
-ffmpeg:<name>#video=h264#width=854#raw=-r 10 -b:v 600k -maxrate 600k -g:v 20
+ffmpeg:<name>#video=h264#width=1280#raw=-r#raw=15#raw=-b:v#raw=1500k#raw=-maxrate#raw=1500k#raw=-g:v#raw=30
+ffmpeg:<name>#video=h264#width=854#raw=-r#raw=10#raw=-b:v#raw=600k#raw=-maxrate#raw=600k#raw=-g:v#raw=20
 ```
 
 Two changes from what `feat/webrtc-video-2` sketched. **854 rather than 640** for Low: Low is meant
@@ -239,7 +268,11 @@ What it asserts:
    loopback port (§3.2);
 4. `/state` reports both `med` and `low` variants;
 5. a real pull of the low variant returns a stream whose **SPS says ≤ 854x480**, and is genuinely
-   downscaled from the 1080p source;
+   downscaled from the 1080p source — pulled as **MSE over the hub's own `/api/ws` tunnel**, the
+   path the phone actually uses, not go2rtc's `/api/stream.mp4` (which `allow_paths` deliberately
+   does not expose, so a gate using it would be testing a door the product keeps shut and would
+   read the resulting 404 as a transcode failure);
+   the variant sources it registers carry **no spaces**, asserted directly (§3.2b);
 6. the transcode is lazy — 0 ffmpeg processes idle, ≥1 while a viewer is connected, back to 0
    within ~10 s of the viewer leaving.
 
