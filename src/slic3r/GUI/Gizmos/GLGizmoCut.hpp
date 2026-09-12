@@ -393,6 +393,9 @@ class GLGizmoCut3D : public GLGizmoBase
     // Invalidate everything keyed on the stroke, the way invalidate_curved_sheet()
     // does for the sheet.
     void   invalidate_draw_stroke();
+    // Drop the cached instance mesh and its raycaster. They live in the CUT PLANE's
+    // frame, so a plane move or turn makes them stale.
+    void   invalidate_draw_pick_mesh();
     // Re-run finish() with the current panel settings and refresh the warnings.
     void   refresh_draw_stroke();
     void   update_draw_empty_sides();

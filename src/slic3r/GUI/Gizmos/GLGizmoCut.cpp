@@ -2744,6 +2744,18 @@ void GLGizmoCut3D::invalidate_draw_stroke()
     m_draw_preview_dirty = true;
 }
 
+// The instance mesh is cached in the CUT PLANE's frame, so moving or turning the
+// plane makes it stale - and both the empty-side test and the preview's bounding
+// box read it. Dropping it here forces the next use to re-derive it in the new
+// frame. (The stroke itself does NOT need re-deriving: it is expressed in that
+// frame too, so it rides along with the plane the way the sheet does.)
+void GLGizmoCut3D::invalidate_draw_pick_mesh()
+{
+    m_draw_pick_its.clear();
+    m_draw_pick_mesh.clear();
+    m_draw_raycaster.reset();
+}
+
 Vec3d GLGizmoCut3D::draw_view_dir_in_plane() const
 {
     // The camera's forward direction, taken into the cut plane's frame - the frame
@@ -3707,9 +3719,7 @@ void GLGizmoCut3D::on_set_state()
     m_draw_last_mouse  = Vec2d::Zero();
     m_draw_upper_empty = m_draw_lower_empty = false;
     m_draw_folds       = false;
-    m_draw_pick_its.clear();
-    m_draw_pick_mesh.clear();
-    m_draw_raycaster.reset();
+    invalidate_draw_pick_mesh();
     invalidate_draw_stroke();
     m_upper_visibility = m_lower_visibility = SideVisibility::Visible;
     apply_side_visibility();
@@ -4128,10 +4138,17 @@ void GLGizmoCut3D::on_dragging(const UpdateData& data)
     // instance mesh, so paying for it on every frame of a plane drag would stall
     // the drag on any real model. Note the intent here and honour it in
     // on_stop_dragging().
-    if (m_surface_mode == CutSurfaceMode::Curved && (m_hover_id == Z || m_hover_id == CutPlane || m_hover_id == CutPlaneXMove ||
-                             m_hover_id == CutPlaneYMove || m_hover_id == X || m_hover_id == Y ||
-                             m_hover_id == CutPlaneZRotation))
+    const bool plane_gesture = m_hover_id == Z || m_hover_id == CutPlane || m_hover_id == CutPlaneXMove ||
+                               m_hover_id == CutPlaneYMove || m_hover_id == X || m_hover_id == Y ||
+                               m_hover_id == CutPlaneZRotation;
+    if (m_surface_mode == CutSurfaceMode::Curved && plane_gesture)
         request_curved_fit();
+    // DRAW: the cached instance mesh is in the plane's frame, so a plane gesture
+    // makes it stale. Drop it rather than re-deriving here - the fit's own reason
+    // for being debounced (it walks the instance mesh, and a drag must not pay for
+    // that every frame) applies just as much to this.
+    if (m_surface_mode == CutSurfaceMode::Draw && plane_gesture)
+        invalidate_draw_pick_mesh();
 
     if (CutMode(m_mode) == CutMode::cutTongueAndGroove)
         reset_cut_by_contours();
@@ -5521,8 +5538,12 @@ void GLGizmoCut3D::flip_cut_plane()
         m_curved_hover_ctl = m_curved_drag_ctl = -1;
     }
 
-    if (carry_stroke)
+    if (carry_stroke) {
+        // The frame turned, so the cached instance mesh in it is stale - and
+        // refresh_draw_stroke() reads it for the empty-side test.
+        invalidate_draw_pick_mesh();
         refresh_draw_stroke();
+    }
 
     if (CutMode(m_mode) == CutMode::cutTongueAndGroove)
         reset_cut_by_contours();
