@@ -112,6 +112,28 @@ html, body { height: 100%; width: 100%; margin: 0; padding: 0; background: #000;
             if (Date.now() - t0 >= giveUp + 500) { reportMode(others[0]); clearInterval(mt); }
         }, 250);
     }
+    // Quality's Auto half needs to know when a tile cannot keep up. 'waiting' fires whenever the
+    // element runs out of buffered data, and on a link that simply cannot carry this stream it
+    // fires repeatedly in the first seconds. Two of them inside the first 8 s is the signal; one
+    // is normal at start-up while the first keyframe arrives, so it is deliberately not enough.
+    // Reported once - the page steps down and rebuilds the tile, which restarts this player.
+    {
+        const inner0 = () => video.video || video.querySelector('video');
+        let waits = 0, told = false;
+        const startedAt = Date.now();
+        const onWait = () => {
+            if (told || ++waits < 2 || Date.now() - startedAt > 8000) return;
+            told = true;
+            try { parent.postMessage({ snorcaStall: true, src: params.get('src') || '' }, location.origin); } catch (e) {}
+        };
+        const hook = () => {
+            const iv = inner0();
+            if (!iv) return false;
+            iv.addEventListener('waiting', onWait);
+            return true;
+        };
+        if (!hook()) { let n = 0; const h = setInterval(() => { if (hook() || ++n > 40) clearInterval(h); }, 250); }
+    }
     if (both && giveUp > 0) setTimeout(() => {
         if (video.pcState === WebSocket.OPEN || !video.pc) return; // WebRTC won, or was never started
         video.pcState = WebSocket.CLOSED;

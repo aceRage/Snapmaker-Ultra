@@ -367,6 +367,12 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         <option value="webrtc">Video: WebRTC</option>
         <option value="mse">Video: relay</option>
       </select>
+      <select id="videoquality" title="How much picture to send. Lower settings cost less bandwidth on a slow link.">
+        <option value="auto">Quality: auto</option>
+        <option value="high">Quality: high</option>
+        <option value="med">Quality: medium</option>
+        <option value="low">Quality: low</option>
+      </select>
     </span>
     <span id="layoutbox" title="Grid layout: columns x rows (drag a name to reorder)">
       <select id="cols"></select><span>&times;</span><select id="rows"></select>
@@ -606,6 +612,71 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     // Whether a WebRTC attempt is worth making at all, for Auto. The hub half of this is
     // remoteWebrtc (see webrtcOffered below); this adds the origin the page was loaded from.
     function webrtcUsable() { return remoteWebrtc && !serveOrigin(); }
+    // ---- Quality -------------------------------------------------------------------------
+    // What the hub can actually offer, from /state: quality[] is the variant suffixes it managed
+    // to register ('med','low' - empty when the PC has no ffmpeg for go2rtc to re-encode with),
+    // and qnames maps them per host to the go2rtc stream name to ask for. quality_mjpeg says the
+    // Bambu relay's frame-drop knob is available, which needs no encoder and so is always true.
+    var QUALITY_KEY = 'snorca_remote_quality';
+    var qualityPref = 'auto', hubQuality = [], hubQualityMjpeg = false, hostQNames = {};
+    try { var qp = localStorage.getItem(QUALITY_KEY); if (qp === 'high' || qp === 'med' || qp === 'low' || qp === 'auto') qualityPref = qp; } catch (e) {}
+    // Auto: the link decides. A Serve origin or a DERP-relayed tailnet hop is the slow case this
+    // setting exists for, so it starts low there; on the LAN it stays at the source. A tile that
+    // stalls in its first seconds drops one step by itself (see noteTileStall).
+    var qualityStalled = {};   // cell id -> true once its first seconds buffered
+    function autoQuality(id) {
+        if (serveOrigin()) return 'low';
+        if (qualityStalled[id]) return 'low';
+        return connHere === 'home' ? 'high' : 'med';
+    }
+    // The effective step for one tile, clamped to what the hub actually has: asking for '_med'
+    // when the hub registered nothing would be a 404 and a black tile, so an unavailable step
+    // falls back to the source.
+    function qualityFor(id) {
+        var q = qualityPref === 'auto' ? autoQuality(id) : qualityPref;
+        if (q === 'high') return 'high';
+        return hubQuality.indexOf(q) !== -1 ? q : 'high';
+    }
+    // The go2rtc stream name for a tile at its chosen step; the source name at 'high' or when the
+    // hub has no variant for it.
+    function qualityName(id, rname) {
+        var q = qualityFor(id);
+        if (q === 'high') return rname;
+        var m = hostQNames[id];
+        return (m && m[q]) ? m[q] : rname;
+    }
+    // The MJPEG (Bambu relay) half: a frame rate rather than a stream name, because that path has
+    // no encoder to re-scale with - see BambuCamRelay. 0 means every frame.
+    function qualityFps(id) {
+        if (!hubQualityMjpeg) return 0;
+        var q = qualityFor(id);
+        return q === 'low' ? 5 : q === 'med' ? 10 : 0;
+    }
+    var QUALITY_LABEL = { high: 'High', med: 'Medium', low: 'Low' };
+    // A tile that buffered in its first seconds steps down once and rebuilds, but only under
+    // Auto - an explicit choice is the user's and is never overridden.
+    function noteTileStall(id) {
+        if (qualityPref !== 'auto' || qualityStalled[id]) return;
+        qualityStalled[id] = true;
+        document.querySelectorAll('#grid .cell').forEach(function(c) { if (c.dataset.id === id) c.remove(); });
+        render();
+    }
+    function renderQualityBox() {
+        if (!REMOTE) return;
+        var sel = document.getElementById('videoquality');
+        if (!sel) return;
+        sel.value = qualityPref;
+        // Steps the hub cannot deliver are hidden rather than offered and silently ignored.
+        ['med', 'low'].forEach(function(q) {
+            var o = sel.querySelector('option[value="' + q + '"]');
+            if (o) o.hidden = hubQuality.indexOf(q) === -1 && !hubQualityMjpeg;
+        });
+        sel.title = 'How much picture to send. Lower settings cost less bandwidth on a slow link.' +
+                    (hubQuality.length === 0
+                     ? ' This PC has no ffmpeg, so go2rtc cannot make downscaled copies of a camera stream: only the Bambu MJPEG relay can be turned down (fewer frames per second).'
+                     : '') +
+                    (qualityPref === 'auto' ? ' Auto starts low over a remote link and at the source quality on your home network.' : '');
+    }
     function renderVideoBox() {
         if (!REMOTE) return;
         var box = document.getElementById('videobox'), sel = document.getElementById('videomode'), warn = document.getElementById('videowarn');
@@ -625,6 +696,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         var show = !!videoNote && videoPref !== 'mse' && !serveOrigin();
         warn.style.display = show ? 'inline' : 'none'; // the stylesheet hides it, so name a value
         warn.title = videoNote;
+        // The Quality select lives in the same #videobox, so its visibility is already handled;
+        // this keeps its labels and its hidden options in step with the same render.
+        renderQualityBox();
     }
     // Phone mode: pull the list from the PC now and every 15 s.
     function fetchRemoteState() {
@@ -635,6 +709,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             var wasMode = remoteVideoMode();
             remoteWebrtc = !!(s && s.webrtc);
             videoNote = (s && s.video_note) || '';
+            hubQuality      = (s && s.quality) || [];
+            hubQualityMjpeg = !!(s && s.quality_mjpeg);
+            hostQNames = {};
+            hosts.forEach(function(h) { if (h.qnames) hostQNames[h.id] = h.qnames; });
+            renderQualityBox();
             var changed = JSON.stringify(hosts) !== JSON.stringify(state.hosts) || remoteVideoMode() !== wasMode;
             renderVideoBox();
             state.hosts = hosts;
@@ -939,7 +1018,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         sel.setAttribute('aria-label', 'Stream mode');
         sel.setAttribute('data-active', active);
         streamModes().forEach(function(m) {
-            var o = el('option', '', m === 'auto' ? 'Auto · ' + (MODE_LABEL[active] || active) : MODE_LABEL[m]);
+            // "Auto · WebRTC · Low": the path it settled on, then the quality step, but only
+            // when that step is not the source (High is the unremarkable case and stays unsaid).
+            var qs = qualityFor(id);
+            var lbl = 'Auto · ' + (MODE_LABEL[active] || active) + (qs !== 'high' ? ' · ' + QUALITY_LABEL[qs] : '');
+            var o = el('option', '', m === 'auto' ? lbl : MODE_LABEL[m]);
             o.value = m;
             if ((modePrefs[id] || 'auto') === m) o.selected = true;
             sel.appendChild(o);
@@ -1001,7 +1084,17 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 if (!sel) return;
                 sel.setAttribute('data-active', d.snorcaMode);
                 var opt = sel.querySelector('option[value="auto"]');
-                if (opt) opt.textContent = 'Auto · ' + (MODE_LABEL[d.snorcaMode] || d.snorcaMode);
+                var qs2 = qualityFor(id);
+                if (opt) opt.textContent = 'Auto · ' + (MODE_LABEL[d.snorcaMode] || d.snorcaMode) +
+                                           (qs2 !== 'high' ? ' · ' + QUALITY_LABEL[qs2] : '');
+            });
+        }
+        // A tile that could not keep up in its first seconds: under Auto, step its quality down
+        // once. Same cell lookup as above.
+        if (d.snorcaStall === true) {
+            document.querySelectorAll('#grid .cell').forEach(function(cell) {
+                var fr = cell.querySelector('iframe');
+                if (fr && fr.contentWindow === e.source && cell.dataset.id) noteTileStall(cell.dataset.id);
             });
         }
         if (typeof d.snorcaAspect !== 'number') return;
@@ -1029,7 +1122,10 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             var f = document.createElement('iframe');
             f.allow = 'autoplay';
             f.setAttribute('scrolling', 'no'); // iOS otherwise grows the frame to its content
-            f.src = '/stream.html?src=' + encodeURIComponent(h.rname) + '&mode=' + encodeURIComponent(streamMode(h.id));
+            // The stream name carries the quality step (a '<name>_med' / '_low' variant the hub
+            // registered, or the source name), so a slow link asks go2rtc for less picture rather
+            // than throttling a full one.
+            f.src = '/stream.html?src=' + encodeURIComponent(qualityName(h.id, h.rname)) + '&mode=' + encodeURIComponent(streamMode(h.id));
             cell.appendChild(f);
             modePicker(cell, h.id);
         } else if (h.rkind === 'p1') {
@@ -1040,7 +1136,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             im.addEventListener('load', function() {
                 if (im.naturalWidth && im.naturalHeight) setCellAspect(cell, im.naturalWidth / im.naturalHeight);
             });
-            im.src = REMOTE + 'bambu?id=' + encodeURIComponent(h.id);
+            // The MJPEG relay has no encoder to downscale with, so its quality knob is a frame
+            // rate (BambuCamRelay drops whole JPEGs). 0 = every frame, and the parameter is left
+            // off entirely then so nothing changes for the High case.
+            var fps = qualityFps(h.id);
+            im.src = REMOTE + 'bambu?id=' + encodeURIComponent(h.id) + (fps ? '&fps=' + fps : '');
             cell.appendChild(im);
         } else if (h.rkind === 'url' && h.rurl) {
             var f2 = document.createElement('iframe');
@@ -1653,6 +1753,18 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             tileMode = {};
             document.querySelectorAll('#grid .cell').forEach(function(cell) { cell.remove(); });
             renderVideoBox(); render();
+        };
+        var qsel = document.getElementById('videoquality');
+        qsel.value = qualityPref;
+        qsel.onchange = function() {
+            qualityPref = qsel.value;
+            try { localStorage.setItem(QUALITY_KEY, qualityPref); } catch (e) {}
+            // A step the user chose clears what Auto had learned, so going back to Auto starts
+            // from the link again rather than from an old stall.
+            qualityStalled = {};
+            // The step is in every tile's URL (a stream name, or ?fps=): drop them and rebuild.
+            document.querySelectorAll('#grid .cell').forEach(function(cell) { cell.remove(); });
+            renderQualityBox(); render();
         };
         document.getElementById('videowarn').onclick = function() { if (videoNote) alert(videoNote); };
     }

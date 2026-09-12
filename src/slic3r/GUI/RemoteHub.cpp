@@ -846,6 +846,63 @@ static std::string go2rtc_exe_path()
     return fs::path(resources_dir() + "/tools/go2rtc/go2rtc.exe").make_preferred().string();
 }
 
+// ---- Stream quality variants -------------------------------------------------------------
+// The phone's Quality setting picks a *stream name*: "<name>" as the camera sends it, or a
+// "<name>_med" / "<name>_low" variant registered beside it. Registering those variants means
+// re-encoding, and go2rtc re-encodes by shelling out to an ffmpeg binary (its `ffmpeg:` source
+// scheme) - it does not carry a codec of its own. We do not bundle ffmpeg: resources/tools/go2rtc
+// holds go2rtc.exe and nothing else, and the Bambu live view's own camera tooling is not ours to
+// repurpose. So the variants exist only when the user has an ffmpeg on PATH, and the hub says so
+// rather than registering streams that would fail to start.
+//
+// What still works without ffmpeg, and is therefore what Quality actually does today:
+//   * the Bambu MJPEG relay drops frames (BambuCamRelay, ?fps=), which needs no decoder at all -
+//     whole JPEGs are forwarded or skipped - and is the setting that helps most on a slow link,
+//     because MJPEG's bitrate is very nearly linear in frame rate;
+//   * the phone asks for a variant name and falls back to the source name when it is absent, so
+//     the plumbing is live and an ffmpeg on PATH lights the rest up with no page change.
+static std::string ffmpeg_path()
+{
+    // Beside go2rtc first (where a user would drop one so go2rtc finds it), then PATH.
+    const std::string beside = fs::path(resources_dir() + "/tools/go2rtc/ffmpeg.exe").make_preferred().string();
+    boost::system::error_code ec;
+    if (fs::exists(beside, ec)) return beside;
+#ifdef _WIN32
+    std::string out; int code = 0;
+    if (run_capture({ "where", "ffmpeg" }, out, code, 8000) && code == 0) {
+        std::istringstream is(out); std::string line;
+        if (std::getline(is, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty()) return line;
+        }
+    }
+#endif
+    return "";
+}
+// The variant suffixes the hub can actually register, in descending quality. Empty without an
+// ffmpeg: a stream go2rtc cannot start is worse than an absent one, because the tile would go
+// black instead of falling back. Computed once - an ffmpeg appearing mid-run is not worth a
+// PATH lookup per request - and the hub logs which case it is at startup.
+static const std::vector<std::string>& quality_variants()
+{
+    static const std::vector<std::string> v = [] {
+        std::vector<std::string> out;
+        if (!ffmpeg_path().empty()) out = { "med", "low" };
+        return out;
+    }();
+    return v;
+}
+
+// go2rtc's `ffmpeg:` source, pointed back at the stream the hub already registered, so a variant
+// is a re-encode of our own stream rather than a second connection to the printer - the camera
+// still sees exactly one consumer. #hardware lets go2rtc pick a GPU encoder (dxva2/cuda on this
+// platform) and fall back to software by itself.
+static std::string variant_src(const std::string& base_name, const std::string& q)
+{
+    const std::string scale = (q == "low") ? "#width=640" : "#width=1280";
+    const std::string rate  = (q == "low") ? "#raw=-r 10" : "";
+    return "ffmpeg:" + base_name + "#video=h264#hardware" + scale + rate;
+}
 // ---- WebRTC (Phase 2): go2rtc's media port ------------------------------------------------
 // Everything else the hub runs is loopback-only, but WebRTC media goes straight from go2rtc to
 // the phone, so this one port has to be reachable on the LAN and on the tailnet. A predictable
@@ -1948,6 +2005,23 @@ void HubServer::register_streams()
                     std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // go2rtc may still be starting
                 }
             }).detach();
+            // Quality variants beside the source stream, when an ffmpeg exists to make them (see
+            // quality_variants()). Each is a re-encode of the stream just registered, not a second
+            // connection to the printer, so the camera still sees one consumer. Registered lazily
+            // by go2rtc - the ffmpeg process only starts when a viewer actually opens the variant,
+            // so an unused _med/_low costs nothing.
+            for (const std::string& q : quality_variants()) {
+                const std::string vurl = base + "/api/streams?name=" + name + "_" + q +
+                                         "&src=" + percent_encode(variant_src(name, q));
+                std::thread([vurl]() {
+                    for (int attempt = 0; attempt < 3; ++attempt) {
+                        bool ok = false;
+                        Http::put2(vurl).timeout_connect(2).timeout_max(5).on_complete([&ok](std::string, unsigned) { ok = true; }).perform_sync();
+                        if (ok) return;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                    }
+                }).detach();
+            }
         }
     } catch (...) {}
 }
@@ -1997,6 +2071,13 @@ std::string HubServer::state_for_phone()
     // block it - one sentence the viewer can act on. The player falls back to MSE either way.
     out["webrtc"]     = webrtc_port > 0;
     out["video_note"] = (webrtc_port > 0 && fw.state != "allowed") ? fw.note : "";
+    // Quality: which downscaled variants the hub was able to register. Empty means "source only",
+    // and the page then shows Quality as High-only rather than offering settings that do nothing.
+    // See ffmpeg_path(): transcoded variants need an ffmpeg we do not bundle. The Bambu MJPEG
+    // relay's frame-drop knob needs no encoder, so it is reported separately and is always on.
+    out["quality"]      = json::array();
+    for (const std::string& q : quality_variants()) out["quality"].push_back(q);
+    out["quality_mjpeg"] = true; // ?fps= on the Bambu relay, decoder-free
     try {
         json j = json::parse(state);
         for (const auto& h : j.value("hosts", json::array())) {
@@ -2009,6 +2090,14 @@ std::string HubServer::state_for_phone()
             if (!u1_h264_url(h).empty()) {
                 p["rname"] = u1_stream_name(h.value("id", "")); // the go2rtc stream fed by /relay/h264
                 p["relay"] = true;                               // rurl still works on the LAN
+            }
+            // The variant stream names this host actually has, so the page asks for a name that
+            // exists rather than guessing "<name>_low" and getting a 404 from go2rtc.
+            if (!p["rname"].get<std::string>().empty()) {
+                json qn = json::object();
+                for (const std::string& q : quality_variants())
+                    qn[q] = p["rname"].get<std::string>() + "_" + q;
+                p["qnames"] = qn;
             }
             out["hosts"].push_back(p);
         }
@@ -3030,7 +3119,14 @@ void HubServer::serve(std::unique_ptr<tcp::socket> owner, bool admin)
             if (!lookup_host(query_param(r.query, "id"), ip, code) || code.empty()) { respond(client, 404, "text/plain", "unknown camera"); return; }
             const int relay = BambuCamRelay::get().port();
             if (relay == 0) { respond(client, 503, "text/plain", "camera relay is not running"); return; }
-            const std::string new_head = "GET /bambu?ip=" + percent_encode(ip) + "&code=" + percent_encode(code) + " HTTP/1.1\r\n" +
+            // Quality for the MJPEG path: the phone passes ?fps= and the relay drops frames to
+            // match (BambuCamRelay). Clamped here as well as there - this is the tunnelled
+            // listener, so the value arrives from the phone and must reach the relay as nothing
+            // but a small integer.
+            int fps = std::atoi(query_param(r.query, "fps").c_str());
+            if (fps < 0 || fps > 60) fps = 0;
+            const std::string new_head = "GET /bambu?ip=" + percent_encode(ip) + "&code=" + percent_encode(code) +
+                                         (fps > 0 ? "&fps=" + std::to_string(fps) : "") + " HTTP/1.1\r\n" +
                                          r.head.substr(r.head.find("\r\n") + 2);
             tunnel(client, relay, force_close(new_head), "");
         } else if (rest == "/ff") {
