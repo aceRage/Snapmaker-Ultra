@@ -436,5 +436,31 @@ editing these shared scripts.
 | Real-data-dir guard, both gates, pointed at `%APPDATA%\EdgeSlicer` | `refusing to run against the real data dir (...)`, exit 1 |
 | Missing-install bail | `no install at ... - run cmake --install first`, exit 1 |
 | `gate_smart.sh` mapping, simulated | `RemoteHub.cpp` -> `... webrtc quality hardening`; `HttpServer.cpp` -> `lan ctl hardening`; `Print.cpp` -> `lan ctl reopen` (unchanged) |
+| **`test_hardening.py` against a scratch install built from this worktree** | **RESULT: PASS — 74 checks, 0 failures** |
+| **`test_security_next.py`, same install** | **RESULT: PASS — 35 checks, 0 failures** |
+| Teardown | 0 leftover `EdgeSlicer.exe` on `dd_hard` / `dd_secnext`; the owner's live hub on `%APPDATA%\EdgeSlicer` untouched throughout |
 
 `gate_all.sh` itself was not run, per the brief.
+
+### Two real bugs the first end-to-end run caught
+
+Neither was visible from static checks, and both were in the port rather than the product.
+
+1. **Section F had no instance to test against.** The hidden slicer was launched as
+   `EXE --datadir <dd>` with no model. Launched that way it exits immediately and never
+   registers under `hub/instances`, so section F failed with "0 listed". `run_control_app.py`
+   always passes a file; the gate now does the same (`h2d_copy.3mf`, overridable with
+   `SNORCA_TEST_MODEL`, omitted if absent). With a model the instance stays up, registers, and
+   section F passes.
+2. **The LAN-refusal probe expected the wrong refusal.** Phase 0a refused a LAN-origin
+   `/hub/*` with a 404 on the single listener. Phase 0b's admin listener is loopback-only, so
+   a LAN peer cannot connect at all — status 0, a *strictly stronger* result that the ported
+   assertion read as a failure. It now accepts unreachable-or-404 and still rejects 200.
+   (`test_hardening.py` already asserted the stronger form, so the two gates now agree.)
+
+One further assertion was relaxed as a genuine test bug, not a product one:
+`same stamp, different random suffix` compared two uploads' timestamps, which fails whenever
+they straddle a second boundary. The property that matters is the random suffix keeping folder
+names collision-proof, so the check now asserts distinct suffixes and merely notes a straddled
+boundary. Observed failing once on a boundary and passing on the re-run with the same code
+path — the product behaviour was correct both times.
