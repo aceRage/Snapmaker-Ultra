@@ -154,11 +154,23 @@ floor, not a total. Fixing the first class of error made the count go **up** bef
 down, because the validator finally reached vendors it had never loaded. Anyone re-running this
 should expect that.
 
-Baseline on this branch's parent: **26 errors**, matching the Creality/Anycubic spec's §6.7.
+Baseline on this branch's parent: **26 `[error]` log lines**, matching the Creality/Anycubic
+spec's §6.7 headline.
+
+**"26" counts lines, not distinct errors**, and the distinction matters. Each dangling
+`inherits` logs two to four lines, so the 26 are 9 inherits + 7 `printer_variant` + 1 parse
+failure = **17 distinct errors**, with 10 more hidden behind the abort. An independent
+re-derivation using per-vendor sweeps (which avoid the abort entirely) puts the parent tree at
+**27 distinct errors** and the pre-import baseline at **17** — so **yesterday's Creality import
+introduced 10 of them**, the `renamed_from` collisions in class 3 below. The Creality/Anycubic
+spec's §6.7 claim that the 26 were "identical to the 26 on the baseline — no regression" is
+wrong on both halves; that spec still wants the correction, which is left to its owner rather
+than edited from this branch.
 
 ### Cause and fix, by class
 
 **1. Nine `can not find inherits` (18 of the 26 lines) — an empty manifest.**
+
 
 Every missing parent (`fdm_filament_abs`, `fdm_filament_tpu`, `fdm_filament_common`,
 `Generic ABS @System`, `AliZ PA-CF @base`) exists on disk under
@@ -233,15 +245,26 @@ validator aborted at the dangling inherits long before it reached Snapmaker. Reg
 library removed the abort, not added the clash. Measured both ways: 54 cross-vendor duplicate
 names exist without the library registered, 130 with it.
 
+The runtime tolerates it deliberately: `PresetCollection::merge_presets` (`Preset.cpp:3238`)
+special-cases `SM_BUNDLE == "Snapmaker"` — a clashing **Snapmaker** preset is kept alongside
+BBL's, where any other vendor's would be dropped. So nothing is lost at runtime, but which copy
+`find_preset` returns depends on load order, i.e. on the filesystem.
+
 Resolving it means renaming user-selectable presets, which changes what users see in their
 filament list and risks their saved selections — a decision that belongs to the owner, not to a
-housekeeping branch. Left alone and recorded here.
+housekeeping branch. If it is taken up, the shape is: rename the ten Snapmaker files, their
+`name` fields and their `Snapmaker.json` entries to `Generic X @Snapmaker U1`, which keeps the
+UI label via `@`-derivation. Do **not** add `renamed_from: "Generic X"` — that bare name is
+still BBL's live preset, so the rename map would be ambiguous. Existing U1 projects referencing
+the bare name need their own compatibility call. Left alone and recorded here; until it is
+done, this one CI gate stays red.
 
 ### Verification
 
 | What | Result |
 |---|---|
-| CI's own `OrcaSlicer_profile_validator -l 2`, baseline (branch parent) | 26 errors |
+| CI's own `OrcaSlicer_profile_validator -l 2`, baseline (branch parent) | 26 `[error]` lines = 17 distinct, +10 hidden by the abort |
+| same, per-vendor sweep (avoids the abort), branch parent vs pre-import | 27 vs 17 distinct — the import added 10 |
 | same, after the fixes | **10 errors**, all the pre-existing Snapmaker/BBL name clash |
 | same, with only the `printer_variant` fixes (library manifest left empty) | 8 errors — isolates the two classes |
 | `orca_extra_profile_check.py` (assets, default) | **0 errors** |
