@@ -189,6 +189,16 @@ const std::string PROJECT_EMBEDDED_FILAMENT_PRESETS_FILE = "Metadata/filament_se
 const std::string PROJECT_EMBEDDED_PRINTER_PRESETS_FILE = "Metadata/machine_settings_";
 const std::string CUT_INFORMATION_FILE = "Metadata/cut_information.xml";
 
+// RE-EDITABLE CUTS. The cut RECIPE (surface, parameters, connector definitions) and, beside it,
+// the pre-cut mesh blobs it refers to, one file per distinct mesh named by its own SHA-256.
+//
+// Both live under Metadata/ and NEITHER is referenced from the main <resources> model, so an
+// upstream slicer that knows nothing about them loads the file and simply sees the two cut
+// halves - exactly the contract Metadata/cut_information.xml and Metadata/image_fill/ already
+// keep. The mesh is stored ONCE per cut and shared by both halves through its hash.
+const std::string CUT_RECIPE_FILE = "Metadata/cut_recipe.xml";
+const std::string CUT_RECIPE_MESH_DIR = "Metadata/cut_recipe/";
+
 const unsigned int AUXILIARY_STR_LEN = 12;
 const unsigned int METADATA_STR_LEN = 9;
 
@@ -966,6 +976,17 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             std::vector<Connector> connectors;
         };
 
+        // RE-EDITABLE CUTS. One per object that carried a recipe, keyed the same way as
+        // CutObjectInfo: by the 1-based 3MF object id. The mesh is NOT here - the recipe
+        // records the hash of the blob it wants, and the blobs arrive as separate archive
+        // entries which may be read before or after this file, so they are collected
+        // separately and joined up once the whole archive has been walked.
+        struct CutRecipeInfo
+        {
+            CutRecipe   recipe;
+            std::string mesh_hash;
+        };
+
         // Map from a 1 based 3MF object ID to a 0 based ModelObject index inside m_model->objects.
         //typedef std::pair<std::string, int> Id; // BBS: encrypt
         typedef std::map<Id, CurrentObject> IdToCurrentObjectMap;
@@ -975,6 +996,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         typedef std::vector<Instance> InstancesList;
         typedef std::map<int, ObjectMetadata> IdToMetadataMap;
         typedef std::map<int, CutObjectInfo>  IdToCutObjectInfoMap;
+        typedef std::map<int, CutRecipeInfo>  IdToCutRecipeInfoMap;
         //typedef std::map<Id, Geometry> IdToGeometryMap;
         typedef std::map<int, std::vector<coordf_t>> IdToLayerHeightsProfileMap;
         typedef std::map<int, t_layer_config_ranges> IdToLayerConfigRangesMap;
@@ -1169,6 +1191,11 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         CurrentConfig m_curr_config;
         IdToMetadataMap m_objects_metadata;
         IdToCutObjectInfoMap       m_cut_object_infos;
+        // RE-EDITABLE CUTS: the recipes, and the mesh blobs they name. The blobs are keyed by
+        // their own SHA-256, so two halves of one cut find the same entry and the mesh is held
+        // once no matter how many objects refer to it.
+        IdToCutRecipeInfoMap       m_cut_recipe_infos;
+        std::map<std::string, TriangleMesh> m_cut_recipe_meshes;
         IdToLayerHeightsProfileMap m_layer_heights_profiles;
         IdToLayerConfigRangesMap m_layer_config_ranges;
         IdToBrimPointsMap m_brim_ear_points;
@@ -1234,6 +1261,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         bool _extract_xml_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, XML_StartElementHandler start_handler, XML_EndElementHandler end_handler);
         bool _extract_model_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat);
         void _extract_cut_information_from_archive(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat, ConfigSubstitutionContext &config_substitutions);
+        // RE-EDITABLE CUTS: Metadata/cut_recipe.xml, and one Metadata/cut_recipe/<sha256>.bin
+        // pre-cut mesh blob per distinct mesh.
+        void _extract_cut_recipe_from_archive(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat);
+        void _extract_cut_recipe_mesh_from_archive(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat);
         void _extract_layer_heights_profile_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat);
         void _extract_layer_config_ranges_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, ConfigSubstitutionContext& config_substitutions);
         void _extract_sla_support_points_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat);
@@ -1972,6 +2003,15 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     // extract object cut info
                     _extract_cut_information_from_archive(archive, stat, config_substitutions);
                 }
+                // RE-EDITABLE CUTS. The recipe file and the mesh blobs it names. Both are
+                // plain extra Metadata entries; a 3MF without them simply loads objects with
+                // no recipe, which is every file written before this feature.
+                else if (boost::algorithm::iequals(name, CUT_RECIPE_FILE)) {
+                    _extract_cut_recipe_from_archive(archive, stat);
+                }
+                else if (boost::algorithm::istarts_with(name, CUT_RECIPE_MESH_DIR)) {
+                    _extract_cut_recipe_mesh_from_archive(archive, stat);
+                }
                 //BBS: project embedded presets
                 else if (!dont_load_config && boost::algorithm::istarts_with(name, PROJECT_EMBEDDED_PRINT_PRESETS_FILE)) {
                     // extract slic3r layer config ranges file
@@ -2244,6 +2284,32 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     // the defaults set by CutInfo stand.
                     if (connector.has_flexi)
                         model_object->volumes[connector.volume_id]->cut_info.flexi = connector.flexi;
+                }
+            }
+
+            // RE-EDITABLE CUTS. The recipe, and the pre-cut mesh it names. The mesh blobs
+            // are separate archive entries that may have been read before or after
+            // cut_recipe.xml, so the join happens here, once both are in hand.
+            IdToCutRecipeInfoMap::iterator cut_recipe_info = m_cut_recipe_infos.find(object.second + 1);
+            if (cut_recipe_info != m_cut_recipe_infos.end()) {
+                CutRecipe recipe = cut_recipe_info->second.recipe;
+                auto mesh_it = m_cut_recipe_meshes.find(cut_recipe_info->second.mesh_hash);
+                if (mesh_it == m_cut_recipe_meshes.end()) {
+                    // The recipe survived but its mesh did not (a hand-edited archive, or a
+                    // blob that failed its own hash check). Without the pre-cut mesh there is
+                    // nothing to re-cut, so the recipe is dropped and the object simply loads
+                    // as a plain cut half - no "Edit cut", rather than a broken one.
+                    BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cut recipe for object "
+                                               << (object.second + 1) << " names mesh "
+                                               << cut_recipe_info->second.mesh_hash
+                                               << " which is not in the archive, recipe dropped";
+                } else {
+                    recipe.mesh = mesh_it->second;
+                    if (recipe.valid())
+                        model_object->cut_recipe = std::move(recipe);
+                    else
+                        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cut recipe for object "
+                                                   << (object.second + 1) << " is not self-consistent, dropped";
                 }
             }
         }
@@ -2737,6 +2803,331 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 m_cut_object_infos.insert({ obj_idx, cut_info });
             }
         }
+    }
+
+    // RE-EDITABLE CUTS: Metadata/cut_recipe.xml.
+    //
+    // Everything read here is UNTRUSTED file content. The discipline is the one the
+    // cut_information.xml reader already follows: every enum is range-checked before it is
+    // cast, every count that drives an allocation is bounded, and a record that does not
+    // add up is dropped rather than half-applied - a recipe that cannot reproduce the cut
+    // exactly is worse than no recipe, because "Edit cut" would then silently make a
+    // DIFFERENT cut from the one the halves were made with.
+    void _BBS_3MF_Importer::_extract_cut_recipe_from_archive(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat)
+    {
+        if (stat.m_uncomp_size == 0)
+            return;
+        std::string buffer((size_t) stat.m_uncomp_size, 0);
+        if (mz_zip_reader_extract_file_to_mem(&archive, stat.m_filename, (void *) buffer.data(), (size_t) stat.m_uncomp_size, 0) == 0) {
+            add_error("Error while reading cut recipe data to buffer");
+            return;
+        }
+
+        pt::ptree tree;
+        try {
+            std::istringstream iss(buffer);
+            pt::read_xml(iss, tree);
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cut recipe is not valid XML (" << e.what() << "), ignored";
+            return;
+        }
+
+        const auto recipes = tree.get_child_optional("cut_recipes");
+        if (!recipes)
+            return;
+
+        for (const auto &entry : *recipes) {
+            if (entry.first != "recipe")
+                continue;
+            const pt::ptree &rt = entry.second;
+
+            const int obj_idx = rt.get<int>("<xmlattr>.object_id", -1);
+            if (obj_idx <= 0) {
+                add_error("Found invalid cut recipe object id");
+                continue;
+            }
+            if (m_cut_recipe_infos.find(obj_idx) != m_cut_recipe_infos.end()) {
+                add_error("Found duplicated cut recipe object id");
+                continue;
+            }
+
+            CutRecipe r;
+            r.version = rt.get<int>("<xmlattr>.version", 0);
+            // A recipe from a SCHEMA WE DO NOT KNOW is dropped, not guessed at. The object
+            // still loads; it simply has no "Edit cut".
+            if (r.version != CutRecipeVersion) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cut recipe for object " << obj_idx
+                                           << " has unsupported version " << r.version << ", ignored";
+                continue;
+            }
+
+            const int kind = rt.get<int>("<xmlattr>.kind", int(CutRecipeKind::Plane));
+            if (!cut_recipe_kind_valid(kind)) {
+                add_error("Invalid cut recipe kind " + std::to_string(kind));
+                continue;
+            }
+            r.kind = CutRecipeKind(kind);
+
+            // --- the cut frame, in the OBJECT's coordinate system ---------------------
+            r.plane_center = Vec3d(rt.get<double>("<xmlattr>.center_x", 0.),
+                                   rt.get<double>("<xmlattr>.center_y", 0.),
+                                   rt.get<double>("<xmlattr>.center_z", 0.));
+            {
+                // The rotation is written as its 16 matrix entries, row-major, so no Euler
+                // convention has to be agreed between writer and reader.
+                const std::string m = rt.get<std::string>("<xmlattr>.rotation", "");
+                std::vector<double> v;
+                if (!m.empty()) {
+                    std::istringstream iss(m);
+                    double x;
+                    while (iss >> x)
+                        v.push_back(x);
+                }
+                if (v.size() == 16) {
+                    Transform3d t = Transform3d::Identity();
+                    for (int row = 0; row < 4; ++row)
+                        for (int col = 0; col < 4; ++col)
+                            t(row, col) = v[size_t(row) * 4 + size_t(col)];
+                    r.rotation_m = t;
+                } else if (!m.empty()) {
+                    add_error("Invalid cut recipe rotation matrix");
+                    continue;
+                }
+            }
+
+            // --- shared parameters ---------------------------------------------------
+            r.thickness = rt.get<double>("<xmlattr>.thickness", 0.);
+            {
+                const int off = rt.get<int>("<xmlattr>.thickness_offset", int(CutThicknessOffset::Centred));
+                r.thickness_offset = (off >= int(CutThicknessOffset::Centred) && off <= int(CutThicknessOffset::Below)) ?
+                                     CutThicknessOffset(off) : CutThicknessOffset::Centred;
+            }
+            r.keep_upper         = rt.get<int>("<xmlattr>.keep_upper", 1) != 0;
+            r.keep_lower         = rt.get<int>("<xmlattr>.keep_lower", 1) != 0;
+            r.keep_as_parts      = rt.get<int>("<xmlattr>.keep_as_parts", 0) != 0;
+            r.place_on_cut_upper = rt.get<int>("<xmlattr>.place_on_cut_upper", 1) != 0;
+            r.place_on_cut_lower = rt.get<int>("<xmlattr>.place_on_cut_lower", 0) != 0;
+            r.rotate_upper       = rt.get<int>("<xmlattr>.rotate_upper", 0) != 0;
+            r.rotate_lower       = rt.get<int>("<xmlattr>.rotate_lower", 0) != 0;
+            r.upper_visibility   = std::max(0, std::min(2, rt.get<int>("<xmlattr>.upper_visibility", 0)));
+            r.lower_visibility   = std::max(0, std::min(2, rt.get<int>("<xmlattr>.lower_visibility", 0)));
+
+            // --- drawn-cut sweep parameters ------------------------------------------
+            {
+                const int dir = rt.get<int>("<xmlattr>.draw_direction", int(DrawCutDirection::SurfaceNormal));
+                r.draw_direction = (dir >= int(DrawCutDirection::SurfaceNormal) && dir <= int(DrawCutDirection::AxisZ)) ?
+                                   dir : int(DrawCutDirection::SurfaceNormal);
+            }
+            r.draw_view_dir    = Vec3d(rt.get<double>("<xmlattr>.draw_view_x", 0.),
+                                       rt.get<double>("<xmlattr>.draw_view_y", 0.),
+                                       rt.get<double>("<xmlattr>.draw_view_z", -1.));
+            r.draw_extension   = rt.get<double>("<xmlattr>.draw_extension", 5.);
+            r.draw_angle_deg   = rt.get<double>("<xmlattr>.draw_angle", 0.);
+            r.draw_through_all = rt.get<int>("<xmlattr>.draw_through_all", 1) != 0;
+            r.draw_depth       = rt.get<double>("<xmlattr>.draw_depth", 10.);
+
+            // --- the curved sheet ----------------------------------------------------
+            if (const auto sheet_tree = rt.get_child_optional("sheet")) {
+                CutRecipeSheet &sh = r.sheet;
+                sh.nx          = sheet_tree->get<int>("<xmlattr>.nx", 0);
+                sh.ny          = sheet_tree->get<int>("<xmlattr>.ny", 0);
+                sh.half_size_u = sheet_tree->get<double>("<xmlattr>.half_size_u", 0.);
+                sh.half_size_v = sheet_tree->get<double>("<xmlattr>.half_size_v", 0.);
+                // The grid drives an allocation of nx*ny doubles: bound it before reserving.
+                // CurvedCutSheet's own MaxResolution is the natural ceiling.
+                if (sh.nx < 0 || sh.ny < 0 || sh.nx > CurvedCutSheet::MaxResolution || sh.ny > CurvedCutSheet::MaxResolution) {
+                    add_error("Invalid cut recipe sheet grid");
+                    continue;
+                }
+                const std::string vals = sheet_tree->get<std::string>("<xmlattr>.values", "");
+                std::istringstream iss(vals);
+                double z;
+                while (iss >> z)
+                    sh.values.push_back(z);
+                if (sh.values.size() != size_t(sh.nx) * size_t(sh.ny)) {
+                    add_error("Cut recipe sheet value count does not match its grid");
+                    continue;
+                }
+            }
+
+            // --- the drawn stroke ----------------------------------------------------
+            if (const auto stroke_tree = rt.get_child_optional("stroke")) {
+                CutRecipeStroke &st = r.stroke;
+                st.closed    = stroke_tree->get<int>("<xmlattr>.closed", 0) != 0;
+                st.smoothing = stroke_tree->get<double>("<xmlattr>.smoothing", 0.2);
+                for (const auto &sample : *stroke_tree) {
+                    if (sample.first != "s")
+                        continue;
+                    DrawCutSample smp;
+                    smp.pos    = Vec3d(sample.second.get<double>("<xmlattr>.px", 0.),
+                                       sample.second.get<double>("<xmlattr>.py", 0.),
+                                       sample.second.get<double>("<xmlattr>.pz", 0.));
+                    smp.normal = Vec3d(sample.second.get<double>("<xmlattr>.nx", 0.),
+                                       sample.second.get<double>("<xmlattr>.ny", 0.),
+                                       sample.second.get<double>("<xmlattr>.nz", 1.));
+                    // facet is an index into a mesh this reader does not have; it is advisory
+                    // only (finish() re-derives everything it needs), so a stale one is
+                    // harmless, but keep it bounded to a plausible value all the same.
+                    const long long facet = sample.second.get<long long>("<xmlattr>.f", 0);
+                    smp.facet = (facet >= 0) ? size_t(facet) : 0;
+                    st.samples.emplace_back(smp);
+                }
+            }
+
+            // --- tongue and groove ---------------------------------------------------
+            if (const auto groove_tree = rt.get_child_optional("groove")) {
+                CutRecipeGroove &g   = r.groove;
+                g.depth              = groove_tree->get<float>("<xmlattr>.depth", 0.f);
+                g.width              = groove_tree->get<float>("<xmlattr>.width", 0.f);
+                g.flaps_angle        = groove_tree->get<float>("<xmlattr>.flaps_angle", 0.f);
+                g.angle              = groove_tree->get<float>("<xmlattr>.angle", 0.f);
+                g.depth_init         = groove_tree->get<float>("<xmlattr>.depth_init", 0.f);
+                g.width_init         = groove_tree->get<float>("<xmlattr>.width_init", 0.f);
+                g.flaps_angle_init   = groove_tree->get<float>("<xmlattr>.flaps_angle_init", 0.f);
+                g.angle_init         = groove_tree->get<float>("<xmlattr>.angle_init", 0.f);
+                g.depth_tolerance    = groove_tree->get<float>("<xmlattr>.depth_tolerance", 0.1f);
+                g.width_tolerance    = groove_tree->get<float>("<xmlattr>.width_tolerance", 0.1f);
+            }
+
+            // --- connectors ----------------------------------------------------------
+            if (const auto conn_tree = rt.get_child_optional("connectors")) {
+                for (const auto &c : *conn_tree) {
+                    if (c.first != "connector")
+                        continue;
+                    const pt::ptree &ct = c.second;
+                    CutRecipeConnector rc;
+                    rc.pos    = Vec3d(ct.get<double>("<xmlattr>.x", 0.),
+                                      ct.get<double>("<xmlattr>.y", 0.),
+                                      ct.get<double>("<xmlattr>.z", 0.));
+                    {
+                        const std::string m = ct.get<std::string>("<xmlattr>.rotation", "");
+                        std::vector<double> v;
+                        if (!m.empty()) {
+                            std::istringstream iss(m);
+                            double x;
+                            while (iss >> x)
+                                v.push_back(x);
+                        }
+                        if (v.size() == 16) {
+                            Transform3d t = Transform3d::Identity();
+                            for (int row = 0; row < 4; ++row)
+                                for (int col = 0; col < 4; ++col)
+                                    t(row, col) = v[size_t(row) * 4 + size_t(col)];
+                            rc.rotation_m = t;
+                        }
+                    }
+                    rc.radius           = ct.get<float>("<xmlattr>.radius", 5.f);
+                    rc.height           = ct.get<float>("<xmlattr>.height", 10.f);
+                    rc.radius_tolerance = ct.get<float>("<xmlattr>.r_tolerance", 0.f);
+                    rc.height_tolerance = ct.get<float>("<xmlattr>.h_tolerance", 0.1f);
+                    rc.z_angle          = ct.get<float>("<xmlattr>.z_angle", 0.f);
+                    // Enums: range-check each before it reaches a cast, exactly as the
+                    // cut_information.xml reader does.
+                    const int type  = ct.get<int>("<xmlattr>.type", 0);
+                    const int style = ct.get<int>("<xmlattr>.style", 0);
+                    const int shape = ct.get<int>("<xmlattr>.shape", 0);
+                    rc.type  = (type  >= 0 && type  <= int(CutConnectorType::FlexiJoint)) ? type  : 0;
+                    rc.style = (style >= 0 && style <= int(CutConnectorStyle::Undef))     ? style : 0;
+                    rc.shape = (shape >= 0 && shape <= int(CutConnectorShape::Undef))     ? shape : 0;
+                    // The Flexi joint's own parameters, when this is one. Same defaulting
+                    // rule as cut_information.xml: every field falls back to the
+                    // FlexiJointParams default, and the counts that drive loops are clamped.
+                    if (rc.type == int(CutConnectorType::FlexiJoint)) {
+                        const FlexiJointParams def;
+                        FlexiJointParams &fj = rc.flexi;
+                        const int fkind = ct.get<int>("<xmlattr>.flexi_kind", int(def.kind));
+                        fj.kind = (fkind >= int(FlexiJointKind::DoubleRing) && fkind <= int(FlexiJointKind::Bayonet)) ?
+                                  FlexiJointKind(fkind) : def.kind;
+                        fj.outer_radius = ct.get<float>("<xmlattr>.flexi_outer_radius", def.outer_radius);
+                        fj.ring_width   = ct.get<float>("<xmlattr>.flexi_ring_width",   def.ring_width);
+                        fj.ring_height  = ct.get<float>("<xmlattr>.flexi_ring_height",  def.ring_height);
+                        fj.clearance    = ct.get<float>("<xmlattr>.flexi_clearance",    def.clearance);
+                        fj.gap          = ct.get<float>("<xmlattr>.flexi_gap",          def.gap);
+                        fj.hub_radius   = ct.get<float>("<xmlattr>.flexi_hub_radius",   def.hub_radius);
+                        fj.tilt         = ct.get<float>("<xmlattr>.flexi_tilt",         def.tilt);
+                        fj.neck_ratio   = ct.get<float>("<xmlattr>.flexi_neck_ratio",   def.neck_ratio);
+                        fj.open_angle   = ct.get<float>("<xmlattr>.flexi_open_angle",   def.open_angle);
+                        fj.link_length  = ct.get<float>("<xmlattr>.flexi_link_length",  def.link_length);
+                        fj.link_width   = ct.get<float>("<xmlattr>.flexi_link_width",   def.link_width);
+                        fj.wire         = ct.get<float>("<xmlattr>.flexi_wire",         def.wire);
+                        fj.tilt_angle   = ct.get<float>("<xmlattr>.flexi_tilt_angle",   def.tilt_angle);
+                        fj.stem         = ct.get<float>("<xmlattr>.flexi_stem",         def.stem);
+                        fj.rotation     = ct.get<float>("<xmlattr>.flexi_rotation",     def.rotation);
+                        fj.hinge_knuckles    = std::max(1, std::min(9, ct.get<int>("<xmlattr>.flexi_hinge_knuckles", def.hinge_knuckles)));
+                        fj.hinge_pin_dia     = ct.get<float>("<xmlattr>.flexi_hinge_pin_dia",     def.hinge_pin_dia);
+                        fj.hinge_barrel_dia  = ct.get<float>("<xmlattr>.flexi_hinge_barrel_dia",  def.hinge_barrel_dia);
+                        fj.hinge_length      = ct.get<float>("<xmlattr>.flexi_hinge_length",      def.hinge_length);
+                        fj.hinge_edge_offset = ct.get<float>("<xmlattr>.flexi_hinge_edge_offset", def.hinge_edge_offset);
+                        fj.hinge_fold_upper  = ct.get<int>("<xmlattr>.flexi_hinge_fold_upper", int(def.hinge_fold_upper)) != 0;
+                        fj.thread_major_dia  = ct.get<float>("<xmlattr>.flexi_thread_major_dia", def.thread_major_dia);
+                        fj.thread_lid_upper  = ct.get<int>("<xmlattr>.flexi_thread_lid_upper", int(def.thread_lid_upper)) != 0;
+                        fj.thread_pitch      = ct.get<float>("<xmlattr>.flexi_thread_pitch", def.thread_pitch);
+                        fj.thread_starts     = std::max(1, std::min(4, ct.get<int>("<xmlattr>.flexi_thread_starts", def.thread_starts)));
+                        fj.thread_turns      = ct.get<float>("<xmlattr>.flexi_thread_turns", def.thread_turns);
+                        fj.thread_left_hand  = ct.get<int>("<xmlattr>.flexi_thread_left_hand", int(def.thread_left_hand)) != 0;
+                        fj.thread_lead_turns = ct.get<float>("<xmlattr>.flexi_thread_lead_turns", def.thread_lead_turns);
+                        fj.bayonet_lugs      = std::max(2, std::min(4, ct.get<int>("<xmlattr>.flexi_bayonet_lugs", def.bayonet_lugs)));
+                        fj.bayonet_lug_height    = ct.get<float>("<xmlattr>.flexi_bayonet_lug_height",    def.bayonet_lug_height);
+                        fj.bayonet_lug_thickness = ct.get<float>("<xmlattr>.flexi_bayonet_lug_thickness", def.bayonet_lug_thickness);
+                        fj.bayonet_lug_arc       = ct.get<float>("<xmlattr>.flexi_bayonet_lug_arc",       def.bayonet_lug_arc);
+                        fj.bayonet_lock_angle    = ct.get<float>("<xmlattr>.flexi_bayonet_lock_angle",    def.bayonet_lock_angle);
+                        fj.bayonet_entry_depth   = ct.get<float>("<xmlattr>.flexi_bayonet_entry_depth",   def.bayonet_entry_depth);
+                        fj.bayonet_detent        = ct.get<float>("<xmlattr>.flexi_bayonet_detent",        def.bayonet_detent);
+                    }
+                    r.connectors.emplace_back(rc);
+                }
+            }
+
+            CutRecipeInfo info;
+            info.mesh_hash = rt.get<std::string>("<xmlattr>.mesh", "");
+            r.mesh_hash    = info.mesh_hash;
+            info.recipe    = std::move(r);
+            m_cut_recipe_infos.insert({ obj_idx, std::move(info) });
+        }
+    }
+
+    // RE-EDITABLE CUTS: one Metadata/cut_recipe/<sha256>.bin pre-cut mesh blob.
+    //
+    // The file name IS the hash, exactly as the Image Fill store works: the bytes are
+    // re-hashed here, so a blob whose name and content disagree is dropped rather than
+    // filed under a name that the recipe would then match against the wrong mesh.
+    void _BBS_3MF_Importer::_extract_cut_recipe_mesh_from_archive(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat)
+    {
+        // A pre-cut mesh is one object's geometry. 256 MB is far past any printable model and
+        // still bounds what a corrupt or hostile header can make us allocate.
+        if (stat.m_uncomp_size == 0 || stat.m_uncomp_size > 256ull * 1024ull * 1024ull) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cut recipe mesh " << stat.m_filename
+                                       << " has an implausible size, skipped";
+            return;
+        }
+        std::vector<uint8_t> blob(size_t(stat.m_uncomp_size));
+        if (!mz_zip_reader_extract_file_to_mem(&archive, stat.m_filename, blob.data(), blob.size(), 0)) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": could not read cut recipe mesh " << stat.m_filename;
+            return;
+        }
+
+        std::string expect = stat.m_filename;
+        const size_t slash = expect.find_last_of('/');
+        if (slash != std::string::npos)
+            expect = expect.substr(slash + 1);
+        const size_t dot = expect.find_last_of('.');
+        if (dot != std::string::npos)
+            expect = expect.substr(0, dot);
+
+        const std::string actual = cut_recipe_mesh_hash(blob);
+        if (!expect.empty() && !boost::iequals(expect, actual)) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cut recipe mesh " << stat.m_filename
+                                       << " does not match its own hash (" << actual << "), dropped";
+            return;
+        }
+
+        TriangleMesh mesh;
+        if (!cut_recipe_mesh_from_blob(blob, mesh)) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cut recipe mesh " << stat.m_filename
+                                       << " is not a readable mesh blob, dropped";
+            return;
+        }
+        m_cut_recipe_meshes.emplace(actual, std::move(mesh));
     }
 
     void _BBS_3MF_Importer::_extract_print_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, DynamicPrintConfig& config, ConfigSubstitutionContext& config_substitutions, const std::string& archive_filename)
@@ -5989,6 +6380,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         bool _add_project_embedded_presets_to_archive(mz_zip_archive& archive, Model& model, std::vector<Preset*> project_presets);
         bool _add_model_config_file_to_archive(mz_zip_archive& archive, const Model& model, PlateDataPtrs& plate_data_list, const ObjectToObjectDataMap &objects_data, const DynamicPrintConfig& config, int export_plate_idx = -1, bool save_gcode = true, bool use_loaded_id = false);
         bool _add_cut_information_file_to_archive(mz_zip_archive &archive, Model &model);
+        // RE-EDITABLE CUTS: "Metadata/cut_recipe.xml" plus one "Metadata/cut_recipe/<sha256>.bin"
+        // per distinct pre-cut mesh. The mesh is written ONCE however many objects refer to it,
+        // which is what keeps the two halves of one cut to a single copy.
+        bool _add_cut_recipe_file_to_archive(mz_zip_archive &archive, Model &model);
         bool _add_slice_info_config_file_to_archive(mz_zip_archive &archive, const Model &model, PlateDataPtrs &plate_data_list, const ObjectToObjectDataMap &objects_data, const DynamicPrintConfig& config);
         // Ultra (H2C 3MF schema): "Metadata/filament_sequence.json" (filament / nozzle entry order).
         bool _add_filament_sequence_file_to_archive(mz_zip_archive& archive, const PlateDataPtrs& plate_data_list);
@@ -6521,6 +6916,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
         if (!_add_cut_information_file_to_archive(archive, model)) {
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":" << __LINE__ << boost::format(", _add_cut_information_file_to_archive failed\n");
+            return false;
+        }
+
+        // RE-EDITABLE CUTS: the recipe and its pre-cut mesh blobs. Written only for objects
+        // that carry one, so a project with no editable cut gains nothing at all.
+        if (!_add_cut_recipe_file_to_archive(archive, model)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":" << __LINE__ << boost::format(", _add_cut_recipe_file_to_archive failed\n");
             return false;
         }
 
@@ -8253,6 +8655,235 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":" << __LINE__ << boost::format("Unable to add model config file to archive\n");
             add_error("Unable to add model config file to archive");
             return false;
+        }
+
+        return true;
+    }
+
+    // RE-EDITABLE CUTS: write "Metadata/cut_recipe.xml" and the pre-cut mesh blobs it names.
+    //
+    // SHARING. Both halves of a cut carry an equal recipe naming the same mesh hash, so the
+    // blob is written once and the second half's recipe simply points at it. Objects that
+    // were cut with "Keep cut editable" off carry no recipe and cost nothing here.
+    //
+    // COMPATIBILITY. Neither the recipe nor the blobs are referenced from the main
+    // <resources> model, so a slicer that knows nothing about them loads the two halves and
+    // ignores these entries - the same contract Metadata/cut_information.xml keeps.
+    bool _BBS_3MF_Exporter::_add_cut_recipe_file_to_archive(mz_zip_archive &archive, Model &model)
+    {
+        pt::ptree tree;
+        // hash -> blob, so a mesh shared by both halves is stored once.
+        std::map<std::string, std::vector<uint8_t>> blobs;
+
+        unsigned int object_cnt = 0;
+        for (const ModelObject *object : model.objects) {
+            object_cnt++;
+            if (!object->cut_recipe.has_value())
+                continue;
+            const CutRecipe &r = *object->cut_recipe;
+            if (!r.valid())
+                continue;
+
+            // The blob, and the hash that names it. Recomputed rather than trusting
+            // r.mesh_hash: the mesh may have been set programmatically since the hash was,
+            // and a name that does not match its content is exactly what the reader drops.
+            const std::vector<uint8_t> blob = cut_recipe_mesh_to_blob(r.mesh);
+            if (blob.empty()) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cut recipe mesh for object " << object_cnt
+                                           << " could not be serialized, recipe not written";
+                continue;
+            }
+            const std::string hash = cut_recipe_mesh_hash(blob);
+            blobs.emplace(hash, blob);
+
+            pt::ptree &rt = tree.add("cut_recipes.recipe", "");
+            rt.put("<xmlattr>.object_id", object_cnt);
+            rt.put("<xmlattr>.version",   r.version);
+            rt.put("<xmlattr>.kind",      int(r.kind));
+            rt.put("<xmlattr>.mesh",      hash);
+
+            rt.put("<xmlattr>.center_x", r.plane_center.x());
+            rt.put("<xmlattr>.center_y", r.plane_center.y());
+            rt.put("<xmlattr>.center_z", r.plane_center.z());
+            {
+                // 16 entries, row-major: no Euler convention to agree on between writer and
+                // reader, and a rotation that round-trips exactly.
+                std::ostringstream oss;
+                oss << std::setprecision(17);
+                for (int row = 0; row < 4; ++row)
+                    for (int col = 0; col < 4; ++col)
+                        oss << (row == 0 && col == 0 ? "" : " ") << r.rotation_m(row, col);
+                rt.put("<xmlattr>.rotation", oss.str());
+            }
+
+            rt.put("<xmlattr>.thickness",          r.thickness);
+            rt.put("<xmlattr>.thickness_offset",   int(r.thickness_offset));
+            rt.put("<xmlattr>.keep_upper",         r.keep_upper ? 1 : 0);
+            rt.put("<xmlattr>.keep_lower",         r.keep_lower ? 1 : 0);
+            rt.put("<xmlattr>.keep_as_parts",      r.keep_as_parts ? 1 : 0);
+            rt.put("<xmlattr>.place_on_cut_upper", r.place_on_cut_upper ? 1 : 0);
+            rt.put("<xmlattr>.place_on_cut_lower", r.place_on_cut_lower ? 1 : 0);
+            rt.put("<xmlattr>.rotate_upper",       r.rotate_upper ? 1 : 0);
+            rt.put("<xmlattr>.rotate_lower",       r.rotate_lower ? 1 : 0);
+            rt.put("<xmlattr>.upper_visibility",   r.upper_visibility);
+            rt.put("<xmlattr>.lower_visibility",   r.lower_visibility);
+
+            rt.put("<xmlattr>.draw_direction",   r.draw_direction);
+            rt.put("<xmlattr>.draw_view_x",      r.draw_view_dir.x());
+            rt.put("<xmlattr>.draw_view_y",      r.draw_view_dir.y());
+            rt.put("<xmlattr>.draw_view_z",      r.draw_view_dir.z());
+            rt.put("<xmlattr>.draw_extension",   r.draw_extension);
+            rt.put("<xmlattr>.draw_angle",       r.draw_angle_deg);
+            rt.put("<xmlattr>.draw_through_all", r.draw_through_all ? 1 : 0);
+            rt.put("<xmlattr>.draw_depth",       r.draw_depth);
+
+            if (r.kind == CutRecipeKind::Curved && r.sheet.valid()) {
+                pt::ptree &sh = rt.add("sheet", "");
+                sh.put("<xmlattr>.nx",          r.sheet.nx);
+                sh.put("<xmlattr>.ny",          r.sheet.ny);
+                sh.put("<xmlattr>.half_size_u", r.sheet.half_size_u);
+                sh.put("<xmlattr>.half_size_v", r.sheet.half_size_v);
+                std::ostringstream oss;
+                oss << std::setprecision(17);
+                for (size_t i = 0; i < r.sheet.values.size(); ++i)
+                    oss << (i ? " " : "") << r.sheet.values[i];
+                sh.put("<xmlattr>.values", oss.str());
+            }
+
+            if (r.kind == CutRecipeKind::Drawn && !r.stroke.samples.empty()) {
+                pt::ptree &st = rt.add("stroke", "");
+                st.put("<xmlattr>.closed",    r.stroke.closed ? 1 : 0);
+                st.put("<xmlattr>.smoothing", r.stroke.smoothing);
+                for (const DrawCutSample &smp : r.stroke.samples) {
+                    pt::ptree &s = st.add("s", "");
+                    s.put("<xmlattr>.px", smp.pos.x());
+                    s.put("<xmlattr>.py", smp.pos.y());
+                    s.put("<xmlattr>.pz", smp.pos.z());
+                    s.put("<xmlattr>.nx", smp.normal.x());
+                    s.put("<xmlattr>.ny", smp.normal.y());
+                    s.put("<xmlattr>.nz", smp.normal.z());
+                    s.put("<xmlattr>.f",  (long long) smp.facet);
+                }
+            }
+
+            if (r.kind == CutRecipeKind::Groove) {
+                pt::ptree &g = rt.add("groove", "");
+                g.put("<xmlattr>.depth",            r.groove.depth);
+                g.put("<xmlattr>.width",            r.groove.width);
+                g.put("<xmlattr>.flaps_angle",      r.groove.flaps_angle);
+                g.put("<xmlattr>.angle",            r.groove.angle);
+                g.put("<xmlattr>.depth_init",       r.groove.depth_init);
+                g.put("<xmlattr>.width_init",       r.groove.width_init);
+                g.put("<xmlattr>.flaps_angle_init", r.groove.flaps_angle_init);
+                g.put("<xmlattr>.angle_init",       r.groove.angle_init);
+                g.put("<xmlattr>.depth_tolerance",  r.groove.depth_tolerance);
+                g.put("<xmlattr>.width_tolerance",  r.groove.width_tolerance);
+            }
+
+            if (!r.connectors.empty()) {
+                pt::ptree &cs = rt.add("connectors", "");
+                for (const CutRecipeConnector &c : r.connectors) {
+                    pt::ptree &ct = cs.add("connector", "");
+                    ct.put("<xmlattr>.x", c.pos.x());
+                    ct.put("<xmlattr>.y", c.pos.y());
+                    ct.put("<xmlattr>.z", c.pos.z());
+                    {
+                        std::ostringstream oss;
+                        oss << std::setprecision(17);
+                        for (int row = 0; row < 4; ++row)
+                            for (int col = 0; col < 4; ++col)
+                                oss << (row == 0 && col == 0 ? "" : " ") << c.rotation_m(row, col);
+                        ct.put("<xmlattr>.rotation", oss.str());
+                    }
+                    ct.put("<xmlattr>.radius",      c.radius);
+                    ct.put("<xmlattr>.height",      c.height);
+                    ct.put("<xmlattr>.r_tolerance", c.radius_tolerance);
+                    ct.put("<xmlattr>.h_tolerance", c.height_tolerance);
+                    ct.put("<xmlattr>.z_angle",     c.z_angle);
+                    ct.put("<xmlattr>.type",        c.type);
+                    ct.put("<xmlattr>.style",       c.style);
+                    ct.put("<xmlattr>.shape",       c.shape);
+                    // The Flexi joint rebuilds its whole geometry from these, so a re-cut that
+                    // did not have them would produce a differently shaped joint. Written only
+                    // for the flexi type, so nothing changes for any other connector.
+                    if (c.type == int(CutConnectorType::FlexiJoint)) {
+                        const FlexiJointParams &fj = c.flexi;
+                        ct.put("<xmlattr>.flexi_kind",         int(fj.kind));
+                        ct.put("<xmlattr>.flexi_outer_radius", fj.outer_radius);
+                        ct.put("<xmlattr>.flexi_ring_width",   fj.ring_width);
+                        ct.put("<xmlattr>.flexi_ring_height",  fj.ring_height);
+                        ct.put("<xmlattr>.flexi_clearance",    fj.clearance);
+                        ct.put("<xmlattr>.flexi_gap",          fj.gap);
+                        ct.put("<xmlattr>.flexi_hub_radius",   fj.hub_radius);
+                        ct.put("<xmlattr>.flexi_tilt",         fj.tilt);
+                        ct.put("<xmlattr>.flexi_neck_ratio",   fj.neck_ratio);
+                        ct.put("<xmlattr>.flexi_open_angle",   fj.open_angle);
+                        ct.put("<xmlattr>.flexi_link_length",  fj.link_length);
+                        ct.put("<xmlattr>.flexi_link_width",   fj.link_width);
+                        ct.put("<xmlattr>.flexi_wire",         fj.wire);
+                        ct.put("<xmlattr>.flexi_tilt_angle",   fj.tilt_angle);
+                        ct.put("<xmlattr>.flexi_stem",         fj.stem);
+                        ct.put("<xmlattr>.flexi_rotation",     fj.rotation);
+                        ct.put("<xmlattr>.flexi_hinge_knuckles",    fj.hinge_knuckles);
+                        ct.put("<xmlattr>.flexi_hinge_pin_dia",     fj.hinge_pin_dia);
+                        ct.put("<xmlattr>.flexi_hinge_barrel_dia",  fj.hinge_barrel_dia);
+                        ct.put("<xmlattr>.flexi_hinge_length",      fj.hinge_length);
+                        ct.put("<xmlattr>.flexi_hinge_edge_offset", fj.hinge_edge_offset);
+                        ct.put("<xmlattr>.flexi_hinge_fold_upper",  int(fj.hinge_fold_upper));
+                        ct.put("<xmlattr>.flexi_thread_major_dia",  fj.thread_major_dia);
+                        ct.put("<xmlattr>.flexi_thread_lid_upper",  int(fj.thread_lid_upper));
+                        ct.put("<xmlattr>.flexi_thread_pitch",      fj.thread_pitch);
+                        ct.put("<xmlattr>.flexi_thread_starts",     fj.thread_starts);
+                        ct.put("<xmlattr>.flexi_thread_turns",      fj.thread_turns);
+                        ct.put("<xmlattr>.flexi_thread_left_hand",  int(fj.thread_left_hand));
+                        ct.put("<xmlattr>.flexi_thread_lead_turns", fj.thread_lead_turns);
+                        ct.put("<xmlattr>.flexi_bayonet_lugs",          fj.bayonet_lugs);
+                        ct.put("<xmlattr>.flexi_bayonet_lug_height",    fj.bayonet_lug_height);
+                        ct.put("<xmlattr>.flexi_bayonet_lug_thickness", fj.bayonet_lug_thickness);
+                        ct.put("<xmlattr>.flexi_bayonet_lug_arc",       fj.bayonet_lug_arc);
+                        ct.put("<xmlattr>.flexi_bayonet_lock_angle",    fj.bayonet_lock_angle);
+                        ct.put("<xmlattr>.flexi_bayonet_entry_depth",   fj.bayonet_entry_depth);
+                        ct.put("<xmlattr>.flexi_bayonet_detent",        fj.bayonet_detent);
+                    }
+                }
+            }
+        }
+
+        if (tree.empty())
+            return true;   // nothing to write is not a failure
+
+        std::string out;
+        {
+            std::ostringstream oss;
+            pt::write_xml(oss, tree);
+            out = oss.str();
+            // Same "beautification" the cut information file gets, for a readable preview.
+            boost::replace_all(out, "><recipe",     ">\n <recipe");
+            boost::replace_all(out, "></recipe>",   ">\n </recipe>");
+            boost::replace_all(out, "><connectors", ">\n  <connectors");
+            boost::replace_all(out, "></connectors>", ">\n  </connectors>");
+            boost::replace_all(out, "><connector",  ">\n   <connector");
+            boost::replace_all(out, "><sheet",      ">\n  <sheet");
+            boost::replace_all(out, "><stroke",     ">\n  <stroke");
+            boost::replace_all(out, "></stroke>",   ">\n  </stroke>");
+            boost::replace_all(out, "><groove",     ">\n  <groove");
+            boost::replace_all(out, "><s ",         ">\n   <s ");
+        }
+
+        if (!mz_zip_writer_add_mem(&archive, CUT_RECIPE_FILE.c_str(), (const void *) out.data(), out.length(), MZ_DEFAULT_COMPRESSION)) {
+            add_error("Unable to add cut recipe file to archive");
+            return false;
+        }
+
+        for (const auto &kv : blobs) {
+            const std::string path = CUT_RECIPE_MESH_DIR + kv.first + ".bin";
+            // MZ_NO_COMPRESSION would be wrong here: the blob is float vertex data and
+            // compresses usefully, and this is the entry that dominates the size cost the
+            // "Keep cut editable" tooltip warns about.
+            if (!mz_zip_writer_add_mem(&archive, path.c_str(), (const void *) kv.second.data(), kv.second.size(), MZ_DEFAULT_COMPRESSION)) {
+                add_error("Unable to add cut recipe mesh to archive");
+                return false;
+            }
         }
 
         return true;
