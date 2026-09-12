@@ -943,14 +943,29 @@ static std::string ffmpeg_h264_template()
 // Software libopenh264 costs ~5% of one core for a 720p Medium on this PC (spec, §CPU), which is
 // not worth that risk by default. To turn it on, add `#hardware` to the strings below and
 // rebuild; go2rtc then tries dxva2/cuda/qsv and falls back to software by itself.
+// Each extra ffmpeg argument is its own #raw= segment, one token per segment and never a space
+// inside one. That is not a style choice: go2rtc rejects a registration whose source contains a
+// space outright, with `400 streams: source with spaces may be insecure`, so the natural
+// `#raw=-r 10 -b:v 600k` form registers as nothing at all and the variant silently does not
+// exist. (Found by gating it - see the spec. The hub's PUT is fire-and-forget on a detached
+// thread, so the 400 would never have surfaced anywhere a user or a log would show it.)
+static std::string variant_raw(std::initializer_list<const char*> toks)
+{
+    std::string s;
+    for (const char* t : toks) s += "#raw=" + std::string(t);
+    return s;
+}
+
 static std::string variant_src(const std::string& base_name, const std::string& q)
 {
     const bool low = (q == "low");
-    const std::string scale = low ? "#width=854" : "#width=1280";
-    // -r caps the frame rate, -b:v the bitrate, -g:v the keyframe interval (~2 s at that rate).
-    const std::string raw = low ? "#raw=-r 10 -b:v 600k -maxrate 600k -g:v 20"
-                                : "#raw=-r 15 -b:v 1500k -maxrate 1500k -g:v 30";
-    return "ffmpeg:" + base_name + "#video=h264" + scale + raw;
+    // -r caps the frame rate, -b:v/-maxrate the bitrate, -g:v the keyframe interval (~2 s at
+    // that rate). #width alone scales and keeps the aspect ratio.
+    if (low)
+        return "ffmpeg:" + base_name + "#video=h264#width=854" +
+               variant_raw({ "-r", "10", "-b:v", "600k", "-maxrate", "600k", "-g:v", "20" });
+    return "ffmpeg:" + base_name + "#video=h264#width=1280" +
+           variant_raw({ "-r", "15", "-b:v", "1500k", "-maxrate", "1500k", "-g:v", "30" });
 }
 // ---- WebRTC (Phase 2): go2rtc's media port ------------------------------------------------
 // Everything else the hub runs is loopback-only, but WebRTC media goes straight from go2rtc to
