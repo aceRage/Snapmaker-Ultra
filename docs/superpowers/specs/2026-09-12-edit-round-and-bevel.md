@@ -83,11 +83,24 @@ Three of these failed on the first run and all three were faults in the *test sc
 
 ## Step 2 — Edge bevel / chamfer (phase 2)
 
-> **STATUS: NOT FINISHED. Do not ship this half.**
+> **STATUS: NOT FINISHED — one named defect left. Do not ship this half.**
 >
-> The API, the global width solve, the panel, the commit path and the tests are all in place and the width solve is *correct and proven order-independent*. The **geometry construction is not**: as of the last run, 14 of 21 `[MeshEdit]` cases pass and **7 fail**, all of them because the built mesh is not closed (`BevelStatus::Failed`). The cause is understood and is written up under *The construction, and why it is not finished* below. It is a design-level problem with the corner-displacement approach, not a typo, and fixing it properly needs the redesign described there rather than another patch.
+> **`[MeshEdit]` 13 / 21.** The construction has been rewritten to the spec's *insert-and-re-triangulate* approach (see below), and the mesh is now **built, closed and manifold**: `status = Ok`, `is_closed_manifold()` passes, and a single-edge chamfer produces exactly the expected **20 triangles / 12 vertices** with no leftover holes and no spurious corner patches.
 >
-> Everything that does **not** depend on the construction passes: the width solve, its order-independence, the refusal paths, and the `width = 0` identity.
+> What is left is **one winding bug in the strip end cap**, which the pre-cleanup dump names exactly. For the cube's 7→4 edge the two caps are `T19 (4,8,10)` — correct — and `T18 (7,9,11)` — **flipped**. Its three directed edges each occur twice in the *same* direction and never in reverse:
+>
+> ```
+> directed edge   fwd  rev
+>     (7, 9)       2    0
+>     (9,11)       2    0
+>     (11,7)       2    0
+> ```
+>
+> That is precisely why the two closedness checks disagree, and it explains every remaining failure in one stroke: `is_closed_manifold()` is *undirected* (counts two facets per edge — passes), while `its_num_open_edges()` is *winding-aware* (via `its_face_neighbors`, which pairs directed half-edges — fails). Every one of the 8 failures is a `watertight()` assertion reporting `status 0`.
+>
+> **The fix:** both caps are emitted by the same `cap_end()` lambda against the same `outward` reference (the mean of the two incident *face* normals). That reference is correct at one end of the edge and wrong at the other. Orient each cap against **its own strip quad** instead of against the shared `outward`.
+>
+> Everything not downstream of this passes: the width solve and its proven order-independence, the refusal paths, the `width = 0` identity, and all 9 phase-1 cases.
 
 ### The contract, stated once
 
@@ -106,9 +119,11 @@ The pass order in `bevel_edges()` is therefore:
 
 Steps 3 and 4 cannot change a width, so no reordering can change the result. `solve_bevel_widths()` is exposed publicly so the tests pin order-independence **directly** rather than inferring it from the output mesh.
 
-### The construction, and why it is not finished
+### The abandoned first approach, and why
 
-The approach taken was **corner displacement**: split each vertex into one copy per side and move each copy inward along its own face. Three rounds of fixes went into it, each correcting a real defect, and the third exposed a flaw in the premise itself. Recorded in full because the next attempt should not repeat any of them.
+*(Superseded. The shipped construction is the insert-and-re-triangulate one described above; this section records the dead end so the next attempt does not walk back into it.)*
+
+The first approach was **corner displacement**: split each vertex into one copy per side and move each copy inward along its own face. Three rounds of fixes went into it, each correcting a real defect, and the third exposed a flaw in the premise itself.
 
 | # | what was wrong | what it broke | fix |
 |---|---|---|---|
@@ -120,7 +135,14 @@ After all three the all-edges cases were close (the 12-edge chamfer's volume mat
 
 **The premise is the problem.** A side's copy of a vertex is shared by that side's *whole* boundary at that vertex. Moving it therefore detaches the side from its neighbour along the **entire shared edge**, not merely near the bevel — so a single-edge chamfer on a cube opens a sliver running the full length of every edge adjacent to a moved corner. The all-12 case masked this exactly because there *every* neighbouring side moves too, and the slivers close against each other.
 
-**What the next attempt should do instead:** do not move the shared corner at all. **Insert** the two rail vertices into the incident faces' boundaries and re-triangulate those faces around the inserted points, leaving every original vertex where it is. That is closer to the research spec's own step (3) — "re-cut the incident facets against the offset line in their own plane" — which was deviated from precisely to avoid the re-triangulation, and the deviation is what cost the correctness. The re-cut is the work; there is no shortcut around it.
+**What replaced it** (and what is in the tree now): do not move the shared corner at all. **Insert** the two rail vertices into the incident faces' boundaries and re-triangulate those faces around them, leaving every original vertex where it is. That is the research spec's own step (3) — *"re-cut the incident facets against the offset line in their own plane"* — which the first attempt deviated from precisely to avoid the re-triangulation. The deviation is what cost the correctness; the re-cut was the work, and there was no shortcut around it.
+
+Two further defects surfaced and were fixed during that rewrite, both found from probe data rather than reasoning:
+
+* **Strip ends were not capped.** The generic hole-filler was left to close them and instead centroid-filled a polygon spanning a whole face, putting a stray vertex at `(7.8, y, 7.8)` in the middle of the part and removing a *pyramid* `(1/3)(w²/2)L` where the *prism* `(w²/2)L` was right — the measured 1.667 against 5.0, a clean factor of three. Fixed by emitting explicit end caps.
+* **The filler then double-covered those caps**, putting three facets on each of the cap's edges. Fixed by recording capped vertices and skipping any loop that touches one — per loop, so real multi-bevel corners are still filled.
+
+Both are settled; what remains is the single winding bug named at the top of this section.
 
 ### The build — corner split rather than facet clipping
 

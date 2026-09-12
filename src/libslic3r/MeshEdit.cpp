@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -677,6 +678,236 @@ bool edge_is_convex(const indexed_triangle_set &its, const MeshTopology &topo, i
     return n1.dot(its.vertices[third] - p1) < 0.f;
 }
 
+// Ear-clip `poly` (indices into its.vertices) in the plane whose normal is `n`,
+// appending the triangles to `out`. The polygon is assumed planar and simple,
+// which is what a rewritten SIDE boundary is: a side is a planar region bounded
+// by creases, and cutting its corners back along its own plane keeps it planar
+// and cannot make it self-intersect as long as the widths were clamped - which
+// is what the global solve is for.
+//
+// Ear clipping rather than a fan because a rewritten side is frequently NOT
+// convex (an L-shaped face, or a face with one corner cut and another not), and
+// a fan from any single vertex folds on those.
+//
+// The winding of the result follows `n`, so the new facets face the same way the
+// side's original facets did.
+void triangulate_planar_polygon(indexed_triangle_set &out, const std::vector<int> &poly_in, const Vec3f &n)
+{
+    std::vector<int> poly = poly_in;
+    if (poly.size() < 3)
+        return;
+    if (poly.size() == 3) {
+        const Vec3f &a = out.vertices[poly[0]];
+        const Vec3f &b = out.vertices[poly[1]];
+        const Vec3f &c = out.vertices[poly[2]];
+        if ((b - a).cross(c - a).dot(n) < 0.f) out.indices.emplace_back(poly[0], poly[2], poly[1]);
+        else                                   out.indices.emplace_back(poly[0], poly[1], poly[2]);
+        return;
+    }
+
+    // A 2D basis in the polygon's plane, so the ear test is an ordinary planar
+    // one rather than a sequence of 3D cross products.
+    Vec3f nn = n;
+    if (nn.norm() < 1e-12f)
+        return;
+    nn.normalize();
+    Vec3f ax = std::abs(nn.x()) < 0.9f ? Vec3f::UnitX() : Vec3f::UnitY();
+    ax = (ax - nn * nn.dot(ax)).normalized();
+    const Vec3f ay = nn.cross(ax);
+    auto to2d = [&](int i) {
+        const Vec3f p = out.vertices[i];
+        return Vec2f(p.dot(ax), p.dot(ay));
+    };
+
+    // Make the working order counter-clockwise in that basis, so "convex" below
+    // has one meaning rather than two.
+    double area2 = 0.;
+    for (size_t i = 0; i < poly.size(); ++i) {
+        const Vec2f p = to2d(poly[i]), q = to2d(poly[(i + 1) % poly.size()]);
+        area2 += double(p.x()) * double(q.y()) - double(q.x()) * double(p.y());
+    }
+    const bool reversed = area2 < 0.;
+    if (reversed)
+        std::reverse(poly.begin(), poly.end());
+
+    auto cross2 = [](const Vec2f &o, const Vec2f &p, const Vec2f &q) {
+        return double(p.x() - o.x()) * double(q.y() - o.y()) -
+               double(p.y() - o.y()) * double(q.x() - o.x());
+    };
+    auto inside = [&](const Vec2f &a, const Vec2f &b, const Vec2f &c, const Vec2f &p) {
+        return cross2(a, b, p) >= 0. && cross2(b, c, p) >= 0. && cross2(c, a, p) >= 0.;
+    };
+
+    auto emit = [&](int i0, int i1, int i2) {
+        // Undo the reversal when emitting, so the facet faces `n` either way.
+        if (reversed) out.indices.emplace_back(i0, i2, i1);
+        else          out.indices.emplace_back(i0, i1, i2);
+    };
+
+    // O(n^2) ear clipping. A side polygon has a handful of vertices, so this is
+    // never hot, and the simple version is the one that is obviously right.
+    size_t guard = poly.size() * poly.size() + 8;
+    while (poly.size() > 3 && guard-- > 0) {
+        bool clipped = false;
+        for (size_t i = 0; i < poly.size(); ++i) {
+            const size_t h = (i + poly.size() - 1) % poly.size();
+            const size_t j = (i + 1) % poly.size();
+            const Vec2f  a = to2d(poly[h]), b = to2d(poly[i]), c = to2d(poly[j]);
+            // >= 0, not > 0: a COLLINEAR vertex has to be clippable. The side
+            // rewrite deliberately produces them - a rail inserted on a boundary
+            // edge is collinear with that edge's endpoints - and they are
+            // load-bearing, because the strip and the end cap both reference them,
+            // so they cannot simply be dropped from the polygon. Requiring a
+            // strictly convex corner would leave them permanently un-clippable,
+            // stall the loop and fall through to the fan, which then emits slivers.
+            // Clipping a collinear ear costs one zero-area triangle, and
+            // its_remove_degenerate_faces() takes that out at the end.
+            if (cross2(a, b, c) < 0.)
+                continue;                       // reflex: not an ear
+            bool empty = true;
+            for (size_t k = 0; k < poly.size() && empty; ++k) {
+                if (k == h || k == i || k == j)
+                    continue;
+                if (inside(a, b, c, to2d(poly[k])))
+                    empty = false;
+            }
+            if (!empty)
+                continue;
+            emit(poly[h], poly[i], poly[j]);
+            poly.erase(poly.begin() + long(i));
+            clipped = true;
+            break;
+        }
+        if (!clipped)
+            break;      // no ear found: degenerate input, fall through to the fan
+    }
+    if (poly.size() == 3) {
+        emit(poly[0], poly[1], poly[2]);
+    } else if (poly.size() > 3) {
+        // Should not happen for a simple polygon, but a fan is better than a hole
+        // and the closedness check will still catch it if it is wrong.
+        for (size_t k = 1; k + 1 < poly.size(); ++k)
+            emit(poly[0], poly[k], poly[k + 1]);
+    }
+}
+
+// Find every genuinely open boundary of `out` - an edge used by exactly one
+// facet - stitch them into loops and fill each one, counting the fills.
+//
+// Used for the bevel's corner patches. Deriving them from the assembled mesh
+// rather than predicting them from the input is what makes the corner handling
+// independent of how the holes came to be there.
+//
+// `capped` names the vertices where a strip END CAP was already emitted. A loop
+// that only touches those is already closed, and filling it again is what made
+// every edge of the cap at one cube vertex carry three facets instead of two
+// (measured: tris=21 where 20 is right, corners=1, and edges (7,9) (7,11) (9,11)
+// all at n=3). The filler is still the right tool for a real corner, where
+// several bevelled edges meet and no cap was emitted - so it is skipped per
+// loop, not disabled.
+void fill_open_loops(indexed_triangle_set &out, size_t &patches, const std::set<int> &capped)
+{
+    // Directed edge (a -> b) appears once per facet using it in that direction.
+    // On a closed surface each undirected edge carries one of each; a hole leaves
+    // the boundary direction unmatched.
+    std::map<std::pair<int, int>, int>    directed;
+    std::map<std::pair<int, int>, size_t> facet_of_directed;
+    for (size_t fi = 0; fi < out.indices.size(); ++fi) {
+        const Vec3i32 &f = out.indices[fi];
+        for (int s = 0; s < 3; ++s) {
+            const auto key = std::make_pair(f[s], f[(s + 1) % 3]);
+            ++directed[key];
+            facet_of_directed.emplace(key, fi);
+        }
+    }
+
+    std::map<int, int> next;
+    for (const auto &d : directed) {
+        auto      it   = directed.find(std::make_pair(d.first.second, d.first.first));
+        const int back = it == directed.end() ? 0 : it->second;
+        if (d.second > back)
+            next.emplace(d.first.first, d.first.second);
+    }
+
+    std::set<int> visited;
+    for (const auto &seed : next) {
+        if (visited.count(seed.first) > 0)
+            continue;
+        std::vector<int> loop;
+        int              cur = seed.first;
+        while (visited.insert(cur).second) {
+            loop.push_back(cur);
+            auto it = next.find(cur);
+            if (it == next.end()) { loop.clear(); break; }
+            cur = it->second;
+            if (cur == seed.first) break;
+        }
+        if (loop.size() < 3)
+            continue;
+
+        // Already closed by a strip end cap: leave it alone. A loop that touches a
+        // capped vertex IS that cap's own boundary, and filling it a second time is
+        // what put three facets on each of the cap's edges.
+        {
+            bool on_cap = false;
+            for (int c : loop)
+                if (capped.count(c) > 0) {
+                    on_cap = true;
+                    break;
+                }
+            if (on_cap)
+                continue;
+        }
+
+        // Outward direction for this hole: the mean normal of the facets that
+        // border it. Those already face outward, so the patch must too.
+        Vec3f vn = Vec3f::Zero();
+        for (size_t i = 0; i < loop.size(); ++i) {
+            auto it = facet_of_directed.find(std::make_pair(loop[(i + 1) % loop.size()], loop[i]));
+            if (it == facet_of_directed.end())
+                continue;
+            const Vec3i32 &f = out.indices[it->second];
+            vn += (out.vertices[f[1]] - out.vertices[f[0]]).cross(out.vertices[f[2]] - out.vertices[f[0]]);
+        }
+
+        // A three-sided hole IS a triangle - the ordinary cube corner - so it is
+        // emitted as one rather than a centroid plus three slivers.
+        if (loop.size() == 3) {
+            const Vec3f p0 = out.vertices[loop[0]];
+            const Vec3f p1 = out.vertices[loop[1]];
+            const Vec3f p2 = out.vertices[loop[2]];
+            if ((p1 - p0).cross(p2 - p0).dot(vn) < 0.f) out.indices.emplace_back(loop[0], loop[2], loop[1]);
+            else                                        out.indices.emplace_back(loop[0], loop[1], loop[2]);
+            ++patches;
+            continue;
+        }
+
+        // Four or more: fan from the CENTROID, which stays valid for the
+        // non-planar (often saddle-shaped) polygon a higher-valence patch is,
+        // where a fan from one of its own vertices would fold.
+        Vec3f centroid = Vec3f::Zero();
+        for (int c : loop)
+            centroid += out.vertices[c];
+        centroid /= float(loop.size());
+        const int cv = int(out.vertices.size());
+        out.vertices.emplace_back(centroid);
+
+        const bool flip = [&] {
+            const Vec3f p0 = out.vertices[loop[0]];
+            const Vec3f p1 = out.vertices[loop[1]];
+            return (p0 - centroid).cross(p1 - centroid).dot(vn) < 0.f;
+        }();
+        for (size_t i = 0; i < loop.size(); ++i) {
+            const int p = loop[i], q = loop[(i + 1) % loop.size()];
+            if (p == q)
+                continue;
+            if (flip) out.indices.emplace_back(cv, q, p);
+            else      out.indices.emplace_back(cv, p, q);
+        }
+        ++patches;
+    }
+}
+
 } // namespace
 
 bool is_closed_manifold(const indexed_triangle_set &its)
@@ -957,39 +1188,20 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
     res.max_width      = w_max;
     res.clamped        = w_min < params.width - 1e-5f;
 
-    // --- the corner split ---------------------------------------------------
+    // --- sides -----------------------------------------------------------------
     //
-    // Every (vertex, SIDE) pair that touches a bevelled edge becomes its own new
-    // vertex, pulled back from the original along the bevels of the edges meeting
-    // there. A facet keeps its shape and simply re-indexes; the holes this opens
-    // are the strips and the corner patches.
+    // Facets grouped into maximal sets connected through edges that are neither
+    // being bevelled nor a crease: a side is one flat CAD face, and it is the unit
+    // the construction below rewrites. A cube is exactly 6 sides.
     //
-    // "SIDE", not "facet", and that distinction is the whole correctness of this
-    // pass. A CAD face is generally several triangles - a cube's square face is
-    // two - and only ONE of them actually contains any given bevelled edge. If the
-    // split were keyed per facet, that one triangle's corner would move while its
-    // coplanar neighbour's stayed put, and the mesh would TEAR along the diagonal
-    // between them. (It did: the first implementation was keyed per facet and every
-    // bevel came back non-closed.)
+    // Both halves of the condition matter. Stopping at bevelled edges makes the
+    // bevel a cut between sides; stopping at creases as well keeps a side PLANAR,
+    // which the ear clip relies on - and it means a side never spans two
+    // differently-oriented faces, while the coplanar diagonals INSIDE a flat face
+    // are still crossed freely, so a face is never split along one.
     //
-    // So facets are first grouped into SIDES: maximal sets connected through edges
-    // that are neither being bevelled NOR a crease. Every facet of a side shares
-    // one split copy of a vertex, so a side deforms as a unit and its interior
-    // edges never tear.
-    //
-    // Both conditions are needed, and the second is the subtle one. Stopping only
-    // at bevelled edges is not enough: bevelling a SINGLE edge does not disconnect
-    // a closed surface, so a flood fill would put the whole cube in one side, the
-    // two faces meeting at that edge would share one vertex copy, and the chamfer
-    // would collapse instead of opening. (Reasoned through before the build
-    // finished, having just been burnt by the per-facet version of the same
-    // mistake.) Stopping at creases as well means a side never spans two
-    // differently-oriented faces, so each face of the edge gets its own copy - and
-    // within a flat face, the coplanar diagonals are still crossed freely, which is
-    // exactly what prevents the tear.
-    //
-    // The crease threshold is the flatness threshold the solve already uses to
-    // decide an edge is too flat to bevel, so the two agree by construction.
+    // The crease threshold is the same min_dihedral_deg the solve uses to decide
+    // an edge is too flat to bevel, so the two agree by construction.
     std::vector<int> side_of(its.indices.size(), -1);
     {
         int                 next_side = 0;
@@ -1009,9 +1221,9 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
                         continue;
                     const int e = topo.face_edge_ids[f][j];
                     if (e >= 0 && width_of.count(e) > 0)
-                        continue; // a bevelled edge is a cut between sides
+                        continue;   // a bevelled edge parts two sides
                     if (e >= 0 && edge_dihedral_deg(topo, e) >= params.min_dihedral_deg)
-                        continue; // so is any other crease
+                        continue;   // so does any other crease
                     side_of[size_t(nb)] = side;
                     stack.push_back(size_t(nb));
                 }
@@ -1019,12 +1231,43 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         }
     }
 
-    // (vertex, side) -> new vertex index.
-    std::map<std::pair<int, int>, int> corner_vertex;
+    // --- the construction ------------------------------------------------------
+    //
+    // INSERT the rail vertices and re-triangulate the faces around them. No
+    // original vertex ever moves.
+    //
+    // That last sentence is the whole design, and it is the research spec's own
+    // step (3) - "re-cut the incident facets against the offset line in their own
+    // plane". An earlier attempt deviated from it, displacing each vertex once per
+    // side instead, to avoid having to re-triangulate. That does not work, and the
+    // reason is worth keeping: a side's copy of a vertex is shared by that side's
+    // WHOLE boundary at that vertex, so moving it detaches the side from its
+    // neighbours along the entire shared edge, not just near the bevel. A
+    // single-edge chamfer then opens a sliver down every adjacent edge. Inserting
+    // instead of moving cannot do that, because a face that no bevel touches keeps
+    // its original triangles exactly.
+    //
+    // The three pieces:
+    //
+    //   RAILS  - per bevelled edge e = (a, b), and per incident SIDE, the edge
+    //            pushed back by w along that side's in-plane normal. Four points
+    //            per bevelled edge.
+    //   SIDES  - each side's boundary loop is rewritten: a boundary edge that is
+    //            bevelled contributes its two RAIL points instead of its two
+    //            original ones, and everything else is left alone. The resulting
+    //            polygon is planar (a side is a planar region by construction) and
+    //            is ear-clipped in its own plane.
+    //   STRIPS - the quad between the two rails of an edge, one band for a
+    //            chamfer, `rings` bands along the tangent arc for a round.
+    //
+    // What is left over at a vertex where several bevelled edges meet is the
+    // corner patch, and it is found from the genuinely open edges of the assembled
+    // mesh rather than predicted - see the end of this function.
+
     indexed_triangle_set out;
     out.vertices = its.vertices;
 
-    // Which bevelled edges touch each vertex.
+    // Which bevelled edges touch each vertex, and which bound each side.
     std::map<int, std::vector<int>> edges_at_vertex;
     for (const auto &kv : width_of) {
         const Vec2i32 ev = topo.edge_vertices[kv.first];
@@ -1032,73 +1275,174 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         edges_at_vertex[ev(1)].push_back(kv.first);
     }
 
-    // The split copy of vertex `v` belonging to the side that facet `f` is in.
-    // Every facet of that side gets the SAME copy, which is what stops a side
-    // tearing along its own interior edges.
-    auto corner_of = [&](int v, size_t f) -> int {
-        const int  side = side_of[f];
-        const auto key  = std::make_pair(v, side);
-        auto       it   = corner_vertex.find(key);
-        if (it != corner_vertex.end())
-            return it->second;
+    // Vertices where a strip END CAP was emitted, so the corner filler can tell
+    // an already-closed strip end from a real multi-bevel corner.
+    std::set<int> capped_vertices;
 
-        // Sum the pullback each bevelled edge at v that BOUNDS this side asks for.
-        // An edge (v, u) on the side's boundary pulls the corner along that edge's
-        // in-plane normal, measured inside a facet of THIS side, by the edge's
-        // width. On a cube corner two bevelled edges bound each side, so the corner
-        // moves diagonally inward by exactly what the three strips and the corner
-        // patch need to meet.
-        Vec3f disp = Vec3f::Zero();
-        auto  eit  = edges_at_vertex.find(v);
-        if (eit != edges_at_vertex.end()) {
-            for (int e : eit->second) {
-                // Which of the edge's two facets is on this side? That facet is the
-                // one whose plane the offset is measured in.
-                const Vec2i32 ff = topo.edge_faces[e];
-                size_t        on_side = size_t(-1);
-                for (int k = 0; k < 2; ++k)
-                    if (ff(k) >= 0 && side_of[size_t(ff(k))] == side)
-                        on_side = size_t(ff(k));
-                if (on_side == size_t(-1))
-                    continue; // this bevelled edge does not bound the side
-                // .at(), not operator[]: edges_at_vertex is built from width_of so
-                // the entry is always there, and .at() says so rather than silently
-                // inserting a zero if that ever stopped being true.
-                const Vec2i32 ev = topo.edge_vertices[e];
-                const int     u  = ev(0) == v ? ev(1) : ev(0);
-                disp += width_of.at(e) * in_plane_normal(its, topo, on_side, v, u);
-            }
-        }
-        if (disp.squaredNorm() < 1e-20f) {
-            // Nothing pulls this corner: it keeps the original vertex, which also
-            // keeps the mesh compact where no bevel reaches.
-            corner_vertex.emplace(key, v);
-            return v;
-        }
-        const int nv = int(out.vertices.size());
-        out.vertices.emplace_back(its.vertices[v] + disp);
-        corner_vertex.emplace(key, nv);
+    // rail[(edge, side, vertex)] -> index of the inserted point.
+    std::map<std::tuple<int, int, int>, int> rail;
+    auto rail_of = [&](int e, int side, int v) -> int {
+        const auto key = std::make_tuple(e, side, v);
+        auto       it  = rail.find(key);
+        if (it != rail.end())
+            return it->second;
+        // The facet of this edge that lies on this side gives the plane the
+        // offset is measured in.
+        const Vec2i32 ff = topo.edge_faces[e];
+        size_t        on_side = size_t(-1);
+        for (int k = 0; k < 2; ++k)
+            if (ff(k) >= 0 && side_of[size_t(ff(k))] == side)
+                on_side = size_t(ff(k));
+        if (on_side == size_t(-1))
+            return -1;
+        const Vec2i32 ev = topo.edge_vertices[e];
+        const int     u  = ev(0) == v ? ev(1) : ev(0);
+        const Vec3f   t  = in_plane_normal(its, topo, on_side, v, u);
+        const int     nv = int(out.vertices.size());
+        out.vertices.emplace_back(its.vertices[v] + width_of.at(e) * t);
+        rail.emplace(key, nv);
         return nv;
     };
 
-    // --- re-index every original facet --------------------------------------
-    out.indices.reserve(its.indices.size() * 2 + width_of.size() * size_t(rings) * 2);
-    for (size_t f = 0; f < its.indices.size(); ++f) {
-        const auto &tri = its.indices[f];
-        const int   a = corner_of(tri[0], f);
-        const int   b = corner_of(tri[1], f);
-        const int   c = corner_of(tri[2], f);
-        if (a == b || b == c || a == c)
-            continue; // the pullback collapsed this facet; the patches cover it
-        out.indices.emplace_back(a, b, c);
+    // --- rewrite each side -----------------------------------------------------
+    //
+    // A side's boundary is the cycle of its edges that are not interior to it. It
+    // is walked as a sequence of (vertex, edge) steps so the rewrite can see, at
+    // every corner, whether the edge arriving and the edge leaving are bevelled.
+
+    // side -> its facets.
+    std::map<int, std::vector<size_t>> facets_of_side;
+    for (size_t f = 0; f < its.indices.size(); ++f)
+        facets_of_side[side_of[f]].push_back(f);
+
+    for (const auto &sv : facets_of_side) {
+        const int side = sv.first;
+
+        // Does any bevelled edge bound this side? If not, the side is untouched
+        // and its facets are emitted exactly as they were - which is the property
+        // that makes this construction safe.
+        bool touched = false;
+        for (size_t f : sv.second) {
+            for (int j = 0; j < 3 && !touched; ++j) {
+                const int e = topo.face_edge_ids[f][j];
+                if (e >= 0 && width_of.count(e) > 0)
+                    touched = true;
+            }
+            if (touched)
+                break;
+        }
+        if (!touched) {
+            for (size_t f : sv.second)
+                out.indices.emplace_back(its.indices[f]);
+            continue;
+        }
+
+        // The side's boundary, as directed edges (u -> v) that have no partner
+        // inside the side. Each facet contributes the sides whose neighbour is on
+        // another side (or nothing).
+        std::map<int, int>           nxt;      // u -> v along the boundary
+        std::map<std::pair<int, int>, int> bedge; // (u,v) -> global edge id
+        for (size_t f : sv.second) {
+            const auto &tri = its.indices[f];
+            for (int j = 0; j < 3; ++j) {
+                const int nb = topo.face_neighbors[f][j];
+                if (nb >= 0 && side_of[size_t(nb)] == side)
+                    continue; // interior to the side
+                const int u = tri[j], v = tri[(j + 1) % 3];
+                nxt[u] = v;
+                bedge[std::make_pair(u, v)] = topo.face_edge_ids[f][j];
+            }
+        }
+        if (nxt.empty())
+            continue;
+
+        // Walk it. A side whose boundary is not a single clean cycle is left as
+        // its original facets - refusing to guess is better than emitting a fold,
+        // and the closedness check will report it if it matters.
+        std::vector<int> loop;
+        {
+            const int start = nxt.begin()->first;
+            int       cur   = start;
+            std::set<int> seen;
+            while (seen.insert(cur).second) {
+                loop.push_back(cur);
+                auto it = nxt.find(cur);
+                if (it == nxt.end()) { loop.clear(); break; }
+                cur = it->second;
+                if (cur == start) break;
+            }
+            if (cur != start || loop.size() != nxt.size())
+                loop.clear();
+        }
+        if (loop.size() < 3) {
+            for (size_t f : sv.second)
+                out.indices.emplace_back(its.indices[f]);
+            continue;
+        }
+
+        // Rewrite: at each boundary vertex emit, in boundary order, the rail of the
+        // arriving bevelled edge, the vertex itself only when NEITHER of its two
+        // boundary edges is bevelled, and then the rail of the leaving one.
+        //
+        // In other words a vertex is REPLACED by the rails of whichever of its
+        // edges are being bevelled. Worked through on the cube: chamfering the
+        // 4-7 edge turns the +Z square [4, 5, 6, 7] into [railA, 5, 6, railB],
+        // which is the square with a w-wide band removed along that edge - area
+        // 10x10 - w*10, exactly right.
+        //
+        // Keeping v ALONGSIDE its rail (tried, and wrong) makes the polygon
+        // self-touching, because the rail lies on the very edge v->next that
+        // would follow it.
+        std::vector<int> poly;
+        poly.reserve(loop.size() * 2);
+        for (size_t i = 0; i < loop.size(); ++i) {
+            const int v    = loop[i];
+            const int prev = loop[(i + loop.size() - 1) % loop.size()];
+            const int next = loop[(i + 1) % loop.size()];
+
+            auto edge_between = [&](int x, int y) {
+                auto it = bedge.find(std::make_pair(x, y));
+                return it == bedge.end() ? -1 : it->second;
+            };
+            const int  e_in    = edge_between(prev, v);   // arriving at v
+            const int  e_out   = edge_between(v, next);   // leaving v
+            const bool in_bev  = e_in  >= 0 && width_of.count(e_in)  > 0;
+            const bool out_bev = e_out >= 0 && width_of.count(e_out) > 0;
+
+            auto push = [&](int idx) {
+                if (idx >= 0 && (poly.empty() || poly.back() != idx))
+                    poly.push_back(idx);
+            };
+
+            if (in_bev)
+                push(rail_of(e_in, side, v));
+            // v is dropped only when BOTH of its boundary edges are bevelled -
+            // then the corner really is cut away and the two rails replace it.
+            // When only one is, v must stay: the face still reaches the vertex
+            // along its un-bevelled edge, and the rail is merely an extra point
+            // on the way there. Dropping it leaves that un-bevelled edge with one
+            // facet on one side and none on the other (measured: the single-edge
+            // chamfer came back non-closed, with edge 4-5 open). The rail is
+            // collinear with v and the next boundary vertex, which keeps the
+            // polygon simple - collinear is not self-intersecting.
+            if (!(in_bev && out_bev))
+                push(v);
+            if (out_bev)
+                push(rail_of(e_out, side, v));
+        }
+        while (poly.size() > 1 && poly.front() == poly.back())
+            poly.pop_back();
+        if (poly.size() < 3)
+            continue;
+
+        // Triangulate the rewritten polygon in the side's own plane. A side is
+        // planar by construction (it is bounded by creases), so a 2D ear clip in
+        // that plane is exact and cannot fold the way a 3D fan would.
+        const Vec3f n = topo.face_normals[sv.second.front()];
+        triangulate_planar_polygon(out, poly, n);
     }
 
-    // --- the strips ----------------------------------------------------------
-    //
-    // For edge e = (a, b) with facets f0, f1, the four corner vertices
-    // (a,f0) (b,f0) (b,f1) (a,f1) bound the hole the re-index opened. For a
-    // chamfer that hole is filled with two triangles. For a round it is filled
-    // with `rings` bands whose intermediate vertices follow the tangent arc.
+    // --- the strips ------------------------------------------------------------
     for (const auto &kv : width_of) {
         const int     e  = kv.first;
         const float   w  = kv.second;
@@ -1106,96 +1450,106 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
         const Vec2i32 ff = topo.edge_faces[e];
         const int     a = ev(0), b = ev(1);
         const size_t  f0 = size_t(ff(0)), f1 = size_t(ff(1));
+        const int     s0 = side_of[f0], s1 = side_of[f1];
 
-        const int a0 = corner_of(a, f0), b0 = corner_of(b, f0);
-        const int a1 = corner_of(a, f1), b1 = corner_of(b, f1);
+        const int a0 = rail_of(e, s0, a), b0 = rail_of(e, s0, b);
+        const int a1 = rail_of(e, s1, a), b1 = rail_of(e, s1, b);
+        if (a0 < 0 || b0 < 0 || a1 < 0 || b1 < 0)
+            continue;
 
-        // The strip has to face OUTWARD like the faces it joins. Rather than
+        // The strip must face OUTWARD like the faces it joins, so rather than
         // hard-code a winding and hope the mesh is wound the way the derivation
-        // assumed, emit one quad through a helper that checks its own normal
-        // against the two incident face normals and flips if it got it wrong.
-        // A band between two outward faces must point outward too, so their mean
-        // is the reference.
+        // assumed, every quad goes through a helper that checks its own normal
+        // against the two incident face normals and flips the pair if it got it
+        // wrong. (The hand-derived winding WAS inverted when this was first
+        // written, caught by working the cube corner through on paper.)
         const Vec3f outward = topo.face_normals[f0] + topo.face_normals[f1];
         auto emit_quad = [&](int p0, int p1, int q1, int q0) {
-            // Quad (p0 -> p1 -> q1 -> q0). Split into two triangles, both wound the
-            // same way, and flip the pair together if the first faces inward.
-            const Vec3f &A = out.vertices[p0];
-            const Vec3f &B = out.vertices[p1];
-            const Vec3f &C = out.vertices[q1];
-            const Vec3f  n = (B - A).cross(C - A);
-            const bool   flip = n.dot(outward) < 0.f;
+            const Vec3f A = out.vertices[p0];
+            const Vec3f B = out.vertices[p1];
+            const Vec3f C = out.vertices[q1];
+            const bool  flip = (B - A).cross(C - A).dot(outward) < 0.f;
             auto tri = [&](int x, int y, int z) {
                 if (x == y || y == z || x == z)
                     return;
-                if (flip)
-                    out.indices.emplace_back(x, z, y);
-                else
-                    out.indices.emplace_back(x, y, z);
+                if (flip) out.indices.emplace_back(x, z, y);
+                else      out.indices.emplace_back(x, y, z);
             };
             tri(p0, p1, q1);
             tri(p0, q1, q0);
         };
 
+        // END CAPS. Where a bevelled edge STOPS at a vertex - because no other
+        // bevelled edge continues through it - the strip has an open end, and the
+        // triangle (v, rail_on_side_0, rail_on_side_1) is what closes it. That
+        // triangle lies in the plane of the faces that still meet at v, so it adds
+        // no volume of its own; it simply caps the wedge the strip cut out.
+        //
+        // It has to be emitted HERE rather than left to the generic hole filler at
+        // the end. The hole at such a vertex is not the little triangle - it is a
+        // polygon that reaches all the way around v across the faces that were NOT
+        // rewritten (on a cube, a pentagon spanning the +Y face), and filling THAT
+        // with a centroid fan bulges a patch into the solid: measured, the
+        // single-edge chamfer came back at volume 998.3 where 995.0 was right, with
+        // a stray vertex at (7.8, y, 7.8) in the middle of the part. Capping the
+        // strip end first leaves nothing for the filler to get wrong.
+        auto cap_end = [&](int v, int r0, int r1) {
+            // Only when the vertex is not carried on by another bevelled edge: if
+            // it is, the two strips meet there and the corner patch is the right
+            // answer instead.
+            auto it = edges_at_vertex.find(v);
+            if (it != edges_at_vertex.end() && it->second.size() > 1)
+                return;
+            if (r0 == r1 || v == r0 || v == r1)
+                return;
+            const Vec3f A = out.vertices[v], B = out.vertices[r0], C = out.vertices[r1];
+            if ((B - A).cross(C - A).dot(outward) < 0.f) out.indices.emplace_back(v, r1, r0);
+            else                                        out.indices.emplace_back(v, r0, r1);
+            capped_vertices.insert(v);
+        };
+
         if (rings <= 1) {
-            // Chamfer: one flat band across the hole, from f0's rail to f1's.
             emit_quad(a0, a1, b1, b0);
+            cap_end(a, a0, a1);
+            cap_end(b, b0, b1);
             continue;
         }
 
         // Round: interpolate `rings` bands along the arc tangent to both faces.
-        //
-        // The arc is built in the plane perpendicular to the edge. Its endpoints
-        // are the two rails; its centre lies along the inward bisector at
-        // w / tan(interior/2) from the edge - which is exactly the distance that
-        // makes the arc tangent to both faces, the spec's r / sin(theta/2)
-        // expressed for the offset distance rather than the radius.
         const Vec3f t0 = in_plane_normal(its, topo, f0, a, b);
         const Vec3f t1 = in_plane_normal(its, topo, f1, a, b);
         const float interior = edge_interior_angle(topo, e);
-        // Degenerate angle: fall back to the chamfer rather than dividing by ~0.
-        if (!(interior > 1e-3f) || interior > float(M_PI) - 1e-3f) {
-            emit_quad(a0, a1, b1, b0);
-            continue;
-        }
-
-        // The bisector pointing INTO the material, and the arc centre offset.
-        Vec3f bis = t0 + t1;
-        const float bl = bis.norm();
-        if (bl < 1e-9f) {
-            emit_quad(a0, a1, b1, b0);
+        Vec3f       bis = t0 + t1;
+        const float bl  = bis.norm();
+        if (!(interior > 1e-3f) || interior > float(M_PI) - 1e-3f || bl < 1e-9f) {
+            emit_quad(a0, a1, b1, b0);   // degenerate angle: the chamfer is right
+            cap_end(a, a0, a1);
+            cap_end(b, b0, b1);
             continue;
         }
         bis /= bl;
         const float half = interior * 0.5f;
-        // The arc centre sits on the inward bisector, at the point equidistant from
-        // both rails. Each rail is w from the edge along its own face, and the
-        // bisector makes an angle `half` with each face, so that distance is
-        // w / cos(half) - which is the spec's r / sin(theta/2) written for the
-        // offset distance rather than the fillet radius.
-        //
-        // The intermediate ring points are then a spherical interpolation of the
-        // two rail directions ABOUT that centre, which is exact for a circular
-        // cross-section and needs no further trigonometry.
+        // The arc centre sits on the inward bisector, at the point equidistant
+        // from both rails: each rail is w from the edge along its own face and the
+        // bisector makes `half` with each, so that distance is w / cos(half) -
+        // the spec's r / sin(theta/2) written for the offset rather than the
+        // radius. Checked numerically on the cube: for a 90 deg edge at w = 1 the
+        // centre lands at sqrt(2) and both rails are exactly 1 from it, so the arc
+        // is a true tangent quarter-circle.
         const float centre_dist = w / std::max(std::cos(half), 1e-3f);
 
-        // Build the intermediate rings at both ends of the edge.
         auto arc_points = [&](int v, int cA, int cB) {
-            // cA / cB are this end's two rail vertices (on f0 and f1).
             std::vector<int> ring;
             ring.reserve(size_t(rings) + 1);
             ring.push_back(cA);
-            const Vec3f  P  = its.vertices[v];
-            const Vec3f  C  = P + bis * centre_dist;
-            const Vec3f  dA = (out.vertices[cA] - C).normalized();
-            const Vec3f  dB = (out.vertices[cB] - C).normalized();
-            const float  rA = (out.vertices[cA] - C).norm();
-            const float  rB = (out.vertices[cB] - C).norm();
-            const float  cosang = std::clamp(dA.dot(dB), -1.f, 1.f);
-            const float  ang    = std::acos(cosang);
-            // The two rail directions must actually span a plane, or there is no
-            // arc between them and the slerp below is undefined.
-            const float  al     = dA.cross(dB).norm();
+            // Values, not references: out.vertices grows inside this loop.
+            const Vec3f C  = its.vertices[v] + bis * centre_dist;
+            const Vec3f dA = (out.vertices[cA] - C).normalized();
+            const Vec3f dB = (out.vertices[cB] - C).normalized();
+            const float rA = (out.vertices[cA] - C).norm();
+            const float rB = (out.vertices[cB] - C).norm();
+            const float ang = std::acos(std::clamp(dA.dot(dB), -1.f, 1.f));
+            const float al  = dA.cross(dB).norm();
             for (int s = 1; s < rings; ++s) {
                 const float u = float(s) / float(rings);
                 Vec3f       d;
@@ -1204,13 +1558,12 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
                 } else {
                     // Spherical interpolation about the arc centre: exact for a
                     // circular cross-section, and it degenerates cleanly.
-                    const float s0 = std::sin((1.f - u) * ang) / std::sin(ang);
-                    const float s1 = std::sin(u * ang) / std::sin(ang);
-                    d = (dA * s0 + dB * s1).normalized();
+                    const float s0f = std::sin((1.f - u) * ang) / std::sin(ang);
+                    const float s1f = std::sin(u * ang) / std::sin(ang);
+                    d = (dA * s0f + dB * s1f).normalized();
                 }
-                const float r = rA + (rB - rA) * u;
                 ring.push_back(int(out.vertices.size()));
-                out.vertices.emplace_back(C + d * r);
+                out.vertices.emplace_back(C + d * (rA + (rB - rA) * u));
             }
             ring.push_back(cB);
             return ring;
@@ -1218,147 +1571,35 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
 
         const std::vector<int> ring_a = arc_points(a, a0, a1);
         const std::vector<int> ring_b = arc_points(b, b0, b1);
-
-        // One band per ring step, wound by the same self-correcting helper the
-        // chamfer uses - so the two profiles cannot disagree about which way the
-        // strip faces.
         for (size_t s = 0; s + 1 < ring_a.size(); ++s)
             emit_quad(ring_a[s], ring_a[s + 1], ring_b[s + 1], ring_b[s]);
+
+        // The round profile's end cap is a fan from the vertex over the whole
+        // ring, for the same reason the chamfer's is a single triangle.
+        auto cap_ring = [&](int v, const std::vector<int> &ring) {
+            auto it = edges_at_vertex.find(v);
+            if (it != edges_at_vertex.end() && it->second.size() > 1)
+                return;
+            for (size_t s = 0; s + 1 < ring.size(); ++s)
+                cap_end(v, ring[s], ring[s + 1]);
+        };
+        cap_ring(a, ring_a);
+        cap_ring(b, ring_b);
     }
 
-    // --- the corner patches --------------------------------------------------
+    // --- the corner patches ----------------------------------------------------
     //
-    // Where bevelled edges meet at a vertex, their strips arrive from different
-    // directions and leave a hole between them. On a cube with all 12 edges
-    // bevelled that is the eight classic three-sided corners.
+    // Where several bevelled edges meet at a vertex, the strips and the rewritten
+    // sides leave a hole between them - on a cube with all 12 edges bevelled, the
+    // eight classic three-sided corners.
     //
-    // These are found from the mesh that has actually been built, NOT predicted
-    // from the one-ring of the original vertex. Predicting them is what the first
-    // two attempts did and both were wrong in the same way: a vertex where a
-    // bevelled edge meets an UNBEVELLED crease has its two sides resolve to the
-    // very same original vertex index, so there is no tear there at all - and
-    // emitting a patch anyway put a third facet on edges that already had two,
-    // making the result non-manifold rather than closed. (The all-12-edges cube
-    // passed throughout, because there every side transition IS a bevel; the
-    // single-edge chamfer is what exposed it.)
-    //
-    // So: collect the edges that are genuinely open - used by exactly one facet -
-    // stitch them into loops, and fill each loop. An edge that was never torn is
-    // not open, so it is never touched, and a hole that does exist is filled
-    // exactly once whatever produced it. That is robust by construction instead of
-    // by case analysis.
-    {
-        // Directed edge (a -> b) appears once per facet that uses it in that
-        // direction. On a closed surface every undirected edge carries one of each
-        // direction; a hole leaves the boundary direction unmatched.
-        std::map<std::pair<int, int>, int>    directed;
-        // (a -> b) -> one facet that uses it in that direction, for the winding
-        // reference below.
-        std::map<std::pair<int, int>, size_t> facet_of_directed;
-        for (size_t fi = 0; fi < out.indices.size(); ++fi) {
-            const Vec3i32 &f = out.indices[fi];
-            for (int s = 0; s < 3; ++s) {
-                const auto key = std::make_pair(f[s], f[(s + 1) % 3]);
-                ++directed[key];
-                facet_of_directed.emplace(key, fi);
-            }
-        }
-
-        // next[a] = b for every unmatched a -> b: the hole boundary, already
-        // oriented so that walking it keeps the solid on the correct side, which is
-        // what makes the fill's winding follow automatically.
-        std::map<int, int> next;
-        for (const auto &d : directed) {
-            const auto rev = std::make_pair(d.first.second, d.first.first);
-            auto       it  = directed.find(rev);
-            const int  back = it == directed.end() ? 0 : it->second;
-            if (d.second > back)
-                next.emplace(d.first.first, d.first.second);
-        }
-
-        std::set<int> visited;
-        for (const auto &seed : next) {
-            if (visited.count(seed.first) > 0)
-                continue;
-
-            std::vector<int> loop;
-            int              cur = seed.first;
-            while (visited.insert(cur).second) {
-                loop.push_back(cur);
-                auto it = next.find(cur);
-                if (it == next.end()) {
-                    loop.clear(); // an open chain, not a loop: leave it to the check
-                    break;
-                }
-                cur = it->second;
-                if (cur == seed.first)
-                    break;
-            }
-            if (loop.size() < 3)
-                continue;
-
-            // Outward direction for this hole: the mean normal of the facets that
-            // border it. Those already face outward, so the patch must too. The
-            // bordering facet of boundary edge (a -> b) is the one using (b -> a),
-            // looked up through the index built above rather than by rescanning the
-            // mesh per edge.
-            Vec3f vn = Vec3f::Zero();
-            for (size_t i = 0; i < loop.size(); ++i) {
-                const int a = loop[i], b = loop[(i + 1) % loop.size()];
-                auto      it = facet_of_directed.find(std::make_pair(b, a));
-                if (it == facet_of_directed.end())
-                    continue;
-                const Vec3i32 &f = out.indices[it->second];
-                const Vec3f   &p0 = out.vertices[f[0]];
-                const Vec3f   &p1 = out.vertices[f[1]];
-                const Vec3f   &p2 = out.vertices[f[2]];
-                vn += (p1 - p0).cross(p2 - p0);
-            }
-
-            // A three-sided hole IS a triangle - the ordinary cube corner - so it is
-            // emitted as one rather than as a centroid plus three slivers.
-            if (loop.size() == 3) {
-                const Vec3f p0 = out.vertices[loop[0]];
-                const Vec3f p1 = out.vertices[loop[1]];
-                const Vec3f p2 = out.vertices[loop[2]];
-                if ((p1 - p0).cross(p2 - p0).dot(vn) < 0.f)
-                    out.indices.emplace_back(loop[0], loop[2], loop[1]);
-                else
-                    out.indices.emplace_back(loop[0], loop[1], loop[2]);
-                ++res.corner_patches;
-                continue;
-            }
-
-            // Four or more sides: fan from the CENTROID, which stays valid for the
-            // non-planar (often saddle-shaped) polygon a higher-valence corner patch
-            // is, where a fan from one of its own vertices would fold.
-            Vec3f centroid = Vec3f::Zero();
-            for (int c : loop)
-                centroid += out.vertices[c];
-            centroid /= float(loop.size());
-
-            const int cv = int(out.vertices.size());
-            out.vertices.emplace_back(centroid);
-
-            // Copies, not references: out.vertices has just grown and may have moved.
-            const bool flip = [&] {
-                const Vec3f p0 = out.vertices[loop[0]];
-                const Vec3f p1 = out.vertices[loop[1]];
-                return (p0 - centroid).cross(p1 - centroid).dot(vn) < 0.f;
-            }();
-            for (size_t i = 0; i < loop.size(); ++i) {
-                const int p = loop[i];
-                const int q = loop[(i + 1) % loop.size()];
-                if (p == q)
-                    continue;
-                if (flip)
-                    out.indices.emplace_back(cv, q, p);
-                else
-                    out.indices.emplace_back(cv, p, q);
-            }
-            ++res.corner_patches;
-        }
-    }
+    // These are found from the mesh that has actually been built, not predicted
+    // from the original one-ring: collect the edges that are genuinely open (used
+    // by exactly one facet), stitch them into loops and fill each one. An edge
+    // that was never torn is never open, so it is never touched, and a hole that
+    // does exist is filled exactly once whatever produced it. Robust by
+    // construction rather than by case analysis.
+    fill_open_loops(out, res.corner_patches, capped_vertices);
 
 
     // --- clean up ------------------------------------------------------------

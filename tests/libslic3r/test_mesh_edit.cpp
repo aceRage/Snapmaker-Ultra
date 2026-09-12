@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <set>
 
 #include "libslic3r/MeshEdit.hpp"
@@ -1095,3 +1096,4 @@ TEST_CASE("MeshEdit: a concave edge is dropped and named, not silently mangled",
     CHECK(watertight(mixed.mesh));
     CHECK(is_closed_manifold(mixed.mesh));
 }
+
