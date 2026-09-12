@@ -1,6 +1,9 @@
 #include "GLGizmoCut.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/CameraUtils.hpp"
+// OpenGLManager::get_gl_info().is_mesa(), for the mm_contour shader's clip-space
+// bias the drawn stroke's ribbon uses.
+#include "slic3r/GUI/OpenGLManager.hpp"
 
 #include <glad/gl.h>
 
@@ -348,6 +351,13 @@ bool GLGizmoCut3D::on_mouse(const wxMouseEvent &mouse_event)
     // Curved surface: a control-point drag wins over the plane grabbers, so a
     // click that lands on a handle bends the sheet instead of moving the plane.
     if (curved_on_mouse(mouse_event))
+        return true;
+
+    // Draw surface: a left drag on the model PAINTS the cut line, so it has to
+    // win over everything the plane would otherwise do with a drag. It claims the
+    // event only when the ray actually hits the model, so a drag on empty space
+    // still orbits the camera.
+    if (draw_on_mouse(mouse_event))
         return true;
 
     if (mouse_event.ShiftDown() && mouse_event.LeftDown())
@@ -1200,7 +1210,8 @@ bool GLGizmoCut3D::curved_instance_mesh_in_plane(indexed_triangle_set& out) cons
 
 void GLGizmoCut3D::fit_curved_sheet_to_section(bool force)
 {
-    if (!m_curved_surface)
+    // The sheet's own fit. Draw has no sheet, so there is nothing to fit.
+    if (m_surface_mode != CutSurfaceMode::Curved)
         return;
 
     // Only re-fit when the plane has actually moved or turned. A fit costs a
@@ -2217,7 +2228,7 @@ void GLGizmoCut3D::apply_curved_sheet_state(const CurvedSheetState& st)
 
 void GLGizmoCut3D::push_curved_undo()
 {
-    if (!m_curved_surface)
+    if (m_surface_mode != CutSurfaceMode::Curved)
         return;
     m_curved_undo.emplace_back(curved_sheet_state());
     if (m_curved_undo.size() > CurvedUndoLimit)
@@ -2228,7 +2239,7 @@ void GLGizmoCut3D::push_curved_undo()
 
 bool GLGizmoCut3D::curved_undo()
 {
-    if (!m_curved_surface || m_curved_undo.empty())
+    if (m_surface_mode != CutSurfaceMode::Curved || m_curved_undo.empty())
         return false;
     // Park the CURRENT state on the redo stack before restoring, so redo has
     // somewhere to come back to.
@@ -2241,7 +2252,7 @@ bool GLGizmoCut3D::curved_undo()
 
 bool GLGizmoCut3D::curved_redo()
 {
-    if (!m_curved_surface || m_curved_redo.empty())
+    if (m_surface_mode != CutSurfaceMode::Curved || m_curved_redo.empty())
         return false;
     m_curved_undo.emplace_back(curved_sheet_state());
     const CurvedSheetState st = m_curved_redo.back();
@@ -2252,12 +2263,48 @@ bool GLGizmoCut3D::curved_redo()
 
 bool GLGizmoCut3D::on_cut_char(int key_code, bool shift_down, bool ctrl_down)
 {
-    if (m_state != On || !ctrl_down)
+    if (m_state != On)
         return false;
-    // Only while the sheet is the thing being edited. In Flat mode, or while the
-    // connector panel is up, Ctrl+Z means what it always meant and must fall
-    // straight through to the plater.
-    if (!is_curved_surface() || m_connectors_editing)
+
+    // ESC IN DRAW MODE CLEARS THE LINE. It has to be claimed here, ahead of
+    // GLGizmosManager's own Esc branch, because that branch calls
+    // reset_all_states() - i.e. it CLOSES the gizmo - and "Esc clears the stroke"
+    // is the gesture the research spec asks for. Returning true is what keeps the
+    // gizmo open; with no stroke to clear it falls through and Esc closes the
+    // gizmo as it always did.
+    if (!ctrl_down && !shift_down && key_code == WXK_ESCAPE && is_draw_surface() && !m_connectors_editing) {
+        if (m_draw_capturing) {
+            // Mid-stroke: abandon the line being drawn and put back the one that
+            // was there before the press (push_draw_undo() stored it).
+            m_draw_capturing  = false;
+            m_draw_last_mouse = Vec2d::Zero();
+            if (!m_draw_undo.empty()) {
+                const DrawStrokeState st = m_draw_undo.back();
+                m_draw_undo.pop_back();
+                apply_draw_stroke_state(st);
+            }
+            else
+                clear_draw_stroke(/*push_undo*/ false);
+            return true;
+        }
+        if (!m_draw_stroke.empty()) {
+            clear_draw_stroke(/*push_undo*/ true);
+            return true;
+        }
+        return false;
+    }
+
+    if (!ctrl_down)
+        return false;
+    // Only while a SHAPED surface is the thing being edited - the sheet or the
+    // stroke. In Flat mode, or while the connector panel is up, Ctrl+Z means what
+    // it always meant and must fall straight through to the plater.
+    //
+    // THE TRAP THE RESEARCH SPEC FLAGS: this used to gate on is_curved_surface()
+    // alone, so Draw would have got no Ctrl+Z at all - and the symptom (Ctrl+Z
+    // undoing a MODEL action instead of a stroke) reads as confusing rather than
+    // broken.
+    if (!is_shaped_surface() || m_connectors_editing)
         return false;
 
     // wx delivers Ctrl+<letter> as either the control code or the letter,
@@ -2267,6 +2314,13 @@ bool GLGizmoCut3D::on_cut_char(int key_code, bool shift_down, bool ctrl_down)
     const bool is_y = key_code == 'y' || key_code == 'Y' || key_code == WXK_CONTROL_Y;
 
     // Ctrl+Shift+Z is redo as well, the second binding everyone expects.
+    if (is_draw_surface()) {
+        if (is_y || (is_z && shift_down))
+            return draw_redo();
+        if (is_z)
+            return draw_undo();
+        return false;
+    }
     if (is_y || (is_z && shift_down))
         return curved_redo();
     if (is_z)
@@ -2447,16 +2501,18 @@ void GLGizmoCut3D::render_curved_surface_inputs()
     // outlive the call.
     const std::string flat_label   = _u8L("Flat");
     const std::string curved_label = _u8L("Curved");
+    const std::string draw_label   = _u8L("Draw");
 
-    bool flat = !m_curved_surface;
+    bool flat = m_surface_mode == CutSurfaceMode::Flat;
     if (m_imgui->bbl_radio_button(flat_label.c_str(), flat)) {
-        m_curved_surface = false;
+        m_surface_mode = CutSurfaceMode::Flat;
         invalidate_curved_sheet();
+        invalidate_draw_stroke();
     }
     ImGui::SameLine();
-    bool curved = m_curved_surface;
+    bool curved = m_surface_mode == CutSurfaceMode::Curved;
     if (m_imgui->bbl_radio_button(curved_label.c_str(), curved)) {
-        m_curved_surface = true;
+        m_surface_mode = CutSurfaceMode::Curved;
         // A fresh Curved session starts with no sheet history: the surfaces the
         // old entries describe belong to a sheet that has just been re-fitted.
         clear_curved_undo();
@@ -2468,12 +2524,29 @@ void GLGizmoCut3D::render_curved_surface_inputs()
         fit_curved_sheet_to_section(/*force*/ true);
         invalidate_curved_sheet();
     }
+    ImGui::SameLine();
+    bool draw = m_surface_mode == CutSurfaceMode::Draw;
+    if (m_imgui->bbl_radio_button(draw_label.c_str(), draw)) {
+        m_surface_mode = CutSurfaceMode::Draw;
+        // A fresh Draw session starts with no stroke and no stroke history. The
+        // sheet is left alone rather than reset: switching back to Curved should
+        // find the surface where it was.
+        m_draw_stroke.clear();
+        clear_draw_undo();
+        m_draw_capturing = false;
+        invalidate_draw_stroke();
+        invalidate_curved_sheet();
+    }
 
     // Side visibility is useful on a flat cut too - "let me see the other half"
-    // has nothing to do with the sheet - so it is offered in both modes.
+    // has nothing to do with the sheet - so it is offered in every mode.
     render_side_visibility_inputs();
 
-    if (!m_curved_surface)
+    if (m_surface_mode == CutSurfaceMode::Draw) {
+        render_draw_surface_inputs();
+        return;
+    }
+    if (m_surface_mode != CutSurfaceMode::Curved)
         return;
 
     // Control grid: nx COLUMNS by ny ROWS. Resizing re-samples the current
@@ -2637,6 +2710,657 @@ void GLGizmoCut3D::render_curved_surface_inputs()
 // than inside the curved-surface block.
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// DRAW CUT (phase 1)
+//
+// Draw is the third surface mode: instead of the flat plane or the curved
+// sheet's height field, the cut surface is a RULED STRIP swept along a stroke
+// the user paints on the model. The geometry is all in libslic3r/DrawCut.{hpp,cpp}
+// where tests reach it; what lives here is the capture, the preview and the
+// panel.
+//
+// THE PREVIEW, and why it is what it is. The curved cut's coloured halves come
+// from the volume shader, which splits fragments by sampling the sheet's height
+// field out of a texture (gouraud.fs, curved_sheet_*). That trick needs the cut
+// surface to BE a height field over the plane, single-valued in (u,v) - and a
+// ruled strip swept along a curve is exactly the thing that is not. The research
+// spec offered the alternative of computing the real split in a background job on
+// stroke end and previewing the resulting half meshes with a spinner.
+//
+// This takes a third, more robust route: render the CUTTER SOLID itself,
+// translucent, over the model. That solid IS what the boolean will use - not an
+// approximation of it, not a re-derivation - so what the user sees is what they
+// will get, it needs no boolean and therefore no job, no spinner and no stale
+// state, and it updates the instant any parameter changes rather than after a
+// few hundred milliseconds of Manifold. The two halves are not separately
+// coloured (the shader cannot tell them apart without the split), which is the
+// deviation; the Visible / Ghost / Hidden side controls still work against the
+// plane's own split, and ghosting the near half is what lets the shell be seen
+// inside the part.
+// ===========================================================================
+
+void GLGizmoCut3D::invalidate_draw_stroke()
+{
+    m_draw_preview_dirty = true;
+}
+
+Vec3d GLGizmoCut3D::draw_view_dir_in_plane() const
+{
+    // The camera's forward direction, taken into the cut plane's frame - the frame
+    // the stroke and the cutter live in. Forward, i.e. INTO the screen and so into
+    // the part, which is the direction a "View" cut reaches.
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    const Vec3d   fwd_world = camera.get_dir_forward();
+    const Vec3d   d = m_rotation_m.linear().inverse() * fwd_world;
+    return d.norm() > 1e-9 ? Vec3d(d.normalized()) : Vec3d(-Vec3d::UnitZ());
+}
+
+void GLGizmoCut3D::latch_draw_view_dir()
+{
+    m_draw_params.view_dir = draw_view_dir_in_plane();
+}
+
+bool GLGizmoCut3D::update_draw_raycaster()
+{
+    // ONE MESH PER GESTURE. curved_instance_mesh_in_plane() merges every
+    // is_model_part() volume of the selected instance into the cut plane's frame -
+    // the right frame, the right volume filter, one existing call - and it costs a
+    // pass over the instance mesh, so it is derived on the press and kept for the
+    // whole stroke. Re-deriving it per motion event stalls the drag on a heavy
+    // model, which is the same rule m_curved_snap_mesh follows.
+    if (m_draw_raycaster && !m_draw_pick_mesh.empty())
+        return true;
+
+    if (!curved_instance_mesh_in_plane(m_draw_pick_its))
+        return false;
+    m_draw_pick_mesh = TriangleMesh(m_draw_pick_its);
+    if (m_draw_pick_mesh.empty())
+        return false;
+    m_draw_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(m_draw_pick_mesh));
+    return true;
+}
+
+bool GLGizmoCut3D::draw_sample_at(const Vec2d& mouse_position)
+{
+    if (!update_draw_raycaster())
+        return false;
+
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    // The pick mesh is in the PLANE frame, so the raycaster's trafo is what takes
+    // the plane frame to the world. The hit and its normal come back in the plane
+    // frame, which is exactly where the stroke is stored.
+    const Transform3d plane_to_world = translation_transform(m_plane_center) * m_rotation_m;
+
+    Vec3f  hit_f, normal_f;
+    size_t facet = 0;
+    // unproject_on_mesh returns FALSE when the hit count is odd, i.e. when the
+    // nearest hit would be from inside the mesh - a ray starting inside the part is
+    // refused rather than clamped. That is the behaviour wanted here: a click that
+    // lands inside is not a point on the surface.
+    if (!m_draw_raycaster->unproject_on_mesh(mouse_position, plane_to_world, camera, hit_f, normal_f, nullptr, &facet))
+        return false;
+
+    m_draw_stroke.append(hit_f.cast<double>(), normal_f.cast<double>(), facet);
+    // The painter's contract: the last mouse position is re-set only on an actual
+    // HIT, which is what makes a miss non-fatal - the next hit interpolates from
+    // the last place the ray found the surface rather than from a miss.
+    m_draw_last_mouse = mouse_position;
+    return true;
+}
+
+void GLGizmoCut3D::draw_interpolate_to(const Vec2d& mouse_position)
+{
+    // GLGizmoPainterBase::get_projected_mouse_positions()'s interpolation loop
+    // (GLGizmoPainterBase.cpp 403-417), and ONLY that loop: without it a quick
+    // flick leaves a metre-long chord across the part, because one wx Dragging
+    // event can jump a hundred pixels. GLGizmoSculpt does not interpolate - a
+    // sphere brush closes its own gaps - but a thin line has no such forgiveness.
+    //
+    // NOT reused: the plane-fit tail at :442-516. It fits a plane, projects to 2D,
+    // simplifies and projects back, and the points that come back are PLANE points
+    // never re-projected onto the mesh (only the facet is re-derived) - and the
+    // plane fit degenerates on exactly the curved strokes Draw exists for.
+    //
+    // The painter builds its seed list NEWEST-FIRST (current, then backwards, then
+    // the last click); a chronological stroke has to walk it the other way, which
+    // is what the loop below does directly rather than reversing a list.
+    const double resolution = 1.0; // px, the value every painter caller passes
+
+    // COPY the anchor before the loop. draw_sample_at() re-sets m_draw_last_mouse on
+    // every hit (that is the painter's contract - only a hit moves it), so reading
+    // the member inside the loop would walk the origin forward as the seeds land and
+    // bunch them all against the end of the gap.
+    const Vec2d from = m_draw_last_mouse;
+
+    if (from != Vec2d::Zero()) {
+        const double dist = (mouse_position - from).norm();
+        if (size_t patches = size_t(dist / resolution); patches > 0) {
+            // Cap the seed count: a 2000 px flick at 1 px would be 2000 raycasts in
+            // one event, which is a stall of its own. 256 seeds across any gap is
+            // finer than the 1 mm resample can use anyway.
+            const size_t n = std::min<size_t>(patches, 256);
+            const Vec2d  step = (mouse_position - from) / double(n + 1);
+            for (size_t k = 1; k <= n; ++ k)
+                // A miss is SKIPPED, not terminating: crossing a hole or the
+                // silhouette must not end the stroke.
+                draw_sample_at(from + double(k) * step);
+        }
+    }
+    draw_sample_at(mouse_position);
+}
+
+void GLGizmoCut3D::refresh_draw_stroke()
+{
+    // NOTE what is NOT refreshed here: m_draw_params.view_dir.
+    //
+    // This runs on stroke end AND on every parameter change, so re-reading the
+    // camera each time would mean that with Direction = View, orbiting and then
+    // nudging the Extension slider silently re-aims the cut - the preview would
+    // swing round for a reason the user did not ask for. The view direction is
+    // LATCHED instead, at the moment the user picks View and at the moment a stroke
+    // is finished, which are the two moments they are looking at the angle they
+    // mean. latch_draw_view_dir() does that.
+    m_draw_params.direction   = DrawCutDirection(m_draw_direction);
+    m_draw_params.extension   = double(m_draw_extension);
+    m_draw_params.depth       = double(m_draw_depth);
+    m_draw_params.thickness   = double(m_cut_thickness);
+    m_draw_params.thickness_offset = cut_thickness_offset();
+
+    m_draw_stroke.finish(DrawCutStroke::DefaultSpacing, double(m_draw_smoothing));
+
+    double kappa = 0.0;
+    m_draw_folds = m_draw_stroke.valid() && draw_cut_strip_folds(m_draw_stroke, m_draw_params.extension, &kappa);
+
+    update_draw_empty_sides();
+    invalidate_draw_stroke();
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoCut3D::update_draw_empty_sides()
+{
+    m_draw_upper_empty = m_draw_lower_empty = false;
+    if (!is_draw_surface() || !m_draw_stroke.valid())
+        return;
+
+    // The same mesh the stroke was drawn against, which is already cached for the
+    // gesture; derive it here when there was no gesture (a parameter change).
+    indexed_triangle_set mesh;
+    if (!m_draw_pick_its.empty())
+        mesh = m_draw_pick_its;
+    else if (!curved_instance_mesh_in_plane(mesh))
+        return;
+
+    draw_cut_empty_sides(mesh, m_draw_stroke, m_draw_params, m_draw_upper_empty, m_draw_lower_empty);
+}
+
+void GLGizmoCut3D::clear_draw_stroke(bool push_undo)
+{
+    if (m_draw_stroke.empty())
+        return;
+    if (push_undo)
+        push_draw_undo();
+    m_draw_stroke.clear();
+    m_draw_capturing  = false;
+    m_draw_last_mouse = Vec2d::Zero();
+    m_draw_upper_empty = m_draw_lower_empty = false;
+    m_draw_folds       = false;
+    invalidate_draw_stroke();
+    m_parent.set_as_dirty();
+}
+
+// --- gizmo-local undo, the stroke's half of it -----------------------------
+//
+// Same contract as the sheet's: one entry per COMPLETED stroke, pushed BEFORE the
+// change, consumed by the same on_cut_char() hook so Ctrl+Z reaches the plater
+// only when this stack has nothing to give. The entry stores the RAW samples, not
+// the finished path, so restoring it and re-running finish() with the current
+// panel settings gives a stroke that is consistent with them - restoring a
+// finished path would resurrect the smoothing the user has since changed.
+
+GLGizmoCut3D::DrawStrokeState GLGizmoCut3D::draw_stroke_state() const
+{
+    DrawStrokeState st;
+    st.samples = m_draw_stroke.samples();
+    st.closed  = m_draw_stroke.is_closed();
+    return st;
+}
+
+void GLGizmoCut3D::apply_draw_stroke_state(const DrawStrokeState& st)
+{
+    DrawCutStroke restored;
+    for (const DrawCutSample& smp : st.samples)
+        restored.append(smp.pos, smp.normal, smp.facet);
+    m_draw_stroke = restored;
+    refresh_draw_stroke();
+}
+
+void GLGizmoCut3D::push_draw_undo()
+{
+    if (m_surface_mode != CutSurfaceMode::Draw)
+        return;
+    m_draw_undo.emplace_back(draw_stroke_state());
+    if (m_draw_undo.size() > CurvedUndoLimit)
+        m_draw_undo.erase(m_draw_undo.begin());
+    // A new edit ends the redo branch, the way every undo stack does.
+    m_draw_redo.clear();
+}
+
+bool GLGizmoCut3D::draw_undo()
+{
+    if (m_surface_mode != CutSurfaceMode::Draw || m_draw_undo.empty())
+        return false;
+    m_draw_redo.emplace_back(draw_stroke_state());
+    const DrawStrokeState st = m_draw_undo.back();
+    m_draw_undo.pop_back();
+    apply_draw_stroke_state(st);
+    return true;
+}
+
+bool GLGizmoCut3D::draw_redo()
+{
+    if (m_surface_mode != CutSurfaceMode::Draw || m_draw_redo.empty())
+        return false;
+    m_draw_undo.emplace_back(draw_stroke_state());
+    const DrawStrokeState st = m_draw_redo.back();
+    m_draw_redo.pop_back();
+    apply_draw_stroke_state(st);
+    return true;
+}
+
+// --- mouse ----------------------------------------------------------------
+
+bool GLGizmoCut3D::draw_on_mouse(const wxMouseEvent& mouse_event)
+{
+    if (!is_draw_surface() || m_connectors_editing || m_hide_cut_plane)
+        return false;
+
+    const Vec2d mouse_pos(mouse_event.GetX(), mouse_event.GetY());
+
+    if (m_draw_capturing) {
+        if (mouse_event.Dragging()) {
+            draw_interpolate_to(mouse_pos);
+            // The RIBBON is rebuilt every tick - it is a light strip of triangles
+            // and the raycaster's AABB tree stays valid all stroke (Draw never
+            // moves a vertex, so none of Sculpt's stale-tree caveats apply). The
+            // CUTTER SHELL waits for LeftUp, which is where the stroke is resampled
+            // and so where the surface it describes actually exists.
+            invalidate_draw_stroke();
+            m_parent.set_as_dirty();
+            return true;
+        }
+        if (mouse_event.LeftUp() || mouse_event.Leaving()) {
+            m_draw_capturing  = false;
+            m_draw_last_mouse = Vec2d::Zero();
+            // The camera angle AT THE MOMENT THE STROKE WAS DRAWN is the one a
+            // "View" cut means, so latch it here rather than re-reading it on every
+            // later parameter change (see refresh_draw_stroke).
+            latch_draw_view_dir();
+            // Resample, smooth, decide open/closed, rebuild the preview - one
+            // undo entry per COMPLETED stroke, which was pushed on the press.
+            refresh_draw_stroke();
+            // A press-and-release that captured nothing USABLE must not leave a step
+            // on the undo stack: the first Ctrl+Z would then appear to do nothing,
+            // and the only thing it would take back is a line the user never got.
+            // Same suppression the sheet's drag and snap use, keyed on "the stroke
+            // that came out is not one you could cut with" rather than on comparing
+            // it to the entry (which holds the PREVIOUS stroke, so a comparison
+            // would be meaningless).
+            if (!m_draw_stroke.valid() && !m_draw_undo.empty()) {
+                // Put the previous stroke back, rather than leaving the user with a
+                // dab that replaced a good line.
+                const DrawStrokeState st = m_draw_undo.back();
+                m_draw_undo.pop_back();
+                if (!st.samples.empty())
+                    apply_draw_stroke_state(st);
+            }
+            m_parent.set_as_dirty();
+            return true;
+        }
+        return true;
+    }
+
+    if (mouse_event.LeftDown() && !mouse_event.ShiftDown() && !mouse_event.CmdDown() && !mouse_event.AltDown()) {
+        if (!update_draw_raycaster())
+            return false;
+
+        // A new stroke replaces the old one, and that is an edit worth taking back.
+        // The undo entry is pushed FIRST, while m_draw_stroke still holds the old
+        // stroke, because the entry has to be the state to come back TO - the same
+        // "push before the change" rule push_curved_undo() follows.
+        push_draw_undo();
+
+        // The painter's guard: a click that MISSES the mesh must not capture the
+        // mouse, or the rest of the gizmo (and the plater's own rectangle select)
+        // stops working wherever the model is not. So clear, probe, and put the old
+        // stroke back out of the entry we just pushed if the probe found nothing.
+        DrawCutStroke previous = m_draw_stroke;
+        m_draw_stroke.clear();
+        m_draw_last_mouse = Vec2d::Zero();
+        if (!draw_sample_at(mouse_pos)) {
+            m_draw_stroke     = previous;
+            m_draw_last_mouse = Vec2d::Zero();
+            if (!m_draw_undo.empty())
+                m_draw_undo.pop_back();
+            return false;
+        }
+
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Draw cut line"), UndoRedo::SnapshotType::GizmoAction);
+        m_draw_capturing = true;
+        invalidate_draw_stroke();
+        m_parent.set_as_dirty();
+        return true;
+    }
+
+    return false;
+}
+
+// --- render ----------------------------------------------------------------
+
+void GLGizmoCut3D::update_draw_preview_models()
+{
+    m_draw_ribbon_model.reset();
+    m_draw_cutter_model.reset();
+    m_draw_preview_dirty = false;
+
+    // THE RIBBON. Drawn from the samples that exist right now - the RAW ones while
+    // a stroke is in progress (there is no finished path yet), the finished path
+    // once there is one - as a narrow strip of quads lying on the surface, one
+    // quad per span, widened along the surface normal crossed with the tangent so
+    // the strip hugs the face rather than standing off it.
+    const std::vector<DrawCutSample>& pts = m_draw_stroke.path().empty() ? m_draw_stroke.samples()
+                                                                        : m_draw_stroke.path();
+    if (pts.size() >= 2) {
+        // Half width scaled to the part, so the line reads the same on a 10 mm
+        // trinket and a 200 mm print.
+        const double half_w = std::max(0.15, 0.004 * get_grabber_mean_size(m_bounding_box));
+        const bool   closed = !m_draw_stroke.path().empty() && m_draw_stroke.is_closed();
+
+        indexed_triangle_set its;
+        const size_t n = pts.size();
+        its.vertices.reserve(n * 2);
+        for (size_t i = 0; i < n; ++ i) {
+            // The tangent, one-sided at an open end.
+            Vec3d t;
+            if (closed)
+                t = pts[(i + 1) % n].pos - pts[(i + n - 1) % n].pos;
+            else if (i == 0)
+                t = pts[1].pos - pts[0].pos;
+            else if (i + 1 == n)
+                t = pts[n - 1].pos - pts[n - 2].pos;
+            else
+                t = pts[i + 1].pos - pts[i - 1].pos;
+            if (t.norm() < 1e-9)
+                t = Vec3d::UnitX();
+            t.normalize();
+            const Vec3d& nrm = pts[i].normal;
+            Vec3d side = t.cross(nrm);
+            if (side.norm() < 1e-9)
+                side = Vec3d::UnitY();
+            side.normalize();
+            its.vertices.emplace_back((pts[i].pos - half_w * side).cast<float>());
+            its.vertices.emplace_back((pts[i].pos + half_w * side).cast<float>());
+        }
+        const size_t spans = closed ? n : n - 1;
+        its.indices.reserve(spans * 2);
+        for (size_t i = 0; i < spans; ++ i) {
+            const int a = int(2 * i), b = int(2 * i + 1);
+            const int c = int(2 * ((i + 1) % n)), d = int(2 * ((i + 1) % n) + 1);
+            its.indices.emplace_back(Vec3i32(a, b, d));
+            its.indices.emplace_back(Vec3i32(a, d, c));
+        }
+        if (!its.indices.empty())
+            m_draw_ribbon_model.init_from(its);
+    }
+
+    // THE CUTTER SHELL, i.e. the preview of the cut surface. Built from exactly the
+    // same call the cut will make, so this is the surface, not a picture of it.
+    if (m_draw_stroke.valid()) {
+        BoundingBoxf3 bbox;
+        if (!m_draw_pick_its.empty())
+            for (const Vec3f& v : m_draw_pick_its.vertices)
+                bbox.merge(v.cast<double>());
+        else {
+            indexed_triangle_set mesh;
+            if (curved_instance_mesh_in_plane(mesh))
+                for (const Vec3f& v : mesh.vertices)
+                    bbox.merge(v.cast<double>());
+        }
+        const indexed_triangle_set cutter = draw_cut_cutter_solid(m_draw_stroke, m_draw_params, bbox);
+        if (!cutter.empty())
+            m_draw_cutter_model.init_from(cutter);
+    }
+}
+
+void GLGizmoCut3D::render_draw_stroke()
+{
+    if (cut_line_processing())
+        return;
+
+    if (m_draw_preview_dirty)
+        update_draw_preview_models();
+
+    const Camera&     camera = wxGetApp().plater()->get_camera();
+    const Transform3d plane_to_world  = translation_transform(m_plane_center) * m_rotation_m;
+    const Transform3d view_model_matrix = camera.get_view_matrix() * plane_to_world;
+
+    // (1) THE CUTTER SHELL, translucent, in the plain flat shader with blending -
+    // the same treatment the curved sheet's own preview gets.
+    if (m_draw_cutter_model.is_initialized()) {
+        if (GLShaderProgram* shader = wxGetApp().get_shader("flat"); shader != nullptr) {
+            glsafe(::glEnable(GL_DEPTH_TEST));
+            glsafe(::glDisable(GL_CULL_FACE));
+            glsafe(::glEnable(GL_BLEND));
+            glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+            shader->start_using();
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            shader->set_uniform("view_model_matrix", view_model_matrix);
+            ColorRGBA clr = can_perform_cut() ? CUT_PLANE_DEF_COLOR : CUT_PLANE_ERR_COLOR;
+            clr.a(0.25f); // a shell, not a wall: the part has to show through it
+            m_draw_cutter_model.set_color(clr);
+            m_draw_cutter_model.render();
+            shader->stop_using();
+            glsafe(::glEnable(GL_CULL_FACE));
+            glsafe(::glDisable(GL_BLEND));
+        }
+    }
+
+    if (!m_draw_ribbon_model.is_initialized())
+        return;
+
+    // (2) THE RIBBON, twice.
+    //
+    // First with the depth test OFF in a dim colour, so a closed loop's HIDDEN
+    // half still reads as a ring - the render_cursor_circle() treatment. Then on
+    // the surface in full colour.
+    if (GLShaderProgram* shader = wxGetApp().get_shader("flat"); shader != nullptr) {
+        glsafe(::glDisable(GL_DEPTH_TEST));
+        glsafe(::glDisable(GL_CULL_FACE));
+        glsafe(::glEnable(GL_BLEND));
+        glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+        shader->start_using();
+        shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+        shader->set_uniform("view_model_matrix", view_model_matrix);
+        m_draw_ribbon_model.set_color(ColorRGBA(0.9f, 0.55f, 0.1f, 0.35f));
+        m_draw_ribbon_model.render();
+        shader->stop_using();
+        glsafe(::glEnable(GL_DEPTH_TEST));
+        glsafe(::glEnable(GL_CULL_FACE));
+        glsafe(::glDisable(GL_BLEND));
+    }
+
+    // A strip lying exactly on the mesh z-fights with it. The codebase solved this
+    // twice and the FIRST way is the one to use: the mm_contour shader biases the
+    // vertex IN CLIP SPACE (clip_position.z -= offset * abs(clip_position.w), so
+    // the nudge is depth-independent), which is why nothing here needs
+    // glPolygonOffset or a geometric normal offset. The shader-swap dance is
+    // TriangleSelectorGUI::render_paint_contour()'s, copied including the stash and
+    // restart of whatever shader was current.
+    {
+        auto* curr_shader = wxGetApp().get_current_shader();
+        if (curr_shader != nullptr)
+            curr_shader->stop_using();
+
+        if (auto* contour = wxGetApp().get_shader("mm_contour"); contour != nullptr) {
+            contour->start_using();
+            contour->set_uniform("offset", OpenGLManager::get_gl_info().is_mesa() ? 0.0005 : 0.00001);
+            contour->set_uniform("view_model_matrix", view_model_matrix);
+            contour->set_uniform("projection_matrix", camera.get_projection_matrix());
+            glsafe(::glDisable(GL_CULL_FACE));
+            m_draw_ribbon_model.set_color(ColorRGBA(1.f, 0.65f, 0.f, 1.f));
+            m_draw_ribbon_model.render();
+            glsafe(::glEnable(GL_CULL_FACE));
+            contour->stop_using();
+        }
+
+        if (curr_shader != nullptr)
+            curr_shader->start_using();
+    }
+}
+
+// --- panel ----------------------------------------------------------------
+
+void GLGizmoCut3D::render_draw_surface_inputs()
+{
+    // Direction. The constant modes (View, Axis X/Y/Z) are the "as-is" extrusion:
+    // a prism through the stroke, the same ray at every sample. Surface normal is
+    // per-sample, so the surface follows the shape the stroke was drawn on.
+    // (The draft ANGLE that rotates this toward the binormal is phase 2.)
+    static const char* dir_labels[5] = { "Surface normal", "View", "Axis X", "Axis Y", "Axis Z" };
+
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Direction") + ": ");
+    ImGui::SameLine(m_label_width);
+    ImGui::PushItemWidth(m_control_width * 0.7f);
+    const std::string dir_current = _u8L(dir_labels[std::clamp(m_draw_direction, 0, 4)]);
+    if (ImGui::BeginCombo("##draw_dir", dir_current.c_str())) {
+        for (int k = 0; k < 5; ++ k) {
+            const std::string lbl = _u8L(dir_labels[k]);
+            if (ImGui::Selectable(lbl.c_str(), m_draw_direction == k) && m_draw_direction != k) {
+                m_draw_direction = k;
+                // Picking View means "this way, the way I am looking now", so take
+                // the camera here. The other directions do not use it.
+                if (DrawCutDirection(k) == DrawCutDirection::View)
+                    latch_draw_view_dir();
+                refresh_draw_stroke();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_u8L("Which way the cut surface reaches into the part. Surface normal follows the face the line was drawn on; the others are a single direction, i.e. a straight extrusion of the line.").c_str(),
+                         ImGui::GetFontSize() * 20.f);
+
+    // Extension: how far the surface reaches PAST the line. This is what lets an
+    // open line reach past the silhouette so the cut separates the part, and what
+    // lifts a closed loop's rim clear of a concavity.
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Extension") + ": ");
+    ImGui::SameLine(m_label_width);
+    ImGui::PushItemWidth(m_control_width * 0.7f);
+    if (ImGui::SliderFloat("##draw_ext", &m_draw_extension, 0.f, 50.f, "%.1f mm"))
+        refresh_draw_stroke();
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_u8L("How far the cut surface reaches past the line. An open line needs enough of this to reach across the part, or the cut will not separate it.").c_str(),
+                         ImGui::GetFontSize() * 20.f);
+
+    // Depth: through all by default, which is the reach a cut usually wants.
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Depth") + ": ");
+    ImGui::SameLine(m_label_width);
+    bool through = m_draw_params.through_all;
+    if (m_imgui->bbl_checkbox(_L("Through all"), through)) {
+        m_draw_params.through_all = through;
+        refresh_draw_stroke();
+    }
+    if (!m_draw_params.through_all) {
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(" ");
+        ImGui::SameLine(m_label_width);
+        ImGui::PushItemWidth(m_control_width * 0.7f);
+        const float max_depth = std::max(10.f, float(m_bounding_box.size().norm()));
+        if (ImGui::SliderFloat("##draw_depth", &m_draw_depth, 0.1f, max_depth, "%.1f mm"))
+            refresh_draw_stroke();
+        ImGui::PopItemWidth();
+    }
+
+    // Smoothing. A raw stroke picks up every triangle normal it crossed, and an
+    // unsmoothed normal field visibly kinks the ruled surface.
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Smoothing") + ": ");
+    ImGui::SameLine(m_label_width);
+    ImGui::PushItemWidth(m_control_width * 0.7f);
+    if (ImGui::SliderFloat("##draw_smooth", &m_draw_smoothing, 0.f, 1.f, "%.2f"))
+        refresh_draw_stroke();
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_u8L("Averages the line and its surface normals. A hand-drawn line picks up every facet it crossed; a little of this takes the kinks out of the cut surface.").c_str(),
+                         ImGui::GetFontSize() * 20.f);
+
+    m_imgui->disabled_begin(m_draw_stroke.empty());
+    if (m_imgui->button(_L("Clear line"), _L("Remove the drawn line"))) {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Clear draw cut line"), UndoRedo::SnapshotType::GizmoAction);
+        clear_draw_stroke(/*push_undo*/ true);
+    }
+    m_imgui->disabled_end();
+
+    ImGui::PushTextWrapPos(m_editing_window_width);
+    m_imgui->text(_L("Drag on the model to draw the cut line. Esc clears it; Ctrl+Z and Ctrl+Y step through your lines."));
+
+    if (m_draw_stroke.empty())
+        m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT, _L("Draw a line on the model."));
+    else if (!m_draw_stroke.valid()) {
+        // The message comes from libslic3r as untranslated English (the tests read the
+        // enum, so the strings live next to it), and _L() needs a literal to extract.
+        // Translate the ENUM here, where the literals are visible to gettext.
+        wxString why;
+        switch (m_draw_stroke.error()) {
+        case DrawCutError::TooShort:         why = _L("Draw a longer line on the model."); break;
+        case DrawCutError::SelfCrossing:     why = _L("The line crosses itself."); break;
+        case DrawCutError::LeavesMesh:       why = _L("The line leaves the model."); break;
+        case DrawCutError::CutterDegenerate: why = _L("The line does not make a usable cut surface."); break;
+        case DrawCutError::EmptySide:        why = _L("The stroke does not separate the part."); break;
+        default:                             why = from_u8(draw_cut_error_message(m_draw_stroke.error())); break;
+        }
+        m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT, why);
+    }
+    else {
+        // Say WHICH it chose. A loop and a line cut differently (a loop takes a
+        // plug out; a line splits the part), so the user has to be able to see
+        // which one they got.
+        m_imgui->text(m_draw_stroke.is_closed()
+                      ? _L("Closed loop: the cut takes out the piece the line goes around.")
+                      : _L("Open line: the cut splits the part along the line."));
+
+        // THE EMPTY-SIDE WARNING, the analogue of the curved cut's. Said BEFORE the
+        // click, and here it also DISABLES the cut (see can_perform_cut): a stroke
+        // that does not separate the part gives back the whole part and nothing
+        // else, which is not a cut at all.
+        if (m_draw_upper_empty || m_draw_lower_empty)
+            m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                                  _L("The stroke does not separate the part - increase Extension or draw the line right across it."));
+        if (m_draw_folds)
+            m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                                  _L("The line turns tighter than the Extension reaches, so the cut surface folds there. Reduce Extension."));
+    }
+    ImGui::PopTextWrapPos();
+}
+
+// The cut THICKNESS applies to every surface mode, so a change to it has to
+// refresh whichever surface is live - the sheet's empty-side test and preview, or
+// the stroke's. One call rather than the pair repeated at every widget, which is
+// how the Draw case came to be missing from three of the four.
+void GLGizmoCut3D::invalidate_cut_surfaces()
+{
+    if (is_draw_surface())
+        refresh_draw_stroke();
+    else {
+        update_curved_empty_sides();
+        invalidate_curved_sheet();
+    }
+}
+
 void GLGizmoCut3D::render_cut_thickness_input()
 {
     ImGui::AlignTextToFramePadding();
@@ -2647,8 +3371,7 @@ void GLGizmoCut3D::render_cut_thickness_input()
     float t = m_cut_thickness;
     if (ImGui::SliderFloat("##cut_thickness", &t, float(CutThicknessMin), float(CutThicknessMax), "%.2f mm")) {
         m_cut_thickness = std::clamp(t, float(CutThicknessMin), float(CutThicknessMax));
-        update_curved_empty_sides();
-        invalidate_curved_sheet();
+        invalidate_cut_surfaces();
     }
     if (ImGui::IsItemHovered())
         m_imgui->tooltip(_u8L("Width of the band of material the cut removes, measured along the cut normal. "
@@ -2669,22 +3392,19 @@ void GLGizmoCut3D::render_cut_thickness_input()
         bool centred = m_cut_thickness_offset == int(CutThicknessOffset::Centred);
         if (m_imgui->bbl_radio_button(centred_label.c_str(), centred)) {
             m_cut_thickness_offset = int(CutThicknessOffset::Centred);
-            update_curved_empty_sides();
-            invalidate_curved_sheet();
+            invalidate_cut_surfaces();
         }
         ImGui::SameLine();
         bool above = m_cut_thickness_offset == int(CutThicknessOffset::Above);
         if (m_imgui->bbl_radio_button(above_label.c_str(), above)) {
             m_cut_thickness_offset = int(CutThicknessOffset::Above);
-            update_curved_empty_sides();
-            invalidate_curved_sheet();
+            invalidate_cut_surfaces();
         }
         ImGui::SameLine();
         bool below = m_cut_thickness_offset == int(CutThicknessOffset::Below);
         if (m_imgui->bbl_radio_button(below_label.c_str(), below)) {
             m_cut_thickness_offset = int(CutThicknessOffset::Below);
-            update_curved_empty_sides();
-            invalidate_curved_sheet();
+            invalidate_cut_surfaces();
         }
 
         ImGui::PushTextWrapPos(m_editing_window_width);
@@ -2930,9 +3650,10 @@ void GLGizmoCut3D::apply_color_clip_plane_colors()
 void GLGizmoCut3D::on_set_state()
 {
     m_facet_picker.set_active(false); // never leave pick-face armed across open/close
-    // The control grid is session state, never persisted (the cut is baked, as a
-    // plane cut is), so opening or closing the gizmo starts from a flat surface.
-    m_curved_surface = false;
+    // The control grid AND the drawn stroke are session state, never persisted
+    // (the cut is baked, as a plane cut is), so opening or closing the gizmo
+    // starts from the flat surface.
+    m_surface_mode = CutSurfaceMode::Flat;
     m_curved_sheet.reset(m_curved_nx, m_curved_ny);
     // The sheet history is session state too - it describes surfaces that no
     // longer exist once the grid is flattened.
@@ -2954,6 +3675,19 @@ void GLGizmoCut3D::on_set_state()
     m_cut_thickness_offset = int(CutThicknessOffset::Centred);
     m_curved_res_user_set  = false;
     m_curved_upper_empty = m_curved_lower_empty = false;
+    // The drawn stroke goes the same way: on_set_state() runs on open AND on
+    // close, which is where a stroke has to be cleared or the next object would
+    // open the gizmo with the last one's line still on it.
+    m_draw_stroke.clear();
+    clear_draw_undo();
+    m_draw_capturing   = false;
+    m_draw_last_mouse  = Vec2d::Zero();
+    m_draw_upper_empty = m_draw_lower_empty = false;
+    m_draw_folds       = false;
+    m_draw_pick_its.clear();
+    m_draw_pick_mesh.clear();
+    m_draw_raycaster.reset();
+    invalidate_draw_stroke();
     m_upper_visibility = m_lower_visibility = SideVisibility::Visible;
     apply_side_visibility();
     invalidate_curved_sheet();
@@ -3371,7 +4105,7 @@ void GLGizmoCut3D::on_dragging(const UpdateData& data)
     // instance mesh, so paying for it on every frame of a plane drag would stall
     // the drag on any real model. Note the intent here and honour it in
     // on_stop_dragging().
-    if (m_curved_surface && (m_hover_id == Z || m_hover_id == CutPlane || m_hover_id == CutPlaneXMove ||
+    if (m_surface_mode == CutSurfaceMode::Curved && (m_hover_id == Z || m_hover_id == CutPlane || m_hover_id == CutPlaneXMove ||
                              m_hover_id == CutPlaneYMove || m_hover_id == X || m_hover_id == Y ||
                              m_hover_id == CutPlaneZRotation))
         request_curved_fit();
@@ -3612,6 +4346,14 @@ void GLGizmoCut3D::render_clipper_cut()
         render_curved_cap();
         return;
     }
+
+    // DRAW: MeshClipper's cap is a slice at one z, so on a drawn cut it would put
+    // a flat disc through the ruled surface, in a place the cut does not go. The
+    // drawn surface's own preview is the translucent cutter shell
+    // render_draw_stroke() puts up, which IS the surface the boolean will use, so
+    // there is nothing to draw here.
+    if (is_draw_surface() && !m_connectors_editing)
+        return;
 
     if (! m_connectors_editing)
         ::glDisable(GL_DEPTH_TEST);
@@ -3922,13 +4664,23 @@ void GLGizmoCut3D::on_render()
         // its control handles are drawn on top. The plane's own rotate and
         // translate grabbers stay exactly as they are, and the sheet rides on
         // the plane's frame, so moving the plane moves the sheet.
-        if (is_curved_surface())
-            render_curved_sheet();
-        else
-            render_cut_plane();
-        render_cut_plane_grabbers();
-        if (is_curved_surface())
-            render_curved_control_points();
+        // DRAW: the stroke and its cutter shell stand in for the plane entirely,
+        // and THE PLANE GRABBERS HIDE - the drawn surface is positioned by where
+        // the user drew, not by dragging a plane, and leaving the grabbers up
+        // would invite a gesture that moves the stroke out from under itself.
+        // (The plane's own frame still matters - the stroke lives in it - so the
+        // Cut position / rotation inputs in the panel stay available.)
+        if (is_draw_surface())
+            render_draw_stroke();
+        else {
+            if (is_curved_surface())
+                render_curved_sheet();
+            else
+                render_cut_plane();
+            render_cut_plane_grabbers();
+            if (is_curved_surface())
+                render_curved_control_points();
+        }
     }
 
     render_cut_line();
@@ -4690,10 +5442,27 @@ void GLGizmoCut3D::flip_cut_plane()
     // so the surface in WORLD space is identical before and after and only which
     // half counts as upper and which as lower swaps. It is pure arithmetic on the
     // control grid: no evaluation, no re-sampling, nothing lost.
-    const bool carry_sheet = m_curved_surface && !m_curved_sheet.is_flat();
+    const bool carry_sheet = m_surface_mode == CutSurfaceMode::Curved && !m_curved_sheet.is_flat();
     if (carry_sheet) {
         push_curved_undo();
         m_curved_sheet.flip_about_u();
+    }
+
+    // THE STROKE HAS TO COME WITH THE FRAME TOO, for the same reason: the samples
+    // are expressed IN the plane frame, so leaving them alone would describe a
+    // different world curve. The flip turns the frame 180 degrees about its own X,
+    // so a point that was at local (x, y, z) is at (x, -y, -z) afterwards - and
+    // the same for the normals, which are directions in that frame. That is the
+    // exact matching change, and like the sheet's it is pure arithmetic: no
+    // re-projection, no re-fit, nothing lost.
+    const bool carry_stroke = m_surface_mode == CutSurfaceMode::Draw && !m_draw_stroke.empty();
+    if (carry_stroke) {
+        push_draw_undo();
+        DrawCutStroke flipped;
+        for (const DrawCutSample& s : m_draw_stroke.samples())
+            flipped.append(Vec3d(s.pos.x(), -s.pos.y(), -s.pos.z()),
+                           Vec3d(s.normal.x(), -s.normal.y(), -s.normal.z()), s.facet);
+        m_draw_stroke = flipped;
     }
 
     m_rotation_m = m_rotation_m * rotation_transform(PI * Vec3d::UnitX());
@@ -4709,7 +5478,7 @@ void GLGizmoCut3D::flip_cut_plane()
     // under this flip anyway (the part projects onto the same u and the mirrored
     // v, so the half extents are unchanged), so tell the fit the sheet is already
     // correct for the new frame rather than making it re-derive that.
-    if (m_curved_surface) {
+    if (m_surface_mode == CutSurfaceMode::Curved) {
         m_curved_fit_rotation = m_rotation_m;
         m_curved_fit_center   = m_plane_center;
         m_curved_fit_valid    = true;
@@ -4728,6 +5497,9 @@ void GLGizmoCut3D::flip_cut_plane()
         update_curved_connector_warnings();
         m_curved_hover_ctl = m_curved_drag_ctl = -1;
     }
+
+    if (carry_stroke)
+        refresh_draw_stroke();
 
     if (CutMode(m_mode) == CutMode::cutTongueAndGroove)
         reset_cut_by_contours();
@@ -5593,6 +6365,18 @@ bool GLGizmoCut3D::can_perform_cut() const
     if (CutMode(m_mode) == CutMode::cutTongueAndGroove)
         return has_valid_groove();
 
+    // DRAW: there has to BE a usable line. The same gate shape has_valid_groove()
+    // uses - a mode's own precondition, checked here so the Cut button greys out
+    // rather than the cut failing after the click.
+    //
+    // An EMPTY SIDE is a refusal here, unlike on the curved cut. The curved cut
+    // produces the one half that has material, which is a sensible thing to get
+    // from a plane that misses part of the object; a stroke that does not separate
+    // the part gives back the whole part and nothing else, which is not a cut at
+    // all.
+    if (is_draw_surface())
+        return m_draw_stroke.valid() && !m_draw_upper_empty && !m_draw_lower_empty;
+
     if (m_part_selection.valid())
         return ! m_part_selection.is_one_object();
 
@@ -5802,6 +6586,11 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
     // that has just been zeroed and come out as the plain flat plane cut.
     const bool           curved_surface = is_curved_surface();
     const CurvedCutSheet curved_sheet   = m_curved_sheet;
+    // Same reason for the drawn stroke: on_set_state() clears it when the gizmo
+    // closes, and reset_all_gizmos() below closes it.
+    const bool           draw_surface   = is_draw_surface();
+    const DrawCutStroke  draw_stroke    = m_draw_stroke;
+    DrawCutParams        draw_params    = m_draw_params;
     // Same reason: the thickness is session state and reset_all_gizmos() below
     // closes the gizmo. Take it first.
     const double         cut_thickness  = CutMode(m_mode) == CutMode::cutTongueAndGroove ? 0.0 : double(m_cut_thickness);
@@ -5818,9 +6607,10 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
         ScopeGuard part_selection_killer([this]() { m_part_selection = PartSelection(); });
 
         const bool cut_with_groove = CutMode(m_mode) == CutMode::cutTongueAndGroove;
+        const bool cut_drawn       = !cut_with_groove && draw_surface && draw_stroke.valid();
         // A bent sheet wins over a part selection: the contour cut is a plane cut and would
         // silently discard the curve (second route to a flat result, via right-click part picking).
-        const bool cut_by_contour = !cut_with_groove && m_part_selection.valid() && !(curved_surface && !curved_sheet.is_flat());
+        const bool cut_by_contour = !cut_with_groove && !cut_drawn && m_part_selection.valid() && !(curved_surface && !curved_sheet.is_flat());
 
         ModelObject* cut_mo = cut_by_contour ? m_part_selection.model_object() : nullptr;
         if (cut_mo)
@@ -5881,9 +6671,18 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
                 into_u8(format_wxstr(_L("Cut: the surface does not cross the part on %1%, so that half is empty."), which)));
         }
 
+        // DRAW: the kerf reaches the cut through the params, not through the
+        // perform() arguments, because it is offset along the strip's OWN normal -
+        // there is no single plane normal to measure it along.
+        if (cut_drawn) {
+            draw_params.thickness        = cut_thickness;
+            draw_params.thickness_offset = thickness_offset;
+        }
+
         Cut cut(cut_mo, instance_idx, get_cut_matrix(selection), attributes);
         const ModelObjectPtrs& new_objects = cut_by_contour    ? cut.perform_by_contour(m_part_selection.get_cut_parts(), dowels_count):
                                              cut_with_groove   ? cut.perform_with_groove(m_groove, m_rotation_m) :
+                                             cut_drawn         ? cut.perform_with_draw_stroke(draw_stroke, draw_params) :
                                              cut_curved        ? cut.perform_with_curved_sheet(curved_sheet, cut_thickness, thickness_offset) :
                                                                  cut.perform_with_plane(cut_thickness, thickness_offset);
 

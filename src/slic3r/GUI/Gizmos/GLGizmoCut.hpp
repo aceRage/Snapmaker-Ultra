@@ -10,6 +10,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/CutUtils.hpp"
 #include "libslic3r/CurvedCut.hpp"
+#include "libslic3r/DrawCut.hpp"
 #include "imgui/imgui.h"
 
 namespace Slic3r {
@@ -148,12 +149,20 @@ class GLGizmoCut3D : public GLGizmoBase
     std::vector<std::string> m_flexi_kinds;
 
     // --- Curved cut (phase 1) ---------------------------------------------
-    // Surface: Flat | Curved. Curved replaces the flat cut plane with a height
-    // field z = f(u,v) defined over it by a coarse control grid, upsampled to a
-    // dense sheet for the preview and for the cut. Nothing here is persisted:
-    // the cut is baked, exactly as a plane cut is, and the grid lives only for
-    // the gizmo session.
-    bool           m_curved_surface{ false };
+    // Surface: Flat | Curved | Draw. Curved replaces the flat cut plane with a
+    // height field z = f(u,v) defined over it by a coarse control grid, upsampled
+    // to a dense sheet for the preview and for the cut. Draw replaces it with a
+    // RULED STRIP swept along a stroke the user paints on the model. Nothing here
+    // is persisted: the cut is baked, exactly as a plane cut is, and the surface
+    // lives only for the gizmo session.
+    //
+    // DRAW IS A THIRD SURFACE MODE, a peer of the other two, not a CutMode value:
+    // adding it to CutMode would drag the groove/connector branching in
+    // everywhere, and Curved is already a sub-mode of Planar driven by what used
+    // to be a bool. This enum is that bool widened, and is_curved_surface() keeps
+    // its exact old meaning for Curved so every curved behaviour is bit-identical.
+    enum class CutSurfaceMode { Flat, Curved, Draw };
+    CutSurfaceMode m_surface_mode{ CutSurfaceMode::Flat };
     CurvedCutSheet m_curved_sheet;
     // The control grid is nx COLUMNS by ny ROWS, kept apart so a RULED bend
     // (10 x 2: every column one straight line, grabbable from either end) is
@@ -323,6 +332,94 @@ class GLGizmoCut3D : public GLGizmoBase
     // The flat cut has the same failure mode (a plane clear of the part), and
     // has_valid_contour() already covers it, so this is only computed in Curved.
 
+    // --- DRAW CUT (phase 1) ------------------------------------------------
+    // The stroke the user paints on the model, in the CUT PLANE's frame (the
+    // frame the sheet lives in and the frame the cut runs in), so it survives a
+    // plane nudge the way the sheet does. Session state, like the sheet: the cut
+    // is baked and nothing about it reaches the 3MF.
+    DrawCutStroke   m_draw_stroke;
+    DrawCutParams   m_draw_params;
+    // The panel's smoothing, 0..1, which draw_cut_smooth_passes() turns into
+    // windowed-average passes.
+    float           m_draw_smoothing{ 0.2f };
+    // Depth in mm, used only when Through all is off. Kept out of m_draw_params
+    // so toggling the checkbox does not lose the number the user typed.
+    float           m_draw_depth{ 10.f };
+    float           m_draw_extension{ 5.f };
+    int             m_draw_direction{ int(DrawCutDirection::SurfaceNormal) };
+    // Capture: set between LeftDown on the object and LeftUp. The painter base's
+    // interpolation needs the previous mouse position to know how big a gap to
+    // fill; this is that, in the painter's own sense (re-set only on an actual
+    // HIT, which is what makes a miss non-fatal).
+    bool            m_draw_capturing{ false };
+    Vec2d           m_draw_last_mouse{ Vec2d::Zero() };
+    // The instance mesh in the PLANE frame plus a raycaster over it, cached for
+    // the duration of one stroke: it does not change while the button is down,
+    // and re-deriving it per motion event would stall the drag on a heavy model.
+    // The same cache-per-gesture rule m_curved_snap_mesh follows.
+    indexed_triangle_set           m_draw_pick_its;
+    TriangleMesh                   m_draw_pick_mesh;
+    std::unique_ptr<MeshRaycaster> m_draw_raycaster;
+    // The ribbon drawn along the stroke, and the translucent cutter shell that is
+    // the PREVIEW of the cut surface. Both rebuilt from the finished stroke.
+    GLModel         m_draw_ribbon_model;
+    GLModel         m_draw_cutter_model;
+    bool            m_draw_preview_dirty{ true };
+    // The empty-side warning, the analogue of m_curved_*_empty: recomputed when
+    // the stroke or a parameter changes, so the panel can say "this line does not
+    // separate the part" before the user commits.
+    bool            m_draw_upper_empty{ false };
+    bool            m_draw_lower_empty{ false };
+    // Advisory: the ruled strip folds near a corner tighter than the Extension.
+    bool            m_draw_folds{ false };
+
+    // The gizmo-local undo stack carries strokes as well as sheets. One entry per
+    // completed stroke, per Clear, and before a lossy parameter change - the same
+    // granularity the sheet uses, and consumed by the same on_cut_char() hook.
+    struct DrawStrokeState {
+        std::vector<DrawCutSample> samples; // the RAW samples, so finish() can re-run
+        bool                       closed{ false };
+    };
+    std::vector<DrawStrokeState> m_draw_undo;
+    std::vector<DrawStrokeState> m_draw_redo;
+
+    DrawStrokeState draw_stroke_state() const;
+    void            apply_draw_stroke_state(const DrawStrokeState& st);
+    void            push_draw_undo();
+    bool            draw_undo();
+    bool            draw_redo();
+    void            clear_draw_undo() { m_draw_undo.clear(); m_draw_redo.clear(); }
+
+    // Invalidate everything keyed on the stroke, the way invalidate_curved_sheet()
+    // does for the sheet.
+    void   invalidate_draw_stroke();
+    // Re-run finish() with the current panel settings and refresh the warnings.
+    void   refresh_draw_stroke();
+    void   update_draw_empty_sides();
+    // The instance mesh in the plane frame plus its raycaster, built once per
+    // stroke gesture.
+    bool   update_draw_raycaster();
+    void   render_draw_stroke();
+    void   render_draw_surface_inputs();
+    bool   draw_on_mouse(const wxMouseEvent& mouse_event);
+    // One raycast against the cached instance mesh, appending a sample when it
+    // hits. Returns true on a hit.
+    bool   draw_sample_at(const Vec2d& mouse_position);
+    // The painter base's gap-filling interpolation (GLGizmoPainterBase.cpp
+    // 403-417), reimplemented over the cut gizmo's own raycaster: seeds between
+    // the last HIT position and the current one so a quick flick does not leave a
+    // metre-long chord. Deliberately NOT the plane-fit tail at :442-516 - those
+    // points are never re-projected onto the mesh.
+    void   draw_interpolate_to(const Vec2d& mouse_position);
+    void   clear_draw_stroke(bool push_undo);
+    // The inward direction for DrawCutDirection::View, in the plane frame.
+    Vec3d  draw_view_dir_in_plane() const;
+    // Take the camera's current forward direction as the one a Direction = View cut
+    // means. LATCHED rather than re-read, so a later parameter change does not
+    // silently re-aim the cut to wherever the camera has since been orbited.
+    void   latch_draw_view_dir();
+    void   update_draw_preview_models();
+
     // (3) CUT THICKNESS ("kerf"), for BOTH Flat and Curved: a band of material
     // centred on the cut surface is removed, so the two halves come apart with a
     // real gap between them. Session state like everything else in this gizmo -
@@ -335,6 +432,9 @@ class GLGizmoCut3D : public GLGizmoBase
     // normal: lo <= 0 <= hi, hi - lo == thickness.
     void           cut_thickness_faces(double& lo, double& hi) const;
     void           render_cut_thickness_input();
+    // Refresh whichever surface mode is live, after a change (the thickness) that
+    // applies to all of them.
+    void           invalidate_cut_surfaces();
 
     bool m_hide_cut_plane{ false };
     bool m_connectors_editing{ false };
@@ -603,7 +703,11 @@ private:
     void render_connectors();
 
     // --- Curved cut (phase 1) ---------------------------------------------
-    bool   is_curved_surface() const { return m_curved_surface && CutMode(m_mode) == CutMode::cutPlanar; }
+    bool   is_curved_surface() const { return m_surface_mode == CutSurfaceMode::Curved && CutMode(m_mode) == CutMode::cutPlanar; }
+    bool   is_draw_surface() const { return m_surface_mode == CutSurfaceMode::Draw && CutMode(m_mode) == CutMode::cutPlanar; }
+    // "Not the flat plane", i.e. either of the two shaped surfaces. Most of the
+    // sites that used to read m_curved_surface meant exactly this.
+    bool   is_shaped_surface() const { return m_surface_mode != CutSurfaceMode::Flat && CutMode(m_mode) == CutMode::cutPlanar; }
     // Half extent the sheet needs so it covers the object under the cut plane.
     // The FALLBACK extent, used before the first successful cross-section fit
     // (and when the plane misses the object): the bounding-box based size phase
