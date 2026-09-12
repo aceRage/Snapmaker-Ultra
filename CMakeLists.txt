@@ -994,6 +994,40 @@ if (WIN32)
     else()
         message(STATUS "EdgeSlicer: no FLASHNETWORK_BIN_DIR - FlashForge LAN printing will be unavailable in this package")
     endif()
+
+    # EdgeSlicer: the bundled ffmpeg for the remote hub's camera Quality steps. go2rtc re-encodes
+    # by shelling out to an ffmpeg binary and carries no codec of its own, so without one the
+    # per-phone Quality setting is reduced to the Bambu MJPEG frame-rate knob. It installs beside
+    # go2rtc.exe, which is where RemoteHub.cpp's ffmpeg_path() looks first and what start_go2rtc()
+    # names in go2rtc's `ffmpeg: bin:` - so it is found by path, never by PATH.
+    #
+    #   -DFFMPEG_BIN_DIR=C:/path/to/ffmpeg_out/ship
+    #
+    # The build is **LGPL-3.0** (BtbN/FFmpeg-Builds, --disable-libx264 --disable-libx265), chosen
+    # over a GPL one so the tool carries no copyleft stronger than the app's own AGPL-3.0. It is
+    # redistributed unmodified as a separate executable that the hub invokes as a subprocess; its
+    # LICENSE.txt ships beside it and it is listed in CopyrightsDialog::fill_entries(). See
+    # docs/superpowers/specs/2026-09-12-bundled-ffmpeg.md for the pinned release tag, the sha256,
+    # and why the H.264 encoder is libopenh264 rather than libx264.
+    #
+    # Both packages get it from this one rule: the portable zip is the install tree, and the NSIS
+    # installer is built from the same tree.
+    if (FFMPEG_BIN_DIR AND EXISTS "${FFMPEG_BIN_DIR}/ffmpeg.exe")
+        install(PROGRAMS "${FFMPEG_BIN_DIR}/ffmpeg.exe" DESTINATION "./resources/tools/go2rtc")
+        # The licence text has to travel with the binary - it is the LGPL's condition for shipping
+        # it at all, and a user who finds an ffmpeg.exe in our tree should be able to see whose it
+        # is without leaving the folder.
+        if (EXISTS "${FFMPEG_BIN_DIR}/FFMPEG-LICENSE.txt")
+            install(FILES "${FFMPEG_BIN_DIR}/FFMPEG-LICENSE.txt" DESTINATION "./resources/tools/go2rtc")
+        endif()
+        # Any companion DLLs a shared build would need. A static build (what we ship) has none, so
+        # this is a no-op there and the package stays one extra file.
+        install(DIRECTORY "${FFMPEG_BIN_DIR}/" DESTINATION "./resources/tools/go2rtc" FILES_MATCHING PATTERN "*.dll")
+        message(STATUS "EdgeSlicer: shipping ffmpeg for camera quality variants from ${FFMPEG_BIN_DIR}")
+    else()
+        message(STATUS "EdgeSlicer: no FFMPEG_BIN_DIR - camera Quality falls back to the MJPEG frame-rate knob")
+    endif()
+
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
     include(InstallRequiredSystemLibraries)
     install (PROGRAMS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS} DESTINATION ".")
