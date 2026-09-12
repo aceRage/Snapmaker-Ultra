@@ -5,6 +5,7 @@
 #include "Point.hpp"
 #include "Model.hpp"
 #include "CurvedCut.hpp"
+#include "DrawCut.hpp"
 
 #include <vector>
 
@@ -82,6 +83,21 @@ public:
     // a zero-displacement curved cut runs the same code path as today's flat cut and
     // its output is bit-identical. No connectors on a curved cut in phase 1.
     const ModelObjectPtrs& perform_with_curved_sheet(const CurvedCutSheet& sheet, double thickness = 0.0, CutThicknessOffset offset = CutThicknessOffset::Centred);
+    // Draw cut, phase 1: split by a RULED STRIP swept along a stroke the user drew
+    // on the model's surface, instead of by the plane or by a height field. The
+    // stroke is in the cut plane's own frame, the same frame the sheet lives in.
+    //
+    // The kerf rides in through `params.thickness` rather than as its own argument:
+    // a drawn cut's band is offset along the STRIP's own normal (which varies along
+    // the stroke), not along a single plane normal, so there is nothing for a
+    // separate `thickness` argument to mean here.
+    //
+    // No connectors on a drawn cut in phase 1 (phase 2 adds the surface frame the
+    // connector path would stand on). A flexi joint dispatches to
+    // perform_with_flexi_joints() exactly as it does on a curved cut, for the same
+    // reason: the joint's two segments are separated by its own gap between two
+    // flat faces, so a flexi cut cannot also be a drawn one.
+    const ModelObjectPtrs& perform_with_draw_stroke(const DrawCutStroke& stroke, const DrawCutParams& params);
     // Flexi joint cut: one object, two watertight model parts, a real Manifold boolean.
     // perform_with_plane() dispatches here automatically when a flexi connector is present.
     const ModelObjectPtrs& perform_with_flexi_joints();
