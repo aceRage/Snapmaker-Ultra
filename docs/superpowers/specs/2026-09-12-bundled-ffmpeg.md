@@ -306,12 +306,18 @@ build on this PC took several attempts, for two reasons worth recording.
    `libslic3r.lib`, after which the GUI targets are silently skipped and the build "succeeds"
    having produced no exe.
 
-2. **Take the build lock, and use the compile cache.** Wrap the launch in
-   `sh <snorca_hubtest>/with_build_lock.sh <cmd>` so it does not contend with other agents'
-   builds, and configure with
-   `-DCMAKE_VS_GLOBALS="CLToolExe=sccache.exe;CLToolPath=...;TrackFileAccess=false;UseMultiToolTask=true;EnforceProcessCountAcrossBuilds=true"`.
-   Under contention the build also hit genuine `C3859`/`C1076` (PCH virtual-memory exhaustion) at
-   `/m:4` and `/m:2`; the lock is what actually fixes that, `/m:1` only narrows the window.
+2. **Take the build lock.** Wrap the launch in `sh <snorca_hubtest>/with_build_lock.sh <cmd>` so
+   it does not contend with other agents' builds. Under contention this build also hit genuine
+   `C3859`/`C1076` (PCH virtual-memory exhaustion) at `/m:4` and `/m:2`; the lock is what actually
+   fixes that, `/m:1` only narrows the window.
+
+3. **sccache as `CLToolExe` did not work here.** Configuring with
+   `-DCMAKE_VS_GLOBALS="CLToolExe=sccache.exe;CLToolPath=<WinGet Links>;..."` makes MSBuild invoke
+   sccache *as* the compiler, and sccache 0.17.0 then fails every single compile with
+   `sccache: error: failed to execute compile / caused by: cannot find binary path` - it cannot
+   locate the real `cl.exe` from that launch. The build fails immediately, in the dependencies,
+   before any project of ours. Reverting needs `-UCMAKE_VS_GLOBALS`: simply dropping the flag from
+   the configure line leaves the value sitting in `CMakeCache.txt` and it keeps applying.
 
 **One trap worth knowing when gating this by hand.** A go2rtc started from the *worktree's*
 `resources/tools/go2rtc/go2rtc.exe` holds that file open, and Windows will then fail the build's
