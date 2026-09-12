@@ -978,8 +978,15 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
     }
     function autoStreamMode() {
-        // A desktop browser on the home network keeps exactly what it had: 'mse', byte for byte.
-        if (connHere === 'home' && !iosWebKit()) return 'mse';
+        // The PC's own Stream tab (not REMOTE) on the home network keeps exactly what it had:
+        // 'mse', byte for byte. It is same-origin loopback, there is no hub to ask about a
+        // WebRTC listener, and nothing about that path needed improving.
+        //
+        // A *phone* on the home network is a different case, and used to fall in here too: it
+        // loads this page from http://<pc>:13640/r/<token>/, so connHere is 'home', and an
+        // Android phone is not iosWebKit() - which meant the LAN phone, the case WebRTC helps
+        // most and the one the firewall rule exists for, would never have tried it.
+        if (!REMOTE && connHere === 'home' && !iosWebKit()) return 'mse';
         // The per-phone Video setting is the default for Auto tiles. 'mse' means the relay only;
         // 'webrtc' forces an attempt even from a Serve origin (the user asked for it); 'auto'
         // tries WebRTC only where it can actually work - webrtcUsable() is the hub's listener
