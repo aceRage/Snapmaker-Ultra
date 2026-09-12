@@ -5,6 +5,7 @@
 #include "TriangleMesh.hpp"
 #include "BoundingBox.hpp"
 
+#include <algorithm>
 #include <vector>
 
 namespace Slic3r {
@@ -28,9 +29,12 @@ namespace Slic3r {
 class CurvedCutSheet
 {
 public:
-    // Control grid resolution limits. The gizmo exposes 3..15; the maths works
-    // for any n >= 2 but a 2x2 grid cannot bend, only tilt.
-    static const int MinResolution = 3;
+    // Control grid resolution limits, PER AXIS. The maths works for any n >= 2;
+    // an axis with only 2 points cannot bend along itself, it can only tilt -
+    // which is the whole point of a RULED grid like 10 x 2, where each column is
+    // one straight line the user controls from either end. (2 x 2 is therefore a
+    // tilted plane, not a bend.)
+    static const int MinResolution = 2;
     static const int MaxResolution = 15;
     static const int DefaultResolution = 5;
     // Dense sample resolution for the PREVIEW sheet. 64x64 is plenty to look
@@ -45,15 +49,30 @@ public:
 
     CurvedCutSheet() { reset(DefaultResolution); }
     explicit CurvedCutSheet(int resolution) { reset(resolution); }
+    CurvedCutSheet(int nx, int ny) { reset(nx, ny); }
 
-    // Zero every displacement, optionally changing the grid resolution.
+    // Zero every displacement, optionally changing the grid counts. The one-int
+    // form is the SQUARE form: it sets both counts, which is what every caller
+    // from before non-square grids meant by it.
     void reset(int resolution = -1);
+    void reset(int nx, int ny);
 
-    int  resolution() const { return m_resolution; }
-    // Change the control grid resolution, re-sampling the CURRENT surface onto
-    // the new grid so the shape is preserved as closely as the new grid can
-    // represent it (exactly, when the new grid is a refinement).
-    void set_resolution(int resolution);
+    // PHASE 5: the control grid is a RECTANGLE of counts, nx columns by ny rows,
+    // so a ruled bend (10 x 2: every column a line, grabbable from either end)
+    // is expressible. resolution() / set_resolution(int) are kept as the SQUARE
+    // API - the same compatibility trick half_size() plays for the rectangular
+    // domain - so every caller that only ever wanted "the grid is this dense"
+    // still compiles and still means what it used to. resolution() reports the
+    // LARGER count, matching half_size()'s "the bigger of the two" rule.
+    int  resolution() const { return std::max(m_nx, m_ny); }
+    int  nx() const { return m_nx; }
+    int  ny() const { return m_ny; }
+    // Change the control grid counts, re-sampling the CURRENT surface onto the
+    // new grid so the shape is preserved as closely as the new grid can
+    // represent it (exactly, when the new grid is a refinement). The one-int
+    // form sets both counts.
+    void set_resolution(int resolution) { set_grid(resolution, resolution); }
+    void set_grid(int nx, int ny);
 
     // Half extent of the sheet's domain in the cut plane, in mm. The sheet must
     // cover the object's footprint under the cut plane.
@@ -93,9 +112,10 @@ public:
     // republishes the reference.
     void set_half_size(double hs_u, double hs_v, bool resample = false);
 
-    // Control point displacement along the plane normal, in mm.
-    double  at(int i, int j) const { return m_z[size_t(j) * m_resolution + i]; }
-    double& at(int i, int j)       { return m_z[size_t(j) * m_resolution + i]; }
+    // Control point displacement along the plane normal, in mm. Row-major with
+    // the ROW STRIDE = nx, so i indexes the column (u) and j the row (v).
+    double  at(int i, int j) const { return m_z[size_t(j) * size_t(m_nx) + size_t(i)]; }
+    double& at(int i, int j)       { return m_z[size_t(j) * size_t(m_nx) + size_t(i)]; }
     const std::vector<double>& values() const { return m_z; }
     void set_values(const std::vector<double>& z);
 
@@ -128,11 +148,20 @@ public:
     // indices lands exactly on grid points and the extent is unchanged; the
     // reference grid is republished, so a later re-fit re-samples the FLIPPED
     // surface rather than resurrecting the pre-flip one.
+    //
+    // PHASE 5, THE AXIS TRAP: flip_about_u() mirrors ALONG V, so its index runs
+    // over NY; flip_about_v() mirrors along u, over NX. On a square grid the two
+    // counts are equal and getting them the wrong way round is invisible - on a
+    // 10 x 2 sheet it reads off the end of the grid. The tests pin both.
     void flip_about_u();
     void flip_about_v();
 
-    // (u,v) in [0,1]^2 of control point (i,j).
-    double control_u(int i) const { return m_resolution < 2 ? 0.5 : double(i) / double(m_resolution - 1); }
+    // (u,v) in [0,1]^2 of control point (i,j). u runs over the nx COLUMNS, v over
+    // the ny ROWS - they are different counts now, so they are different
+    // functions. (control_xy() used to call control_u(j) for the v axis, which
+    // was the core square assumption.)
+    double control_u(int i) const { return m_nx < 2 ? 0.5 : double(i) / double(m_nx - 1); }
+    double control_v(int j) const { return m_ny < 2 ? 0.5 : double(j) / double(m_ny - 1); }
     // Local (x,y) of control point (i,j), in the cut plane frame.
     Vec2d  control_xy(int i, int j) const;
     Vec3d  control_pos(int i, int j) const;
@@ -161,6 +190,15 @@ public:
     // One Laplacian smoothing pass over the control grid. `strength` in [0,1]
     // blends between the original value and the 4-neighbour average; when
     // `radius` is positive only points within it (falloff-weighted) move.
+    //
+    // PHASE 5: a ruled grid smooths along the axis that HAS interior points, and
+    // only that one. A 2-point axis is left out of the average entirely, so on a
+    // 10 x 2 sheet the pass is a 1D smooth along u and the two rows keep their
+    // separation - smoothing a ruled sheet must act along the ruling, not across
+    // it. (Edge clamping alone would NOT give that: at ny == 2 row 0's j+1
+    // neighbour is row 1, a real point, so a plain 4-neighbour average would pull
+    // the rows together and flatten the ruling.) The old "either count < 3, do
+    // nothing" guard would instead have turned smoothing off altogether here.
     void smooth(double strength = 0.5, const Vec2d* center_xy = nullptr, double radius = 0.0, bool falloff = true);
 
     // --- sampling ----------------------------------------------------------
@@ -174,7 +212,8 @@ private:
     // point calls.
     void publish_reference();
 
-    int                 m_resolution{DefaultResolution};
+    int                 m_nx{DefaultResolution};
+    int                 m_ny{DefaultResolution};
     double              m_half_size_u{50.0};
     double              m_half_size_v{50.0};
     std::vector<double> m_z;
@@ -241,6 +280,18 @@ int curved_cut_default_resolution(double half_size_u,
                                   double half_size_v,
                                   double target_spacing = 10.0,
                                   int    min_res        = 5);
+
+// PHASE 5: the same answer PER AXIS. The single-answer form above is set by the
+// LONGER axis, which on a long thin part spreads the short axis' handles far
+// wider apart than the target spacing asks for; this gives each axis the count
+// its own extent wants. `min_res` applies to both, so the auto fit never chooses
+// a ruled grid on its own - a 10 x 2 is the user's decision, not the fit's.
+void curved_cut_default_grid(double half_size_u,
+                             double half_size_v,
+                             int&   nx,
+                             int&   ny,
+                             double target_spacing = 10.0,
+                             int    min_res        = 5);
 
 // ---------------------------------------------------------------------------
 // Phase 3: which side of the sheet is empty, cheaply.

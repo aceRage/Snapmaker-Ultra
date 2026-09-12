@@ -3217,3 +3217,452 @@ TEST_CASE("Curved cut: flipping the frame carries the sheet", "[CurvedCut]")
             REQUIRE(s.values()[k] == Approx(flipped[k]).margin(1e-9));
     }
 }
+
+// ---------------------------------------------------------------------------
+// PHASE 5: non-square control grids (nx columns x ny rows).
+//
+// The sheet's DOMAIN has been a rectangle since phase 2; the GRID was still one
+// count. Splitting it lets the owner ask for a RULED sheet - 10 x 2, where each
+// of the ten columns is one straight line along v that can be grabbed from
+// either of its two ends.
+//
+// Two traps, both silent on a square grid, both pinned below:
+//   - smooth()'s "too small to smooth" guard used to fire when EITHER axis was
+//     under 3, which would switch smoothing off entirely on a 10 x 2 sheet;
+//   - flip_about_u() mirrors along V, so it must index over NY (and _v over NX).
+//     Swapping them is invisible while nx == ny and out of bounds when it is not.
+// ---------------------------------------------------------------------------
+
+// A 10 x 2 sheet whose two rows sit at different, per-column heights: the shape
+// the owner described, a ruled bend controlled from either end of each column.
+static CurvedCutSheet ruled_sheet_10x2()
+{
+    CurvedCutSheet s(10, 2);
+    s.set_half_size(50.0, 20.0);
+    for (int i = 0; i < s.nx(); ++ i) {
+        const double t = double(i) / double(s.nx() - 1);
+        // Row 0 and row 1 get DIFFERENT functions of the column, so the surface
+        // is genuinely ruled rather than a plain extrusion.
+        s.at(i, 0) =  6.0 * std::sin(PI * t);
+        s.at(i, 1) = -4.0 * t + 1.0;
+    }
+    s.commit_reference();
+    return s;
+}
+
+TEST_CASE("Curved cut: a 10 x 2 grid is a ruled surface", "[CurvedCut]")
+{
+    const CurvedCutSheet s = ruled_sheet_10x2();
+
+    SECTION("the grid counts are what was asked for, and resolution() is the larger")
+    {
+        REQUIRE(s.nx() == 10);
+        REQUIRE(s.ny() == 2);
+        // The square compatibility API reports the larger count, the same rule
+        // half_size() follows for the rectangular domain.
+        REQUIRE(s.resolution() == 10);
+        REQUIRE(s.values().size() == 20);
+    }
+
+    SECTION("along v the surface is EXACTLY the linear blend of the two rows")
+    {
+        // This is what "ruled" means: every column is a straight line in the
+        // (v, z) plane. It is also the reason a 2-count axis interpolates
+        // linearly rather than through the clamped spline - see evaluate().
+        // catmull_rom(a, a, b, b, t) is a + (b-a)(0.5t + 1.5t^2 - t^3), an
+        // S-curve that departs from the straight line by up to ~4.7% of the
+        // rise; a sheet built from that is not ruled and the cut face bows.
+        for (int i = 0; i < s.nx(); ++ i) {
+            const double u  = s.control_u(i);
+            const double z0 = s.at(i, 0);
+            const double z1 = s.at(i, 1);
+            for (double v : { 0.0, 0.125, 0.25, 1.0 / 3.0, 0.5, 0.75, 0.875, 1.0 }) {
+                const double got = s.evaluate(u, v);
+                INFO("column " << i << " v " << v);
+                REQUIRE(got == Approx(z0 + (z1 - z0) * v).margin(1e-9));
+            }
+        }
+    }
+
+    SECTION("between columns too: v is linear everywhere, not only over a control column")
+    {
+        // Off a control column the row values are themselves Catmull-Rom
+        // interpolations along u, but the v blend must STILL be linear between
+        // them - the evaluation is separable, so linearity along v is a property
+        // of the axis, not of where we sample u.
+        for (double u : { 0.03, 0.17, 0.41, 0.62, 0.88, 0.97 }) {
+            const double top = s.evaluate(u, 0.0);
+            const double bot = s.evaluate(u, 1.0);
+            for (double v : { 0.2, 0.5, 0.9 }) {
+                INFO("u " << u << " v " << v);
+                REQUIRE(s.evaluate(u, v) == Approx(top + (bot - top) * v).margin(1e-9));
+            }
+        }
+    }
+
+    SECTION("along u it interpolates its control points exactly")
+    {
+        // Catmull-Rom's defining property, unchanged by the rectangular grid.
+        for (int j = 0; j < s.ny(); ++ j)
+            for (int i = 0; i < s.nx(); ++ i) {
+                INFO("control " << i << "," << j);
+                REQUIRE(s.evaluate(s.control_u(i), s.control_v(j)) == Approx(s.at(i, j)).margin(1e-9));
+            }
+    }
+
+    SECTION("control_v is its own axis, so the handles land on the rectangle's rows")
+    {
+        // control_xy() used to read control_u(j) for the v axis - the core square
+        // assumption. With ny = 2 the two rows must sit on the domain's edges.
+        REQUIRE(s.control_v(0) == Approx(0.0));
+        REQUIRE(s.control_v(1) == Approx(1.0));
+        REQUIRE(s.control_xy(0, 0).y() == Approx(-s.half_size_v()));
+        REQUIRE(s.control_xy(0, 1).y() == Approx(+s.half_size_v()));
+        // ... and the columns span u evenly, all ten of them.
+        REQUIRE(s.control_xy(0, 0).x() == Approx(-s.half_size_u()));
+        REQUIRE(s.control_xy(9, 0).x() == Approx(+s.half_size_u()));
+        REQUIRE(s.control_xy(1, 0).x() == Approx(-s.half_size_u() + 2.0 * s.half_size_u() / 9.0));
+    }
+}
+
+TEST_CASE("Curved cut: resampling a non-square grid keeps the shape", "[CurvedCut]")
+{
+    // A dense (u,v) lattice to measure the surface on, before and after.
+    auto sample = [](const CurvedCutSheet& s) {
+        std::vector<double> out;
+        for (int a = 0; a <= 40; ++ a)
+            for (int b = 0; b <= 40; ++ b)
+                out.push_back(s.evaluate(double(a) / 40.0, double(b) / 40.0));
+        return out;
+    };
+
+    SECTION("10 x 2 -> 5 x 5 -> 10 x 2 survives within the resample error")
+    {
+        const CurvedCutSheet      start  = ruled_sheet_10x2();
+        const std::vector<double> before = sample(start);
+
+        CurvedCutSheet s = start;
+        s.set_grid(5, 5);
+        REQUIRE(s.nx() == 5);
+        REQUIRE(s.ny() == 5);
+        REQUIRE(s.values().size() == 25);
+
+        // Going 10 -> 5 along u THROWS AWAY nodes (u = 1/9, 2/9 ... are not
+        // fifths), so this leg is genuinely lossy and the tolerance is the
+        // Catmull-Rom resample error, not zero. Pin the measured figure so a
+        // regression that makes it worse is visible.
+        s.set_grid(10, 2);
+        REQUIRE(s.nx() == 10);
+        REQUIRE(s.ny() == 2);
+        const std::vector<double> after = sample(s);
+        REQUIRE(after.size() == before.size());
+        double worst = 0.0;
+        for (size_t k = 0; k < before.size(); ++ k)
+            worst = std::max(worst, std::abs(after[k] - before[k]));
+        INFO("worst round-trip deviation " << worst << " mm on a 6 mm surface");
+        REQUIRE(worst < 1.5);
+
+        // The v direction is untouched by the round trip: 2 -> 5 -> 2 keeps the
+        // domain's two edge rows, which ARE nodes of the 5-row grid, and the
+        // surface is linear along v at both ends. So the ruled property holds
+        // again afterwards.
+        for (double u : { 0.1, 0.5, 0.9 }) {
+            const double top = s.evaluate(u, 0.0), bot = s.evaluate(u, 1.0);
+            REQUIRE(s.evaluate(u, 0.5) == Approx(0.5 * (top + bot)).margin(1e-9));
+        }
+    }
+
+    SECTION("8 x 2 -> 15 x 3 is EXACT at the shared nodes")
+    {
+        // A refinement in both axes whose nodes include the originals: u = i/7
+        // is (2i)/14, and v = 0, 1 are v = 0 and 2/2. Catmull-Rom interpolates
+        // its control points, so those must come back bit-for-bit.
+        //
+        // 8 -> 15 rather than 10 -> 19 because MaxResolution is 15: the true
+        // refinement of a 10-column axis is 19 columns, which clamps. That is a
+        // limit of the grid's range, not of the resampling.
+        CurvedCutSheet start(8, 2);
+        start.set_half_size(50.0, 20.0);
+        for (int i = 0; i < start.nx(); ++ i) {
+            const double t = double(i) / double(start.nx() - 1);
+            start.at(i, 0) =  6.0 * std::sin(PI * t);
+            start.at(i, 1) = -4.0 * t + 1.0;
+        }
+        start.commit_reference();
+
+        CurvedCutSheet s = start;
+        s.set_grid(15, 3);
+        REQUIRE(s.nx() == 15);
+        REQUIRE(s.ny() == 3);
+        for (int i = 0; i < start.nx(); ++ i) {
+            INFO("shared node column " << i);
+            REQUIRE(s.at(2 * i, 0) == Approx(start.at(i, 0)).margin(1e-12));
+            REQUIRE(s.at(2 * i, 2) == Approx(start.at(i, 1)).margin(1e-12));
+            // The new middle row is the ruled surface's own midpoint.
+            REQUIRE(s.at(2 * i, 1) == Approx(0.5 * (start.at(i, 0) + start.at(i, 1))).margin(1e-12));
+        }
+    }
+
+    SECTION("a re-fit of the EXTENT resamples over the right counts")
+    {
+        // set_half_size(resample) loops the control grid; with the loops or the
+        // stride on the wrong axis a 10 x 2 sheet would read out of bounds or
+        // transpose. Re-fit out and back: the reference makes it idempotent.
+        CurvedCutSheet            s    = ruled_sheet_10x2();
+        const std::vector<double> want = s.values();
+        const double hs_u = s.half_size_u(), hs_v = s.half_size_v();
+        s.set_half_size(hs_u * 1.6, hs_v * 1.3, /*resample*/ true);
+        REQUIRE(s.values().size() == 20);
+        s.set_half_size(hs_u, hs_v, /*resample*/ true);
+        REQUIRE(s.values().size() == want.size());
+        for (size_t k = 0; k < want.size(); ++ k)
+            REQUIRE(s.values()[k] == Approx(want[k]).margin(1e-9));
+    }
+}
+
+TEST_CASE("Curved cut: flipping a non-square grid mirrors over the right axis", "[CurvedCut]")
+{
+    // THE TRAP. flip_about_u() mirrors along v (over ny); flip_about_v() mirrors
+    // along u (over nx). On a square grid the counts are equal and a swap is
+    // invisible - on 10 x 2 it indexes off the end of the grid.
+
+    SECTION("flip_about_u satisfies f_new(x, -y) == -f_old(x, y)")
+    {
+        const CurvedCutSheet before = ruled_sheet_10x2();
+        CurvedCutSheet       after  = before;
+        after.flip_about_u();
+
+        // The grid keeps its shape and its domain: a flip is an index mirror, not
+        // a re-fit.
+        REQUIRE(after.nx() == before.nx());
+        REQUIRE(after.ny() == before.ny());
+        REQUIRE(after.half_size_u() == Approx(before.half_size_u()));
+        REQUIRE(after.half_size_v() == Approx(before.half_size_v()));
+
+        for (double x : { -50.0, -31.0, -7.0, 0.0, 12.5, 33.0, 50.0 })
+            for (double y : { -20.0, -9.0, 0.0, 4.0, 15.0, 20.0 }) {
+                INFO("local (" << x << ", " << y << ")");
+                REQUIRE(after.evaluate_local(x, -y) == Approx(-before.evaluate_local(x, y)).margin(1e-9));
+            }
+    }
+
+    SECTION("flip_about_v satisfies f_new(-x, y) == -f_old(x, y)")
+    {
+        const CurvedCutSheet before = ruled_sheet_10x2();
+        CurvedCutSheet       after  = before;
+        after.flip_about_v();
+
+        for (double x : { -50.0, -31.0, -7.0, 0.0, 12.5, 33.0, 50.0 })
+            for (double y : { -20.0, -9.0, 0.0, 4.0, 15.0, 20.0 }) {
+                INFO("local (" << x << ", " << y << ")");
+                REQUIRE(after.evaluate_local(-x, y) == Approx(-before.evaluate_local(x, y)).margin(1e-9));
+            }
+    }
+
+    SECTION("both flips are their own inverse, bit for bit")
+    {
+        const CurvedCutSheet before = ruled_sheet_10x2();
+
+        CurvedCutSheet u2 = before;
+        u2.flip_about_u();
+        u2.flip_about_u();
+        REQUIRE(u2.values() == before.values());
+
+        CurvedCutSheet v2 = before;
+        v2.flip_about_v();
+        v2.flip_about_v();
+        REQUIRE(v2.values() == before.values());
+    }
+
+    SECTION("the mirrors act on the axis they name, and on no other")
+    {
+        // The sharpest form of the trap: flip_about_u swaps ROW 0 with ROW 1 and
+        // leaves the COLUMN order alone; flip_about_v does the opposite. Read the
+        // control values directly, so nothing hides behind the evaluation.
+        const CurvedCutSheet before = ruled_sheet_10x2();
+
+        CurvedCutSheet fu = before;
+        fu.flip_about_u();
+        for (int i = 0; i < before.nx(); ++ i) {
+            INFO("column " << i);
+            REQUIRE(fu.at(i, 0) == Approx(-before.at(i, 1)).margin(1e-12));
+            REQUIRE(fu.at(i, 1) == Approx(-before.at(i, 0)).margin(1e-12));
+        }
+
+        CurvedCutSheet fv = before;
+        fv.flip_about_v();
+        for (int j = 0; j < before.ny(); ++ j)
+            for (int i = 0; i < before.nx(); ++ i) {
+                INFO("control " << i << "," << j);
+                REQUIRE(fv.at(i, j) == Approx(-before.at(before.nx() - 1 - i, j)).margin(1e-12));
+            }
+    }
+}
+
+TEST_CASE("Curved cut: smoothing a 2-row grid works and leaves v alone", "[CurvedCut]")
+{
+    // The other trap. The guard used to be "either count < 3 -> do nothing",
+    // which would have made Smooth a no-op on every ruled sheet.
+
+    SECTION("it does not crash, and it does change the surface along u")
+    {
+        CurvedCutSheet            s      = ruled_sheet_10x2();
+        const std::vector<double> before = s.values();
+        s.smooth(0.5);
+        REQUIRE(s.values().size() == before.size());
+        REQUIRE(s.values() != before);   // the u axis has eight interior columns
+        REQUIRE(std::isfinite(s.max_displacement()));
+    }
+
+    SECTION("the two rows keep their separation: no smoothing happens ALONG v")
+    {
+        // A 2-point axis takes no part in the Laplacian, so the pass is a 1D
+        // smooth along u applied to each row and the rows are never blended into
+        // each other. This is NOT what edge clamping alone would give: at ny == 2
+        // row 0's j+1 neighbour is row 1, a real point, so a plain 4-neighbour
+        // average would drag 5 and -3 to 3 and -1 in a single full-strength pass
+        // and flatten the ruling the sheet exists for.
+        CurvedCutSheet s = ruled_sheet_10x2();
+        // Make both rows constant along u, so the u smoothing has nothing to do
+        // and only a v leak could move anything.
+        for (int i = 0; i < s.nx(); ++ i) {
+            s.at(i, 0) =  5.0;
+            s.at(i, 1) = -3.0;
+        }
+        s.commit_reference();
+        s.smooth(1.0);
+        for (int i = 0; i < s.nx(); ++ i) {
+            INFO("column " << i);
+            REQUIRE(s.at(i, 0) == Approx(5.0).margin(1e-12));
+            REQUIRE(s.at(i, 1) == Approx(-3.0).margin(1e-12));
+        }
+    }
+
+    SECTION("a grid short on BOTH axes still smooths to nothing")
+    {
+        // 2 x 2 is a tilted plane: no interior point on either axis, so there is
+        // genuinely nothing for a Laplacian to do and the guard still holds.
+        CurvedCutSheet s(2, 2);
+        s.set_half_size(20.0, 20.0);
+        s.at(0, 0) = 1.0;
+        s.at(1, 1) = -2.0;
+        const std::vector<double> before = s.values();
+        s.smooth(1.0);
+        REQUIRE(s.values() == before);
+    }
+}
+
+TEST_CASE("Curved cut: the square API still means what it meant", "[CurvedCut]")
+{
+    // The compatibility proof for resolution() / set_resolution(int) / reset(int).
+    SECTION("the one-int constructors and setters make a SQUARE grid")
+    {
+        CurvedCutSheet s(7);
+        REQUIRE(s.nx() == 7);
+        REQUIRE(s.ny() == 7);
+        REQUIRE(s.resolution() == 7);
+
+        s.set_resolution(9);
+        REQUIRE(s.nx() == 9);
+        REQUIRE(s.ny() == 9);
+
+        s.reset(4);
+        REQUIRE(s.nx() == 4);
+        REQUIRE(s.ny() == 4);
+        REQUIRE(s.is_flat());
+    }
+
+    SECTION("set_resolution on a non-square grid squares it up")
+    {
+        CurvedCutSheet s = ruled_sheet_10x2();
+        s.set_resolution(6);
+        REQUIRE(s.nx() == 6);
+        REQUIRE(s.ny() == 6);
+    }
+
+    SECTION("reset() with no argument keeps the counts, square or not")
+    {
+        CurvedCutSheet s = ruled_sheet_10x2();
+        s.reset();
+        REQUIRE(s.nx() == 10);
+        REQUIRE(s.ny() == 2);
+        REQUIRE(s.is_flat());
+    }
+
+    SECTION("MinResolution allows a ruled axis; Max is unchanged")
+    {
+        REQUIRE(CurvedCutSheet::MinResolution == 2);
+        REQUIRE(CurvedCutSheet::MaxResolution == 15);
+        // Out-of-range counts clamp per axis rather than being refused.
+        CurvedCutSheet s(1, 99);
+        REQUIRE(s.nx() == CurvedCutSheet::MinResolution);
+        REQUIRE(s.ny() == CurvedCutSheet::MaxResolution);
+    }
+}
+
+TEST_CASE("Curved cut: the default grid follows each extent separately", "[CurvedCut]")
+{
+    // The single-answer form is set by the LONGER axis, which on a long thin part
+    // stretches that density across the short one. The two-output form gives each
+    // axis the count its own extent asks for.
+    int nx = 0, ny = 0;
+    curved_cut_default_grid(50.0, 10.0, nx, ny, 10.0, 5);
+    REQUIRE(nx == 11);                                   // 100 mm span
+    REQUIRE(ny == 5);                                    // 20 mm span -> 3, floored at 5
+    // The single-answer form would have given 11 for BOTH.
+    REQUIRE(curved_cut_default_resolution(50.0, 10.0, 10.0, 5) == 11);
+
+    // Square in, square out - so the fit's behaviour on a cube is unchanged.
+    curved_cut_default_grid(30.0, 30.0, nx, ny, 10.0, 5);
+    REQUIRE(nx == ny);
+    REQUIRE(nx == curved_cut_default_resolution(30.0, 30.0, 10.0, 5));
+
+    // The floor applies to both axes, so the automatic fit NEVER chooses a ruled
+    // grid on its own: 10 x 2 is the user's decision about the shape of the cut.
+    curved_cut_default_grid(60.0, 0.5, nx, ny, 10.0, 5);
+    REQUIRE(ny >= 5);
+}
+
+TEST_CASE("Curved cut: a ruled 10 x 2 sheet cuts a cube", "[CurvedCut]")
+{
+    const indexed_triangle_set cube = centred_cube();
+
+    // A ruled bend across the cube: the sheet tilts one way at one end and the
+    // other at the far end, so the cut face is a genuine ruled surface rather
+    // than a plane. Keep it inside the cube's half height (20 mm) with margin.
+    CurvedCutSheet s(10, 2);
+    s.set_half_size(30.0, 30.0);
+    for (int i = 0; i < s.nx(); ++ i) {
+        const double t = double(i) / double(s.nx() - 1);
+        s.at(i, 0) = -6.0 + 12.0 * t;
+        s.at(i, 1) =  6.0 - 12.0 * t;
+    }
+    s.commit_reference();
+    REQUIRE(!s.is_flat());
+
+    indexed_triangle_set upper, lower;
+    REQUIRE(curved_cut_split(cube, s, &upper, &lower));
+
+    // Both halves closed, and their volumes account for the whole cube.
+    REQUIRE(its_num_open_edges(upper) == 0);
+    REQUIRE(its_num_open_edges(lower) == 0);
+    const double total = CUBE * CUBE * CUBE;
+    const double vu = double(its_volume(upper));
+    const double vl = double(its_volume(lower));
+    INFO("upper " << vu << " lower " << vl << " total " << total);
+    REQUIRE(std::abs(vu + vl - total) / total < 1e-3);
+    REQUIRE(vu > 0.05 * total);
+    REQUIRE(vl > 0.05 * total);
+
+    // The cut face is RULED: along v the surface is a straight line, so the
+    // midpoint of every column sits exactly halfway between its two ends. This
+    // is the property the whole feature exists for, checked on the sheet the
+    // cut was actually built from.
+    for (double u : { 0.0, 0.2, 0.37, 0.5, 0.63, 0.8, 1.0 }) {
+        const double top = s.evaluate(u, 0.0), bot = s.evaluate(u, 1.0);
+        for (double v : { 0.25, 0.5, 0.75 }) {
+            INFO("u " << u << " v " << v);
+            REQUIRE(s.evaluate(u, v) == Approx(top + (bot - top) * v).margin(1e-9));
+        }
+    }
+}

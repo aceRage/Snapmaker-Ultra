@@ -31,9 +31,23 @@ void CurvedCutSheet::commit_reference() { publish_reference(); }
 
 void CurvedCutSheet::reset(int resolution)
 {
+    // The one-int form is the SQUARE form: it sets both counts, which is what it
+    // has always meant. A non-positive argument keeps the grid as it is.
     if (resolution > 0)
-        m_resolution = std::clamp(resolution, MinResolution, MaxResolution);
-    m_z.assign(size_t(m_resolution) * size_t(m_resolution), 0.0);
+        reset(resolution, resolution);
+    else {
+        m_z.assign(size_t(m_nx) * size_t(m_ny), 0.0);
+        publish_reference();
+    }
+}
+
+void CurvedCutSheet::reset(int nx, int ny)
+{
+    if (nx > 0)
+        m_nx = std::clamp(nx, MinResolution, MaxResolution);
+    if (ny > 0)
+        m_ny = std::clamp(ny, MinResolution, MaxResolution);
+    m_z.assign(size_t(m_nx) * size_t(m_ny), 0.0);
     publish_reference();
 }
 
@@ -50,11 +64,13 @@ void CurvedCutSheet::set_values(const std::vector<double>& z)
 // control grid that is "mirror j, negate the value" - exact, and self-inverse.
 void CurvedCutSheet::flip_about_u()
 {
-    const int           n = m_resolution;
+    // Mirrors ALONG V, so the mirrored index runs over NY. The row stride is NX.
+    // Swapping those two counts is silent on a square grid and out of bounds on
+    // a 10 x 2 one.
     std::vector<double> nz(m_z.size(), 0.0);
-    for (int j = 0; j < n; ++ j)
-        for (int i = 0; i < n; ++ i)
-            nz[size_t(j) * n + i] = -m_z[size_t(n - 1 - j) * n + i];
+    for (int j = 0; j < m_ny; ++ j)
+        for (int i = 0; i < m_nx; ++ i)
+            nz[size_t(j) * size_t(m_nx) + size_t(i)] = -m_z[size_t(m_ny - 1 - j) * size_t(m_nx) + size_t(i)];
     m_z = std::move(nz);
     // A flip IS an edit of the surface, so the reference follows it. Leaving the
     // pre-flip reference in place would let the next extent re-fit re-sample the
@@ -65,19 +81,20 @@ void CurvedCutSheet::flip_about_u()
 // The same for a turn about the frame's Y: local x and z negate, so mirror i.
 void CurvedCutSheet::flip_about_v()
 {
-    const int           n = m_resolution;
+    // ... and this one mirrors along u, over NX.
     std::vector<double> nz(m_z.size(), 0.0);
-    for (int j = 0; j < n; ++ j)
-        for (int i = 0; i < n; ++ i)
-            nz[size_t(j) * n + i] = -m_z[size_t(j) * n + (n - 1 - i)];
+    for (int j = 0; j < m_ny; ++ j)
+        for (int i = 0; i < m_nx; ++ i)
+            nz[size_t(j) * size_t(m_nx) + size_t(i)] = -m_z[size_t(j) * size_t(m_nx) + size_t(m_nx - 1 - i)];
     m_z = std::move(nz);
     publish_reference();
 }
 
 Vec2d CurvedCutSheet::control_xy(int i, int j) const
 {
+    // control_v(j), not control_u(j): the two axes have their own counts now.
     return Vec2d((2.0 * control_u(i) - 1.0) * m_half_size_u,
-                 (2.0 * control_u(j) - 1.0) * m_half_size_v);
+                 (2.0 * control_v(j) - 1.0) * m_half_size_v);
 }
 
 void CurvedCutSheet::set_half_size(double hs_u, double hs_v, bool resample)
@@ -125,8 +142,7 @@ void CurvedCutSheet::set_half_size(double hs_u, double hs_v, bool resample)
         (m_ref_half_size_u == m_half_size_u && m_ref_half_size_v == m_half_size_v && m_ref_z != m_z))
         publish_reference();
 
-    const int           n = m_resolution;
-    std::vector<double> nz(size_t(n) * size_t(n), 0.0);
+    std::vector<double> nz(size_t(m_nx) * size_t(m_ny), 0.0);
     if (m_ref_z.size() == m_z.size()) {
         // Evaluate the reference surface: temporarily wear the reference values
         // and extent, sample, then put the new ones on. (evaluate_local() reads
@@ -138,11 +154,11 @@ void CurvedCutSheet::set_half_size(double hs_u, double hs_v, bool resample)
         m_z           = m_ref_z;
         m_half_size_u = m_ref_half_size_u;
         m_half_size_v = m_ref_half_size_v;
-        for (int j = 0; j < n; ++ j) {
-            const double y = (2.0 * control_u(j) - 1.0) * hs_v;
-            for (int i = 0; i < n; ++ i) {
+        for (int j = 0; j < m_ny; ++ j) {
+            const double y = (2.0 * control_v(j) - 1.0) * hs_v;
+            for (int i = 0; i < m_nx; ++ i) {
                 const double x = (2.0 * control_u(i) - 1.0) * hs_u;
-                nz[size_t(j) * n + i] = evaluate_local(x, y);
+                nz[size_t(j) * size_t(m_nx) + size_t(i)] = evaluate_local(x, y);
             }
         }
         m_z           = std::move(live_z);
@@ -152,11 +168,11 @@ void CurvedCutSheet::set_half_size(double hs_u, double hs_v, bool resample)
     else {
         // No usable reference (a resolution change left it stale) - fall back to
         // the live surface, which is what phase 2 always did.
-        for (int j = 0; j < n; ++ j) {
-            const double y = (2.0 * control_u(j) - 1.0) * hs_v;
-            for (int i = 0; i < n; ++ i) {
+        for (int j = 0; j < m_ny; ++ j) {
+            const double y = (2.0 * control_v(j) - 1.0) * hs_v;
+            for (int i = 0; i < m_nx; ++ i) {
                 const double x = (2.0 * control_u(i) - 1.0) * hs_u;
-                nz[size_t(j) * n + i] = evaluate_local(x, y);
+                nz[size_t(j) * size_t(m_nx) + size_t(i)] = evaluate_local(x, y);
             }
         }
     }
@@ -207,8 +223,7 @@ static inline double catmull_rom(double p0, double p1, double p2, double p3, dou
 
 double CurvedCutSheet::evaluate(double u, double v) const
 {
-    const int n = m_resolution;
-    if (n < 2 || m_z.empty())
+    if (m_nx < 2 || m_ny < 2 || m_z.empty())
         return 0.0;
     // A flat grid is flat everywhere - short-circuit so the invariant that
     // zero displacement gives exactly z == 0 does not depend on float maths.
@@ -218,28 +233,53 @@ double CurvedCutSheet::evaluate(double u, double v) const
     u = std::clamp(u, 0.0, 1.0);
     v = std::clamp(v, 0.0, 1.0);
 
-    const double fu = u * double(n - 1);
-    const double fv = v * double(n - 1);
+    // Each axis spans its OWN count of cells. The Catmull-Rom evaluation below
+    // is already separable - four row interpolations along u, then one along v -
+    // so a rectangular grid needs nothing but the right extent per axis.
+    const double fu = u * double(m_nx - 1);
+    const double fv = v * double(m_ny - 1);
     int          iu = int(std::floor(fu));
     int          iv = int(std::floor(fv));
-    iu = std::clamp(iu, 0, n - 2);
-    iv = std::clamp(iv, 0, n - 2);
+    iu = std::clamp(iu, 0, m_nx - 2);
+    iv = std::clamp(iv, 0, m_ny - 2);
     const double tu = fu - double(iu);
     const double tv = fv - double(iv);
 
     // Clamped boundary: the neighbour outside the grid repeats the edge row,
     // which gives a zero second derivative at the border rather than an
     // extrapolated overshoot.
-    auto z_at = [this, n](int i, int j) -> double {
-        return at(std::clamp(i, 0, n - 1), std::clamp(j, 0, n - 1));
+    auto z_at = [this](int i, int j) -> double {
+        return at(std::clamp(i, 0, m_nx - 1), std::clamp(j, 0, m_ny - 1));
+    };
+
+    // A 2-POINT AXIS INTERPOLATES LINEARLY, not through the clamped spline.
+    //
+    // The obvious reading - "with only two rows both outer neighbours clamp onto
+    // the two real ones, so Catmull-Rom degenerates to linear" - is FALSE, and it
+    // is worth spelling out because the whole point of a 10 x 2 grid is that it
+    // be RULED. catmull_rom(a, a, b, b, t) works out to
+    //
+    //     a + (b - a) * (0.5 t + 1.5 t^2 - t^3)
+    //
+    // whose blend factor is not t: it is 0 at t=0, 0.5 at t=0.5 and 1 at t=1, but
+    // 0.203 at t=0.25 against a linear 0.25. That is a smoothstep-ish S-curve -
+    // on a 10.5 mm rise it departs from the straight line by 0.49 mm at the
+    // quarter points. A surface built from those is not ruled, and the cut face
+    // the user asked to be generated by straight lines would visibly bow.
+    //
+    // So when an axis has exactly two control points, blend along it LINEARLY.
+    // This cannot change any square grid's behaviour: nx == ny == 2 was below the
+    // old MinResolution of 3, so no existing sheet ever had a 2-count axis.
+    auto blend = [](double p0, double p1, double p2, double p3, double t, int count) {
+        return count == 2 ? p1 + (p2 - p1) * t : catmull_rom(p0, p1, p2, p3, t);
     };
 
     double col[4];
     for (int k = 0; k < 4; ++ k) {
         const int j = iv - 1 + k;
-        col[k] = catmull_rom(z_at(iu - 1, j), z_at(iu, j), z_at(iu + 1, j), z_at(iu + 2, j), tu);
+        col[k] = blend(z_at(iu - 1, j), z_at(iu, j), z_at(iu + 1, j), z_at(iu + 2, j), tu, m_nx);
     }
-    return catmull_rom(col[0], col[1], col[2], col[3], tv);
+    return blend(col[0], col[1], col[2], col[3], tv, m_ny);
 }
 
 double CurvedCutSheet::evaluate_local(double x, double y) const
@@ -249,28 +289,31 @@ double CurvedCutSheet::evaluate_local(double x, double y) const
     return evaluate(u, v);
 }
 
-void CurvedCutSheet::set_resolution(int resolution)
+void CurvedCutSheet::set_grid(int nx, int ny)
 {
-    const int n = std::clamp(resolution, MinResolution, MaxResolution);
-    if (n == m_resolution)
+    const int gx = std::clamp(nx, MinResolution, MaxResolution);
+    const int gy = std::clamp(ny, MinResolution, MaxResolution);
+    if (gx == m_nx && gy == m_ny)
         return;
     // Re-sample the current surface onto the new grid. Catmull-Rom interpolates
     // its control points, so going to a finer grid whose nodes include the old
     // ones (e.g. 3 -> 5 -> 9) reproduces the old values exactly at those nodes,
-    // and coming back lands on them again.
-    std::vector<double> nz(size_t(n) * size_t(n), 0.0);
+    // and coming back lands on them again. Each axis refines independently, so
+    // 10 x 2 -> 19 x 3 is exact on both axes at once.
+    std::vector<double> nz(size_t(gx) * size_t(gy), 0.0);
     if (!is_flat())
-        for (int j = 0; j < n; ++ j) {
-            const double v = n < 2 ? 0.5 : double(j) / double(n - 1);
-            for (int i = 0; i < n; ++ i) {
-                const double u = n < 2 ? 0.5 : double(i) / double(n - 1);
-                nz[size_t(j) * n + i] = evaluate(u, v);
+        for (int j = 0; j < gy; ++ j) {
+            const double v = gy < 2 ? 0.5 : double(j) / double(gy - 1);
+            for (int i = 0; i < gx; ++ i) {
+                const double u = gx < 2 ? 0.5 : double(i) / double(gx - 1);
+                nz[size_t(j) * size_t(gx) + size_t(i)] = evaluate(u, v);
             }
         }
-    m_resolution = n;
-    m_z          = std::move(nz);
-    // The reference grid is sized to the OLD resolution and is now unusable, and
-    // a resolution change is an edit of the surface anyway.
+    m_nx = gx;
+    m_ny = gy;
+    m_z  = std::move(nz);
+    // The reference grid is sized to the OLD counts and is now unusable, and a
+    // grid change is an edit of the surface anyway.
     publish_reference();
 }
 
@@ -282,8 +325,8 @@ void CurvedCutSheet::grab(const Vec2d& center_xy, double radius, double delta, b
 {
     if (radius <= 0.0 || delta == 0.0)
         return;
-    for (int j = 0; j < m_resolution; ++ j)
-        for (int i = 0; i < m_resolution; ++ i) {
+    for (int j = 0; j < m_ny; ++ j)
+        for (int i = 0; i < m_nx; ++ i) {
             const double d = (control_xy(i, j) - center_xy).norm();
             if (d >= radius)
                 continue;
@@ -296,19 +339,24 @@ void CurvedCutSheet::grab(const Vec2d& center_xy, double radius, double delta, b
 
 void CurvedCutSheet::smooth(double strength, const Vec2d* center_xy, double radius, bool falloff)
 {
-    if (m_resolution < 3 || strength <= 0.0)
+    // THE ny == 2 TRAP. The guard used to be "m_resolution < 3", i.e. "if either
+    // axis is too short to have an interior point, do nothing". On a 10 x 2 sheet
+    // that would switch smoothing off altogether, even though the u axis has
+    // eight interior columns crying out for it. Only a grid that is short on BOTH
+    // axes has nothing to smooth.
+    if ((m_nx < 3 && m_ny < 3) || strength <= 0.0)
         return;
     strength = std::clamp(strength, 0.0, 1.0);
 
     const std::vector<double> src = m_z;
     auto z_at = [&src, this](int i, int j) {
-        i = std::clamp(i, 0, m_resolution - 1);
-        j = std::clamp(j, 0, m_resolution - 1);
-        return src[size_t(j) * m_resolution + i];
+        i = std::clamp(i, 0, m_nx - 1);
+        j = std::clamp(j, 0, m_ny - 1);
+        return src[size_t(j) * size_t(m_nx) + size_t(i)];
     };
 
-    for (int j = 0; j < m_resolution; ++ j)
-        for (int i = 0; i < m_resolution; ++ i) {
+    for (int j = 0; j < m_ny; ++ j)
+        for (int i = 0; i < m_nx; ++ i) {
             double w = 1.0;
             if (center_xy != nullptr && radius > 0.0) {
                 const double d = (control_xy(i, j) - *center_xy).norm();
@@ -316,8 +364,25 @@ void CurvedCutSheet::smooth(double strength, const Vec2d* center_xy, double radi
                     continue;
                 w = falloff ? double(Sculpt::falloff_weight(float(d), float(radius))) : 1.0;
             }
-            const double avg = 0.25 * (z_at(i - 1, j) + z_at(i + 1, j) + z_at(i, j - 1) + z_at(i, j + 1));
-            at(i, j) = src[size_t(j) * m_resolution + i] * (1.0 - strength * w) + avg * (strength * w);
+            // The 4-neighbour average with EDGE CLAMPING. On a grid with three
+            // or more points on both axes this is exactly what it always was,
+            // so a square sheet smooths bit for bit as before.
+            //
+            // A 2-POINT AXIS IS EXCLUDED FROM THE AVERAGE. The tempting reading
+            // is that its neighbours clamp onto the point itself and contribute
+            // nothing - but they do not: at ny == 2 the point in row 0 has row 1
+            // as a REAL j+1 neighbour, so a plain 4-neighbour pass drags the two
+            // rows toward each other and flattens the very separation that makes
+            // the sheet ruled. (5 and -3 become 3 and -1 in one pass at full
+            // strength.) Smoothing a ruled sheet must smooth ALONG the ruling,
+            // never across it, so only axes that have an interior point take
+            // part - which for a 10 x 2 grid means u alone.
+            const bool   use_u = m_nx >= 3;
+            const bool   use_v = m_ny >= 3;
+            const double sum   = (use_u ? z_at(i - 1, j) + z_at(i + 1, j) : 0.0) +
+                                 (use_v ? z_at(i, j - 1) + z_at(i, j + 1) : 0.0);
+            const double avg   = sum / double(2 * (int(use_u) + int(use_v)));
+            at(i, j) = src[size_t(j) * size_t(m_nx) + size_t(i)] * (1.0 - strength * w) + avg * (strength * w);
         }
     publish_reference();
 }
@@ -465,6 +530,26 @@ int curved_cut_default_resolution(double half_size_u, double half_size_v, double
     // n points span (n - 1) cells.
     const int    n    = int(std::lround(span / target_spacing)) + 1;
     return std::clamp(n, std::max(min_res, CurvedCutSheet::MinResolution), CurvedCutSheet::MaxResolution);
+}
+
+void curved_cut_default_grid(double half_size_u, double half_size_v, int& nx, int& ny, double target_spacing, int min_res)
+{
+    if (target_spacing <= 0.0) {
+        nx = ny = CurvedCutSheet::DefaultResolution;
+        return;
+    }
+    // Each axis gets the count ITS OWN extent wants, so a long thin part stops
+    // being forced to carry the long axis' density across the short one.
+    // `min_res` floors both: the automatic fit never picks a ruled grid by
+    // itself, since a 2-count axis is a deliberate choice about the shape of the
+    // cut rather than a consequence of the part's proportions.
+    const int lo = std::max(min_res, CurvedCutSheet::MinResolution);
+    auto count = [&](double hs) {
+        const int n = int(std::lround(2.0 * hs / target_spacing)) + 1;
+        return std::clamp(n, lo, CurvedCutSheet::MaxResolution);
+    };
+    nx = count(half_size_u);
+    ny = count(half_size_v);
 }
 
 void curved_cut_thickness_faces(double thickness, CutThicknessOffset offset, double& lo, double& hi)
