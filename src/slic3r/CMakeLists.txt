@@ -82,6 +82,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/FillBedDialog.hpp
     GUI/RemeshDialog.cpp
     GUI/RemeshDialog.hpp
+    GUI/QuadRemeshDialog.cpp
+    GUI/QuadRemeshDialog.hpp
     GUI/ColorSplitDialog.cpp
     GUI/ColorSplitDialog.hpp
     GUI/ImageFillDialog.cpp

@@ -4,6 +4,7 @@
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
+#include "libslic3r/QuadRemesh.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmosCommon.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/MeshUtils.hpp"
@@ -1404,6 +1405,31 @@ void GLGizmoSculpt::on_render_input_window(float x, float y, float bottom_limit)
     if (m_imgui->button(GUI::format_wxstr(_L("Subdivide to %1% triangles"), after)) && ! too_big)
         wxGetApp().CallAfter([this]() { do_subdivide(); });
     m_imgui->disabled_end();
+
+    // Ultra: Phase 2 - the second entry point into the quad remesher, as the spec
+    // asks. It belongs next to Subdivide because that is what it is FOR: Subdivide
+    // splits whatever triangles the part happens to have, so an uneven mesh stays
+    // uneven and the brush bites differently in different places. Quad remeshing
+    // first gives it an even grid to work on.
+    //
+    // It hands over to the object-list action rather than remeshing in place: the mesh
+    // swap invalidates every mask and cache the open session holds, and
+    // ObjectList::quad_remesh already does the snapshot, the painted-data clearing and
+    // the notification properly.
+    //
+    // Sculpt has to be closed first, since quad_remesh() declines while a gizmo is
+    // open - and closing it is the manager's job. A gizmo .cpp in this tree
+    // deliberately does not include GLGizmosManager.hpp (only the manager itself and
+    // GizmoObjectManipulation do), so the close happens on the other side, inside
+    // quad_remesh(), which already holds a reference to the manager. Deferred, so it
+    // does not run inside this ImGui frame.
+    if (quad_remesh_available()) {
+        ImGui::Separator();
+        m_imgui->text_wrapped(_L("Rebuild the part as an even grid of quads first, so the brush and "
+                                 "Subdivide behave the same everywhere. Closes Sculpt."), wrap_width);
+        if (m_imgui->button(_L("Quad remesh...")))
+            wxGetApp().CallAfter([]() { wxGetApp().obj_list()->quad_remesh(/*close_gizmos*/ true); });
+    }
 
     GizmoImguiEnd();
     ImGuiWrapper::pop_toolbar_style();

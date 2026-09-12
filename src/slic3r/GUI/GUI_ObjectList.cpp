@@ -27,6 +27,7 @@
 #include "SingleChoiceDialog.hpp"
 #include "StepMeshDialog.hpp"
 #include "RemeshDialog.hpp"
+#include "QuadRemeshDialog.hpp"
 
 #include <boost/algorithm/string.hpp>
 #include <wx/progdlg.h>
@@ -5888,6 +5889,162 @@ void ObjectList::repair_by_remesh()
         if (opts.keep_bottom_flat && flat_declined > 0)
             msg += " " + GUI::format(_L("%1% part(s) had no flat bottom to protect."), flat_declined);
         notify->push_notification(msg);
+    }
+}
+
+// Ultra: Phase 2 - quad remesh (QuadriFlow). Rebuilds a part as an even, field-aligned
+// grid of quads at a target face count. Unlike "Repair/Remesh" above this REPAIRS
+// NOTHING - it needs a closed, single-shell mesh and refuses otherwise - but the faces
+// it produces are evenly sized and follow the surface, which is what Sculpt's
+// Subdivide workflow wants.
+//
+// The volume stores the triangulated result (two triangles per quad), exactly as
+// repair_by_remesh does, so slicing and every other consumer are unaffected. The quad
+// topology is deliberately NOT stored: the spec keeps it for the Subdivide workflow to
+// recompute, rather than adding a second mesh representation to ModelVolume.
+void ObjectList::quad_remesh(bool close_gizmos)
+{
+    if (!quad_remesh_available())
+        return;
+    GLGizmosManager& gizmos = wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager();
+    // The Sculpt entry point asks for this: it is itself a gizmo, so it would always
+    // trip the check below. Closing is the manager's job and a gizmo .cpp cannot
+    // reach it, so the request comes here instead.
+    if (close_gizmos)
+        gizmos.reset_all_states();
+    if (!gizmos.check_gizmos_closed_except(GLGizmosManager::Undefined))
+        return;
+
+    std::vector<int> obj_idxs, vol_idxs;
+    get_selection_indexes(obj_idxs, vol_idxs);
+    if (obj_idxs.empty() && vol_idxs.empty())
+        return;
+
+    // The dialog's prefilled target and its refusal notice are per-selection, so they
+    // come from the first part the run would touch - same approach as repair_by_remesh.
+    auto first_target = [&]() -> const ModelVolume* {
+        const int obj_idx = obj_idxs.empty() ? -1 : obj_idxs.front();
+        if (obj_idx < 0)
+            return nullptr;
+        const ModelObject* mo = object(obj_idx);
+        if (mo == nullptr)
+            return nullptr;
+        for (size_t i = 0; i < mo->volumes.size(); ++i) {
+            if (!vol_idxs.empty() && std::find(vol_idxs.begin(), vol_idxs.end(), int(i)) == vol_idxs.end())
+                continue;
+            if (mo->volumes[i]->is_model_part())
+                return mo->volumes[i];
+        }
+        return nullptr;
+    }();
+
+    int    default_target = 0;
+    size_t tris           = 0;
+    std::string refusal;
+    if (first_target != nullptr) {
+        const indexed_triangle_set& its = first_target->mesh().its;
+        default_target = quad_remesh_default_target(its);
+        tris           = its.indices.size();
+        // Ask BEFORE opening the dialog whether this part can be remeshed at all, so
+        // an open mesh gets an explanation with the reason in it rather than a dialog
+        // that does nothing when pressed.
+        quad_remesh_accepts(its, &refusal);
+    }
+
+    QuadRemeshOptions opts;
+    {
+        QuadRemeshDialog dlg(wxGetApp().mainframe, default_target, tris, refusal);
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+        opts = dlg.options();
+    }
+
+    Plater* plater = wxGetApp().plater();
+    Plater::TakeSnapshot snapshot(plater, "Quad remesh");
+    wxBusyCursor wait;
+
+    size_t total_before = 0, total_after = 0, total_quads = 0;
+    std::string first_refusal;
+    auto remesh_volume = [&](ModelVolume& mv) -> bool {
+        QuadRemeshOptions o = opts;
+        // An untouched target field means "this part's own default", so a multi-part
+        // selection keeps each part near its own density rather than forcing them all
+        // to the first part's count.
+        if (o.target_faces == default_target)
+            o.target_faces = quad_remesh_default_target(mv.mesh().its);
+
+        QuadRemeshReport rep;
+        indexed_triangle_set its = quad_remesh_triangulated(mv.mesh().its, o, &rep);
+        BOOST_LOG_TRIVIAL(info) << "quad_remesh: '" << mv.name << "' " << rep.triangles_before
+                                << " triangles -> " << rep.quads_after << " quads / "
+                                << rep.triangles_after << " triangles"
+                                << (rep.status == QuadRemeshStatus::Ok ? "" : ", refused: " + rep.note);
+        if (its.indices.empty()) {
+            if (first_refusal.empty())
+                first_refusal = rep.note;
+            return false;
+        }
+        total_before += rep.triangles_before;
+        total_after  += rep.triangles_after;
+        total_quads  += rep.quads_after;
+        mv.set_mesh(std::move(its));
+        mv.set_new_unique_id();
+        mv.calculate_convex_hull();
+        return true;
+    };
+
+    int remeshed = 0, failed = 0;
+    auto process_object = [&](int obj_idx, const std::vector<int>& vols) {
+        ModelObject* mo = object(obj_idx);
+        if (mo == nullptr)
+            return;
+        // Facet indices are meaningless after any remesh, so the painted data goes -
+        // this also fires the existing "custom supports removed" notification.
+        plater->clear_before_change_mesh(obj_idx);
+        bool any = false;
+        for (size_t i = 0; i < mo->volumes.size(); ++i) {
+            if (!vols.empty() && std::find(vols.begin(), vols.end(), int(i)) == vols.end())
+                continue;
+            if (!mo->volumes[i]->is_model_part())
+                continue;
+            if (remesh_volume(*mo->volumes[i])) { ++remeshed; any = true; }
+            else ++failed;
+        }
+        if (any) {
+            mo->invalidate_bounding_box();
+            mo->ensure_on_bed();
+            plater->changed_mesh(obj_idx);
+            plater->get_partplate_list().notify_instance_update(obj_idx, 0);
+            update_item_error_icon(obj_idx, -1);
+            update_info_items(obj_idx);
+        }
+    };
+
+    if (vol_idxs.empty()) {
+        for (int obj_idx : obj_idxs)
+            process_object(obj_idx, {});
+    } else if (!obj_idxs.empty()) {
+        process_object(obj_idxs.front(), vol_idxs);
+    }
+    plater->sidebar().obj_list()->update_plate_values_for_items();
+
+    NotificationManager* notify = plater->get_notification_manager();
+    if (notify != nullptr) {
+        wxString msg;
+        if (remeshed > 0) {
+            msg = GUI::format(_L("Quad remeshed %1% part(s)."), remeshed) + " " +
+                  GUI::format(_L("Triangles: %1% -> %2% (%3% quads)."), total_before, total_after, total_quads);
+        } else {
+            msg = _L("Nothing was quad remeshed.");
+        }
+        // A refusal is the common failure and it always has an actionable reason
+        // (holes, or several shells), so carry the first one into the notification
+        // rather than making the user open the log.
+        if (failed > 0 && !first_refusal.empty())
+            msg += " " + GUI::format(_L("%1% part(s) were skipped: %2%"), failed, from_u8(first_refusal));
+        else if (failed > 0)
+            msg += " " + GUI::format(_L("%1% part(s) failed."), failed);
+        notify->push_notification(into_u8(msg));
     }
 }
 
