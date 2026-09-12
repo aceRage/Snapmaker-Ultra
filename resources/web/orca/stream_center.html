@@ -822,7 +822,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     // that could not carry the UDP media anyway. It stays in the manual list for whoever turns it
     // on, and WEBRTC_RELAY is the one line to flip when they do.
     var WEBRTC_RELAY = false;
-    var STREAM_MODES = ['auto', 'webrtc', 'mp4', 'mjpeg', 'mse'];
+    // WebRTC is only offered once the hub's go2rtc has a listener to answer with (WEBRTC_RELAY);
+    // until then the entry would silently never play, so it is not shown.
+    var STREAM_MODES = WEBRTC_RELAY ? ['auto', 'webrtc', 'mp4', 'mjpeg', 'mse'] : ['auto', 'mp4', 'mjpeg', 'mse'];
     var MODE_LABEL   = { auto: 'Auto', webrtc: 'WebRTC', mp4: 'MP4', mjpeg: 'MJPEG', mse: 'MSE' };
     var MODE_KEY     = 'snorca_stream_mode';
     var modePrefs = {};
