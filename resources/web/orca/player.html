@@ -74,13 +74,44 @@ html, body { height: 100%; width: 100%; margin: 0; padding: 0; background: #000;
         let tries = 0;
         const t = setInterval(() => { if (bind() || ++tries > 40) clearInterval(t); }, 250);
     }
-    // With mode=webrtc,mse the player runs both at once and swaps to WebRTC as soon as it has a
-    // picture, so MSE is already playing while the peer connection is negotiated. If WebRTC has
-    // not taken over by then (the PC's firewall blocks go2rtc's media port, or the network drops
-    // UDP), stop it: the browser would otherwise keep an ICE agent and a second decode alive
-    // behind a stream the viewer can already see. MSE is untouched and keeps playing.
-    const both = video.mode.includes('webrtc') && video.mode.includes('mse');
-    const giveUp = parseInt(params.get('rtctimeout') || '8000', 10);
+    // With a mode list like 'webrtc,mp4,mjpeg' the player runs the first two at once and swaps to
+    // WebRTC as soon as it has a picture, so the relayed stream is already playing while the peer
+    // connection is negotiated - there is never a black tile waiting on ICE. If WebRTC has not
+    // taken over by the deadline (the PC's firewall blocks go2rtc's media port, the network drops
+    // UDP, or the origin is a Tailscale Serve proxy that cannot carry it), stop it: the browser
+    // would otherwise keep an ICE agent and a second decode alive behind a stream the viewer can
+    // already see. The relayed stream is untouched and keeps playing.
+    //
+    // 2.5 s, not the 8 s this started at: the fallback has to be bounded tightly enough that a
+    // viewer does not sit watching a tile decide. On the LAN a working peer connection is up in
+    // well under a second (measured ~0.4 s slower to first picture than MSE), so 2.5 s only ever
+    // expires on a path that was never going to work.
+    const others = video.mode.split(',').filter(m => m && m !== 'webrtc');
+    const both   = video.mode.includes('webrtc') && others.length > 0;
+    const giveUp = parseInt(params.get('rtctimeout') || '2500', 10);
+    // Tell the embedding page which path this tile actually ended on, so its badge can read
+    // "Auto · WebRTC" or "Auto · MP4" truthfully rather than naming what was asked for.
+    // Same-origin, same convention as snorcaAspect above.
+    let reported = '';
+    const reportMode = (m) => {
+        if (!m || m === reported) return;
+        reported = m;
+        try { parent.postMessage({ snorcaMode: m, src: params.get('src') || '' }, location.origin); } catch (e) {}
+    };
+    // <video-stream> records what it settled on in video.mode once a source plays; for a single
+    // mode there is nothing to decide, so report it straight away.
+    if (!both) reportMode(video.mode.split(',')[0]);
+    else {
+        // WebRTC has taken over exactly when its peer connection is open. Poll briefly rather
+        // than patching the vendored player (video-rtc.js is a verbatim go2rtc copy and must stay
+        // refreshable), and stop as soon as the answer is known or the deadline has passed.
+        const t0 = Date.now();
+        const mt = setInterval(() => {
+            const won = video.pcState === WebSocket.OPEN && video.pc;
+            if (won) { reportMode('webrtc'); clearInterval(mt); return; }
+            if (Date.now() - t0 >= giveUp + 500) { reportMode(others[0]); clearInterval(mt); }
+        }, 250);
+    }
     if (both && giveUp > 0) setTimeout(() => {
         if (video.pcState === WebSocket.OPEN || !video.pc) return; // WebRTC won, or was never started
         video.pcState = WebSocket.CLOSED;
