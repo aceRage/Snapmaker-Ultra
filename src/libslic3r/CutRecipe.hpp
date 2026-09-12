@@ -40,6 +40,9 @@
 #include <libslic3r/TriangleMesh.hpp>
 #include <libslic3r/CurvedCut.hpp>
 #include <libslic3r/DrawCut.hpp>
+// FlexiJointParams, carried per connector. Neither CurvedCut.hpp nor DrawCut.hpp
+// pulls it in, so it has to be named here.
+#include <libslic3r/FlexiJoint.hpp>
 
 namespace Slic3r {
 

@@ -7651,7 +7651,13 @@ void GLGizmoCut3D::begin_reedit()
     // The stand-in.
     ModelObject* proxy = model.add_object();
     proxy->name        = proxy_name;
-    proxy->add_volume(m_reedit_pending_recipe.mesh, ModelVolumeType::MODEL_PART, false);
+    // An explicit COPY, moved in: the three-argument overload takes a
+    // TriangleMesh&&, and the recipe's own mesh has to survive this - it is what
+    // the re-cut runs against and what the recipe written forward carries.
+    // modify_to_center_geometry is false because the mesh is already in the
+    // object frame; letting add_volume re-centre it would shift the cut plane
+    // out from under the recipe's own coordinates.
+    proxy->add_volume(TriangleMesh(m_reedit_pending_recipe.mesh), ModelVolumeType::MODEL_PART, false);
     if (first->instances.empty())
         proxy->add_instance();
     else {
