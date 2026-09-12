@@ -736,38 +736,29 @@ static bool curved_boolean(const TriangleMesh& a, const TriangleMesh& b, const s
     return true;
 }
 
-bool curved_cut_split(const indexed_triangle_set& mesh,
-                      const CurvedCutSheet&       sheet,
-                      indexed_triangle_set*       upper,
-                      indexed_triangle_set*       lower,
-                      int                         samples,
-                      double                      thickness,
-                      CutThicknessOffset          offset)
+// ---------------------------------------------------------------------------
+// The shared boolean core. See CurvedCut.hpp for what each of the four
+// behaviours below defends against; all four were learned on the curved cut and
+// all four are exactly as applicable to the drawn one, which is why this lives
+// here instead of being written twice.
+// ---------------------------------------------------------------------------
+
+bool cut_with_solid(const indexed_triangle_set& mesh,
+                    const indexed_triangle_set& cutter_lo,
+                    const indexed_triangle_set& cutter_hi,
+                    bool                        kerf,
+                    indexed_triangle_set*       upper,
+                    indexed_triangle_set*       lower,
+                    const char*                 log_tag)
 {
-    if (mesh.empty())
+    if (mesh.empty() || cutter_lo.empty())
+        return false;
+    if (kerf && cutter_hi.empty())
         return false;
 
-    TriangleMesh object(mesh);
+    const std::string tag = log_tag != nullptr ? log_tag : "Cut";
 
-    // The slab must reach past the object on every side, or "below the sheet" is
-    // only defined over part of it. WIDEN THE SLAB, never the sheet: set_half_size()
-    // on the sheet would drag its control points outwards and stretch the surface,
-    // so a small part under a large plane would get a differently shaped cut than
-    // the one the gizmo drew (and, at a rotated plane where the object's footprint
-    // in the cut frame is much larger than the sheet, a nearly flat one).
-    // Phase 2: the sheet's domain is a rectangle, so the slab is widened PER
-    // AXIS. Taking one square extent from the larger side would still cover the
-    // object, but it would spend the slab's fixed sample budget on empty space
-    // along the short axis and coarsen the surface where it actually cuts.
-    BoundingBoxf3 bbox     = object.bounding_box();
-    double        extent   = sheet.half_size_u();
-    double        extent_v = sheet.half_size_v();
-    if (bbox.defined) {
-        const double need_u = 1.05 * std::max(std::abs(bbox.min.x()), std::abs(bbox.max.x())) + 1.0;
-        const double need_v = 1.05 * std::max(std::abs(bbox.min.y()), std::abs(bbox.max.y())) + 1.0;
-        extent   = std::max(extent,   need_u);
-        extent_v = std::max(extent_v, need_v);
-    }
+    TriangleMesh object(mesh);
 
     // THE "ONLY ONE HALF SURVIVES" FIX, part 1: the object's winding.
     //
@@ -780,29 +771,15 @@ bool curved_cut_split(const indexed_triangle_set& mesh,
     // handed to the boolean. its_volume() is one pass over the triangles and this
     // runs once per cut, so it costs nothing measurable.
     if (its_volume(object.its) < 0.f) {
-        BOOST_LOG_TRIVIAL(warning) << "Curved cut: the input mesh is wound inwards (negative signed volume); "
-                                      "flipping it before the boolean";
+        BOOST_LOG_TRIVIAL(warning) << tag << ": the input mesh is wound inwards (negative signed volume); "
+                                             "flipping it before the boolean";
         for (Vec3i32& t : object.its.indices)
             std::swap(t(1), t(2));
     }
 
-    // PHASE 3: the kerf. With a thickness the two halves are cut by DIFFERENT
-    // surfaces - the lower half at sheet - t/2, the upper at sheet + t/2 - so the
-    // band between them is removed from both. At t == 0 the two offsets are both
-    // zero and the two slabs are the same object, which is why the t == 0 path
-    // below builds ONE slab and runs exactly the boolean pair phase 2 ran: the
-    // no-thickness output is not "close to" the old one, it is the old one.
-    const double t = std::max(0.0, thickness);
-    double face_lo = 0.0, face_hi = 0.0;
-    curved_cut_thickness_faces(t, offset, face_lo, face_hi);
-
-    TriangleMesh slab(curved_cut_lower_slab(sheet, bbox, samples, extent, extent_v, face_lo));
-    // The upper half is cut by the slab whose top sits at face_hi. Only built when
-    // the kerf actually separates the two faces.
-    const bool   kerf = t > 0.0;
-    TriangleMesh slab_hi = kerf ? TriangleMesh(curved_cut_lower_slab(sheet, bbox, samples, extent, extent_v, face_hi))
-                                : TriangleMesh();
-    const TriangleMesh& upper_cutter = kerf ? slab_hi : slab;
+    const TriangleMesh  lo_mesh(cutter_lo);
+    const TriangleMesh  hi_mesh      = kerf ? TriangleMesh(cutter_hi) : TriangleMesh();
+    const TriangleMesh& upper_cutter = kerf ? hi_mesh : lo_mesh;
 
     // THE "ONLY ONE HALF SURVIVES" FIX, part 2: never let ONE failed boolean
     // cost the caller a half.
@@ -837,7 +814,7 @@ bool curved_cut_split(const indexed_triangle_set& mesh,
     bool have_lower = false, have_upper = false;
     {
         TriangleMesh out;
-        if (curved_boolean(object, slab, "INTERSECTION", out) && !out.its.empty()) {
+        if (curved_boolean(object, lo_mesh, "INTERSECTION", out) && !out.its.empty()) {
             lower_its  = std::move(out.its);
             have_lower = true;
         }
@@ -851,11 +828,11 @@ bool curved_cut_split(const indexed_triangle_set& mesh,
     }
 
     if (!have_upper && have_lower) {
-        BOOST_LOG_TRIVIAL(warning) << "Curved cut: the upper boolean gave nothing; recovering it as object - lower";
+        BOOST_LOG_TRIVIAL(warning) << tag << ": the upper boolean gave nothing; recovering it as object - lower";
         have_upper = complement(lower_its, upper_its);
     }
     else if (!have_lower && have_upper) {
-        BOOST_LOG_TRIVIAL(warning) << "Curved cut: the lower boolean gave nothing; recovering it as object - upper";
+        BOOST_LOG_TRIVIAL(warning) << tag << ": the lower boolean gave nothing; recovering it as object - upper";
         have_lower = complement(upper_its, lower_its);
     }
 
@@ -877,6 +854,64 @@ bool curved_cut_split(const indexed_triangle_set& mesh,
         }
     }
     return ok;
+}
+
+bool curved_cut_split(const indexed_triangle_set& mesh,
+                      const CurvedCutSheet&       sheet,
+                      indexed_triangle_set*       upper,
+                      indexed_triangle_set*       lower,
+                      int                         samples,
+                      double                      thickness,
+                      CutThicknessOffset          offset)
+{
+    if (mesh.empty())
+        return false;
+
+    // The bounding box only; the mesh itself goes to cut_with_solid(), which owns
+    // the copy the boolean needs (and the winding flip that copy may want).
+    BoundingBoxf3 bbox;
+    for (const Vec3f& v : mesh.vertices)
+        bbox.merge(v.cast<double>());
+
+    // The slab must reach past the object on every side, or "below the sheet" is
+    // only defined over part of it. WIDEN THE SLAB, never the sheet: set_half_size()
+    // on the sheet would drag its control points outwards and stretch the surface,
+    // so a small part under a large plane would get a differently shaped cut than
+    // the one the gizmo drew (and, at a rotated plane where the object's footprint
+    // in the cut frame is much larger than the sheet, a nearly flat one).
+    // Phase 2: the sheet's domain is a rectangle, so the slab is widened PER
+    // AXIS. Taking one square extent from the larger side would still cover the
+    // object, but it would spend the slab's fixed sample budget on empty space
+    // along the short axis and coarsen the surface where it actually cuts.
+    double        extent   = sheet.half_size_u();
+    double        extent_v = sheet.half_size_v();
+    if (bbox.defined) {
+        const double need_u = 1.05 * std::max(std::abs(bbox.min.x()), std::abs(bbox.max.x())) + 1.0;
+        const double need_v = 1.05 * std::max(std::abs(bbox.min.y()), std::abs(bbox.max.y())) + 1.0;
+        extent   = std::max(extent,   need_u);
+        extent_v = std::max(extent_v, need_v);
+    }
+
+    const double t = std::max(0.0, thickness);
+    double face_lo = 0.0, face_hi = 0.0;
+    curved_cut_thickness_faces(t, offset, face_lo, face_hi);
+
+    // PHASE 3: the kerf. With a thickness the two halves are cut by DIFFERENT
+    // surfaces - the lower half at sheet - t/2, the upper at sheet + t/2 - so the
+    // band between them is removed from both. At t == 0 the two offsets are both
+    // zero and the two slabs are the same object, which is why the t == 0 path
+    // builds ONE slab and runs exactly the boolean pair phase 2 ran: the
+    // no-thickness output is not "close to" the old one, it is the old one.
+    const bool kerf = t > 0.0;
+
+    const indexed_triangle_set slab    = curved_cut_lower_slab(sheet, bbox, samples, extent, extent_v, face_lo);
+    const indexed_triangle_set slab_hi = kerf ? curved_cut_lower_slab(sheet, bbox, samples, extent, extent_v, face_hi)
+                                              : indexed_triangle_set();
+
+    // Everything that was hard about the rest of this cut - the winding flip, the
+    // both-sides-with-complement-recovery, the Manifold->mcut chain - lives in
+    // cut_with_solid() now, shared verbatim with the drawn cut.
+    return cut_with_solid(mesh, slab, kerf ? slab_hi : slab, kerf, upper, lower, "Curved cut");
 }
 
 

@@ -374,6 +374,40 @@ bool curved_cut_snap_distance(const indexed_triangle_set& mesh,
 // the result is watertight the same way.
 indexed_triangle_set curved_cut_lower_slab(const CurvedCutSheet& sheet, const BoundingBoxf3& bbox, int samples = CurvedCutSheet::CutSamples, double extent = -1.0, double extent_v = -1.0, double offset = 0.0);
 
+// ---------------------------------------------------------------------------
+// The shared boolean core, factored out of curved_cut_split() so the DRAW cut
+// (DrawCut.hpp) runs the SAME chain rather than a second copy of it.
+//
+// It takes the two CUTTER SOLIDS and nothing else, so it knows nothing about
+// height fields, strokes or planes:
+//
+//   lower = mesh INTERSECTION cutter_lo     ("the part inside the cutter")
+//   upper = mesh A_NOT_B      cutter_hi     ("the part outside it")
+//
+// and carries all four of the behaviours the curved cut had to learn the hard
+// way, which a second implementation would have had to learn again:
+//
+//   1. Manifold first, mcut as the fallback, multi-part results merged.
+//   2. The NEGATIVE-SIGNED-VOLUME winding flip: a mesh wound inwards reports its
+//      complement as its interior, so the INTERSECTION comes back empty and the
+//      caller sees exactly one half.
+//   3. BOTH sides always run, and a side that failed is recovered as the
+//      complement (object A_NOT_B kept) - disabled when a kerf is in play, since
+//      the two halves then deliberately do not partition the object.
+//   4. The kerf's two-solid shape: cutter_lo != cutter_hi and `kerf` true.
+//
+// `kerf` must be true exactly when cutter_lo and cutter_hi are DIFFERENT solids.
+// Pass the same solid twice with kerf == false for the plain two-boolean cut.
+// Either output pointer may be null; returns false when a requested side has
+// nothing (and clears it).
+bool cut_with_solid(const indexed_triangle_set& mesh,
+                    const indexed_triangle_set& cutter_lo,
+                    const indexed_triangle_set& cutter_hi,
+                    bool                        kerf,
+                    indexed_triangle_set*       upper,
+                    indexed_triangle_set*       lower,
+                    const char*                 log_tag = "Curved cut");
+
 // Split `mesh` (already in the cut plane's frame) by the sheet. Returns false
 // when both booleans failed. Either output pointer may be null.
 // Manifold first, mcut as the fallback - the same chain the flexi joint cut and

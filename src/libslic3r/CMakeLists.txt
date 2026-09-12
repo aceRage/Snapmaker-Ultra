@@ -118,6 +118,8 @@ set(lisbslic3r_sources
     CutUtils.hpp
     CurvedCut.cpp
     CurvedCut.hpp
+    DrawCut.cpp
+    DrawCut.hpp
     EdgeGrid.cpp
     EdgeGrid.hpp
     ElephantFootCompensation.cpp

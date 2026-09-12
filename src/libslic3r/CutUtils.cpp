@@ -703,6 +703,170 @@ const ModelObjectPtrs& Cut::perform_with_curved_sheet(const CurvedCutSheet& shee
     return m_model.objects;
 }
 
+// ---------------------------------------------------------------------------- draw cut
+
+// The drawn counterpart of process_volume_curved_cut(): identical in shape, and
+// the only line that differs is the split call. The frame maths, the want_upper /
+// want_lower gating and the output shape are the curved path's, unchanged.
+static void process_volume_draw_cut(ModelVolume* volume, const Transform3d& instance_matrix, const Transform3d& cut_matrix,
+                                    ModelObjectCutAttributes attributes, const DrawCutStroke& stroke,
+                                    const DrawCutParams& params, TriangleMesh& upper_mesh, TriangleMesh& lower_mesh)
+{
+    const auto volume_matrix = volume->get_matrix();
+
+    const Transformation cut_transformation = Transformation(cut_matrix);
+    const Transform3d invert_cut_matrix = cut_transformation.get_rotation_matrix().inverse() * translation_transform(-1 * cut_transformation.get_offset());
+
+    TriangleMesh mesh(volume->mesh());
+    mesh.transform(invert_cut_matrix * instance_matrix * volume_matrix, true);
+
+    indexed_triangle_set upper_its, lower_its;
+    const bool want_upper = attributes.has(ModelObjectCutAttribute::KeepUpper);
+    const bool want_lower = attributes.has(ModelObjectCutAttribute::KeepLower);
+    DrawCutError err = DrawCutError::None;
+    if (!draw_cut_split(mesh.its, stroke, params, want_upper ? &upper_its : nullptr, want_lower ? &lower_its : nullptr, &err))
+        BOOST_LOG_TRIVIAL(error) << "Draw cut: boolean failed for volume " << volume->name
+                                 << " (" << draw_cut_error_message(err) << ")";
+
+    if (want_upper)
+        upper_mesh = TriangleMesh(upper_its);
+    if (want_lower)
+        lower_mesh = TriangleMesh(lower_its);
+}
+
+static void process_solid_part_draw_cut(ModelVolume* volume, const Transform3d& instance_matrix, const Transform3d& cut_matrix,
+                                        ModelObjectCutAttributes attributes, const DrawCutStroke& stroke,
+                                        const DrawCutParams& params, ModelObject* upper, ModelObject* lower)
+{
+    TriangleMesh upper_mesh, lower_mesh;
+    process_volume_draw_cut(volume, instance_matrix, cut_matrix, attributes, stroke, params, upper_mesh, lower_mesh);
+
+    if (attributes.has(ModelObjectCutAttribute::KeepAsParts)) {
+        add_cut_volume(upper_mesh, upper, volume, cut_matrix, "_A");
+        if (!lower_mesh.empty()) {
+            add_cut_volume(lower_mesh, upper, volume, cut_matrix, "_B");
+            upper->volumes.back()->cut_info.is_from_upper = false;
+        }
+        return;
+    }
+
+    if (attributes.has(ModelObjectCutAttribute::KeepUpper))
+        add_cut_volume(upper_mesh, upper, volume, cut_matrix);
+
+    if (attributes.has(ModelObjectCutAttribute::KeepLower) && !lower_mesh.empty())
+        add_cut_volume(lower_mesh, lower, volume, cut_matrix);
+}
+
+const ModelObjectPtrs& Cut::perform_with_draw_stroke(const DrawCutStroke& stroke, const DrawCutParams& params)
+{
+    // There is no "zero stroke" that degenerates to the flat cut the way a zero
+    // sheet does - an empty stroke is simply no cut - so unlike
+    // perform_with_curved_sheet() there is nothing to route back into
+    // perform_with_plane(). An unusable stroke is a refusal.
+    if (!stroke.valid()) {
+        BOOST_LOG_TRIVIAL(error) << "Cut::perform_with_draw_stroke - the stroke is not usable: "
+                                 << draw_cut_error_message(stroke.error());
+        m_model.clear_objects();
+        return m_model.objects;
+    }
+
+    if (!m_attributes.has(ModelObjectCutAttribute::KeepUpper) && !m_attributes.has(ModelObjectCutAttribute::KeepLower)) {
+        m_model.clear_objects();
+        return m_model.objects;
+    }
+
+    // A flexi joint on a drawn cut, exactly as on a curved one: the joint's two
+    // segments are separated by its OWN gap - two flat faces `gap` apart - and the
+    // bodies are generated relative to those faces, so the surface between the
+    // segments IS the joint's face pair and cannot also be the drawn strip. It
+    // takes the flexi path, with the joint standing on whatever frame the gizmo
+    // baked into the connector's rotation_m.
+    m_kerf = std::max(0.0, params.thickness);
+    if (!m_model.objects.empty() && has_flexi_joint(m_model.objects.front()))
+        return perform_with_flexi_joints();
+
+    ModelObject* mo = m_model.objects.front();
+
+    BOOST_LOG_TRIVIAL(trace) << "Cut::perform_with_draw_stroke - start";
+
+    ModelObject* upper{ nullptr };
+    if (m_attributes.has(ModelObjectCutAttribute::KeepUpper))
+        mo->clone_for_cut(&upper);
+
+    ModelObject* lower{ nullptr };
+    if (m_attributes.has(ModelObjectCutAttribute::KeepLower) && !m_attributes.has(ModelObjectCutAttribute::KeepAsParts))
+        mo->clone_for_cut(&lower);
+
+    std::vector<ModelObject*> dowels;
+
+    const auto           instance_matrix    = mo->instances[m_instance]->get_transformation().get_matrix_no_offset();
+    const Transformation cut_transformation = Transformation(m_cut_matrix);
+    const Transform3d    inverse_cut_matrix = cut_transformation.get_rotation_matrix().inverse() * translation_transform(-1. * cut_transformation.get_offset());
+
+    // PHASE 1 SHIPS CONNECTOR-FREE on the drawn surface (the gizmo's panel does not
+    // offer them), but the loop keeps the curved path's shape so a connector volume
+    // that reached here some other way is still processed rather than dropped -
+    // which is also what phase 2 will need once the drawn surface grows a frame.
+    for (ModelVolume* volume : mo->volumes) {
+        volume->reset_extra_facets();
+
+        if (!volume->is_model_part()) {
+            if (volume->cut_info.is_processed)
+                process_modifier_cut(volume, instance_matrix, inverse_cut_matrix, m_attributes, upper, lower);
+            else
+                process_connector_cut(volume, instance_matrix, m_cut_matrix, m_attributes, upper, lower, dowels);
+        }
+        else if (!volume->mesh().empty())
+            process_solid_part_draw_cut(volume, instance_matrix, m_cut_matrix, m_attributes, stroke, params, upper, lower);
+    }
+
+    if (m_attributes.has(ModelObjectCutAttribute::KeepAsParts) && upper->volumes.empty()) {
+        m_model = Model();
+        m_model.objects.push_back(upper);
+        return m_model.objects;
+    }
+
+    ModelObjectPtrs cut_object_ptrs;
+
+    if (m_attributes.has(ModelObjectCutAttribute::KeepAsParts) && !upper->volumes.empty()) {
+        reset_instance_transformation(upper, m_instance, m_cut_matrix);
+        cut_object_ptrs.push_back(upper);
+    }
+    else {
+        auto delete_extra_modifiers = [this](ModelObject* mo) {
+            if (!mo) return;
+            const BoundingBoxf3 obj_bb = mo->instance_bounding_box(m_instance);
+            const Transform3d inst_matrix = mo->instances[m_instance]->get_transformation().get_matrix();
+
+            for (int i = int(mo->volumes.size()) - 1; i >= 0; --i)
+                if (const ModelVolume* vol = mo->volumes[i];
+                    !vol->is_model_part() && !vol->is_cut_connector()) {
+                    auto bb = vol->mesh().transformed_bounding_box(inst_matrix * vol->get_matrix());
+                    if (!obj_bb.intersects(bb))
+                        mo->delete_volume(i);
+                }
+        };
+
+        post_process(upper, lower, cut_object_ptrs);
+        delete_extra_modifiers(upper);
+        delete_extra_modifiers(lower);
+
+        if (m_attributes.has(ModelObjectCutAttribute::CreateDowels) && !dowels.empty()) {
+            for (auto dowel : dowels) {
+                reset_instance_transformation(dowel, m_instance);
+                dowel->name += "-Dowel-" + dowel->volumes[0]->name;
+                cut_object_ptrs.push_back(dowel);
+            }
+        }
+    }
+
+    BOOST_LOG_TRIVIAL(trace) << "Cut::perform_with_draw_stroke - end";
+
+    finalize(cut_object_ptrs);
+
+    return m_model.objects;
+}
+
 const ModelObjectPtrs& Cut::perform_with_plane(double thickness, CutThicknessOffset offset)
 {
     if (!m_attributes.has(ModelObjectCutAttribute::KeepUpper) && !m_attributes.has(ModelObjectCutAttribute::KeepLower)) {

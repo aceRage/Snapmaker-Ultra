@@ -820,11 +820,16 @@ bool GLGizmosManager::on_char(wxKeyEvent& evt)
     }
 
     // The Cut gizmo gets the same first refusal, for the same reason: its curved
-    // SHEET is gizmo-local state that the plater undo stack cannot restore, so
-    // Ctrl+Z has to reach the gizmo's own stack BEFORE the canvas turns it into
-    // an EVT_GLCANVAS_UNDO. The gizmo returns false whenever it has no sheet edit
-    // to take back (Flat mode, connector editing, an empty stack), and the plater
-    // undo then happens exactly as before.
+    // SHEET and its drawn STROKE are gizmo-local state that the plater undo stack
+    // cannot restore, so Ctrl+Z has to reach the gizmo's own stack BEFORE the canvas
+    // turns it into an EVT_GLCANVAS_UNDO. The gizmo returns false whenever it has no
+    // surface edit to take back (Flat mode, connector editing, an empty stack), and
+    // the plater undo then happens exactly as before.
+    //
+    // Note this hook sees EVERY key, not only the Ctrl ones - it runs ahead of the
+    // modifier branches below - which is what lets Draw mode claim ESC to clear the
+    // drawn line. Without that claim Esc would fall through to the no-modifier
+    // branch, which calls reset_all_states() and CLOSES the gizmo.
     if (m_current == Cut) {
         if (auto *cut = dynamic_cast<GLGizmoCut3D *>(m_gizmos[Cut].get());
             cut != nullptr && cut->on_cut_char(keyCode, evt.ShiftDown(), evt.CmdDown())) {
