@@ -879,6 +879,829 @@ TEST_CASE("Draw cut: Depth stops the cut short of through-all", "[DrawCut]")
     REQUIRE(plug + double(its_volume(lower)) == Approx(double(its_volume(cube))).epsilon(1e-3));
 }
 
+// ===========================================================================
+// PHASE 2
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// (10) THE DRAFT ANGLE.
+//
+// The closed form these check against, worked out once here so the cases below
+// can quote it.
+//
+// A circle of radius R is drawn on the cube's top face, so at every sample the
+// surface normal is +Z and the outward binormal is the radial direction. The
+// ruling is then
+//
+//   d = cos(theta) * (-Z) + sin(theta) * r_hat
+//
+// so travelling a distance t along it from a point at (R, z = +20) reaches
+// radius R + t sin(theta) at height 20 - t cos(theta). To drop a height h the
+// ruling has to run t = h / cos(theta), and the radius there is
+//
+//   r(h) = R + h * tan(theta)
+//
+// The plug is therefore a CONE FRUSTUM of height h with radii R and R + h tan
+// theta, whose volume is the standard
+//
+//   V = pi * h / 3 * (r1^2 + r1 r2 + r2^2)
+//
+// NOTE THE UNITS TRAP, which is the whole reason `depth` is set the way it is
+// below: DrawCutParams::depth is measured ALONG THE RULING, not in z. Asking for
+// depth = h would cut only h * cos(theta) deep. So the cases ask for
+// h / cos(theta) and check the height that comes back.
+//
+// h = 8 mm on a 40 mm cube keeps both frusta comfortably inside the part (the
+// +30 case's widest radius is 16.6 mm against the cube's 20 mm half-width), which
+// is what makes the closed form the right answer rather than a clipped version of
+// it.
+// ---------------------------------------------------------------------------
+
+// The closed-form frustum volume for a draft of `angle_deg` cut `h` deep in z
+// from a circle of radius R.
+static double frustum_volume(double R, double h, double angle_deg)
+{
+    const double r2 = R + h * std::tan(angle_deg * M_PI / 180.0);
+    return M_PI * h / 3.0 * (R * R + R * r2 + r2 * r2);
+}
+
+// The ruling depth that cuts `h` deep in z at `angle_deg`.
+static double ruling_depth_for(double h, double angle_deg)
+{
+    return h / std::cos(angle_deg * M_PI / 180.0);
+}
+
+TEST_CASE("Draw cut: a positive angle flares the plug into a frustum", "[DrawCut]")
+{
+    const indexed_triangle_set cube = centred_cube();
+    const double cube_volume = double(its_volume(cube));
+
+    const double R = 12.0, H = 8.0, ANGLE = 30.0;
+
+    DrawCutStroke stroke = circle_on_top(R, 96);
+    REQUIRE(stroke.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(stroke.is_closed());
+
+    DrawCutParams params;
+    params.direction   = DrawCutDirection::SurfaceNormal;
+    params.extension   = 3.0;
+    params.through_all = false;
+    params.depth       = ruling_depth_for(H, ANGLE);
+    params.angle_deg   = ANGLE;
+
+    indexed_triangle_set upper, lower;
+    DrawCutError err = DrawCutError::None;
+    REQUIRE(draw_cut_split(cube, stroke, params, &upper, &lower, &err));
+    REQUIRE(err == DrawCutError::None);
+    REQUIRE(watertight(upper));
+    REQUIRE(watertight(lower));
+
+    // THE HEADLINE: the plug's volume matches the closed form within 5%, which is
+    // the tolerance the brief asks for.
+    const double plug = double(its_volume(upper));
+    REQUIRE(plug == Approx(frustum_volume(R, H, ANGLE)).epsilon(0.05));
+
+    // And it is a FRUSTUM, not a cylinder: a positive angle makes it visibly bigger
+    // than the straight cut would have been (1.43x here - well outside the 5%).
+    const double cylinder = M_PI * R * R * H;
+    REQUIRE(plug > 1.2 * cylinder);
+
+    // Volume is still conserved - a draft angle changes the SHAPE of the cut, not
+    // how much material there is.
+    REQUIRE(plug + double(its_volume(lower)) == Approx(cube_volume).epsilon(1e-3));
+
+    // The geometry the volume is standing in for: the plug is WIDER AT THE BOTTOM.
+    BoundingBoxf3 bb;
+    for (const Vec3f& v : upper.vertices)
+        bb.merge(v.cast<double>());
+    REQUIRE(bb.max.z() == Approx(0.5 * CUBE).margin(0.2));
+    REQUIRE(bb.min.z() == Approx(0.5 * CUBE - H).margin(0.4));
+
+    double r_top = 0.0, r_bottom = 0.0;
+    for (const Vec3f& v : upper.vertices) {
+        const Vec3d p = v.cast<double>();
+        const double r = p.head<2>().norm();
+        if (p.z() > bb.max.z() - 1.0)
+            r_top = std::max(r_top, r);
+        if (p.z() < bb.min.z() + 1.0)
+            r_bottom = std::max(r_bottom, r);
+    }
+    REQUIRE(r_top == Approx(R).margin(0.3));
+    REQUIRE(r_bottom == Approx(R + H * std::tan(ANGLE * M_PI / 180.0)).margin(0.5));
+    REQUIRE(r_bottom > r_top);
+}
+
+TEST_CASE("Draw cut: a negative angle undercuts the plug", "[DrawCut]")
+{
+    const indexed_triangle_set cube = centred_cube();
+    const double cube_volume = double(its_volume(cube));
+
+    const double R = 12.0, H = 8.0, ANGLE = -30.0;
+
+    DrawCutStroke stroke = circle_on_top(R, 96);
+    REQUIRE(stroke.finish(1.0, 0.0) == DrawCutError::None);
+
+    DrawCutParams params;
+    params.direction   = DrawCutDirection::SurfaceNormal;
+    params.extension   = 3.0;
+    params.through_all = false;
+    params.depth       = ruling_depth_for(H, ANGLE);
+    params.angle_deg   = ANGLE;
+
+    indexed_triangle_set upper, lower;
+    DrawCutError err = DrawCutError::None;
+    REQUIRE(draw_cut_split(cube, stroke, params, &upper, &lower, &err));
+    REQUIRE(err == DrawCutError::None);
+    REQUIRE(watertight(upper));
+    REQUIRE(watertight(lower));
+
+    const double plug = double(its_volume(upper));
+    REQUIRE(plug == Approx(frustum_volume(R, H, ANGLE)).epsilon(0.05));
+
+    // AN UNDERCUT PLUG: narrower at the bottom than at the top, so it cannot be
+    // lifted straight out - which is the whole point of a negative angle. It is
+    // therefore SMALLER than the straight cut, the mirror of the +30 case.
+    const double cylinder = M_PI * R * R * H;
+    REQUIRE(plug < 0.8 * cylinder);
+
+    REQUIRE(plug + double(its_volume(lower)) == Approx(cube_volume).epsilon(1e-3));
+
+    BoundingBoxf3 bb;
+    for (const Vec3f& v : upper.vertices)
+        bb.merge(v.cast<double>());
+    double r_top = 0.0, r_bottom = 0.0;
+    for (const Vec3f& v : upper.vertices) {
+        const Vec3d p = v.cast<double>();
+        const double r = p.head<2>().norm();
+        if (p.z() > bb.max.z() - 1.0)
+            r_top = std::max(r_top, r);
+        if (p.z() < bb.min.z() + 1.0)
+            r_bottom = std::max(r_bottom, r);
+    }
+    REQUIRE(r_bottom < r_top);
+    REQUIRE(r_bottom == Approx(R + H * std::tan(ANGLE * M_PI / 180.0)).margin(0.5));
+}
+
+TEST_CASE("Draw cut: angle 0 is bit-for-bit the phase 1 cut", "[DrawCut]")
+{
+    // The regression net for the whole of (10): adding the angle must not have
+    // moved the zero case even slightly, because every phase 1 test and every
+    // existing user's cut IS the zero case.
+    DrawCutStroke stroke = circle_on_top(10.0, 64);
+    REQUIRE(stroke.finish(1.0, 0.2) == DrawCutError::None);
+
+    DrawCutParams p0;
+    p0.direction = DrawCutDirection::SurfaceNormal;
+    p0.angle_deg = 0.0;
+
+    for (size_t i = 0; i < stroke.path().size(); ++ i) {
+        const Vec3d d = draw_cut_inward_dir(stroke, p0, i);
+        // Exactly the inward normal, to the last bit: at theta == 0
+        // draw_cut_inward_dir() short-circuits before touching the binormal at all.
+        REQUIRE((d + stroke.path()[i].normal).norm() < 1e-15);
+    }
+}
+
+TEST_CASE("Draw cut: the angle only applies to Surface normal", "[DrawCut]")
+{
+    // A constant direction is ONE direction at every sample - that is what "as-is
+    // extrusion" means - so a per-sample tilt is exactly what it is not. The panel
+    // greys the slider out; this is the geometry behind that.
+    DrawCutStroke stroke = circle_on_top(10.0, 64);
+    REQUIRE(stroke.finish(1.0, 0.0) == DrawCutError::None);
+
+    for (DrawCutDirection dir : { DrawCutDirection::AxisX, DrawCutDirection::AxisY,
+                                  DrawCutDirection::AxisZ, DrawCutDirection::View }) {
+        DrawCutParams p;
+        p.direction = dir;
+        p.view_dir  = Vec3d(0.3, -0.2, -1.0);
+        p.angle_deg = 45.0;
+
+        const Vec3d first = draw_cut_inward_dir(stroke, p, 0);
+        for (size_t i = 1; i < stroke.path().size(); ++ i)
+            REQUIRE((draw_cut_inward_dir(stroke, p, i) - first).norm() < 1e-12);
+    }
+}
+
+TEST_CASE("Draw cut: the angle rotates the ruling toward the outward binormal", "[DrawCut]")
+{
+    // The structural check behind the two volume cases: at every sample the ruling
+    // is the inward normal rotated by exactly theta, in the plane it spans with the
+    // binormal, and it is still a unit vector.
+    DrawCutStroke stroke = circle_on_top(10.0, 64);
+    REQUIRE(stroke.finish(1.0, 0.0) == DrawCutError::None);
+
+    for (double theta : { -60.0, -30.0, -5.0, 5.0, 30.0, 60.0 }) {
+        DrawCutParams p;
+        p.direction = DrawCutDirection::SurfaceNormal;
+        p.angle_deg = theta;
+
+        const double rad = theta * M_PI / 180.0;
+        for (size_t i = 0; i < stroke.path().size(); ++ i) {
+            const Vec3d d = draw_cut_inward_dir(stroke, p, i);
+            const Vec3d n = stroke.path()[i].normal;
+            const Vec3d b = stroke.binormal(i);
+
+            REQUIRE(d.norm() == Approx(1.0).margin(1e-9));
+            // The two components, read straight back off the rotation.
+            REQUIRE(d.dot(-n) == Approx(std::cos(rad)).margin(1e-9));
+            REQUIRE(d.dot(b)  == Approx(std::sin(rad)).margin(1e-9));
+        }
+    }
+}
+
+TEST_CASE("Draw cut: a concave stroke with a large angle is detected as a fold", "[DrawCut]")
+{
+    // THE FOLD CASE THE BRIEF ASKS FOR, and the thing phase 1's guard could not
+    // see. A stroke with tight CONCAVE corners, with an extension small enough that
+    // phase 1's test passes it - and then an angle large enough that the INWARD
+    // rail, leaning sideways by depth * sin(theta), folds.
+    DrawCutStroke flower;
+    const int n = 200;
+    for (int i = 0; i < n; ++ i) {
+        const double a = 2.0 * M_PI * double(i) / double(n);
+        const double r = 10.0 + 3.0 * std::cos(6.0 * a);
+        flower.append(Vec3d(r * std::cos(a), r * std::sin(a), 0.5 * CUBE), Vec3d::UnitZ(), size_t(i));
+    }
+    flower.append(Vec3d(13.0, 0.0, 0.5 * CUBE), Vec3d::UnitZ(), 0);
+    REQUIRE(flower.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(flower.is_closed());
+
+    double kappa = 0.0;
+    // A modest extension and NO angle: whatever phase 1 says here is the baseline.
+    const bool folds_flat = draw_cut_strip_folds(flower, 1.0, &kappa, 0.0, 0.0);
+
+    // The same stroke, the same extension, but drafted 45 degrees through 30 mm. The
+    // lateral reach is then 30 * sin(45) = 21 mm, against lobes whose turning radius
+    // is a couple of millimetres - so it folds, and unmistakably.
+    double kappa_angled = 0.0;
+    const bool folds_angled = draw_cut_strip_folds(flower, 1.0, &kappa_angled, 45.0, 30.0);
+    REQUIRE(folds_angled);
+    // The curvature reported is the real thing: a lobe of this flower turns tighter
+    // than a 5 mm radius somewhere.
+    REQUIRE(kappa_angled > 1.0 / 5.0);
+
+    // And it is the ANGLE that did it, not the depth on its own - the negative
+    // control. (If the flat case already folded, the angled one folding would say
+    // nothing, so this is conditional on the baseline being clean.)
+    if (!folds_flat)
+        REQUIRE(draw_cut_strip_folds(flower, 1.0, nullptr, 0.0, 30.0) == false);
+}
+
+TEST_CASE("Draw cut: a plain circle never folds until the reach passes its radius", "[DrawCut]")
+{
+    // The negative control the phase 1 suite has for the extension, extended to the
+    // angle. Every point of a circle drawn as a loop is a CONVEX corner as seen from
+    // outside, so the outward rail can never fold - and the inward rail, which the
+    // angle does move, would have to travel the full radius to reach the centre.
+    DrawCutStroke circle = circle_on_top(15.0, 128);
+    REQUIRE(circle.finish(1.0, 0.0) == DrawCutError::None);
+
+    // 10 mm of depth at 30 degrees is 5 mm of lateral reach against a 15 mm radius.
+    for (double theta : { -30.0, 0.0, 30.0 })
+        REQUIRE(draw_cut_strip_folds(circle, 2.0, nullptr, theta, 10.0) == false);
+
+    // Push the reach past the radius and it DOES fold, which is the guard working
+    // rather than the test being vacuous: 60 mm at 30 degrees is 30 mm of reach.
+    REQUIRE(draw_cut_strip_folds(circle, 2.0, nullptr, 30.0, 60.0));
+}
+
+// ---------------------------------------------------------------------------
+// (11) LINE EDITING.
+//
+// The gizmo owns the gestures (hover, drag, right-click, Shift+click) and they
+// need a GUI to exercise. What is testable headless is the CONTRACT the gestures
+// rely on, and it is the part that would silently break: an edit rewrites the
+// point list and hands it back to finish(), so the line has to come out resampled
+// and - if it was a loop - still closed.
+// ---------------------------------------------------------------------------
+
+// What the gizmo's commit_draw_points() does, in the two lines of it that are not
+// wx: rebuild the stroke from the edited points, re-expressing the closing span
+// for a loop, and re-finish.
+static DrawCutStroke commit_points(const std::vector<DrawCutSample>& pts, bool was_closed,
+                                   double spacing = 1.0, double smoothing = 0.0)
+{
+    DrawCutStroke edited;
+    for (const DrawCutSample& s : pts)
+        edited.append(s.pos, s.normal, s.facet);
+    if (was_closed)
+        edited.append(pts.front().pos, pts.front().normal, pts.front().facet);
+    edited.finish(spacing, smoothing);
+    return edited;
+}
+
+// Is the path resampled at `spacing`?
+//
+// THE MEASURE HAS TO BE THE CHORD, AND THE CHORD IS NOT THE ARC. The resampler
+// walks the INPUT polyline's arc length and emits a point every `spacing` along
+// it, so two consecutive output points are `spacing` apart ALONG THAT POLYLINE -
+// and the straight-line distance between them equals that only where the line is
+// locally straight. Across a corner it is shorter, and across a sharp one much
+// shorter: an edit that pulls one point 4 mm out of a 12 mm ring leaves an apex
+// whose two neighbouring chords measure about 0.71 and 0.85 mm. That is the
+// resampler working, not failing, and an earlier version of this helper that
+// demanded equal chords was measuring the wrong thing.
+//
+// So the assertion is the one that actually distinguishes a resampled line from an
+// un-resampled one: no span is LONGER than the spacing, and none is degenerate. A
+// line that had not been re-finished after an edit would carry one span of several
+// millimetres where the point was dragged - which is exactly what this catches -
+// while the short chords at a corner are legitimate and are allowed.
+static bool evenly_spaced(const DrawCutStroke& s, double spacing, double tol = 0.02)
+{
+    const std::vector<DrawCutSample>& p = s.path();
+    if (p.size() < 3)
+        return false;
+    // The interior spans only: the last span of an open stroke is whatever is left
+    // over, and a closed one's wrap span likewise.
+    for (size_t i = 1; i + 2 < p.size(); ++ i) {
+        const double d = (p[i + 1].pos - p[i].pos).norm();
+        if (d > spacing + tol)   // a span the resampler would have split
+            return false;
+        if (d < 0.25 * spacing)  // a degenerate span the tangent maths would trip on
+            return false;
+    }
+    return true;
+}
+
+TEST_CASE("Draw cut: moving a point keeps the line resampled and closed", "[DrawCut]")
+{
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(ring.is_closed());
+
+    std::vector<DrawCutSample> pts = ring.path();
+    const size_t n_before = pts.size();
+    REQUIRE(n_before > 10);
+
+    // Drag one point 4 mm outward, the way a user pulling a handle would. It stays
+    // on the top face (z is untouched), which is what the gizmo's raycast gives.
+    const size_t moved = n_before / 3;
+    const Vec3d radial = Vec3d(pts[moved].pos.x(), pts[moved].pos.y(), 0.0).normalized();
+    pts[moved].pos += 4.0 * radial;
+
+    const DrawCutStroke edited = commit_points(pts, /*was_closed*/ true);
+
+    // STILL A USABLE LOOP. Both halves of that matter: an edit that opened the ring
+    // would turn a plug cut into a splitting cut without telling anyone.
+    REQUIRE(edited.error() == DrawCutError::None);
+    REQUIRE(edited.valid());
+    REQUIRE(edited.is_closed());
+
+    // STILL RESAMPLED. This is the reason an edit goes back through finish() at all:
+    // moving a point leaves one long span and one short one either side of it, and
+    // the ruling density follows the spans.
+    REQUIRE(evenly_spaced(edited, 1.0));
+
+    // And the edit actually took: the line is longer than it was, and reaches
+    // further out than the original ring.
+    REQUIRE(edited.length() > ring.length());
+    double max_r = 0.0;
+    for (const DrawCutSample& s : edited.path())
+        max_r = std::max(max_r, s.pos.head<2>().norm());
+    REQUIRE(max_r > 13.0);
+}
+
+TEST_CASE("Draw cut: inserting a point keeps the line resampled and closed", "[DrawCut]")
+{
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+
+    std::vector<DrawCutSample> pts = ring.path();
+    const size_t n_before = pts.size();
+
+    // Shift+click on a segment: a new point on the chord between two neighbours,
+    // pulled 3 mm outward (the gizmo re-projects it onto the model, which on a flat
+    // face leaves it where the click was).
+    const size_t seg = n_before / 2;
+    DrawCutSample mid;
+    mid.pos    = 0.5 * (pts[seg].pos + pts[seg + 1].pos);
+    mid.normal = Vec3d::UnitZ();
+    mid.facet  = pts[seg].facet;
+    const Vec3d radial = Vec3d(mid.pos.x(), mid.pos.y(), 0.0).normalized();
+    mid.pos += 3.0 * radial;
+    pts.insert(pts.begin() + int(seg) + 1, mid);
+
+    const DrawCutStroke edited = commit_points(pts, /*was_closed*/ true);
+
+    REQUIRE(edited.error() == DrawCutError::None);
+    REQUIRE(edited.is_closed());
+    REQUIRE(evenly_spaced(edited, 1.0));
+    // The resample is what makes the point COUNT rather than just be there: the new
+    // bump lengthens the line, so the resampled path has at least as many points as
+    // before even though only one was inserted.
+    REQUIRE(edited.path().size() >= n_before);
+    REQUIRE(edited.length() > ring.length());
+}
+
+TEST_CASE("Draw cut: deleting a point keeps the line resampled and closed", "[DrawCut]")
+{
+    // A ring with a deliberate spike in it, so deleting the spike's point is a
+    // visible edit rather than a no-op the resampler would put straight back.
+    DrawCutStroke ring = circle_on_top(12.0, 64);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+
+    std::vector<DrawCutSample> pts = ring.path();
+    const size_t spike = pts.size() / 4;
+    const Vec3d radial = Vec3d(pts[spike].pos.x(), pts[spike].pos.y(), 0.0).normalized();
+    pts[spike].pos += 6.0 * radial;
+
+    const DrawCutStroke with_spike = commit_points(pts, true);
+    REQUIRE(with_spike.valid());
+    const double spiked_len = with_spike.length();
+
+    // Now delete it - right-click on the handle.
+    pts.erase(pts.begin() + int(spike));
+    const DrawCutStroke edited = commit_points(pts, true);
+
+    REQUIRE(edited.error() == DrawCutError::None);
+    REQUIRE(edited.is_closed());
+    REQUIRE(evenly_spaced(edited, 1.0));
+    // Taking the spike out shortens the line back toward the plain ring.
+    REQUIRE(edited.length() < spiked_len);
+    double max_r = 0.0;
+    for (const DrawCutSample& s : edited.path())
+        max_r = std::max(max_r, s.pos.head<2>().norm());
+    REQUIRE(max_r < 13.5);
+}
+
+TEST_CASE("Draw cut: editing an open line leaves it open", "[DrawCut]")
+{
+    // The mirror of the three closed cases: an open line edited is still an open
+    // line, and its ENDS DO NOT CREEP - which is what stops a series of edits in the
+    // middle of a line from quietly shortening or lengthening the cut's reach.
+    DrawCutStroke line = line_on_top(18.0, 40);
+    REQUIRE(line.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(!line.is_closed());
+
+    std::vector<DrawCutSample> pts = line.path();
+    const Vec3d first_before = pts.front().pos;
+    const Vec3d last_before  = pts.back().pos;
+
+    pts[pts.size() / 2].pos += Vec3d(0.0, 5.0, 0.0);
+
+    const DrawCutStroke edited = commit_points(pts, /*was_closed*/ false);
+    REQUIRE(edited.error() == DrawCutError::None);
+    REQUIRE(!edited.is_closed());
+    REQUIRE(evenly_spaced(edited, 1.0));
+
+    // The FIRST point is exact: the resampler always emits the input's first sample.
+    REQUIRE((edited.path().front().pos - first_before).norm() < 1e-6);
+
+    // THE LAST POINT IS WITHIN HALF A SPACING, NOT EXACT, and the difference is a
+    // deliberate rule rather than slack. draw_cut_resample() appends the final input
+    // sample only when it is more than half a spacing from the last one already
+    // emitted - otherwise it would leave a span the central-difference tangent reads
+    // as a near-zero direction. Lengthening the middle of the line changes where the
+    // last multiple of the spacing falls, so the end can be dropped and the path then
+    // stops up to half a spacing short.
+    //
+    // What matters is that the end does not CREEP - the line still reaches the place
+    // the user drew to, within that half spacing, and in particular has not grown
+    // past it.
+    const double end_gap = (edited.path().back().pos - last_before).norm();
+    REQUIRE(end_gap < 0.5 * 1.0);
+    // And it stops SHORT of the original end rather than overshooting it: the
+    // original end is still the furthest point the line was ever asked to reach.
+    REQUIRE(edited.path().back().pos.x() <= last_before.x() + 1e-6);
+}
+
+TEST_CASE("Draw cut: set_path replaces the path without resampling it", "[DrawCut]")
+{
+    // The re-projection hook the gizmo uses to put a smoothed line back on the mesh
+    // (phase 1's deviation #7). Its contract: same length in, same length out,
+    // binormals recomputed, open/closed untouched - and NO resample, because the
+    // path already is one and running the resampler over its own output would walk
+    // the samples a little further every time a slider moved.
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.3) == DrawCutError::None);
+    REQUIRE(ring.is_closed());
+
+    std::vector<DrawCutSample> path = ring.path();
+    const size_t n = path.size();
+    const Vec3d b_before = ring.binormal(0);
+
+    // Push every sample 2 mm outward, which is what a re-projection onto a slightly
+    // larger surface would do - and which must move the binormals' basepoints but
+    // not their outwardness.
+    for (DrawCutSample& s : path) {
+        const Vec3d radial = Vec3d(s.pos.x(), s.pos.y(), 0.0).normalized();
+        s.pos += 2.0 * radial;
+    }
+    ring.set_path(path);
+
+    REQUIRE(ring.path().size() == n);
+    REQUIRE(ring.is_closed());
+    for (size_t i = 0; i < n; ++ i) {
+        REQUIRE((ring.path()[i].pos - path[i].pos).norm() < 1e-12);
+        // Still outward: the binormal points away from the centroid.
+        const Vec3d radial = Vec3d(ring.path()[i].pos.x(), ring.path()[i].pos.y(), 0.0).normalized();
+        REQUIRE(ring.binormal(i).dot(radial) > 0.5);
+    }
+    REQUIRE(ring.binormal(0).dot(b_before) > 0.9);
+
+    // A path of the wrong length is refused rather than half-applied, which is what
+    // keeps the closed decision finish() made meaningful.
+    std::vector<DrawCutSample> shorter(path.begin(), path.end() - 3);
+    ring.set_path(shorter);
+    REQUIRE(ring.path().size() == n);
+}
+
+// ---------------------------------------------------------------------------
+// (12) THE DRAWN SURFACE AS A SURFACE, and CONNECTORS ON IT.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Draw cut: the surface point and frame agree with the cutter", "[DrawCut]")
+{
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+
+    DrawCutParams params;
+    params.direction   = DrawCutDirection::SurfaceNormal;
+    params.extension   = 3.0;
+    params.through_all = false;
+    params.depth       = 10.0;
+
+    // w == 0 is ON the stroke, so the surface point at a sample's own arc length is
+    // that sample. This is the anchor everything else is measured from.
+    const std::vector<DrawCutSample>& p = ring.path();
+    double s_walk = 0.0;
+    for (size_t i = 0; i < p.size(); ++ i) {
+        const Vec3d q = draw_cut_surface_point(ring, params, s_walk, 0.0);
+        REQUIRE((q - p[i].pos).norm() < 1e-6);
+        s_walk += (p[(i + 1) % p.size()].pos - p[i].pos).norm();
+    }
+
+    // w > 0 goes INTO the part: on a cube's top face with no draft, straight down.
+    const Vec3d in = draw_cut_surface_point(ring, params, 0.0, 5.0);
+    REQUIRE(in.z() == Approx(0.5 * CUBE - 5.0).margin(1e-6));
+    // w < 0 comes back OUT of it.
+    const Vec3d out = draw_cut_surface_point(ring, params, 0.0, -2.0);
+    REQUIRE(out.z() == Approx(0.5 * CUBE + 2.0).margin(1e-6));
+
+    // THE FRAME's Z is the strip's own normal, which on a circular loop cut straight
+    // down is the RADIAL direction - the direction the plug and the hole come apart
+    // in. That is what makes a connector built on this frame coaxial in the two
+    // halves.
+    for (double s : { 0.0, 5.0, 20.0, 50.0 }) {
+        const Transform3d f = draw_cut_surface_frame(ring, params, s, 3.0);
+        const Vec3d z = f.linear().col(2);
+        const Vec3d q = draw_cut_surface_point(ring, params, s, 3.0);
+        const Vec3d radial = Vec3d(q.x(), q.y(), 0.0).normalized();
+        REQUIRE(std::abs(z.dot(radial)) == Approx(1.0).margin(0.05));
+        // Orthonormal and right-handed - a connector's own Rotation is applied in
+        // this frame, so a skewed one would skew every connector.
+        REQUIRE(f.linear().col(0).norm() == Approx(1.0).margin(1e-9));
+        REQUIRE(f.linear().col(1).norm() == Approx(1.0).margin(1e-9));
+        REQUIRE(f.linear().col(0).dot(f.linear().col(1)) == Approx(0.0).margin(1e-9));
+        REQUIRE(f.linear().determinant() == Approx(1.0).margin(1e-9));
+    }
+
+    // THE FRAME IS CONTINUOUS round the loop, which a raw t x d would not be: two
+    // neighbouring points must not have opposite normals, or two connectors a
+    // millimetre apart would point opposite ways.
+    Vec3d prev = draw_cut_surface_normal(ring, params, 0.0, 0.0);
+    for (double s = 1.0; s < ring.length(); s += 1.0) {
+        const Vec3d nrm = draw_cut_surface_normal(ring, params, s, 0.0);
+        REQUIRE(nrm.dot(prev) > 0.9);
+        prev = nrm;
+    }
+}
+
+TEST_CASE("Draw cut: the surface projection inverts the surface point", "[DrawCut]")
+{
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+
+    DrawCutParams params;
+    params.through_all = false;
+    params.depth       = 12.0;
+    params.extension   = 3.0;
+
+    // Round-trip: pick an (s, w), evaluate the surface there, project the result
+    // back, and land on the same place. This is what turns a connector's stored
+    // position into the parameters its frame is built from, so an error here is a
+    // connector whose frame belongs to a different part of the surface.
+    for (double s : { 2.0, 11.0, 37.0, 61.0 })
+        for (double w : { 0.0, 3.0, 8.0 }) {
+            const Vec3d q = draw_cut_surface_point(ring, params, s, w);
+            double s2 = 0.0, w2 = 0.0, dist = 0.0;
+            REQUIRE(draw_cut_surface_project(ring, params, q, s2, w2, &dist));
+            REQUIRE(dist < 0.2);          // it IS on the surface
+            REQUIRE(w2 == Approx(w).margin(0.2));
+            // The POINT comes back, which is the property that matters - the
+            // parameter s can sit a sample either side on a polygonised circle.
+            REQUIRE((draw_cut_surface_point(ring, params, s2, w2) - q).norm() < 0.3);
+        }
+}
+
+TEST_CASE("Draw cut: the surface domain test keeps a connector clear of the rims", "[DrawCut]")
+{
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+
+    DrawCutParams params;
+    params.extension   = 4.0;
+    params.through_all = false;
+    params.depth       = 10.0;
+    const double reach  = 10.0;
+    const double radius = 2.0; // the connector's own half-extent
+
+    // Comfortably inside: yes.
+    REQUIRE(draw_cut_surface_contains(ring, params, 20.0, 5.0, radius, reach));
+    // Past the inward rim: no - its body would hang off the bottom of the cut.
+    REQUIRE(!draw_cut_surface_contains(ring, params, 20.0, 9.5, radius, reach));
+    // Past the outward rim: no.
+    REQUIRE(!draw_cut_surface_contains(ring, params, 20.0, -3.5, radius, reach));
+    // A closed stroke WRAPS, so no arc length is out of range.
+    REQUIRE(draw_cut_surface_contains(ring, params, 1000.0, 5.0, radius, reach));
+
+    // An OPEN line has ends to fall off, and they are what the test is for.
+    DrawCutStroke line = line_on_top(18.0, 40);
+    REQUIRE(line.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(!line.is_closed());
+    REQUIRE(draw_cut_surface_contains(line, params, line.length() * 0.5, 5.0, radius, reach));
+    REQUIRE(!draw_cut_surface_contains(line, params, 0.5, 5.0, radius, reach));
+    REQUIRE(!draw_cut_surface_contains(line, params, line.length() - 0.5, 5.0, radius, reach));
+}
+
+TEST_CASE("Draw cut: a ruled strip is flat along its rules and curves across them", "[DrawCut]")
+{
+    // The reason Hinge and Thread get the SAME warning here as on a curved sheet
+    // rather than a blanket refusal: a ruled surface is DEVELOPABLE along its rules,
+    // so only one of its two directions can curve at all. A connector on a straight
+    // stretch of stroke sits on a genuinely flat patch.
+    DrawCutParams params;
+    params.through_all = false;
+    params.depth       = 10.0;
+    params.extension   = 2.0;
+
+    // A straight line swept straight down is a PLANE: flat in both directions.
+    DrawCutStroke line = line_on_top(18.0, 40);
+    REQUIRE(line.finish(1.0, 0.0) == DrawCutError::None);
+    for (double w : { 0.0, 5.0 })
+        REQUIRE(draw_cut_surface_curvature_radius(line, params, line.length() * 0.5, w) > 1000.0);
+    REQUIRE(draw_cut_patch_is_flat_enough(line, params, line.length() * 0.5, 3.0, 5.0));
+
+    // A tight ring curves across the rules by its own radius, so a connector wider
+    // than a third of it is warned about - which is the curved cut's own rule
+    // (CurvedConnectorFlatPatchFactor == 3) applied to the drawn surface.
+    DrawCutStroke tight = circle_on_top(6.0, 64);
+    REQUIRE(tight.finish(1.0, 0.0) == DrawCutError::None);
+    const double r = draw_cut_surface_curvature_radius(tight, params, 5.0, 0.0);
+    REQUIRE(r == Approx(6.0).margin(1.0));
+    REQUIRE(draw_cut_patch_is_flat_enough(tight, params, 5.0, 0.0, 1.0));   // small connector: fine
+    REQUIRE(!draw_cut_patch_is_flat_enough(tight, params, 5.0, 0.0, 4.0));  // big one: warned
+}
+
+TEST_CASE("Draw cut: the surface tilt reads the strip's own normal", "[DrawCut]")
+{
+    // A loop on a flat top face cut straight down has a VERTICAL wall, so its normal
+    // is horizontal - 90 degrees from the plane's +Z, and well past the
+    // CurvedConnectorTiltWarnDeg threshold. That is correct, and it is what the panel
+    // says about it: a connector in the wall of a plug does print sideways.
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+
+    DrawCutParams params;
+    params.through_all = false;
+    params.depth       = 10.0;
+
+    REQUIRE(draw_cut_surface_tilt_deg(ring, params, 10.0, 5.0) == Approx(90.0).margin(2.0));
+    REQUIRE(draw_cut_surface_tilt_deg(ring, params, 10.0, 5.0) > CurvedConnectorTiltWarnDeg);
+}
+
+TEST_CASE("Draw cut: a connector on the swept surface makes a matching hole and plug", "[DrawCut]")
+{
+    // THE HEADLINE CONNECTOR CASE the brief asks for: a connector placed on the
+    // drawn surface has to survive the split, with the hole in one half and the plug
+    // in the other, and the two have to MATCH.
+    //
+    // Headless there is no gizmo, so the connector body is built the way the gizmo
+    // builds it - a cylinder on the frame draw_cut_surface_frame() gives at the
+    // connector's (s, w) - and the two halves are made by the same boolean the real
+    // path uses. What is being checked is the property the real path depends on:
+    // that the SAME surface frame, applied to both halves, subtracts and adds the
+    // same solid.
+    const indexed_triangle_set cube = centred_cube();
+
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(ring.is_closed());
+
+    DrawCutParams params;
+    params.direction   = DrawCutDirection::SurfaceNormal;
+    params.extension   = 3.0;
+    params.through_all = true;
+
+    indexed_triangle_set upper, lower;
+    REQUIRE(draw_cut_split(cube, ring, params, &upper, &lower, nullptr));
+    REQUIRE(watertight(upper));
+    REQUIRE(watertight(lower));
+
+    // The connector: a 3 mm radius, 4 mm long dowel standing on the surface a third
+    // of the way round and 8 mm down, on the frame the surface gives there.
+    const double s = ring.length() * 0.25;
+    const double w = 8.0;
+    const double CR = 3.0, CH = 4.0;
+
+    const Vec3d       at    = draw_cut_surface_point(ring, params, s, w);
+    const Transform3d frame = draw_cut_surface_frame(ring, params, s, w);
+
+    // A cylinder about the frame's +Z, CENTRED on the surface so half of it is in
+    // each side - which is what a plug/hole pair is.
+    indexed_triangle_set conn = its_make_cylinder(CR, CH, 2.0 * M_PI / 64.0);
+    // its_make_cylinder stands on z == 0 and runs up; centre it.
+    for (Vec3f& v : conn.vertices)
+        v.z() -= float(0.5 * CH);
+    its_transform(conn, Geometry::translation_transform(at) * frame);
+
+    const double conn_volume = double(its_volume(conn));
+    REQUIRE(conn_volume == Approx(M_PI * CR * CR * CH).epsilon(0.05));
+
+    // The part of the connector inside each half. cut_with_solid() returns the
+    // INTERSECTION as `lower`, so that is the side read here.
+    //
+    // The property being asserted is that the two are COMPLEMENTARY: the part inside
+    // the plug plus the part inside the rest is the whole connector, with nothing
+    // double-counted and nothing lost. That only holds if the two halves meet exactly
+    // on the surface the connector is standing on - so this is the real test of the
+    // frame, and it is what makes the hole and the plug the cut produces match.
+    indexed_triangle_set a, b;
+    REQUIRE(cut_with_solid(conn, upper, upper, /*kerf*/ false, &a, &b, "draw connector"));
+    const double part_upper = double(its_volume(b));
+    REQUIRE(cut_with_solid(conn, lower, lower, /*kerf*/ false, &a, &b, "draw connector"));
+    const double part_lower = double(its_volume(b));
+
+    REQUIRE(part_upper > 0.1 * conn_volume);
+    REQUIRE(part_lower > 0.1 * conn_volume);
+    // The two parts add up to the whole connector: the surface really is the
+    // boundary between the halves, right where the connector stands.
+    REQUIRE(part_upper + part_lower == Approx(conn_volume).epsilon(0.03));
+
+    // And it is a genuinely BALANCED pair: the connector straddles the surface, so
+    // neither half gets almost all of it. (A frame built from the wrong normal would
+    // lie ALONG the surface instead of across it, and one side would get nearly
+    // everything - which is the failure this catches.)
+    REQUIRE(part_upper == Approx(part_lower).epsilon(0.25));
+}
+
+TEST_CASE("Draw cut: a connector's frame survives the kerf", "[DrawCut]")
+{
+    // The kerf moves BOTH faces along the same strip normal - the field
+    // draw_cut_cutter_solid() derives once for the whole strip - so a connector
+    // standing perpendicular to the surface stays coaxial with its own hole: the gap
+    // opens along the connector's axis, which is the direction it comes apart in
+    // anyway. Concretely that means the frame at an (s, w) does not depend on the
+    // thickness, which is what this checks.
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+
+    DrawCutParams no_kerf;
+    no_kerf.through_all = false;
+    no_kerf.depth       = 10.0;
+
+    DrawCutParams kerfed = no_kerf;
+    kerfed.thickness = 1.0;
+
+    for (double s : { 3.0, 19.0, 44.0 })
+        for (double w : { 0.0, 4.0 }) {
+            const Transform3d fa = draw_cut_surface_frame(ring, no_kerf, s, w);
+            const Transform3d fb = draw_cut_surface_frame(ring, kerfed,  s, w);
+            REQUIRE((fa.linear() - fb.linear()).norm() < 1e-12);
+            REQUIRE((draw_cut_surface_point(ring, no_kerf, s, w) -
+                     draw_cut_surface_point(ring, kerfed,  s, w)).norm() < 1e-12);
+        }
+}
+
+TEST_CASE("Draw cut: the holonomy check passes a plain loop", "[DrawCut]")
+{
+    // A circle on a flat face has a perfectly consistent outward side, so the angle
+    // is usable - the check must not fire on the common case.
+    DrawCutStroke ring = circle_on_top(12.0, 96);
+    REQUIRE(ring.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(!draw_cut_frame_holonomy_flips(ring));
+
+    // Nor on a wobbly one: the field is oriented from the centroid, so it survives
+    // anything star-shaped about it.
+    DrawCutStroke wobble;
+    const int n = 120;
+    for (int i = 0; i < n; ++ i) {
+        const double a = 2.0 * M_PI * double(i) / double(n);
+        const double r = 12.0 + 2.0 * std::sin(3.0 * a);
+        wobble.append(Vec3d(r * std::cos(a), r * std::sin(a), 0.5 * CUBE), Vec3d::UnitZ(), size_t(i));
+    }
+    wobble.append(Vec3d(12.0, 0.0, 0.5 * CUBE), Vec3d::UnitZ(), 0);
+    REQUIRE(wobble.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(!draw_cut_frame_holonomy_flips(wobble));
+
+    // An OPEN stroke has no loop to come back round, so it never flips.
+    DrawCutStroke line = line_on_top(18.0, 40);
+    REQUIRE(line.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(!draw_cut_frame_holonomy_flips(line));
+}
+
 // ---------------------------------------------------------------------------
 // (9) Demo exports, matching the curved suite's habit. Behind an env var so a
 // normal run writes nothing.
