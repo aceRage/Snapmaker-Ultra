@@ -16,6 +16,7 @@
 #include "wxExtensions.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/MeshRepair.hpp"
+#include "libslic3r/MeshRemesh.hpp"
 #include "GLCanvas3D.hpp"
 #include "Selection.hpp"
 #include "PartPlate.hpp"
@@ -25,6 +26,7 @@
 #include "Widgets/ProgressDialog.hpp"
 #include "SingleChoiceDialog.hpp"
 #include "StepMeshDialog.hpp"
+#include "RemeshDialog.hpp"
 
 #include <boost/algorithm/string.hpp>
 #include <wx/progdlg.h>
@@ -5725,9 +5727,37 @@ void ObjectList::update_support_group_badges()
     }
 }
 
+// The world -Z (the print bed side) expressed in the volume's OWN frame, which is the
+// frame mv.mesh().its lives in and therefore the frame the flat-bottom cut has to work
+// in. Rotation only - the translation is irrelevant to a direction - and no-offset
+// matrices so a non-uniform scale still maps the direction correctly. Falls back to
+// straight down if the matrix is singular.
+static Vec3d volume_bed_direction(const ModelObject& mo, const ModelVolume& mv)
+{
+    const Vec3d down(0., 0., -1.);
+    Transform3d world = mv.get_matrix();
+    if (!mo.instances.empty() && mo.instances.front() != nullptr)
+        world = mo.instances.front()->get_matrix_no_offset() * mv.get_matrix_no_offset();
+    else
+        world = mv.get_matrix_no_offset();
+
+    const Eigen::Matrix3d m = world.matrix().block<3, 3>(0, 0);
+    if (std::abs(m.determinant()) < 1e-12)
+        return down;
+    // A direction pulls back through the inverse, and the result has to be
+    // renormalised because a scaled matrix does not preserve length.
+    const Vec3d d = m.inverse() * down;
+    if (!d.allFinite() || d.norm() < 1e-12)
+        return down;
+    return d.normalized();
+}
+
 // Ultra: robust local repair - rebuild each selected part from its signed distance
 // field (OpenVDB voxel remesh). Always produces a watertight manifold mesh; detail
 // below the voxel size is lost. Complements the Windows-only "Fix model".
+//
+// The Remesh dialog collects the options first (voxel size, keep the bottom flat,
+// preserve sharp edges); the geometry itself is all in libslic3r/MeshRemesh.
 void ObjectList::repair_by_remesh()
 {
     if (!wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager().check_gizmos_closed_except(GLGizmosManager::Undefined))
@@ -5738,16 +5768,72 @@ void ObjectList::repair_by_remesh()
     if (obj_idxs.empty() && vol_idxs.empty())
         return;
 
+    // Which volumes the run will touch - needed before the dialog, because the
+    // prefilled voxel size and the triangle count are per-selection. The dialog shows
+    // the figures for the first part it will remesh; a multi-part selection still gets
+    // one auto value per part at remesh time when the field is left at the auto value.
+    auto first_target = [&]() -> const ModelVolume* {
+        const std::vector<int>& vols = vol_idxs;
+        const int obj_idx = obj_idxs.empty() ? -1 : obj_idxs.front();
+        if (obj_idx < 0)
+            return nullptr;
+        const ModelObject* mo = object(obj_idx);
+        if (mo == nullptr)
+            return nullptr;
+        for (size_t i = 0; i < mo->volumes.size(); ++i) {
+            if (!vols.empty() && std::find(vols.begin(), vols.end(), int(i)) == vols.end())
+                continue;
+            if (mo->volumes[i]->is_model_part())
+                return mo->volumes[i];
+        }
+        return nullptr;
+    }();
+
+    double auto_voxel = 0.1, area = 0.;
+    size_t tris = 0;
+    if (first_target != nullptr) {
+        const indexed_triangle_set& its = first_target->mesh().its;
+        auto_voxel = remesh_auto_voxel_size(its);
+        tris       = its.indices.size();
+        // Surface area drives the dialog's triangle estimate; cheap enough to do here
+        // (one pass, no allocation) and it saves the dialog a second remesh.
+        for (const Vec3i32& f : its.indices)
+            area += 0.5 * (its.vertices[f(1)] - its.vertices[f(0)]).cross(its.vertices[f(2)] - its.vertices[f(0)]).norm();
+    }
+
+    RemeshOptions opts;
+    {
+        RemeshDialog dlg(wxGetApp().mainframe, auto_voxel, tris, area);
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+        opts = dlg.options();
+    }
+
     Plater* plater = wxGetApp().plater();
     Plater::TakeSnapshot snapshot(plater, "Repair by remeshing");
     wxBusyCursor wait;
 
-    auto remesh_volume = [](ModelVolume& mv) -> bool {
-        const BoundingBoxf3 bb = mv.mesh().bounding_box();
-        const double voxel = std::clamp(bb.size().norm() / 300., 0.05, 0.3);
-        indexed_triangle_set its = remesh_by_voxels(mv.mesh().its, voxel);
+    size_t total_before = 0, total_after = 0, flat_kept = 0, flat_declined = 0;
+    auto remesh_volume = [&](const ModelObject& mo, ModelVolume& mv) -> bool {
+        RemeshOptions o = opts;
+        // An untouched voxel field means "auto", and auto is per part - so a
+        // multi-part selection still gets each part's own scale-appropriate value
+        // rather than the first part's.
+        if (std::abs(o.voxel_size - auto_voxel) < 1e-9)
+            o.voxel_size = 0.;
+        RemeshReport rep;
+        indexed_triangle_set its = remesh_with_options(mv.mesh().its, o, &remesh_by_voxels,
+                                                       volume_bed_direction(mo, mv), &rep);
         if (its.indices.empty())
             return false;
+        total_before += rep.triangles_before;
+        total_after  += rep.triangles_after;
+        if (rep.kept_bottom_flat) ++flat_kept;
+        if (rep.fell_back)        ++flat_declined;
+        BOOST_LOG_TRIVIAL(info) << "repair_by_remesh: '" << mv.name << "' " << rep.triangles_before
+                                << " -> " << rep.triangles_after << " triangles, flat bottom "
+                                << (rep.kept_bottom_flat ? "kept" : (rep.fell_back ? "declined: " + rep.note : "off"))
+                                << ", sharp vertices snapped " << rep.sharp_snapped;
         mv.set_mesh(std::move(its));
         mv.set_new_unique_id();
         mv.calculate_convex_hull();
@@ -5766,7 +5852,7 @@ void ObjectList::repair_by_remesh()
                 continue;
             if (!mo->volumes[i]->is_model_part())
                 continue;
-            if (remesh_volume(*mo->volumes[i])) { ++repaired; any = true; }
+            if (remesh_volume(*mo, *mo->volumes[i])) { ++repaired; any = true; }
             else ++failed;
         }
         if (any) {
@@ -5789,10 +5875,19 @@ void ObjectList::repair_by_remesh()
 
     NotificationManager* notify = plater->get_notification_manager();
     if (notify != nullptr) {
-        if (failed == 0)
-            notify->push_notification(GUI::format(_L("Repaired %1% part(s) by remeshing."), repaired));
-        else
-            notify->push_notification(GUI::format(_L("Repaired %1% part(s), %2% failed."), repaired, failed));
+        std::string msg = failed == 0
+            ? GUI::format(_L("Repaired %1% part(s) by remeshing."), repaired)
+            : GUI::format(_L("Repaired %1% part(s), %2% failed."), repaired, failed);
+        if (repaired > 0)
+            msg += " " + GUI::format(_L("Triangles: %1% -> %2%."), total_before, total_after);
+        // Say when the flat-bottom option was asked for but could not be applied, so
+        // "the base is still rounded" has an answer without opening the log.
+        BOOST_LOG_TRIVIAL(info) << "repair_by_remesh: " << repaired << " repaired, " << failed
+                                << " failed, flat bottom kept on " << flat_kept << " and declined on "
+                                << flat_declined << " part(s)";
+        if (opts.keep_bottom_flat && flat_declined > 0)
+            msg += " " + GUI::format(_L("%1% part(s) had no flat bottom to protect."), flat_declined);
+        notify->push_notification(msg);
     }
 }
 

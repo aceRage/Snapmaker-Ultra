@@ -317,6 +317,8 @@ set(lisbslic3r_sources
     MeasureUtils.hpp
     MeshSculpt.cpp
     MeshSculpt.hpp
+    MeshRemesh.cpp
+    MeshRemesh.hpp
     MeshSplitImpl.hpp
     MinAreaBoundingBox.cpp
     MinAreaBoundingBox.hpp

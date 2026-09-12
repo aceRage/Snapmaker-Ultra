@@ -80,6 +80,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/CloneDialog.hpp
     GUI/FillBedDialog.cpp
     GUI/FillBedDialog.hpp
+    GUI/RemeshDialog.cpp
+    GUI/RemeshDialog.hpp
     GUI/ColorSplitDialog.cpp
     GUI/ColorSplitDialog.hpp
     GUI/ImageFillDialog.cpp
