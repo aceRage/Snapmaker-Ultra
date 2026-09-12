@@ -19,6 +19,7 @@ add_executable(${_TEST_NAME}_tests
 	test_contour_z.cpp
 	test_curved_cut.cpp
 	test_draw_cut.cpp
+	test_cut_recipe.cpp
 	test_config_include.cpp
 	test_custom_gcode.cpp
 	test_default_bed_type.cpp
