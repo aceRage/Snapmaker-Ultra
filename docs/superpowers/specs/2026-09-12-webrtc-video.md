@@ -71,6 +71,24 @@ tailnet rather than behind Serve does reach the media port, and the user forcing
 case. The Video setting's help text says which of the two applies from the current origin, so the
 explanation is where the user meets it.
 
+### 1.6 A phone on the home network may use WebRTC at all
+
+Found while reviewing the merged result, and the most consequential bug in this branch.
+
+`autoStreamMode()` opened with `if (connHere === 'home' && !iosWebKit()) return 'mse';`. That rule
+was written for the PC's own Stream tab — same-origin loopback, no hub to ask, nothing to improve.
+But a **phone on the LAN lands in it too**: it loads this page from
+`http://<pc>:13640/r/<token>/`, so `connHere` is `'home'`, and an Android phone is not
+`iosWebKit()`.
+
+The effect would have been that the LAN phone — the case WebRTC helps most, and the exact case the
+new installer firewall rule exists for — went straight to the relay and never attempted a direct
+connection. Every other piece of this branch would have looked correct while the headline feature
+silently did nothing on the most common setup.
+
+Fixed by gating the early return on `!REMOTE`, so it means what it was written to mean. This is
+what click-test 1 in §6.4 verifies.
+
 ## 2. Conflict resolutions
 
 Five conflicts across four files. Each was re-read rather than resolved by taking a side.
@@ -146,6 +164,24 @@ overridden.
 
 The badge names the step when it is not the source: `Auto · WebRTC · Low`.
 
+### 3.5 Where the clamp belongs
+
+The first version clamped the chosen step centrally, in `qualityFor()`, to `hubQuality` — the
+variants the hub could register. On a PC with no ffmpeg, which is the stock install and the case
+§3.1 is entirely about, `hubQuality` is empty, so **every step collapsed to High and the whole
+setting did nothing**. Exactly the configuration the feature is for was the one where it was
+silently inert.
+
+The two delivery paths honour a step independently, so a single central clamp cannot be right:
+
+* a go2rtc tile needs a registered variant, and falls back to the source name without one — that
+  clamp belongs in `qualityName()`, where it already was;
+* a Bambu MJPEG tile needs no variant at all, only `?fps=`, so it honours Medium and Low with no
+  ffmpeg anywhere on the PC.
+
+`renderQualityBox()` had this right from the start (it keeps the options when the MJPEG knob can
+serve them); `qualityFor()` now agrees with it.
+
 ## 4. Installer
 
 `cmake/nsis/SnapmakerURLProtocols_install.nsh` / `_uninstall.nsh`, and the standalone `installer.nsi`,
@@ -190,7 +226,102 @@ Wired into `gate_all.sh` as a `webrtc` section and into `gate_smart.sh`'s file m
 
 ## 6. Measurements and click-tests
 
-<!-- MEASUREMENTS -->
+### 6.1 Gate
+
+`test_webrtc.py` against a scratch instance built from this worktree, installed to
+`snorca_hubtest\inst_webrtc`, on its own data dir `dd_webrtc`. **PASS, 44/44 checks.** The hub
+took media port **8556** (8555 was held by the live install's go2rtc, which is exactly the
+next-free-port path the range exists for), wrote the expected `go2rtc.yaml`, and reported it on
+both `/hub/info` and the phone's `/state`.
+
+Two findings worth keeping, both from the gate rather than from reading the code:
+
+* **The firewall verdict is genuinely asynchronous.** `firewall_state(false)` returns `unknown`
+  with an empty note until the ~9 s PowerShell query lands on its detached thread. The first
+  version of the refreshed gate asserted the state/note pairing immediately and failed itself.
+  The gate now waits for the answer, and then saw `missing` with the full note - the detection
+  works end to end.
+* **The `_WIN32_WINNT`/link path is untouched**; `/hub/*` answers only on `admin_port` and 404s on
+  the phone-facing listener, so the Phase 0b split survived the merge.
+
+### 6.2 Measurements (LAN, PC-side clients through the hub's own `/api/ws`)
+
+Re-taken with `measure.py` + `rtcutil` (aiortc against the hand-written MSE client), 15 s per run,
+two runs. **No printer was touched**: the source is a looping Annex-B H.264 elementary stream
+served over loopback HTTP by `h264serve.py` (built from `snorca_hubtest\sps_5s.mp4`, 154 frames,
+`avc1.640029`), which go2rtc pulls with its native `http` source - no ffmpeg involved.
+
+| path | WebSocket open | connected / first media | bytes over the window |
+|---|---|---|---|
+| WebRTC | 0.060 / 0.025 s | `connected` at **0.284 / 0.197 s** | 4.09 / 4.11 MB |
+| MSE (the fallback) | 0.002 / 0.002 s | first media at **0.004 / 0.004 s** | 3.79 / 3.98 MB |
+
+Same conclusion as 2026-09-02, on different numbers: **the two paths carry the same H.264 and the
+same order of bytes** (the spread is container overhead, RTP/SRTP against fMP4), and MSE starts
+sooner because it has no ICE and DTLS handshake to do first. From the PC, WebRTC is neither faster
+nor cheaper - the whole value is which wire the bytes take, which can only be seen from a phone.
+`webrtc,mp4,mjpeg` is what makes the difference invisible to the viewer: the relayed stream's
+start-up, then WebRTC's path.
+
+The `connected` figure is what the new 2.5 s give-up bound was chosen against: a working peer
+connection on the LAN completes in under 0.3 s, so 2.5 s is roughly eight times the margin it
+needs and still short enough that a dead path is given up on while the viewer is still looking at
+the first seconds of picture.
+
+**ICE candidates offered** (unaltered through the tunnel, which is the thing the gate checks):
+
+```
+udp 100.78.10.92        8556  typ host    <- Tailscale (what a phone on the tailnet uses)
+udp 10.0.0.131          8556  typ host    <- LAN       (what a phone on the home Wi-Fi uses)
+tcp fd7a:115c:a1e0::…   8556  typ host    <- Tailscale IPv6, ICE-TCP
+tcp 100.78.10.92        8556  typ host    passive
+tcp 10.0.0.131          8556  typ host    passive
+udp 76.224.12.103      64976  typ srflx   <- STUN-discovered, ephemeral port
+```
+
+This is the direct confirmation that the `8555-8574` firewall rule is the right shape: every host
+candidate is on the media port, on both UDP and TCP.
+
+Note on `frames: 0` in the WebRTC rows: `bytes` is counted off the ICE socket and is real, but
+aiortc could not decode the track because go2rtc offered baseline H.264
+(`profile-level-id=42001f`) for my synthetic High-profile source. That is an artifact of feeding
+go2rtc a hand-built elementary stream, not of the WebRTC path - the 2026-09-02 runs against real
+printer streams decoded 389-536 frames on the same client. A real camera negotiates its own
+profile.
+
+### 6.3 Windows Firewall, observed
+
+The PC's live network profiles are **Wi-Fi = Public, Tailscale = Private** - the split the note
+exists to explain, still true. Windows created inbound allow rules for the scratch `go2rtc.exe` by
+itself on first bind (six rules, `Private, Public` and `Public`), so the common case resolves
+without the user doing anything; the note is for the installs where the prompt was dismissed, is
+policy-managed, or covers the wrong profile.
+
+`Get-NetFirewallRule -DisplayName 'EdgeSlicer WebRTC video'` is **absent**, as expected - the NSIS
+installer has not been run since the change. That rule is verified by reading the script, not by
+running an installer on the owner's PC.
+
+### 6.4 Owner click-tests - NOT DONE
+
+These four need the owner's own phone, tailnet and printers, and are deliberately left for them:
+
+1. **LAN phone/emulator tile shows "WebRTC".** Open the phone page on the home Wi-Fi; a camera
+   tile's badge should read `Auto · WebRTC` within a couple of seconds. Note the §1.6 fix - before
+   it, a LAN phone would never have tried.
+2. **Second viewer on MSE and WebRTC simultaneously.** Two phones, or a phone and the PC's Stream
+   tab, on the same camera - one forced to `Video: relay`, one on Auto. Both should play; the U1's
+   one-consumer limit is handled by the relay, not by this change.
+3. **Tailscale Serve falls back to MSE.** Open the `https://<machine>.<tailnet>.ts.net/r/<token>/`
+   link; the badge should read `Auto · MP4` (or MSE), the Video setting's help text should say why,
+   and no tile should spend 2.5 s black first.
+4. **Firewall rule present after install.** Run the built installer, then
+   `Get-NetFirewallRule -DisplayName 'EdgeSlicer WebRTC video'` - two rules (UDP and TCP), enabled,
+   program-bound to `$INSTDIR\resources\tools\go2rtc\go2rtc.exe`.
+
+The measurements above all ran between two processes on the same PC, so **no WebRTC session in
+this branch has yet crossed Windows Firewall to a real phone.** That is precisely what click-test 1
+decides, and it is the one result this branch cannot produce for itself.
+
 
 ## 7. Notes for the merge
 
