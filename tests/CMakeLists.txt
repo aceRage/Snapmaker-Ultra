@@ -50,6 +50,17 @@ if (Python3_Interpreter_FOUND)
                      ${PROJECT_SOURCE_DIR}/scripts/orca_extra_profile_check.py
                      --check-assets)
     set_tests_properties(profile_assets PROPERTIES LABELS "profile")
+
+    # Every filament a machine names in default_materials / default_filament_profile has to
+    # resolve to a preset that exists, in the vendor's own library or in OrcaFilamentLibrary.
+    # A name that does not silently disappears from the material picker at runtime. Kept as a
+    # test of its own so the two failure modes stay distinguishable; --no-check-assets because
+    # --check-assets defaults to on and profile_assets already covers it.
+    add_test(NAME profile_materials
+             COMMAND ${Python3_EXECUTABLE}
+                     ${PROJECT_SOURCE_DIR}/scripts/orca_extra_profile_check.py
+                     --check-materials --no-check-assets)
+    set_tests_properties(profile_materials PROPERTIES LABELS "profile")
 else()
-    message(STATUS "Python3 interpreter not found - skipping the profile_assets test")
+    message(STATUS "Python3 interpreter not found - skipping the profile tests")
 endif()
