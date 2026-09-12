@@ -7670,9 +7670,13 @@ void GLGizmoCut3D::begin_reedit()
     for (int i : idxs)
         m_reedit_object_ids.push_back(model.objects[size_t(i)]->id());
 
-    // Remove the halves. Descending, so the earlier indices stay valid.
+    // Keep the halves aside, then remove them. Descending, so the earlier indices
+    // stay valid. The copies are what Cancel puts back - see m_reedit_stash for
+    // why this does not go through the plater's undo.
+    m_reedit_stash.clear_objects();
     std::sort(idxs.begin(), idxs.end(), std::greater<int>());
     for (int i : idxs) {
+        m_reedit_stash.add_object(*model.objects[size_t(i)]);
         model.delete_object(size_t(i));
         wxGetApp().obj_list()->delete_object_from_list(size_t(i));
     }
@@ -7697,26 +7701,50 @@ void GLGizmoCut3D::begin_reedit()
 
 // Undo begin_reedit(): the stand-in goes, the halves come back.
 //
-// The halves are restored from the recipe rather than kept aside: a re-edit runs
-// inside one undo snapshot, so the cheap and reliable way to put the model back
-// is to let the plater's own undo do it. That is what the caller triggers; this
-// only has to clear the gizmo's own state so nothing dangles.
+// The halves are restored from m_reedit_stash rather than by asking the plater to
+// undo. Plater::TakeSnapshot suppresses snapshots only for its own scope, so by
+// the time the user cancels, the top of the undo stack is no longer the snapshot
+// the menu item took and a single undo() would land somewhere else entirely.
+// Putting the stashed objects back is exact, and leaves the undo stack alone - so
+// the user's own Ctrl+Z still reaches the "Edit cut" snapshot and does the same
+// thing, which is what design point 2 asks for.
 void GLGizmoCut3D::cancel_reedit()
 {
     if (!m_reedit_active)
         return;
-    m_reedit_active           = false;
+    m_reedit_active = false;
+
+    Plater* plater = wxGetApp().plater();
+    if (plater) {
+        Model& model = plater->model();
+
+        // The stand-in goes.
+        for (size_t i = 0; i < model.objects.size(); ++i)
+            if (model.objects[i]->id() == m_reedit_proxy_id) {
+                model.delete_object(i);
+                wxGetApp().obj_list()->delete_object_from_list(i);
+                break;
+            }
+
+        // ... and the halves come back, in the order they were taken.
+        if (!m_reedit_stash.objects.empty()) {
+            ModelObjectPtrs restored;
+            for (ModelObject* o : m_reedit_stash.objects)
+                restored.push_back(model.add_object(*o));
+            plater->update();
+            for (size_t i = 0; i < model.objects.size(); ++i)
+                wxGetApp().obj_list()->update_info_items(i);
+        }
+        else {
+            plater->update();
+        }
+    }
+
     m_reedit_one_half_missing = false;
     m_reedit_object_ids.clear();
     m_reedit_proxy_id         = ObjectID();
     m_reedit_recipe           = CutRecipe();
-
-    // Roll the model back to before begin_reedit(). The snapshot the menu item
-    // took brackets the whole re-edit, so this restores the two halves and drops
-    // the stand-in in one step - which is also what makes the user's Ctrl+Z
-    // behave the same way (design point 2).
-    if (Plater* plater = wxGetApp().plater())
-        plater->undo();
+    m_reedit_stash.clear_objects();
 }
 
 void GLGizmoCut3D::render_reedit_notice()
@@ -7786,6 +7814,9 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
     m_reedit_one_half_missing = false;
     m_reedit_object_ids.clear();
     m_reedit_proxy_id         = ObjectID();
+    // The stashed halves are being REPLACED, not restored, so they go now: holding
+    // them past this point would keep a whole object's meshes alive for nothing.
+    m_reedit_stash.clear_objects();
 
     // deactivate CutGizmo and than perform a cut
     m_parent.reset_all_gizmos();

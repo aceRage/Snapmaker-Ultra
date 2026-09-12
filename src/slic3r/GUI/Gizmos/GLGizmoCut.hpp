@@ -546,6 +546,19 @@ class GLGizmoCut3D : public GLGizmoBase
     // The stand-in object that shows the pre-cut mesh while the re-edit is open,
     // so Cancel can remove it and the re-cut can replace it. Again an ObjectID.
     ObjectID m_reedit_proxy_id;
+    // The halves themselves, kept aside while the re-edit is open so Cancel can
+    // put them back EXACTLY as they were.
+    //
+    // The obvious alternative - let the plater's undo restore them - does not
+    // work: Plater::TakeSnapshot suppresses snapshots only for its own scope, so
+    // by the time the user cancels, the stack's top is no longer the snapshot the
+    // menu item took and a single undo() would land somewhere else entirely.
+    // Holding the objects is exact, and does not depend on what else has been
+    // snapshotted in between.
+    //
+    // A Model of their own rather than loose pointers: a ModelObject's lifetime
+    // is owned by its Model, and this gives them one for the duration.
+    Model m_reedit_stash;
     // Only one half of the cut is still in the model: the other was deleted. The
     // re-cut still works and produces both halves again, but the panel says so
     // first - re-cutting would otherwise silently resurrect a part the user had

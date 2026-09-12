@@ -220,10 +220,20 @@ surface, the parameters and the connectors. Two things worth noting:
   smoothing and closed flag, which is what makes the reproduced path identical to the one that was
   cut with.
 
-**Cancel** (closing the gizmo without cutting) → `cancel_reedit()` → `plater->undo()`, which rolls
-back to before `begin_reedit()`. The halves come back and the stand-in goes, in one step — and
-because it is the *same* snapshot, the user's own Ctrl+Z does exactly the same thing (design
-point 2).
+**Cancel** (closing the gizmo without cutting) → `cancel_reedit()`, which removes the stand-in and
+puts the halves back from `m_reedit_stash` — copies `begin_reedit()` kept aside before deleting
+them.
+
+The obvious alternative — let `plater->undo()` roll back to the "Edit cut" snapshot — **does not
+work**, and this is worth stating because it is the natural first design. `Plater::TakeSnapshot`
+suppresses further snapshots only for **its own scope** (`Plater.hpp`: ctor calls `take_snapshot()`
+then `suppress_snapshots()`; the dtor un-suppresses). `edit_cut()`'s scope ends when the menu
+handler returns, long before the user cancels, so by then the top of the undo stack is whatever has
+been snapshotted since and a single `undo()` would land somewhere else entirely.
+
+Holding the objects is exact and does not depend on what else has been snapshotted in between. It
+also leaves the undo stack untouched, so the user's own Ctrl+Z still reaches the "Edit cut"
+snapshot and does the same thing — which is what design point 2 asks for.
 
 **Perform cut** in a re-edit: `perform_cut()` clears `m_reedit_active` *before* closing the gizmo
 (so the committing path does not reach `cancel_reedit()`), cuts the stand-in normally, and then
