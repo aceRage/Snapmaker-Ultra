@@ -8,6 +8,7 @@
 #include "../ClipperUtils.hpp"
 #include "../Geometry.hpp"
 #include "../ImageFill.hpp"
+#include "../ImageRowWalls.hpp"
 #include "../Layer.hpp"
 #include "../MixedFilament.hpp"
 #include "../Model.hpp"
@@ -1173,8 +1174,44 @@ std::vector<ExtrusionEntityCollection *> split_top_infill_by_image_row(const Ima
         // case is not a gap-fill child (role would be erGapFill, not erTopSolidInfill) and not
         // covered by "only one run" below - flag it once so the fallback is visible in the log,
         // not just inferred from the checkbox's own tooltip.
-        if (path_candidate == nullptr && child->role() == erTopSolidInfill)
+        // PHASE 4, step 4: an Arachne/Concentric-family top surface produces an
+        // ExtrusionMultiPath or ExtrusionLoop here rather than a plain ExtrusionPath, so
+        // `path_candidate` is null even though the child's own role IS erTopSolidInfill. Phase 3
+        // left those unsplit (they fell back to the row's per-layer colour cycle, and
+        // log_image_row_pattern_not_split_once() said so). They are now split by the SAME
+        // multi-path cutter the wall dithering uses (ImageRowWalls.cpp), which walks a sequence
+        // of ExtrusionPaths and cuts by arc length while keeping each piece's own attributes -
+        // exactly what a variable-width Arachne path needs, since its width varies from path to
+        // path and a cut must not homogenise it.
+        //
+        // A top-surface Concentric LOOP is cut open by this, the same way a wall loop is: there
+        // is no such thing as a partially-coloured closed loop. That is the intended trade - the
+        // alternative is the phase 3 behaviour, i.e. no dither on those patterns at all.
+        if (path_candidate == nullptr && child->role() == erTopSolidInfill) {
+            ImageRowWallContext wall_like;
+            wall_like.params            = ctx.params;
+            wall_like.candidate_ids     = ctx.candidate_ids;
+            wall_like.candidate_colors  = ctx.candidate_colors;
+            wall_like.mesh_box          = ctx.mesh_box;
+            wall_like.mesh_from_print   = ctx.mesh_from_print;
+            wall_like.min_run_len_mm    = ctx.min_run_len_mm;
+            wall_like.sample_spacing_mm = ctx.sample_spacing_mm;
+            // A top surface is ONE plane: hand the cutter the same synthesised "up" normal
+            // image_row_runs_for_path() uses, so a Box projection picks the top face rather
+            // than a side face computed from the path's own tangent.
+            wall_like.fixed_normal_mesh = ctx.facet_normal_mesh;
+            std::vector<std::unique_ptr<ExtrusionEntityCollection>> split =
+                image_row_split_wall_entity(assets, wall_like, *child, print_z);
+            if (!split.empty()) {
+                for (auto &c : split)
+                    out.push_back(c.release());
+                split_any = true;
+                continue;
+            }
+            // Genuinely could not be split (one colour, or the projection declined everywhere):
+            // fall through to the un-split path below and log the fallback once, as before.
             log_image_row_pattern_not_split_once();
+        }
         std::vector<ImageRowRun> runs = path != nullptr ? image_row_runs_for_path(assets, ctx, path->polyline, print_z)
                                                         : std::vector<ImageRowRun>();
         if (path == nullptr || runs.size() < 2) {
@@ -2107,12 +2144,13 @@ void Layer::make_ironing()
 					// Iron just the infill.
 					ironing_params.extruder = config.solid_infill_filament;
 				}
-				// Step 5, item 3: ironing_params.extruder above is left as the ROW's own virtual
-				// id (resolve()'s job, further down, turns it into a physical one) - it is never
-				// re-sampled per the image the way split_top_infill_by_image_row() re-samples
-				// top-solid-infill paths. See log_image_row_ironing_not_split_once()'s own comment.
-				if (image_row_configured_virtual_id(*this->object(), config) != 0)
-					log_image_row_ironing_not_split_once();
+				// PHASE 4, step 3: ironing IS now split per image, so ironing_params.extruder's
+				// virtual id is only the fallback for the case the split declines (see the
+				// split site further down in this function). Phase 3 left ironing on the row's
+				// per-layer colour cycle, which on an image surface meant the ironed skin -
+				// the layer you actually SEE - was a single flat colour smeared over a
+				// correctly dithered surface, hiding the feature it was meant to finish.
+				(void)config;
 			}
 			if (ironing_params.extruder != -1) {
 				//TODO just_infill is currently not used.
@@ -2244,6 +2282,42 @@ void Layer::make_ironing()
 		            eec->entities, std::move(polylines),
 		            erIroning,
 		            flow_mm3_per_mm, extrusion_width, float(extrusion_height));
+		        // PHASE 4, step 3: dither the ironing pass through the same image the top solid
+		        // infill beneath it was dithered through, so the ironed skin matches the picture
+		        // instead of covering it with one flat colour. The geometry here is plain
+		        // ExtrusionPaths in a no_sort collection - structurally what
+		        // split_top_infill_by_image_row() already handles - so the split is the same
+		        // operation, only keyed on erIroning rather than erTopSolidInfill.
+		        //
+		        // The sampling resolution is the IRONING pass's own extrusion width, which is
+		        // much narrower than a top-infill line (ironing lays a thin cover bead at
+		        // ironing_spacing). That is deliberate: the ironed skin can therefore resolve the
+		        // image at least as finely as the surface under it, never more coarsely.
+		        ImageRowWallContext iron_ctx;
+		        if (image_row_wall_iron_context(*this->object(), ironing_params.layerm->region(),
+		                                        extrusion_width, iron_ctx)) {
+		            std::vector<ExtrusionEntityCollection *> replacement;
+		            for (ExtrusionEntity *child : eec->entities) {
+		                std::vector<std::unique_ptr<ExtrusionEntityCollection>> split =
+		                    image_row_split_wall_entity(this->object()->model_object()->get_model()->image_assets,
+		                                                iron_ctx, *child, this->print_z);
+		                if (split.empty()) {
+		                    auto *solo = new ExtrusionEntityCollection();
+		                    solo->no_sort = true;
+		                    solo->entities.push_back(child->clone());
+		                    replacement.push_back(solo);
+		                } else {
+		                    for (auto &c : split)
+		                        replacement.push_back(c.release());
+		                }
+		            }
+		            if (!replacement.empty()) {
+		                ironing_params.layerm->fills.entities.pop_back();
+		                delete eec;
+		                for (ExtrusionEntityCollection *c : replacement)
+		                    ironing_params.layerm->fills.entities.push_back(c);
+		            }
+		        }
 		    }
 		}
 
