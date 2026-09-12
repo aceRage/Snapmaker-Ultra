@@ -940,7 +940,7 @@ static std::string ffmpeg_h264_template()
 // PC with a working one that is cheaper - but it fails in ways software encoding does not (a
 // headless/RDP session with no GPU, a driver that refuses a second session, an encoder that is
 // already busy with a game), and it fails as a black tile rather than an error the user sees.
-// Software libopenh264 costs ~5% of one core for a 720p Medium on this PC (spec, §CPU), which is
+// Software libopenh264 costs ~5% of one core for a 720p Medium on this PC (see the spec), which is
 // not worth that risk by default. To turn it on, add `#hardware` to the strings below and
 // rebuild; go2rtc then tries dxva2/cuda/qsv and falls back to software by itself.
 // Each extra ffmpeg argument is its own #raw= segment, one token per segment and never a space
