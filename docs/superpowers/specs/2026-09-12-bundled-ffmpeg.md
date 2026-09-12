@@ -23,7 +23,7 @@ to change in the hub to make go2rtc actually use it.
 | `LICENSE.txt` sha256 | `da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768` |
 | Version string | `N-126523-g884590dd4a-20260912` (ffmpeg commit `884590dd4a`) |
 | Licence | **LGPL-3.0** (`--enable-version3`, no `--enable-gpl`) |
-| Kind | static, x64, one file (133 MB) |
+| Kind | static, x64, one file (128 MiB; 53 MiB compressed) |
 
 Pinned to the **dated autobuild tag**, not to `latest`. BtbN's `latest` is a rolling tag whose
 assets are replaced on every build, so pinning to it would pin nothing: the same URL would fetch a
@@ -42,6 +42,19 @@ A **static** build deliberately: a shared one would scatter a dozen `av*.dll` in
 `resources/tools/go2rtc/`, where they would sit next to `go2rtc.exe` and be mistaken for its
 dependencies. One file is also one thing to verify. The CMake rule still carries a `*.dll` glob so
 a future shared build would work, but ships nothing extra today.
+
+**Size, and the one thing worth the owner's attention.** The static exe is 128 MiB uncompressed and
+**53 MiB deflate-compressed** (measured, not estimated). That is the largest single file we ship,
+and it grows both packages by roughly that compressed figure. Two things to weigh if that matters:
+
+* a **shared** LGPL build is smaller in total, at the cost of the DLL clutter above;
+* we already ship only `ffmpeg.exe` — `ffplay`/`ffprobe` from the same zip are discarded, so 128 MiB
+  *is* the ffmpeg-only figure. Trimming further would mean building ffmpeg ourselves with
+  `--disable-everything` plus just what this feature touches (h264 in, libopenh264 out, mp4/rtsp),
+  which typically lands under 20 MiB.
+
+Neither is done here: correctness first, and the size is not a regression anyone has complained
+about. Flagged so the choice is deliberate rather than inherited.
 
 ## 2. Licence reasoning
 
