@@ -12,6 +12,7 @@
 #include "Geometry/ConvexHull.hpp"
 #include "GCode/PrintExtents.hpp"
 #include "GCode/Thumbnails.hpp"
+#include "ImageRowWalls.hpp"
 #include "GCode/WipeTower.hpp"
 #include "GCode/WipeTower2.hpp"
 #include "ShortestPath.hpp"
@@ -5516,6 +5517,14 @@ LayerResult GCode::process_layer(const Print& print,
     auto configured_filament_id_1based = [&layer_tools](const GCode::ObjectByExtruder::Island::Region::Type entity_type,
                                                         const ExtrusionEntityCollection&                    entities,
                                                         const PrintRegion&                                  region) -> unsigned int {
+        // Phase 4 (image row on WALLS): the per-run tag is now produced for perimeters too, not
+        // only for fills, so the check is hoisted above the INFILL gate. It stays exact for every
+        // other print because image_row_extruder_1based is 0 on every collection the image row
+        // did not create - see ExtrusionEntityCollection::image_row_extruder_1based. A per-layer
+        // extruder_override still wins, exactly as it does inside the INFILL branch below.
+        if (entity_type != GCode::ObjectByExtruder::Island::Region::INFILL &&
+            entities.image_row_extruder_1based != 0 && layer_tools.extruder_override == 0)
+            return entities.image_row_extruder_1based;
         if (entity_type == GCode::ObjectByExtruder::Island::Region::INFILL) {
             if (layer_tools.extruder_override != 0)
                 return layer_tools.extruder_override;
@@ -5542,6 +5551,11 @@ LayerResult GCode::process_layer(const Print& print,
     auto configured_extruder_id = [&layer_tools](const GCode::ObjectByExtruder::Island::Region::Type entity_type,
                                                  const ExtrusionEntityCollection&                    entities,
                                                  const PrintRegion&                                  region) -> int {
+        // Phase 4 (image row on WALLS): same hoist as configured_filament_id_1based's just above,
+        // for the same reason and with the same "0 unless the feature is in use" guarantee.
+        if (entity_type != GCode::ObjectByExtruder::Island::Region::INFILL &&
+            entities.image_row_extruder_1based != 0 && layer_tools.extruder_override == 0)
+            return int(entities.image_row_extruder_1based) - 1;
         if (entity_type == GCode::ObjectByExtruder::Island::Region::INFILL) {
             // Phase 3 (image row): see configured_filament_id_1based's own comment just above -
             // same field, same "0 unless the feature is in use" guarantee, and the same
@@ -6078,6 +6092,46 @@ LayerResult GCode::process_layer(const Print& print,
                     return true;
                 };
 
+            // Phase 4 (image row on WALLS): one ImageRowWallContext per PrintRegion per layer,
+            // built lazily and memoised - building it decodes the row's image reference and walks
+            // the owning volume's vertices for a bounding box, which must not happen once per
+            // loop. A region that is not an image-row wall memoises a null and is never retried.
+            // The whole cache stays empty for every print that does not use the feature.
+            std::vector<std::pair<const PrintRegion*, std::unique_ptr<ImageRowWallContext>>> image_row_wall_ctx_cache;
+            const PrintObject* image_row_wall_object =
+                layer_to_print.original_object != nullptr ? layer_to_print.original_object : layer_to_print.object();
+            // A stand-in for an object with no Model behind it (never happens in a real slice;
+            // the split simply finds no image and leaves the wall alone).
+            static const ImageAssetStore image_row_wall_no_assets;
+            const ImageAssetStore& image_row_wall_assets =
+                (image_row_wall_object != nullptr && image_row_wall_object->model_object() != nullptr &&
+                 image_row_wall_object->model_object()->get_model() != nullptr)
+                    ? image_row_wall_object->model_object()->get_model()->image_assets
+                    : image_row_wall_no_assets;
+            auto image_row_wall_ctx_for = [&](const PrintRegion& region) -> const ImageRowWallContext* {
+                if (image_row_wall_object == nullptr)
+                    return nullptr;
+                for (const auto& entry : image_row_wall_ctx_cache)
+                    if (entry.first == &region)
+                        return entry.second.get();
+                std::unique_ptr<ImageRowWallContext> built;
+                if (image_row_wall_configured_virtual_id(*image_row_wall_object, region) != 0) {
+                    auto ctx = std::make_unique<ImageRowWallContext>();
+                    // The external perimeter's own extrusion width sets the sampling resolution,
+                    // so a wall dithers at exactly the granularity a top surface does.
+                    float ext_width = 0.f;
+                    for (const LayerRegion* lr : layer.regions())
+                        if (lr != nullptr && &lr->region() == &region) {
+                            ext_width = float(lr->flow(frExternalPerimeter).width());
+                            break;
+                        }
+                    if (image_row_wall_context_for_region(*image_row_wall_object, region, ext_width, *ctx))
+                        built = std::move(ctx);
+                }
+                image_row_wall_ctx_cache.emplace_back(&region, std::move(built));
+                return image_row_wall_ctx_cache.back().second.get();
+            };
+
             for (size_t region_id = 0; region_id < layer.regions().size(); ++region_id) {
                 const LayerRegion* layerm = layer.regions()[region_id];
                 if (layerm == nullptr)
@@ -6241,6 +6295,85 @@ LayerResult GCode::process_layer(const Print& print,
 
                         // This extrusion is part of certain Region, which tells us which extruder should be used for it:
                         int correct_extruder_id = configured_extruder_id(entity_type, *filtered_extrusions, region);
+
+                        // Phase 4 (image row on WALLS): an ImageWeighted row bound to this
+                        // region's wall filament dithers the OUTER perimeter (and, when the
+                        // region has more than one wall loop, the first inner one) into short
+                        // per-filament runs - the same sampling, the same dither and the same
+                        // per-run override phase 3 applies to a top surface's fill lines.
+                        //
+                        // This runs HERE, at G-code time, rather than in PerimeterGenerator,
+                        // because a wall's seam is chosen at G-code time by SeamPlacer and the
+                        // brief requires the seam to survive: local_z_loop_seam_placer (declared
+                        // just above this loop) rotates the loop to its seam FIRST, and only the
+                        // already-rotated geometry is then cut at the image's colour boundaries.
+                        // A run boundary is therefore a colour boundary and nothing more - the
+                        // nozzle still starts the wall exactly where SeamPlacer put it. Running
+                        // here also means sampling AFTER fuzzy skin (applied inside
+                        // PerimeterGenerator), so run boundaries land on the jittered geometry
+                        // the nozzle really follows. See src/libslic3r/ImageRowWalls.hpp.
+                        if (!is_anything_overridden &&
+                            entity_type == ObjectByExtruder::Island::Region::PERIMETERS &&
+                            layer_tools.extruder_override == 0) {
+                            const ImageRowWallContext* wall_ctx = image_row_wall_ctx_for(region);
+                            if (wall_ctx != nullptr) {
+                                std::vector<std::unique_ptr<ExtrusionEntityCollection>> run_colls;
+                                auto untouched = std::make_unique<ExtrusionEntityCollection>();
+                                untouched->no_sort = filtered_extrusions->no_sort;
+                                for (const ExtrusionEntity* e : filtered_extrusions->entities) {
+                                    std::vector<std::unique_ptr<ExtrusionEntityCollection>> split;
+                                    if (e != nullptr && image_row_wall_entity_is_claimed(*e, wall_ctx->split_first_inner)) {
+                                        const ExtrusionEntity* to_split = e;
+                                        ExtrusionLoop          seam_loop;
+                                        if (const auto* loop = dynamic_cast<const ExtrusionLoop*>(e)) {
+                                            Point seam_anchor = loop->first_point();
+                                            if (local_z_loop_seam_placer(*loop, seam_loop, seam_anchor))
+                                                to_split = &seam_loop;
+                                        }
+                                        split = image_row_split_wall_entity(image_row_wall_assets, *wall_ctx, *to_split, print_z);
+                                    }
+                                    if (split.empty()) {
+                                        if (e != nullptr)
+                                            untouched->append(*e);
+                                    } else {
+                                        for (auto& c : split)
+                                            run_colls.push_back(std::move(c));
+                                    }
+                                }
+                                if (!run_colls.empty()) {
+                                    // One island bucket per run, dispatched exactly the way the
+                                    // outer/inner wall splitter just below dispatches its two
+                                    // buckets, plus one for everything that stayed unsplit.
+                                    auto dispatch = [&](const ExtrusionEntityCollection* coll, unsigned int extruder) {
+                                        if (coll == nullptr || coll->entities.empty())
+                                            return;
+                                        if (!layer_tools.has_extruder(extruder))
+                                            extruder = layer_tools.extruders.back();
+                                        std::vector<ObjectByExtruder::Island>& islands =
+                                            object_islands_by_extruder(by_extruder, extruder, layer_to_print_idx, layers.size(), n_slices + 1);
+                                        for (size_t i = 0; i <= n_slices; ++i) {
+                                            const bool   last       = i == n_slices;
+                                            const size_t island_idx = last ? n_slices : slices_test_order[i];
+                                            if (last || entity_matches_surface(island_idx, *coll)) {
+                                                if (islands[island_idx].by_region.empty())
+                                                    islands[island_idx].by_region.assign(print.num_print_regions(), ObjectByExtruder::Island::Region());
+                                                islands[island_idx].by_region[region.print_region_id()].append(entity_type, coll, nullptr);
+                                                break;
+                                            }
+                                        }
+                                    };
+                                    for (auto& c : run_colls) {
+                                        dispatch(c.get(), c->image_row_extruder_1based);
+                                        local_z_clipped_collections.emplace_back(std::move(c));
+                                    }
+                                    if (!untouched->entities.empty()) {
+                                        dispatch(untouched.get(), unsigned(std::max(0, correct_extruder_id)) + 1);
+                                        local_z_clipped_collections.emplace_back(std::move(untouched));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
 
                         // Ultra: outer walls may print with their own filament - split the island's
                         // perimeter collection into outer/inner sub-collections, one per extruder.

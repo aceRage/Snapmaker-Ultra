@@ -8,6 +8,7 @@
 // Ultra (dual-nozzle): filament->nozzle grouping compute.
 #include "../FilamentGroup.hpp"
 #include "../FilamentGroupUtils.hpp"
+#include "../ImageRowWalls.hpp"
 #include "ToolOrderUtils.hpp"
 
 // #define SLIC3R_DEBUG
@@ -845,6 +846,29 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                         layer_tools.extruders.emplace_back(wall_ext);
                         if (layerCount == 0)
                             firstLayerExtruders.emplace_back(wall_ext);
+                    }
+
+                    // Phase 4 (image row on WALLS): when this region's wall filament names an
+                    // enabled ImageWeighted row, GCode.cpp splits the outer perimeter into
+                    // per-run collections, each tagged with ONE of the row's own candidate
+                    // filaments. That split happens at G-CODE time, which is after this function
+                    // runs - so unlike the fills loop below (which can read the tag off a
+                    // collection the slicer already produced), this branch cannot see the runs.
+                    // It therefore registers the row's whole CANDIDATE SET from the config, which
+                    // is the set the runs are guaranteed to be drawn from. Registering the set is
+                    // what makes GCode.cpp's own `layer_tools.has_extruder(correct_extruder_id)`
+                    // check find each run's filament in the layer's tool list; without it a run
+                    // would be silently reassigned to layer_tools.extruders.back(). Registering a
+                    // filament that no run on THIS layer ends up using costs nothing: the list is
+                    // deduplicated and reordered for minimum switches by reorder_extruders(), and
+                    // an extruder with no extrusions emits no tool change.
+                    if (extruder_override == 0 && m_mixed_mgr != nullptr && m_num_physical > 0) {
+                        for (unsigned int cand : image_row_wall_candidate_filaments(object, region, m_num_physical)) {
+                            layer_tools.extruders.emplace_back(cand);
+                            if (layerCount == 0 &&
+                                std::find(firstLayerExtruders.begin(), firstLayerExtruders.end(), int(cand)) == firstLayerExtruders.end())
+                                firstLayerExtruders.emplace_back(int(cand));
+                        }
                     }
 
                     // Ultra: outer walls may use their own filament

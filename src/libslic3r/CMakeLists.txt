@@ -92,6 +92,8 @@ set(lisbslic3r_sources
     FlexiJoint.cpp
     FlexiJoint.hpp
     ImageFill.hpp
+    ImageRowWalls.cpp
+    ImageRowWalls.hpp
     ColorSplitInternal.hpp
     ColorSplitPartition.cpp
     ColorSplitShell.cpp
