@@ -6363,11 +6363,35 @@ LayerResult GCode::process_layer(const Print& print,
                                         }
                                     };
                                     for (auto& c : run_colls) {
-                                        dispatch(c.get(), c->image_row_extruder_1based);
+                                        // image_row_extruder_1based is 1-BASED; the island
+                                        // bucket key is 0-BASED - the canonical dispatch
+                                        // further down this function keys it on
+                                        // correct_extruder_id, i.e. on
+                                        // LayerTools::wall_filament(), which returns a
+                                        // zero-based extruder. Convert once, here.
+                                        //
+                                        // NOTE, found while writing this and deliberately
+                                        // NOT 'fixed' here: layer_tools.extruders is
+                                        // 1-based (ToolOrdering.cpp:938 and :941 register
+                                        // solid_infill_filament()/sparse_infill_filament()
+                                        // + 1), so every has_extruder() call on this path -
+                                        // the canonical one included - tests a 0-based id
+                                        // against a 1-based list and usually misses,
+                                        // falling back to extruders.back(). That is a
+                                        // pre-existing, file-wide off-by-one, not something
+                                        // this feature introduces; matching the canonical
+                                        // path's convention is what keeps image-row runs
+                                        // behaving exactly like every other entity here,
+                                        // and correcting it belongs in its own change with
+                                        // its own Bar A.
+                                        dispatch(c.get(), c->image_row_extruder_1based - 1);
                                         local_z_clipped_collections.emplace_back(std::move(c));
                                     }
                                     if (!untouched->entities.empty()) {
-                                        dispatch(untouched.get(), unsigned(std::max(0, correct_extruder_id)) + 1);
+                                        // correct_extruder_id is already 0-based
+                                        // (configured_extruder_id returns
+                                        // layer_tools.wall_filament(region)).
+                                        dispatch(untouched.get(), unsigned(std::max(0, correct_extruder_id)));
                                         local_z_clipped_collections.emplace_back(std::move(untouched));
                                     }
                                     continue;
