@@ -3438,7 +3438,9 @@ void ObjectList::edit_cut()
     std::vector<ObjectID> ids;
     for (size_t i = 0; i < m_objects->size(); ++i) {
         const ModelObject *o = (*m_objects)[i];
-        if (o == src || (o->is_cut() && src->is_cut() && o->cut_id.has_same_id(src->cut_id)))
+        // CutObjectBase::has_same_id() is not const-qualified, and these are const
+        // ModelObjects, so compare the ids directly - which is exactly what it does.
+        if (o == src || (o->is_cut() && src->is_cut() && o->cut_id.id() == src->cut_id.id()))
             ids.push_back(o->id());
     }
     if (ids.empty())
