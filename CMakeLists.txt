@@ -160,6 +160,12 @@ endif ()
 
 # Proposal for C++ unit tests and sandboxes
 option(SLIC3R_BUILD_SANDBOXES   "Build development sandboxes" OFF)
+# Ultra: the QuadriFlow-backed quad remesher ("Quad remesh...", Phase 2 of the remesh
+# spec). Optional because QuadriFlow is a new native dependency and CI on macOS/Linux
+# has not been through a deps build with it yet; when the package is missing the whole
+# feature - libslic3r entry points, dialog and menu items - compiles out and the menu
+# entry is not shown. See deps/QuadriFlow/QuadriFlow.cmake.
+option(SLIC3R_QUAD_REMESH       "Build the QuadriFlow-backed quad remesher" ON)
 option(BUILD_TESTS       "Build unit tests" OFF)
 option(ORCA_TOOLS       "Build Orca tools" OFF)
 
@@ -771,6 +777,20 @@ else ()
     message(FATAL_ERROR "OpenVDB could not be found with the bundled find module. "
                    "You can try to specify the find module location of your "
                    "OpenVDB installation with the OPENVDB_FIND_MODULE_PATH cache variable.")
+endif ()
+
+# Ultra: QuadriFlow, for the quad remesher. Optional on purpose - unlike OpenVDB above,
+# a missing package is a warning and a disabled feature, not a fatal error, so a tree
+# whose deps predate deps/QuadriFlow still builds. SLIC3R_QUAD_REMESH stays off unless
+# the package was actually found, and everything downstream keys off that one variable.
+if (SLIC3R_QUAD_REMESH)
+    find_package(QuadriFlow QUIET)
+    if (NOT QuadriFlow_FOUND)
+        set(SLIC3R_QUAD_REMESH OFF)
+        message(STATUS "QuadriFlow not found - the quad remesher will be omitted. Build it with the deps project (deps/QuadriFlow) to enable it.")
+    else ()
+        message(STATUS "QuadriFlow found - building the quad remesher")
+    endif ()
 endif ()
 
 find_path(SPNAV_INCLUDE_DIR spnav.h)
