@@ -426,6 +426,11 @@ public:
     void rename_item();
     void fix_through_netfabb();
     void repair_by_remesh();
+    // Ultra: Phase 2 - QuadriFlow quad remesh. Hidden when the build has no
+    // QuadriFlow (quad_remesh_available()).
+    // close_gizmos: shut an open gizmo first, for the Sculpt panel entry point -
+    // a gizmo .cpp cannot reach GLGizmosManager, so it asks for the close here.
+    void quad_remesh(bool close_gizmos = false);
     void toggle_visibility_state(const wxDataViewItem& item);
     void update_visibility_icons();
     // Ultra (support groups): resync every part row's group badge with ModelVolume::config.

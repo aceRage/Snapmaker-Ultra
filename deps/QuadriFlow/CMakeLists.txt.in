@@ -1,0 +1,219 @@
+# Ultra: replacement CMakeLists for QuadriFlow (hjwdzh/QuadriFlow, BSD-3-Clause).
+#
+# Upstream's own CMakeLists builds ONE thing: the `quadriflow` command-line
+# executable. It defines no library target and no install() rules at all, so
+# ExternalProject's `--target install` has nothing to install and the slicer would
+# have nothing to link against. It also hard-codes GCC/Clang-only flags
+# (`-O3`, `-fopenmp`, `-fsanitize=address`) into CMAKE_CXX_FLAGS_RELEASE, which MSVC
+# rejects outright.
+#
+# So, in the style of deps/OpenCSG, this file REPLACES upstream's CMakeLists rather
+# than patching it. It is a deliberate transcription of upstream's build, with four
+# differences and nothing else:
+#
+#   1. a static library `quadriflow` instead of an executable (src/main.cpp is the
+#      only file dropped from upstream's source list - it is the CLI's main()),
+#   2. install() rules + a QuadriFlowConfig.cmake so find_package(QuadriFlow) works,
+#   3. compiler flags left to the toolchain instead of upstream's GCC-only overrides,
+#   4. a minimal build of the bundled Lemon (four .cc files and a generated
+#      config.h) instead of add_subdirectory() on Lemon's own CMake project, which
+#      drags in docs, demos, tests, an hg/wget/python probe and LP solver bindings
+#      we neither build nor ship.
+#
+# LICENCE AUDIT - what this actually compiles (see docs/superpowers/specs/
+# 2026-09-12-quad-remesh-phase2.md for the full write-up):
+#   * src/*                 QuadriFlow            BSD-3-Clause
+#   * 3rd/lemon-1.3.1/*     LEMON                 Boost Software License 1.0
+#   * 3rd/pcg32, 3rd/pss    pcg32 / pss           Apache-2.0 / BSD-ish, header only
+#   * Boost.Graph           (already a dep)       Boost Software License 1.0
+#   * Eigen                 (already a dep)       MPL2 (EIGEN_MPL2_ONLY is set)
+# NOT compiled, deliberately:
+#   * 3rd/MapleCOMSPS_LRB   MiniSat derivative    MIT - bundled by upstream but not
+#     referenced by any source we build; src/localsat.cpp shells out to a `minisat`
+#     binary instead of linking it, and that path is unreachable here because we
+#     never set flag_aggresive_sat. Left out of the source list entirely.
+#   * src/post-solver.cpp   needs Ceres (Apache-2.0) - also absent from upstream's
+#     own source list. Keeping it out means no Ceres dependency.
+#   * src/Optimizer.cu      CUDA - WITH_CUDA is never defined.
+
+cmake_minimum_required(VERSION 3.13)
+project(QuadriFlow LANGUAGES CXX)
+
+# Mirrors upstream's option of the same name. ON here, always: it defines
+# EIGEN_MPL2_ONLY, which makes Eigen fail the build if a header under its
+# LGPL-licensed subset (sparse Cholesky / SPQR support) is ever pulled in. That is
+# the whole point - it is a compile-time guarantee about which licences end up in
+# the binary, not a solver switch. See the spec: upstream's README wording suggests
+# it swaps solvers, but the CMakeLists only adds this one define.
+option(BUILD_FREE_LICENSE "Only use libraries with permissive licenses" ON)
+
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+find_package(Boost REQUIRED)
+
+if (NOT EIGEN3_INCLUDE_DIR)
+    find_package(Eigen3 3.3 REQUIRED)
+    if (TARGET Eigen3::Eigen)
+        get_target_property(EIGEN3_INCLUDE_DIR Eigen3::Eigen INTERFACE_INCLUDE_DIRECTORIES)
+    endif ()
+endif ()
+if (NOT EIGEN3_INCLUDE_DIR)
+    message(FATAL_ERROR "QuadriFlow needs Eigen: pass -DEIGEN3_INCLUDE_DIR=<path>")
+endif ()
+
+# ---------------------------------------------------------------------------
+# Lemon, minimally. Upstream's flow.hpp uses lemon::SmartDigraph, lemon::Preflow and
+# lemon::NetworkSimplex - all header-only templates. The four .cc files below are
+# what those headers' out-of-line bits and lemon/core.h's assertion machinery need;
+# the rest of lemon/*.cc is LP-solver bindings (glpk, cplex, clp, cbc, soplex) whose
+# third-party libraries we do not have and must not link.
+# ---------------------------------------------------------------------------
+set(LEMON_DIR ${PROJECT_SOURCE_DIR}/3rd/lemon-1.3.1)
+set(LEMON_VERSION "1.3.1")
+configure_file(${LEMON_DIR}/lemon/config.h.in ${PROJECT_BINARY_DIR}/lemon/config.h @ONLY)
+
+add_library(quadriflow_lemon STATIC
+    ${LEMON_DIR}/lemon/base.cc
+    ${LEMON_DIR}/lemon/color.cc
+    ${LEMON_DIR}/lemon/random.cc
+    ${LEMON_DIR}/lemon/arg_parser.cc
+)
+target_include_directories(quadriflow_lemon PUBLIC
+    $<BUILD_INTERFACE:${LEMON_DIR}>
+    $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}>
+)
+if (MSVC)
+    target_compile_definitions(quadriflow_lemon PUBLIC _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    target_compile_options(quadriflow_lemon PRIVATE /wd4267 /wd4244 /wd4018 /wd4800)
+endif ()
+
+# ---------------------------------------------------------------------------
+# QuadriFlow itself. Source list transcribed from upstream's `quadriflow_SRC`, minus
+# src/main.cpp. Headers are listed the way upstream lists them, so an IDE shows them.
+# ---------------------------------------------------------------------------
+add_library(quadriflow STATIC
+    src/adjacent-matrix.cpp
+    src/adjacent-matrix.hpp
+    src/compare-key.hpp
+    src/config.hpp
+    src/dedge.cpp
+    src/dedge.hpp
+    src/disajoint-tree.hpp
+    src/dset.hpp
+    src/field-math.hpp
+    src/flow.hpp
+    src/hierarchy.cpp
+    src/hierarchy.hpp
+    src/loader.cpp
+    src/loader.hpp
+    src/localsat.cpp
+    src/localsat.hpp
+    src/merge-vertex.cpp
+    src/merge-vertex.hpp
+    src/optimizer.cpp
+    src/optimizer.hpp
+    src/parametrizer.cpp
+    src/parametrizer-flip.cpp
+    src/parametrizer-int.cpp
+    src/parametrizer-mesh.cpp
+    src/parametrizer-scale.cpp
+    src/parametrizer-sing.cpp
+    src/parametrizer.hpp
+    src/serialize.hpp
+    src/subdivide.cpp
+    src/subdivide.hpp
+)
+
+target_include_directories(quadriflow PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/3rd/pcg32>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/3rd/pss>
+    $<INSTALL_INTERFACE:include/quadriflow>
+)
+target_include_directories(quadriflow SYSTEM PUBLIC
+    ${EIGEN3_INCLUDE_DIR}
+    ${Boost_INCLUDE_DIRS}
+)
+target_link_libraries(quadriflow PUBLIC quadriflow_lemon)
+
+if (BUILD_FREE_LICENSE)
+    target_compile_definitions(quadriflow PUBLIC EIGEN_MPL2_ONLY)
+endif ()
+
+if (MSVC)
+    # Upstream's own MSVC block, verbatim: M_PI plus the four conversion/sign
+    # warnings its Eigen-heavy code trips on every line.
+    target_compile_definitions(quadriflow PUBLIC _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    target_compile_options(quadriflow PRIVATE /wd4267 /wd4244 /wd4018 /wd4800)
+    # Deep Eigen expression templates in parametrizer-int.cpp exhaust the default
+    # object-file section limit.
+    target_compile_options(quadriflow PRIVATE /bigobj)
+else ()
+    target_compile_options(quadriflow PRIVATE -Wno-sign-compare -Wno-int-in-bool-context)
+endif ()
+
+# ---------------------------------------------------------------------------
+# Install + a config package, so the slicer's find_package(QuadriFlow) works off the
+# same DESTDIR prefix as every other dep.
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+install(TARGETS quadriflow quadriflow_lemon
+    EXPORT QuadriFlowTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/src/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/quadriflow
+    FILES_MATCHING PATTERN "*.hpp"
+)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/3rd/pcg32/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/quadriflow
+    FILES_MATCHING PATTERN "*.h"
+)
+install(DIRECTORY ${LEMON_DIR}/lemon/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/quadriflow/lemon
+    FILES_MATCHING PATTERN "*.h"
+)
+install(FILES ${PROJECT_BINARY_DIR}/lemon/config.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/quadriflow/lemon
+)
+# The licences that end up in the shipped binary, next to the headers.
+install(FILES ${PROJECT_SOURCE_DIR}/LICENSE.txt
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/quadriflow
+    RENAME LICENSE.QuadriFlow.txt
+)
+install(FILES ${LEMON_DIR}/LICENSE
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/quadriflow
+    RENAME LICENSE.LEMON.txt
+)
+
+write_basic_package_version_file(
+    "${PROJECT_BINARY_DIR}/QuadriFlowConfigVersion.cmake"
+    VERSION 1.0.0
+    COMPATIBILITY AnyNewerVersion
+)
+
+install(EXPORT QuadriFlowTargets
+    FILE QuadriFlowTargets.cmake
+    NAMESPACE QuadriFlow::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/QuadriFlow
+)
+
+file(WRITE "${PROJECT_BINARY_DIR}/QuadriFlowConfig.cmake"
+"# Generated by deps/QuadriFlow/CMakeLists.txt.in
+include(CMakeFindDependencyMacro)
+find_dependency(Boost)
+include(\"\${CMAKE_CURRENT_LIST_DIR}/QuadriFlowTargets.cmake\")
+set(QuadriFlow_FOUND TRUE)
+")
+install(FILES
+    "${PROJECT_BINARY_DIR}/QuadriFlowConfig.cmake"
+    "${PROJECT_BINARY_DIR}/QuadriFlowConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/QuadriFlow
+)

@@ -323,6 +323,8 @@ set(lisbslic3r_sources
     MeshSculpt.hpp
     MeshRemesh.cpp
     MeshRemesh.hpp
+    QuadRemesh.cpp
+    QuadRemesh.hpp
     MeshSplitImpl.hpp
     MinAreaBoundingBox.cpp
     MinAreaBoundingBox.hpp
@@ -665,6 +667,15 @@ endif ()
 if (TARGET OpenVDB::openvdb)
     target_link_libraries(libslic3r PRIVATE OpenVDB::openvdb)
 endif()
+
+# Ultra: QuadriFlow backs the quad remesher. QuadRemesh.cpp is compiled either way -
+# without the define it provides refusing stubs, so GUI code needs no #ifdef - and
+# SLIC3R_QUAD_REMESH is PUBLIC so the GUI and the tests see the same answer from
+# quad_remesh_available() that libslic3r was built with.
+if (SLIC3R_QUAD_REMESH AND TARGET QuadriFlow::quadriflow)
+    target_link_libraries(libslic3r PRIVATE QuadriFlow::quadriflow)
+    target_compile_definitions(libslic3r PUBLIC SLIC3R_QUAD_REMESH)
+endif ()
 
 if(WIN32)
     target_link_libraries(libslic3r PRIVATE Psapi.lib)

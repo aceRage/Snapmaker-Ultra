@@ -2,6 +2,7 @@
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/QuadRemesh.hpp"
 
 #include "GUI_Factories.hpp"
 #include "GUI_ObjectList.hpp"
@@ -981,6 +982,19 @@ wxMenuItem* MenuFactory::append_menu_item_fix_through_netfabb(wxMenu* menu)
             obj_list()->get_selection_indexes(obj_idxs, vol_idxs);
             return !obj_idxs.empty() || !vol_idxs.empty();
         }, plater());
+
+    // Ultra: Phase 2 - the quad remesher, next to Repair/Remesh as the spec asks.
+    // Hidden entirely when the build has no QuadriFlow: an entry that can only ever
+    // report "unavailable" is worse than no entry.
+    if (quad_remesh_available()) {
+        append_menu_item(menu, wxID_ANY, _L("Quad remesh..."), _L("Rebuild the selected parts as an even grid of quads at a target face count (needs a closed mesh)"),
+            [](wxCommandEvent&) { obj_list()->quad_remesh(); }, "", menu,
+            []() {
+                std::vector<int> obj_idxs, vol_idxs;
+                obj_list()->get_selection_indexes(obj_idxs, vol_idxs);
+                return !obj_idxs.empty() || !vol_idxs.empty();
+            }, plater());
+    }
 
     if (!is_windows10())
         return nullptr;
