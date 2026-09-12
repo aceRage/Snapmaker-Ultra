@@ -291,6 +291,11 @@ What it asserts:
 
 `test_webrtc.py`'s rtsp assertion was updated as described in §3.2.
 
+**Building this branch.** Nothing here changes the build's memory profile, but the worktree build
+was killed twice by `error C3859` / `C1076` (PCH virtual-memory exhaustion) while other builds ran
+on the same PC — at `/m:4`, and again at `/m:2` with ~7 GB free and 55 foreign `cl.exe` alive. It is
+contention, not anything in this change. If it bites, drop to `/m:1` rather than hunting the code.
+
 **One trap worth knowing when gating this by hand.** A go2rtc started from the *worktree's*
 `resources/tools/go2rtc/go2rtc.exe` holds that file open, and Windows will then fail the build's
 install/copy step into that tree — silently, as a killed `cmd.exe` with no error in the log. Run
