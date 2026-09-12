@@ -383,6 +383,23 @@ The gate retries the same way rather than racing the window, and now also assert
 `ffmpeg.exe` from the install survives hub shutdown** - an ffmpeg that escaped the job object would
 be an orphan holding the camera with nobody watching.
 
+**Verified against the rebuilt install.** Both gates pass, and the live transcode half now runs
+instead of skipping:
+
+```
+registered gatecam_med with go2rtc -> 200
+registered gatecam_low with go2rtc -> 200
+an ffmpeg runs while a viewer is connected (count 2)
+the low variant's SPS says 854x480 (<= 854x480)
+the low variant is genuinely downscaled from the 1080p source
+the transcode exits within ~10 s of the viewer leaving (gone after 1s)
+no ffmpeg.exe from this install survives hub shutdown (0 left)
+```
+
+Run the gates with the venv interpreter directly (`venv_rtc\Scripts\python.exe test_quality.py ...`):
+`rtcutil.use_venv()` re-execs the script with `os.execv` when aiortc is missing from the current
+interpreter, which restarts the gate from the top and interleaves two runs in one log.
+
 ## 7. Click-tests (owner)
 
 To be run on the emulator against an install of this branch:
