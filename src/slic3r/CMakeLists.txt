@@ -896,6 +896,14 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/GeneratedConfig.hpp.in
                @ONLY)
 
 add_library(libslic3r_gui STATIC ${SLIC3R_GUI_SOURCES})
+if (MSVC AND SLIC3R_MSVC_Z7)
+    # With /Z7 the debug info embedded in this library pushes it past the 4 GB static-library limit
+    # (LNK1248), so this one target keeps /Zi and the real compiler (bypassing any CLToolExe cache wrapper).
+    target_compile_options(libslic3r_gui PRIVATE /Zi)
+    get_filename_component(_slic3r_gui_cl_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set_property(TARGET libslic3r_gui PROPERTY VS_GLOBAL_CLToolExe "cl.exe")
+    set_property(TARGET libslic3r_gui PROPERTY VS_GLOBAL_CLToolPath "${_slic3r_gui_cl_dir}")
+endif ()
 target_include_directories(libslic3r_gui PRIVATE Utils ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(libslic3r_gui paho-mqttpp3-static)
 
