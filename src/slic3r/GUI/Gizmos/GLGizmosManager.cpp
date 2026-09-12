@@ -24,6 +24,7 @@
 #include "slic3r/GUI/Gizmos/GLGizmoMmuSegmentation.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSimplify.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSculpt.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoEdit.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoEmboss.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSVG.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoMeshBoolean.hpp"
@@ -181,6 +182,9 @@ void GLGizmosManager::switch_gizmos_icon_filename()
         case (EType::Sculpt):
             gizmo->set_icon_filename(m_is_dark ? "toolbar_sculpt_dark.svg" : "toolbar_sculpt.svg");
             break;
+        case (EType::Edit):
+            gizmo->set_icon_filename(m_is_dark ? "toolbar_edit_dark.svg" : "toolbar_edit.svg");
+            break;
         }
 
     }
@@ -224,6 +228,7 @@ bool GLGizmosManager::init()
     m_gizmos.emplace_back(new GLGizmoSimplify(m_parent, "reduce_triangles.svg", EType::Simplify));
     m_gizmos.emplace_back(new GLGizmoBrimEars(m_parent, m_is_dark ? "toolbar_brimears_dark.svg" : "toolbar_brimears.svg", EType::BrimEars));
     m_gizmos.emplace_back(new GLGizmoSculpt(m_parent, m_is_dark ? "toolbar_sculpt_dark.svg" : "toolbar_sculpt.svg", EType::Sculpt));
+    m_gizmos.emplace_back(new GLGizmoEdit(m_parent, m_is_dark ? "toolbar_edit_dark.svg" : "toolbar_edit.svg", EType::Edit));
     //m_gizmos.emplace_back(new GLGizmoSlaSupports(m_parent, "sla_supports.svg", sprite_id++));
     //m_gizmos.emplace_back(new GLGizmoFaceDetector(m_parent, "face recognition.svg", sprite_id++));
     //m_gizmos.emplace_back(new GLGizmoHollow(m_parent, "hollow.svg", sprite_id++));
@@ -833,6 +838,21 @@ bool GLGizmosManager::on_char(wxKeyEvent& evt)
     if (m_current == Cut) {
         if (auto *cut = dynamic_cast<GLGizmoCut3D *>(m_gizmos[Cut].get());
             cut != nullptr && cut->on_cut_char(keyCode, evt.ShiftDown(), evt.CmdDown())) {
+            m_parent.set_as_dirty();
+            return true;
+        }
+    }
+
+    // Ultra: the Edit gizmo takes the same first refusal, for the same reason.
+    // Its mesh edits live in a gizmo-local stack (a face push is one entry), so
+    // Ctrl+Z has to reach that stack BEFORE the canvas turns it into an
+    // EVT_GLCANVAS_UNDO. It also claims Esc while something is selected, to drop
+    // the selection instead of closing the gizmo. It returns false whenever it
+    // has nothing to take back, and the plater undo then happens exactly as
+    // before.
+    if (m_current == Edit) {
+        if (auto *edit = dynamic_cast<GLGizmoEdit *>(m_gizmos[Edit].get());
+            edit != nullptr && edit->on_edit_char(keyCode, evt.ShiftDown(), evt.CmdDown())) {
             m_parent.set_as_dirty();
             return true;
         }
@@ -1533,6 +1553,8 @@ std::string get_name_from_gizmo_etype(GLGizmosManager::EType type)
         return "Fuzzy Skin Painting";
     case GLGizmosManager::EType::Sculpt:
         return "Sculpt";
+    case GLGizmosManager::EType::Edit:
+        return "Edit";
     default:
         return "";
     }

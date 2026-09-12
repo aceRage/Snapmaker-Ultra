@@ -91,6 +91,10 @@ public:
         Simplify,
         BrimEars,
         Sculpt,
+        // Ultra: CAD-like direct mesh editing (face push/pull, feature-edge
+        // chain selection). Appended AFTER Sculpt so the existing EType
+        // values and the m_gizmos order they index are untouched.
+        Edit,
         //SlaSupports,
         // BBS
         //FaceRecognition,
