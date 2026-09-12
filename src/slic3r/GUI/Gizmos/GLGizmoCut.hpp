@@ -155,7 +155,13 @@ class GLGizmoCut3D : public GLGizmoBase
     // the gizmo session.
     bool           m_curved_surface{ false };
     CurvedCutSheet m_curved_sheet;
-    int            m_curved_resolution{ CurvedCutSheet::DefaultResolution };
+    // The control grid is nx COLUMNS by ny ROWS, kept apart so a RULED bend
+    // (10 x 2: every column one straight line, grabbable from either end) is
+    // expressible. m_curved_square locks the two together and is ON by default,
+    // so the panel behaves exactly as the single "Control points" slider did.
+    int            m_curved_nx{ CurvedCutSheet::DefaultResolution };
+    int            m_curved_ny{ CurvedCutSheet::DefaultResolution };
+    bool           m_curved_square{ true };
     // Brush radius for the control-point grab, in world mm, and whether the
     // Sculpt gizmo's falloff applies. F / Shift+F adjust it the way Sculpt does.
     float          m_curved_brush_radius{ 0.f }; // 0 = take default_curved_bend_radius() on first use
@@ -189,12 +195,15 @@ class GLGizmoCut3D : public GLGizmoBase
     // gizmos behave the same way and the canvas's own Ctrl+Z is only reached
     // when this stack has nothing to give.
     //
-    // An entry carries the extent and resolution as well as the values: a
-    // resolution change or a re-fit alters those, and restoring values against
-    // the wrong grid would be meaningless.
+    // An entry carries the extent and BOTH grid counts as well as the values: a
+    // grid change or a re-fit alters those, and restoring values against the
+    // wrong grid would be meaningless. Both counts, not one: a 10 x 2 and a
+    // 2 x 10 hold the same number of values and nothing else would tell them
+    // apart, so restoring one onto the other would transpose the surface.
     struct CurvedSheetState {
         std::vector<double> values;
-        int                 resolution{ 0 };
+        int                 nx{ 0 };
+        int                 ny{ 0 };
         double              half_size_u{ 0.0 };
         double              half_size_v{ 0.0 };
     };

@@ -1248,11 +1248,17 @@ void GLGizmoCut3D::fit_curved_sheet_to_section(bool force)
     // than the cross-section fit was, so a fixed 5 x 5 would spread the handles
     // too thin. Aim for ~10 mm spacing, clamped into 5..MaxResolution. The user's
     // own slider choice wins once they have made one.
+    // Per axis, so a long thin part gets a grid shaped like the part rather than
+    // the long axis' density stretched across the short one. The fit never picks
+    // a ruled (2-count) axis on its own - min_res floors both at 5 - so a 10 x 2
+    // stays something the user asks for.
     if (!m_curved_res_user_set) {
-        const int res = curved_cut_default_resolution(hs_u, hs_v, 10.0, CurvedCutSheet::DefaultResolution);
-        if (res != m_curved_sheet.resolution()) {
-            m_curved_sheet.set_resolution(res);
-            m_curved_resolution = m_curved_sheet.resolution();
+        int gx = 0, gy = 0;
+        curved_cut_default_grid(hs_u, hs_v, gx, gy, 10.0, CurvedCutSheet::DefaultResolution);
+        if (gx != m_curved_sheet.nx() || gy != m_curved_sheet.ny()) {
+            m_curved_sheet.set_grid(gx, gy);
+            m_curved_nx = m_curved_sheet.nx();
+            m_curved_ny = m_curved_sheet.ny();
             m_curved_hover_ctl = m_curved_drag_ctl = -1;
         }
     }
@@ -1368,9 +1374,12 @@ float GLGizmoCut3D::default_curved_bend_radius() const
     // the SMALLER spacing: 1.5 of the larger would already reach past three
     // neighbours along the short axis, which is not "carry your neighbours"
     // any more, it is "bend the whole sheet".
-    const int    n       = std::max(2, m_curved_sheet.resolution());
-    const double sp_u    = 2.0 * m_curved_sheet.half_size_u() / double(n - 1);
-    const double sp_v    = 2.0 * m_curved_sheet.half_size_v() / double(n - 1);
+    // Each axis has its own count now, so each has its own spacing: a 10 x 2
+    // sheet's v spacing is the whole domain, its u spacing a ninth of it.
+    const int    nx      = std::max(2, m_curved_sheet.nx());
+    const int    ny      = std::max(2, m_curved_sheet.ny());
+    const double sp_u    = 2.0 * m_curved_sheet.half_size_u() / double(nx - 1);
+    const double sp_v    = 2.0 * m_curved_sheet.half_size_v() / double(ny - 1);
     return float(std::max(1.0, 1.5 * std::min(sp_u, sp_v)));
 }
 
@@ -1976,10 +1985,13 @@ void GLGizmoCut3D::render_curved_control_points()
     const double      mean_size   = get_grabber_mean_size(m_bounding_box);
     const double      size        = 0.5 * get_half_size(mean_size);
 
-    const int n = m_curved_sheet.resolution();
-    for (int j = 0; j < n; ++ j)
-        for (int i = 0; i < n; ++ i) {
-            const int  id      = j * n + i;
+    // Flat control-point ids are row-major with the ROW STRIDE = nx, so
+    // id = j * nx + i and the decode below is i = id % nx, j = id / nx.
+    const int nx = m_curved_sheet.nx();
+    const int ny = m_curved_sheet.ny();
+    for (int j = 0; j < ny; ++ j)
+        for (int i = 0; i < nx; ++ i) {
+            const int  id      = j * nx + i;
             const bool hovered = (id == m_curved_hover_ctl) || (id == m_curved_drag_ctl) || (id == m_curved_snap_ctl);
             const ColorRGBA color = hovered ? ColorRGBA::ORANGE() :
                                     m_curved_sheet.at(i, j) != 0.0 ? GRABBER_COLOR : ColorRGBA::GRAY();
@@ -2012,9 +2024,9 @@ bool GLGizmoCut3D::curved_snap_apply(int ctl, bool falloff)
     if (ctl < 0 || m_curved_snap_mesh.empty())
         return false;
 
-    const int   n = m_curved_sheet.resolution();
-    const int   i = ctl % n;
-    const int   j = ctl / n;
+    const int   nx = m_curved_sheet.nx();
+    const int   i  = ctl % nx;
+    const int   j  = ctl / nx;
     const Vec2d xy = m_curved_sheet.control_xy(i, j);
 
     // The gesture is ABSOLUTE, like the left drag: measure and apply from the
@@ -2022,7 +2034,7 @@ bool GLGizmoCut3D::curved_snap_apply(int ctl, bool falloff)
     // from the current sheet would find the handle already sitting on the
     // surface after the first event, report a delta of zero, and then apply
     // that zero to the start grid - undoing the snap on the very next motion.
-    const size_t k0  = size_t(j) * size_t(n) + size_t(i);
+    const size_t k0  = size_t(j) * size_t(nx) + size_t(i);
     const double z0  = k0 < m_curved_drag_grid.size() ? m_curved_drag_grid[k0] : m_curved_sheet.at(i, j);
     const Vec3d  pos(xy.x(), xy.y(), z0);
 
@@ -2097,9 +2109,10 @@ int GLGizmoCut3D::curved_pick_control(const Vec2d& mouse_position) const
 
     int    best    = -1;
     double best_d2 = pick_px2;
-    const int n = m_curved_sheet.resolution();
-    for (int j = 0; j < n; ++ j)
-        for (int i = 0; i < n; ++ i) {
+    const int nx = m_curved_sheet.nx();
+    const int ny = m_curved_sheet.ny();
+    for (int j = 0; j < ny; ++ j)
+        for (int i = 0; i < nx; ++ i) {
             // CameraUtils::project gives screen coordinates directly, the same
             // frame the mouse position arrives in.
             const Slic3r::Point p  = CameraUtils::project(camera, curved_control_world(i, j));
@@ -2107,7 +2120,7 @@ int GLGizmoCut3D::curved_pick_control(const Vec2d& mouse_position) const
             const double        d2 = (sp - mouse_position).squaredNorm();
             if (d2 < best_d2) {
                 best_d2 = d2;
-                best    = j * n + i;
+                best    = j * nx + i;
             }
         }
     return best;
@@ -2153,7 +2166,8 @@ GLGizmoCut3D::CurvedSheetState GLGizmoCut3D::curved_sheet_state() const
 {
     CurvedSheetState st;
     st.values      = m_curved_sheet.values();
-    st.resolution  = m_curved_sheet.resolution();
+    st.nx          = m_curved_sheet.nx();
+    st.ny          = m_curved_sheet.ny();
     st.half_size_u = m_curved_sheet.half_size_u();
     st.half_size_v = m_curved_sheet.half_size_v();
     return st;
@@ -2161,20 +2175,25 @@ GLGizmoCut3D::CurvedSheetState GLGizmoCut3D::curved_sheet_state() const
 
 void GLGizmoCut3D::apply_curved_sheet_state(const CurvedSheetState& st)
 {
-    if (st.resolution <= 0 || st.values.size() != size_t(st.resolution) * size_t(st.resolution))
+    if (st.nx <= 0 || st.ny <= 0 || st.values.size() != size_t(st.nx) * size_t(st.ny))
         return;
 
-    // Order matters. reset() is the only way to change the resolution without
-    // re-sampling (set_resolution would re-sample the CURRENT surface onto the
-    // new grid, which is the opposite of restoring one), and the extent has to
-    // be set with resample == false so the stored values land verbatim.
-    if (m_curved_sheet.resolution() != st.resolution)
-        m_curved_sheet.reset(st.resolution);
+    // Order matters. reset() is the only way to change the grid without
+    // re-sampling (set_grid would re-sample the CURRENT surface onto the new
+    // grid, which is the opposite of restoring one), and the extent has to be
+    // set with resample == false so the stored values land verbatim.
+    //
+    // BOTH counts are compared, not just the value count: a 10 x 2 and a 2 x 10
+    // hold twenty values each, so restoring across them would silently transpose
+    // the surface rather than refuse.
+    if (m_curved_sheet.nx() != st.nx || m_curved_sheet.ny() != st.ny)
+        m_curved_sheet.reset(st.nx, st.ny);
     m_curved_sheet.set_half_size(st.half_size_u, st.half_size_v, /*resample*/ false);
     m_curved_sheet.set_values(st.values);
     // set_values() republishes the reference, so a later extent re-fit
     // re-samples the RESTORED surface rather than the one we just left.
-    m_curved_resolution = m_curved_sheet.resolution();
+    m_curved_nx = m_curved_sheet.nx();
+    m_curved_ny = m_curved_sheet.ny();
 
     // The extent we just restored is the one the fit should consider current;
     // otherwise the next re-fit would immediately resample it away.
@@ -2314,9 +2333,9 @@ bool GLGizmoCut3D::curved_on_mouse(const wxMouseEvent& mouse_event)
         if (mouse_event.Dragging()) {
             double delta = 0.0;
             if (curved_drag_delta(mouse_pos, delta)) {
-                const int n = m_curved_sheet.resolution();
-                const int i = m_curved_drag_ctl % n;
-                const int j = m_curved_drag_ctl / n;
+                const int nx = m_curved_sheet.nx();
+                const int i  = m_curved_drag_ctl % nx;
+                const int j  = m_curved_drag_ctl / nx;
                 // Put the dragged point back where the stroke started, then apply
                 // the whole displacement as one falloff-weighted grab: dragging is
                 // absolute, so a drag that comes back to where it began undoes
@@ -2365,8 +2384,8 @@ bool GLGizmoCut3D::curved_on_mouse(const wxMouseEvent& mouse_event)
         m_curved_drag_ctl          = ctl;
         m_curved_hover_ctl         = ctl;
         m_curved_drag_grid         = m_curved_sheet.values();
-        const int n                = m_curved_sheet.resolution();
-        m_curved_drag_anchor_world = curved_control_world(ctl % n, ctl / n);
+        const int nx               = m_curved_sheet.nx();
+        m_curved_drag_anchor_world = curved_control_world(ctl % nx, ctl / nx);
         return true;
     }
 
@@ -2457,30 +2476,93 @@ void GLGizmoCut3D::render_curved_surface_inputs()
     if (!m_curved_surface)
         return;
 
-    // Control grid resolution. Resizing re-samples the current surface onto the
-    // new grid, so the shape survives the change.
-    int res = m_curved_sheet.resolution();
+    // Control grid: nx COLUMNS by ny ROWS. Resizing re-samples the current
+    // surface onto the new grid, so the shape survives the change.
+    //
+    // "Square" locks the two counts together and is ON by default, which makes
+    // this row behave exactly as the old single "Control points" slider did -
+    // nothing changes for anyone who does not go looking for it. Unlock it and
+    // the two counts move apart, which is how a RULED sheet is asked for: 10 x 2
+    // gives ten columns each of which is a single straight line along v, so the
+    // user bends a column by grabbing either of its two ends.
+    int nx = m_curved_sheet.nx();
+    int ny = m_curved_sheet.ny();
     if (m_curved_brush_radius <= 0.f)
         m_curved_brush_radius = default_curved_bend_radius();
-    ImGui::AlignTextToFramePadding();
-    m_imgui->text(_L("Control points") + ": ");
-    ImGui::SameLine(m_label_width);
-    ImGui::PushItemWidth(m_control_width * 0.7f);
-    // ImGui formats ONE value: "%d x %d" read a second, garbage integer. Spell the label out.
-    char res_fmt[32];
-    snprintf(res_fmt, sizeof(res_fmt), "%d x %d", res, res);
-    if (ImGui::SliderInt("##curved_res", &res, CurvedCutSheet::MinResolution, CurvedCutSheet::MaxResolution, res_fmt)) {
+
+    // Applies a new pair of counts: one undo entry, one re-sample, handles
+    // dropped (their flat ids decode against nx and would point elsewhere).
+    auto apply_grid = [this](int gx, int gy) {
         // The user has an opinion now, so the fit stops choosing for them.
         m_curved_res_user_set = true;
-        // A resolution change re-samples the surface, which is lossy - very much
+        // A grid change re-samples the surface, which is lossy - very much
         // something to be able to take back.
         push_curved_undo();
-        m_curved_sheet.set_resolution(res);
-        m_curved_resolution = m_curved_sheet.resolution();
+        m_curved_sheet.set_grid(gx, gy);
+        m_curved_nx = m_curved_sheet.nx();
+        m_curved_ny = m_curved_sheet.ny();
         m_curved_hover_ctl = m_curved_drag_ctl = -1;
         invalidate_curved_sheet();
         m_curved_brush_radius = default_curved_bend_radius();
+    };
+
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Control points") + ": ");
+    ImGui::SameLine(m_label_width);
+    // ImGui formats ONE value from a slider's format string, so a literal
+    // "%d x %d" would read a second, garbage integer off the stack. Pre-format
+    // the whole label with snprintf and hand ImGui a string with no conversion
+    // left in it. (This is the format-string bug from the square panel; it stays
+    // fixed, and now there really are two different numbers to show.)
+    char grid_fmt[32];
+    // MinResolution dropped to 2 so a ruled AXIS is expressible, but a 2 x 2
+    // SQUARE grid is just a tilted plane - nothing the square slider ever
+    // offered, and not a useful place to land by dragging. So the locked slider
+    // keeps the old floor of 3 and only the per-axis ones go down to 2.
+    static const int SquareMinResolution = 3;
+    if (m_curved_square) {
+        ImGui::PushItemWidth(m_control_width * 0.7f);
+        int res = std::max({ nx, ny, SquareMinResolution });
+        snprintf(grid_fmt, sizeof(grid_fmt), "%d x %d", res, res);
+        if (ImGui::SliderInt("##curved_res", &res, SquareMinResolution, CurvedCutSheet::MaxResolution, grid_fmt))
+            apply_grid(res, res);
+        ImGui::PopItemWidth();
     }
+    else {
+        // Two sliders on one row: columns (along u/X) then rows (along v/Y).
+        const float half = m_control_width * 0.34f;
+        ImGui::PushItemWidth(half);
+        snprintf(grid_fmt, sizeof(grid_fmt), "%d cols", nx);
+        const bool nx_changed = ImGui::SliderInt("##curved_nx", &nx, CurvedCutSheet::MinResolution, CurvedCutSheet::MaxResolution, grid_fmt);
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(_u8L("Control points across the sheet (along X). 2 makes every row a single straight line.").c_str(), ImGui::GetFontSize() * 20.f);
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        ImGui::PushItemWidth(half);
+        snprintf(grid_fmt, sizeof(grid_fmt), "%d rows", ny);
+        const bool ny_changed = ImGui::SliderInt("##curved_ny", &ny, CurvedCutSheet::MinResolution, CurvedCutSheet::MaxResolution, grid_fmt);
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(_u8L("Control points down the sheet (along Y). 2 makes every column a single straight line, grabbable from either end - a ruled bend.").c_str(), ImGui::GetFontSize() * 20.f);
+        ImGui::PopItemWidth();
+        if (nx_changed || ny_changed)
+            apply_grid(nx, ny);
+    }
+
+    // Locking back to square takes the LARGER count, so ticking the box never
+    // silently throws away detail the user has already placed.
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(" ");
+    ImGui::SameLine(m_label_width);
+    bool square = m_curved_square;
+    if (m_imgui->bbl_checkbox(_L("Square"), square)) {
+        m_curved_square = square;
+        if (square && m_curved_sheet.nx() != m_curved_sheet.ny()) {
+            const int n = std::max(m_curved_sheet.nx(), m_curved_sheet.ny());
+            apply_grid(n, n);
+        }
+    }
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_u8L("Keep the same number of control points across and down. Turn it off for a ruled sheet, e.g. 10 x 2.").c_str(), ImGui::GetFontSize() * 20.f);
 
     // How far a dragged handle pulls its neighbours along (falloff-weighted), so the sheet bends
     // as one surface instead of spiking at a single control point. Defaults to 1.5 control
@@ -2851,7 +2933,7 @@ void GLGizmoCut3D::on_set_state()
     // The control grid is session state, never persisted (the cut is baked, as a
     // plane cut is), so opening or closing the gizmo starts from a flat surface.
     m_curved_surface = false;
-    m_curved_sheet.reset(m_curved_resolution);
+    m_curved_sheet.reset(m_curved_nx, m_curved_ny);
     // The sheet history is session state too - it describes surfaces that no
     // longer exist once the grid is flattened.
     clear_curved_undo();
@@ -5780,7 +5862,7 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
         // approximation of it.
         const bool cut_curved = !cut_with_groove && !cut_by_contour && curved_surface && !curved_sheet.is_flat();
         if (curved_surface)
-            BOOST_LOG_TRIVIAL(warning) << "Curved cut: perform, resolution=" << curved_sheet.resolution()
+            BOOST_LOG_TRIVIAL(warning) << "Curved cut: perform, grid=" << curved_sheet.nx() << "x" << curved_sheet.ny()
                                        << " half_size=" << curved_sheet.half_size_u() << "x" << curved_sheet.half_size_v()
                                        << " max_displacement=" << curved_sheet.max_displacement()
                                        << " is_flat=" << curved_sheet.is_flat()
