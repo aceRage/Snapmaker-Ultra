@@ -629,13 +629,15 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         if (qualityStalled[id]) return 'low';
         return connHere === 'home' ? 'high' : 'med';
     }
-    // The effective step for one tile, clamped to what the hub actually has: asking for '_med'
-    // when the hub registered nothing would be a 404 and a black tile, so an unavailable step
-    // falls back to the source.
+    // The step this tile is on. Deliberately NOT clamped to hubQuality here: the two delivery
+    // paths can honour a step independently, and clamping centrally would break the common one.
+    // A go2rtc tile needs a registered '<name>_med' variant (ffmpeg) and falls back to the source
+    // name without one - that clamp lives in qualityName(). A Bambu MJPEG tile needs no variant at
+    // all, only ?fps=, so it can honour Medium and Low on a PC with no ffmpeg whatsoever - which
+    // is the stock install. Clamping here returned 'high' for everything in that case and turned
+    // the whole setting off.
     function qualityFor(id) {
-        var q = qualityPref === 'auto' ? autoQuality(id) : qualityPref;
-        if (q === 'high') return 'high';
-        return hubQuality.indexOf(q) !== -1 ? q : 'high';
+        return qualityPref === 'auto' ? autoQuality(id) : qualityPref;
     }
     // The go2rtc stream name for a tile at its chosen step; the source name at 'high' or when the
     // hub has no variant for it.
