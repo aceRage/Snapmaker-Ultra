@@ -138,6 +138,122 @@ revived as briefed.
 
 ---
 
+## Item 2 — Profile validator errors (26 -> 10)
+
+### How it was reproduced
+
+`.github/workflows/check_profiles.yml` does not build a validator: it **downloads a prebuilt
+binary**, `SoftFever/Orca_tools` release `1`, and runs
+`./OrcaSlicer_profile_validator -p resources/profiles -l 2`. So these errors gate real PRs.
+The same binary was fetched and run under WSL Ubuntu against this worktree — no build needed,
+and no approximation of the checks.
+
+**A method note that matters.** In validation mode the loader rethrows on the first bad vendor
+(`PresetBundle.cpp:1472`), so a whole-tree run *aborts early* and the headline count is a
+floor, not a total. Fixing the first class of error made the count go **up** before it came
+down, because the validator finally reached vendors it had never loaded. Anyone re-running this
+should expect that.
+
+Baseline on this branch's parent: **26 errors**, matching the Creality/Anycubic spec's §6.7.
+
+### Cause and fix, by class
+
+**1. Nine `can not find inherits` (18 of the 26 lines) — an empty manifest.**
+
+Every missing parent (`fdm_filament_abs`, `fdm_filament_tpu`, `fdm_filament_common`,
+`Generic ABS @System`, `AliZ PA-CF @base`) exists on disk under
+`resources/profiles/OrcaFilamentLibrary/filament/`. But `OrcaFilamentLibrary.json` ships an
+**empty `filament_list`**, so none of its 274 presets is registered, and every cross-vendor
+`inherits` into the library dangles.
+
+The app does not notice because this fork carries a workaround: when the library's manifest is
+empty, `PresetBundle::load_vendor_configs_from_json` (`PresetBundle.cpp:3211`, added in
+`ac3dafe08a`, 2026-05-26) discovers the files by scanning the directory. Upstream's binary has
+no such fallback. So the profiles were fine at runtime and broken for CI — which is exactly the
+kind of divergence worth closing rather than annotating.
+
+**Fix:** populate `filament_list` with all 274 presets, in the same order the disk scan uses
+(`filament/base` recursively, then the top level, then each vendor subdirectory sorted), and
+then **topologically sort** it so every parent precedes its children. Plain filename order is
+not enough: alphabetically `fdm_filament_abs` comes before its own parent
+`fdm_filament_common`, and the loader resolves `inherits` in list order. This is the same
+ordering contract §6.6 of the Creality/Anycubic spec discovered the hard way.
+
+**2. Seven `printer_variant` mismatches — which turned out to be thirteen.**
+
+The rule: `printer_variant` must *begin with* the preset's own `nozzle_diameter`, optionally
+plus a non-numeric suffix. Six more appeared once the early abort was gone. Three distinct
+causes, all fixed in the metadata, never in the nozzle geometry a user prints with:
+
+| Cause | Presets | Fix |
+|---|---|---|
+| `printer_variant` absent, so it inherits `"0.4"` from the vendor's common base | Creality CR-10 V3 0.6, Ender-3 V3 KE 0.2 / 0.6 / 0.8; Sovol SV07 0.6 / 0.8 / 1.0 | set it explicitly, as every sibling of the same family already does |
+| `nozzle_diameter` is the typo — the name, `printer_variant` and all siblings agree, and only the diameter disagrees | Prusa MK3S 0.25 (`0.2`), RatRig V-Core 4 HYBRID 500 0.5 (`0.4`) and 0.8 (`0.6`) | correct the diameter, not the variant (every other MK3S/HYBRID sibling has nd == pv) |
+| a suffix variant claiming its plain sibling's value | the six Flashforge Guider4 / Guider4 Pro HF presets | give each its own `0.4HF` / `0.6HF` / `0.8HF` |
+
+The Flashforge HF case was the most interesting: `Guider4` and `Guider4 Pro` **declare**
+`0.4HF;0.6HF;0.8HF` in their model `nozzle_diameter` lists, but no preset claimed any of them —
+all six HF presets claimed `0.4` or `0.6` instead, colliding with their plain siblings. So
+three declared variants per model were unreachable and three variants were double-claimed.
+After the fix every declared variant resolves to exactly one preset, verified for both models.
+
+`Flashforge Adventurer 4 Series HS` was handled differently: its suffix-only `"HS"` is
+*self-consistent and reachable today*, because the model declares `HS` too. Changing the preset
+alone would have made it unreachable, so **both files moved together**, `HS` -> `0.4HS`.
+
+One more, found on the way: **`Sovol SV07`'s model still declared only `"0.4"`**, so the
+0.6/0.8/1.0 variants imported the day before were unreachable. §6.3 of the Creality/Anycubic
+spec states this bump was made; it was not. Fixed here.
+
+**3. Two more the validator could never reach, both ours.**
+
+- **`resources/profiles/Snapmaker.json`** named
+  `process/0.10mm Color Mixing @Snapmaker U1 (0.4 nozzle).json` where the file on disk is
+  `(0.4 **N**ozzle).json`. Case-insensitive on Windows, **fatal on Linux and macOS**: the read
+  comes back empty and the entire vendor json fails to parse. A one-character fix, and the
+  whole tree was audited for this class — it is the only one.
+- **The ten `Generic X @Creality K2-all` filaments imported the day before** each declared
+  `renamed_from: "Creality Generic X @K2-all;Creality Generic X K2-all"`. The second clause
+  collides with the old name the pre-existing `Creality Generic X @K2-all` preset *auto-derives*
+  by `@`-stripping (`PresetBundle.cpp:3562`), so two presets claimed one old name. Dropped the
+  redundant clause; the first is the real rename and is uncontested. This was a regression from
+  yesterday's import, not a pre-existing error — the spec's "no regression" claim was wrong on
+  this point.
+
+### What is left, and why
+
+**10 errors remain**, all one kind: `Found duplicated preset: Generic <type> in vendor:
+Snapmaker`. BBL and Snapmaker each ship a filament named literally `Generic PLA`, `Generic ABS`
+and so on — genuinely different presets (different `setting_id`s, different
+`compatible_printers`) that collide only on the display name.
+
+This clash **predates this branch** — those Snapmaker files date to the 2.1.2 merge — and it is
+not caused by populating the library manifest. It was simply never visible, because the
+validator aborted at the dangling inherits long before it reached Snapmaker. Registering the
+library removed the abort, not added the clash. Measured both ways: 54 cross-vendor duplicate
+names exist without the library registered, 130 with it.
+
+Resolving it means renaming user-selectable presets, which changes what users see in their
+filament list and risks their saved selections — a decision that belongs to the owner, not to a
+housekeeping branch. Left alone and recorded here.
+
+### Verification
+
+| What | Result |
+|---|---|
+| CI's own `OrcaSlicer_profile_validator -l 2`, baseline (branch parent) | 26 errors |
+| same, after the fixes | **10 errors**, all the pre-existing Snapmaker/BBL name clash |
+| same, with only the `printer_variant` fixes (library manifest left empty) | 8 errors — isolates the two classes |
+| `orca_extra_profile_check.py` (assets, default) | **0 errors** |
+| `orca_extra_profile_check.py --check-materials --no-check-assets` | **0 errors** |
+| Flashforge Guider4 / Guider4 Pro / Adventurer 4: every declared variant claimed exactly once | no missing, no collisions |
+| Diff shape | surgical — one value per file; the 1126 insertions are almost entirely the 274-entry library manifest |
+
+A caution for anyone repeating this: the validator calls `set_data_dir()` on the profiles
+folder and leaves a `resources/profiles/user/` directory behind. It is untracked scratch —
+delete it, and do not commit it.
+---
+
 ## Item 3 — Material check errors (112 -> 0)
 
 ### Cause
