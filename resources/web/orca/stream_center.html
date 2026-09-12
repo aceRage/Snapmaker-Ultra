@@ -882,9 +882,19 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     // as the relay player reports, so there is nothing to go stale in localStorage.
     var CELL_AR_DEFAULT = 16 / 9;
     var cellAspect = {};     // stream name (rname) -> measured aspect, this page load only
+    var phoneTileW = 0; // the column width render() laid the phone grid out with
     function setCellAspect(cell, ar) {
         if (!REMOTE || !cell || !(ar > 0.2 && ar < 6)) return; // ignore nonsense (a 0x0 frame, say)
         cell.style.setProperty('--cell-ar', ar);
+        // An explicit height as well as the aspect-ratio: Android's WebView (Chromium 130-era)
+        // sizes an auto grid row from the cell's content, not from its aspect-ratio, so the
+        // 4:3 cells were 296px tall in 181px rows and each tile painted over the bottom of the
+        // one above - the picture looked cropped. Measured on the emulator, 2026-09-11.
+        if (phoneTileW > 0 && !cell.classList.contains('expanded')) {
+            var g = document.getElementById('grid');
+            var cap = g.clientHeight > 68 ? g.clientHeight - 8 : Infinity;
+            cell.style.height = Math.max(60, Math.min(Math.floor(phoneTileW / ar), cap)) + 'px';
+        }
     }
     // The guess a tile starts with, before (or instead of) a measurement.
     function guessAspect(h) {
@@ -1307,8 +1317,10 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         document.querySelectorAll('#grid .cell.expanded').forEach(function(c) {
             c.classList.remove('expanded');
             var b = c.querySelector('.expand'); if (b) { b.textContent = '\u2922'; b.title = 'Expand'; }
+            if (c.dataset.tileH) { c.style.height = c.dataset.tileH; delete c.dataset.tileH; } // phone: the tile height set by setCellAspect
         });
         if (on) {
+            if (cell.style.height) { cell.dataset.tileH = cell.style.height; cell.style.height = ''; } // inset:0 must win while expanded
             cell.classList.add('expanded');
             var b2 = cell.querySelector('.expand'); if (b2) { b2.textContent = '\u2715'; b2.title = 'Close'; }
         }
@@ -1408,6 +1420,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             // the label / expand button then sit beside the picture rather than over it. The
             // layout's row count still only decides when the "more below" note shows.
             grid.style.gridAutoRows = 'auto';
+            phoneTileW = (grid.clientWidth - 8 - (lay.cols - 1) * 4) / lay.cols;
             // The landscape cap that the old row height carried: a tile is never taller than the
             // visible grid (a one-column layout turned sideways). Published as a custom property
             // so the cap follows a cell whatever aspect it ends up with.
