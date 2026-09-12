@@ -358,6 +358,163 @@ def check_obsolete_keys(profiles_dir, vendor_name):
 
     return error_count
 
+
+def _build_name_index(vendor_dir, subdir):
+    """
+    Index every json under vendor_dir/subdir by its own "name" field.
+
+    This mirrors PresetCollection::find_preset() in Preset.cpp, which resolves an
+    "inherits" value against the preset *name* wherever it lives in the vendor tree --
+    not against a sibling file called "<inherits>.json". A path-based check produces
+    hundreds of false positives, because a parent often lives in a different directory
+    than the child that inherits it.
+    """
+    index = {}
+    base = vendor_dir / subdir
+    if not base.is_dir():
+        return index
+
+    for file_path in base.rglob("*.json"):
+        try:
+            with open(file_path, "r", encoding="UTF-8") as fp:
+                data = json.load(fp)
+        except Exception:
+            continue
+        name = data.get("name")
+        if name and name not in index:
+            index[name] = data
+
+    return index
+
+
+def check_asset_files(profiles_dir, vendor_name):
+    """
+    Verify that every file a profile *names* actually exists on disk.
+
+    check_name_consistency() only proves a `sub_path` file exists; it says nothing
+    about the bed model/texture, the printer-picker cover image, or the parent preset
+    an "inherits" key points at. Each of those fails silently at runtime -- every load
+    site gates on exists() or swallows the exception -- so a missing one degrades the
+    bed or the printer picker with no log line, and nothing in CI catches it today.
+
+    Checks: bed_model / bed_texture named by each machine json; the
+    "<model>_cover.png" Plater.cpp derives for each machine_model_list entry; and
+    that every "inherits" resolves to a preset of the same type.
+
+    Parameters:
+        profiles_dir (Path): Base profiles directory
+        vendor_name (str): Vendor name
+
+    Returns:
+        int: Number of errors found
+        int: Number of warnings found
+    """
+    error_count = 0
+    warning_count = 0
+    vendor_dir = profiles_dir / vendor_name
+    vendor_file = profiles_dir / (vendor_name + ".json")
+
+    if not vendor_file.exists() or not vendor_dir.is_dir():
+        return 0, 0
+
+    try:
+        with open(vendor_file, "r", encoding="UTF-8") as fp:
+            data = json.load(fp)
+    except Exception as e:
+        print_error(f"Error loading vendor profile {vendor_file}: {e}")
+        return 1, 0
+
+    indexes = {kind: _build_name_index(vendor_dir, kind)
+               for kind in ("machine", "filament", "process")}
+
+    # Filament presets may inherit from the shared OrcaFilamentLibrary, which
+    # PresetBundle loads from disk into the same pool as the vendor's own presets
+    # (PresetBundle.cpp, ORCA_FILAMENT_LIBRARY). Those parents are resolvable at
+    # runtime even though they live outside this vendor's folder, so index them too.
+    if vendor_name != "OrcaFilamentLibrary":
+        shared = _build_name_index(profiles_dir / "OrcaFilamentLibrary", "filament")
+        for name, preset in shared.items():
+            indexes["filament"].setdefault(name, preset)
+
+    def check_inherits(preset, kind, origin):
+        """Walk the inherits chain, reporting a missing parent or a cycle once."""
+        nonlocal error_count
+        seen = {preset.get("name")}
+        parent = preset.get("inherits")
+        while parent:
+            if parent in seen:
+                print_error(f"Inherits cycle: '{parent}' reached again from {origin}")
+                error_count += 1
+                return
+            seen.add(parent)
+            target = indexes[kind].get(parent)
+            if target is None:
+                print_error(f"Missing {kind} parent: '{parent}' inherited by {origin}")
+                error_count += 1
+                return
+            parent = target.get("inherits")
+
+    def load_sub(sub_path):
+        """Load a sub profile, or None if check_name_consistency already reported it."""
+        sub_file = vendor_dir / sub_path
+        if not sub_file.exists():
+            return None, None
+        try:
+            with open(sub_file, "r", encoding="UTF-8") as fp:
+                return json.load(fp), sub_file
+        except Exception:
+            return None, None
+
+    # Machine presets: bed_model / bed_texture files, plus the inherits chain.
+    for section in ("machine_model_list", "machine_list"):
+        for child in data.get(section, []):
+            sub_path = child.get("sub_path")
+            if not sub_path:
+                continue
+            preset, sub_file = load_sub(sub_path)
+            if preset is None:
+                continue
+
+            origin = sub_file.relative_to(profiles_dir)
+            check_inherits(preset, "machine", origin)
+
+            for key in ("bed_model", "bed_texture"):
+                value = preset.get(key, "")
+                if isinstance(value, list):
+                    value = value[0] if value else ""
+                if not value:
+                    continue
+                if not (vendor_dir / value).is_file():
+                    print_error(f"Missing {key}: '{value}' referenced in {origin}")
+                    error_count += 1
+
+    # The cover image Plater.cpp derives from the model name at runtime.
+    for child in data.get("machine_model_list", []):
+        model_name = child.get("name")
+        if not model_name:
+            continue
+        if not (vendor_dir / f"{model_name}_cover.png").is_file():
+            print_error(f"Missing cover image: '{model_name}_cover.png' for machine model "
+                        f"'{model_name}' in {vendor_file.relative_to(profiles_dir)}")
+            error_count += 1
+        # ConfigWizard.cpp's legacy tile; a miss only downgrades to a placeholder icon.
+        if not (vendor_dir / f"{model_name}_thumbnail.png").is_file():
+            warning_count += 1
+
+    # Filament / process presets: the inherits chain.
+    for section, kind in (("filament_list", "filament"), ("process_list", "process")):
+        for child in data.get(section, []):
+            sub_path = child.get("sub_path")
+            if not sub_path:
+                continue
+            preset, sub_file = load_sub(sub_path)
+            if preset is None:
+                continue
+            check_inherits(preset, kind, sub_file.relative_to(profiles_dir))
+
+    return error_count, warning_count
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Check 3D printer profiles for common issues",
@@ -367,6 +524,10 @@ def main():
     parser.add_argument("--check-filaments", action="store_true", help="Check 'compatible_printers' in filament profiles")
     parser.add_argument("--check-materials", action="store_true", help="Check default materials in machine profiles")
     parser.add_argument("--check-obsolete-keys", action="store_true", help="Warn if obsolete keys are found in filament profiles")
+    parser.add_argument("--check-assets", dest="check_assets", action="store_true", default=True,
+                        help="Check that bed models/textures, cover images and 'inherits' parents all resolve")
+    parser.add_argument("--no-check-assets", dest="check_assets", action="store_false",
+                        help="Skip the asset/inherits existence check")
     args = parser.parse_args()
 
     print_info("Checking profiles ...")
@@ -391,6 +552,11 @@ def main():
 
         if args.check_obsolete_keys:
             warnings_found += check_obsolete_keys(profiles_dir, vendor_name)
+
+        if args.check_assets:
+            new_errors, new_warnings = check_asset_files(profiles_dir, vendor_name)
+            errors_found += new_errors
+            warnings_found += new_warnings
 
         new_errors, new_warnings = check_name_consistency(profiles_dir, vendor_name)
         errors_found += new_errors
