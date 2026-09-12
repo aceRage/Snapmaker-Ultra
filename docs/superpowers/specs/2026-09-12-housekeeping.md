@@ -138,7 +138,13 @@ revived as briefed.
 
 ---
 
-## Item 2 — Profile validator errors (26 -> 10)
+## Item 2 — Profile validator errors (26 -> 10 -> 0)
+
+> **Status update, 2026-09-12 — done.** The 10 remaining errors are resolved on
+> `fix/snapmaker-preset-names`; the tree now validates at **0 errors** and the CI gate is
+> green. The owner took the decision this section left to them. The shape differs from the
+> one sketched in "What is left, and why" below on one important point — the alias — see
+> **Resolution** at the end of this item.
 
 ### How it was reproduced
 
@@ -275,6 +281,126 @@ done, this one CI gate stays red.
 A caution for anyone repeating this: the validator calls `set_data_dir()` on the profiles
 folder and leaves a `resources/profiles/user/` directory behind. It is untracked scratch —
 delete it, and do not commit it.
+
+### Resolution: the ten name clashes (2026-09-12)
+
+Branch `fix/snapmaker-preset-names`. The owner's call was to rename the Snapmaker presets and
+keep an alias so existing projects still resolve.
+
+**The rename needed no new convention — the vendor already had one, and these ten were simply
+the presets that never got it.** Every other U1 0.4-nozzle filament in
+`resources/profiles/Snapmaker/filament/` is already suffixed: `Generic ASA @U1 0.4 nozzle`,
+`Snapmaker ABS @U1 0.4 nozzle`, `Snapmaker ASA @U1 0.4 nozzle`. All ten clashing presets carry
+`compatible_printers: ["Snapmaker U1 (0.4 nozzle)"]`, exactly like those siblings. So the
+rename is `Generic X` -> `Generic X @U1 0.4 nozzle`, which is what the files should have been
+called all along — and `Generic ASA @U1 0.4 nozzle` is the standing proof the pattern does not
+clash.
+
+| Old name | New name |
+|---|---|
+| `Generic ABS` | `Generic ABS @U1 0.4 nozzle` |
+| `Generic PA` | `Generic PA @U1 0.4 nozzle` |
+| `Generic PA-CF` | `Generic PA-CF @U1 0.4 nozzle` |
+| `Generic PC` | `Generic PC @U1 0.4 nozzle` |
+| `Generic PETG` | `Generic PETG @U1 0.4 nozzle` |
+| `Generic PLA` | `Generic PLA @U1 0.4 nozzle` |
+| `Generic PLA Silk` | `Generic PLA Silk @U1 0.4 nozzle` |
+| `Generic PLA-CF` | `Generic PLA-CF @U1 0.4 nozzle` |
+| `Generic PVA` | `Generic PVA @U1 0.4 nozzle` |
+| `Generic TPU` | `Generic TPU @U1 0.4 nozzle` |
+
+File renamed, `name` field updated, `Snapmaker.json` `filament_list` entry updated (name and
+`sub_path`) for each. Nothing inherits from any of the ten, no machine's `default_materials` /
+`default_filament_profile` names them (the U1 machines use `Snapmaker PLA`-style names), and
+`filament_hot_bed_nozzles.json` is keyed by material *type*, not preset name. The bare names
+that remain in the tree — `BBL.json`, `resources/web/guide/*/test.js` — are BBL's own and are
+correctly left alone.
+
+#### The alias: no `renamed_from` is added, and that is the point
+
+"What is left, and why" above already warned against `renamed_from: "Generic X"`, and was
+right. It is worth stating *why* precisely, because the reason also shows why no explicit
+`renamed_from` is needed at all.
+
+Every lookup in the preset system tries the live-name map first and the rename map only as a
+fallback — `find_preset_internal(name)` then `find_preset_renamed(name)`, the same order in
+`load_external_preset` (`Preset.cpp:2138-2144`), `validate_preset` (`Preset.cpp:2053-2056`) and
+`find_preset2` (`Preset.cpp:2813`). BBL's `Generic PLA` is still live. So a
+`renamed_from: "Generic PLA"` could never fire — and worse, `update_map_system_profile_renamed`
+(`Preset.cpp:3309`) would log an error the moment any other preset claimed the same old name.
+That is exactly the trap the Creality import fell into.
+
+**The alias that does the work is derived automatically.** `PresetBundle.cpp:3560-3570` splits
+a preset name on `@` and, when no explicit alias is given, uses the left-hand part:
+
+```cpp
+size_t end_pos = preset_name.find_first_of("@");
+if (end_pos != std::string::npos) {
+    alias_name = preset_name.substr(0, end_pos);
+    if (renamed_from.empty())
+        renamed_from.emplace_back(alias_name + preset_name.substr(end_pos + 1));
+    boost::trim_right(alias_name);
+}
+```
+
+So `Generic PLA @U1 0.4 nozzle` gets `alias = "Generic PLA"`, and `Preset::label()`
+(`Preset.cpp:655`) returns the alias — **the filament list still reads "Generic PLA"**. The
+rename is invisible in the UI, which is the property that protects users' saved selections.
+The auto-derived `renamed_from` is the junk string `"Generic PLA U1 0.4 nozzle"`; it is inert
+(nothing else claims it, checked across every rename claim in the tree) and is deliberately
+left alone rather than overridden, because supplying an explicit `renamed_from` would suppress
+this derivation — the `if (renamed_from.empty())` guard — and the derivation is what we want.
+
+#### How an old project resolves
+
+An old U1 project stores `filament_settings_id = "Generic PLA"`. On load,
+`PresetBundle::load_config_model` -> `load_config_file_config` (`PresetBundle.cpp:2953`) hands
+that string to `PresetCollection::load_external_preset` as `original_name`, which finds it as a
+live system preset — **BBL's `Generic PLA`** — and selects it, applying the project's own saved
+values on top. No "preset not found" prompt: the "Customized Preset" dialog
+(`Plater.cpp:12290`) fires only when `validate_preset` resolves neither the name nor its
+`inherits`, and the name resolves.
+
+Be precise about what this does and does not give you. The project does not re-bind to the
+Snapmaker preset; it binds to BBL's same-named one, carrying its own stored settings, so the
+print comes out as the project specified. That is not a new behaviour introduced here — it is
+what already happened whenever BBL's copy sorted first, which is exactly the load-order
+dependence this clash caused (`find_preset_internal` does a `lower_bound` over a sorted deque
+and returns the first of two equal names). **The rename removes the ambiguity rather than
+preserving it**: before, which preset a bare `Generic PLA` reached depended on the filesystem;
+now `Generic PLA` unambiguously means BBL's and `Generic PLA @U1 0.4 nozzle` unambiguously
+means Snapmaker's, while the U1 user still sees "Generic PLA" in the picker because of the
+alias.
+
+#### Verification
+
+| What | Result |
+|---|---|
+| CI's own `OrcaSlicer_profile_validator -p resources/profiles -l 2` (same binary, WSL) | **0 errors** (was 10) |
+| `orca_extra_profile_check.py` (assets, default) | **0 errors**, 352 warnings — unchanged |
+| `orca_extra_profile_check.py --check-materials --no-check-assets` | **0 errors**, 0 warnings |
+| `scripts/check_preset_name_clashes.py` (new) | **0 errors** — no duplicate names, no ambiguous rename claims |
+| Negative test: rename one preset back to `Generic PLA` | correctly reported as duplicated across BBL/Snapmaker; restored |
+| `Snapmaker.json` parses; every `filament_list` `sub_path` exists | 328 entries, 0 missing |
+
+`ctest -R profile` was **not** run: there is no build tree in this worktree and the brief said
+not to build one. The new check is registered as the `profile_names` test in
+`tests/CMakeLists.txt` (label `profile`), alongside `profile_assets` and `profile_materials`,
+and was run directly as the script it wraps.
+
+#### Owner's click-test
+
+1. Select printer **Snapmaker U1 (0.4 nozzle)**. Open the filament dropdown. It reads
+   **"Generic PLA"**, exactly as before — not "Generic PLA @U1 0.4 nozzle". Same for the other
+   nine. This is the alias doing its job; if a suffix is visible, the alias derivation broke.
+2. Open a **project saved before this change** that used the U1 with Generic PLA. It loads with
+   no "Customized Preset" prompt and no missing-preset warning, the filament still shows
+   "Generic PLA", and the print settings are the ones saved in the project.
+3. Slice it and compare against a slice from before the branch — the G-code should be
+   unchanged, since no slicing value was touched, only names.
+4. Switch to a **Bambu** printer and confirm its own "Generic PLA" is still there and still
+   selects normally; the two no longer compete for the same name.
+
 ---
 
 ## Item 3 — Material check errors (112 -> 0)
