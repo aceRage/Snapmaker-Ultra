@@ -1,6 +1,7 @@
 {
     "type": "machine",
     "name": "Creality CR-10 V3 0.6 nozzle",
+    "printer_variant": "0.6",
     "inherits": "fdm_creality_common",
     "from": "system",
     "setting_id": "GM001",
