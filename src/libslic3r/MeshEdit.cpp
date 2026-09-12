@@ -1367,6 +1367,13 @@ BevelResult bevel_edges(const indexed_triangle_set &its,
     its_compactify_vertices(out);
 
     if (out.indices.empty() || !is_closed_manifold(out)) {
+        // Define MESHEDIT_BEVEL_DIAG (at the top of this file, or on the compiler
+        // command line) to have a failure print WHY: how many edges came out open,
+        // how many non-manifold, and where the offending ones are. Kept rather than
+        // deleted because it is what finally located the tear that the construction
+        // still has - see the spec's "why it is not finished" - and whoever
+        // finishes the re-cut will want it on the first run, not after
+        // reinventing it.
 #ifdef MESHEDIT_BEVEL_DIAG
         {
             std::map<std::pair<int, int>, int> cnt;
