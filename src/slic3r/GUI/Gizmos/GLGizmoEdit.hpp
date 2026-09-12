@@ -125,6 +125,24 @@ private:
     void  commit_to_volume();
     void  refresh_render_volume();
 
+    // --- bevel / chamfer (phase 2) ---
+    // The params the panel's Width / Segments / Profile controls describe.
+    MeshEdit::BevelParams bevel_params() const;
+    // Recompute the live preview from the CURRENT selection and params and show
+    // it. The brief asks for a strip preview if feasible and the result mesh
+    // otherwise; the result mesh is what this does, because the bevel is linear
+    // in the SELECTED edges (not in the mesh) and so is fast enough to re-run on
+    // a slider tick, and because showing the actual result cannot disagree with
+    // what Apply will produce.
+    void  update_bevel_preview();
+    void  clear_bevel_preview();
+    // Apply the bevel for real: session undo entry, commit, rebuild.
+    void  apply_bevel();
+    // The bevel RENUMBERS every facet, so unlike a push it cannot go through
+    // Sculpt::commit_sculpted_mesh() - it takes the clear_before_change_mesh()
+    // path Subdivide and Simplify take, and the painted data is dropped.
+    void  commit_bevelled_mesh(indexed_triangle_set &&its);
+
     // --- rendering ---
     // init_plane_data-style highlight of a facet list, the way
     // GLGizmoMeasure::init_plane_glmodel builds its plane overlay.
@@ -199,6 +217,36 @@ private:
     // of silently doing nothing.
     MeshEdit::TranslateStatus m_last_status{MeshEdit::TranslateStatus::Ok};
     bool  m_show_last_status{false};
+
+    // --- bevel / chamfer state (phase 2) ---
+    float m_bevel_width{1.f};
+    int   m_bevel_segments{1};
+    // 0 = chamfer, 1 = round. An int because that is what the radio buttons want.
+    int   m_bevel_profile{0};
+    static constexpr float BevelWidthMin = 0.01f;
+    static constexpr float BevelWidthMax = 50.f;
+
+    // The live preview. `m_bevel_preview_mesh` is the bevelled mesh the render
+    // volume is currently showing; empty when no preview is up. The key is what
+    // the preview was built from, so a redraw that changes nothing rebuilds
+    // nothing.
+    indexed_triangle_set m_bevel_preview_mesh;
+    bool                 m_bevel_preview_valid{false};
+    float                m_bevel_preview_width{-1.f};
+    int                  m_bevel_preview_segments{-1};
+    int                  m_bevel_preview_profile{-1};
+    int                  m_bevel_preview_seed{-1};
+
+    // What the last solve/preview decided, so the panel can show the clamped
+    // width and the corner count before the user commits.
+    MeshEdit::BevelStatus m_bevel_status{MeshEdit::BevelStatus::EmptyChain};
+    float                 m_bevel_applied_width{0.f};
+    bool                  m_bevel_clamped{false};
+    size_t                m_bevel_corner_patches{0};
+    // Edges the solve dropped for being concave, so the panel can point at "Round
+    // all edges" rather than reporting a bare "too flat".
+    size_t                m_bevel_dropped_concave{0};
+    bool                  m_show_bevel_status{false};
 
     // --- render models ---
     // Cached highlight geometry. The key is what the model was built from - the
