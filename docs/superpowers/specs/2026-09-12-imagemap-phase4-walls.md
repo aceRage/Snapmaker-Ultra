@@ -280,6 +280,37 @@ The 3 expected failures are the only three `[!mayfail]`-tagged cases in the tree
 "A second nozzle adds the ramming of one nozzle change per layer"); both are pre-existing and
 unrelated. Neither new test file uses that tag.
 
+### Measured cost on the test cube
+
+A 30 mm cube, `bands3.png` (three vertical R/G/B bands) box-projected, three filaments, row bound
+to `wall_filament`; sliced twice from the same fixture with the row bound and unbound (the
+`[.measure]` case in `test_image_row_walls.cpp`, not run by default).
+
+| | row OFF | row ON |
+| --- | --- | --- |
+| Layers | 150 | 150 |
+| `T<n>` commands in the file | 1 | 301 |
+| Tool changes per layer, max | 0 | **2** |
+| Tool changes per layer, mean | 0 | **2.00** |
+| Distinct tools on a layer, max | 1 | 2 |
+| Filament used (mm) | 3746.75 / 0 / 0 | 2932.79 / 400.36 / 414.01 |
+| Estimated print time | **1h 22m 40s** | **1h 50m 41s** |
+
+**Print-time delta: +28m 01s, i.e. +33.9%** - which is the cost of 300 tool changes on a print
+that previously needed none, not the cost of the extra geometry (the split reproduces the same
+path; only the filament changes part-way round).
+
+**The tool-change bound holds exactly**: every one of the 150 layers has precisely 2 changes,
+against a bound of `2*(filaments-1) = 4`. This is the economics rule working as designed - the
+cube's wall is cut into many colour runs per layer, but the per-layer per-extruder grouping
+visits each needed filament once, so tool changes track *filament count*, not run count.
+
+One detail worth recording because it looks wrong at first glance: **only 2 distinct tools appear
+on any single layer, yet all three filaments are used across the print.** That is the Box
+projection behaving correctly - `bands3.png` varies with `u` and is constant in `v`, so every
+layer's wall crosses the same set of bands, and which two dominate depends on where the loop
+runs. A projection that varied along the build axis would put all three on each layer.
+
 ### Two bugs the tests caught, both in this phase's own code
 
 1. **`no_sort` stopped perimeters reaching the nozzle.** The per-run collections were created

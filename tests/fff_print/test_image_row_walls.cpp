@@ -499,3 +499,31 @@ TEST_CASE("Image Row walls: two runs of the same project produce identical G-cod
     };
     CHECK(stripped_lines(a, sa) == stripped_lines(b, sb));
 }
+
+// ================================================================================================
+// TEMPORARY measurement harness (tag [.measure], not run by default) - writes the two G-code
+// files the phase 4 spec's cost table is computed from: the same cube with the image row bound to
+// its walls, and without it.
+// ================================================================================================
+TEST_CASE("Image Row walls: write the measurement pair", "[.measure]")
+{
+    auto run = [](bool with_row, const std::string &out) {
+        Model                 model;
+        ModelVolume          *volume = make_cube_part(model, 30.);
+        DynamicPrintConfig    config = wall_test_config();
+        MixedFilamentManager  mgr;
+        if (with_row) {
+            const ImageFillParams p = box_params(model, "bands3.png");
+            bind_image_row_to_walls(mgr, *volume, p);
+            config.set_key_value("mixed_filament_definitions", new ConfigOptionString(mgr.serialize_custom_entries()));
+        }
+        std::string text;
+        GCodeProcessorResult result;
+        slice_to_result(model, config, result, &text);
+        boost::nowide::ofstream f(out);
+        f << text;
+    };
+    run(true,  "C:/Dev/wt_imgp4/scratch/walls_on.gcode");
+    run(false, "C:/Dev/wt_imgp4/scratch/walls_off.gcode");
+    SUCCEED("measurement pair written");
+}
