@@ -42,6 +42,15 @@ select { background: #3a3a3a; color: #fff; border: 1px solid #555; border-radius
 #grid::-webkit-scrollbar-thumb:hover { background: #777; }
 .cell { position: relative; background: #000; border-radius: 4px; overflow: hidden; }
 .cell iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+/* Phone only (body.remote, set next to the other REMOTE-mode setup): each tile takes the shape of
+   its own camera instead of one row height for all of them, so a 4:3 stream (the Snapmaker U1's)
+   is not letterboxed inside a 16:9 box - which is also what pushed the name label and the expand
+   button out beside the picture rather than over it. --cell-ar is set per cell by render() and by
+   the player's snorcaAspect message; --cell-max is the landscape cap (a tile is never taller than
+   the visible grid). The PC keeps grid-auto-rows and never sees either of these rules. */
+body.remote .cell { aspect-ratio: var(--cell-ar, 16 / 9); max-height: var(--cell-max, none); }
+/* An expanded tile fills the screen: neither the aspect nor the cap applies to it. */
+body.remote .cell.expanded { aspect-ratio: auto; max-height: none; }
 .cell .label { -webkit-touch-callout: none; }
 @media (min-width: 641px) and (max-width: 1100px) and (pointer: coarse) { /* tablets */
     .chip { font-size: 14px; padding: 8px 12px; }
@@ -386,6 +395,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     var REMOTE_KEY = 'snorca_remote_v1';
     if (REMOTE) {
         try { document.cookie = 'rt=' + REMOTE.split('/')[2] + '; path=/; SameSite=Lax'; } catch (e) {}
+        // The phone's per-tile aspect rules hang off this class (see .cell in the stylesheet), so
+        // the PC's layout stays byte-identical.
+        document.body.classList.add('remote');
         document.getElementById('addchip').style.display = 'none';
         document.getElementById('phonechip').style.display = 'none';
     }
@@ -858,10 +870,53 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         cell.appendChild(sel);
     }
 
+    // ---- per-tile aspect (phone only) ----------------------------------------------------
+    // A tile is shaped like the picture inside it, so nothing is letterboxed and the label and the
+    // expand button overlay the video. Two sources, best first:
+    //   * the relay player (our own /stream.html, same origin) posts the decoded videoWidth /
+    //     videoHeight once it has metadata - see player.html - and that is exact;
+    //   * a printer's own page is a cross-origin iframe we can learn nothing from, so it gets a
+    //     per-kind guess: a Snapmaker U1's camera page (/webcam/...) is 4:3, everything else -
+    //     Bambu and the general case - 16:9.
+    // Nothing is persisted: a wrong guess costs one render and the real value replaces it as soon
+    // as the relay player reports, so there is nothing to go stale in localStorage.
+    var CELL_AR_DEFAULT = 16 / 9;
+    var cellAspect = {};     // stream name (rname) -> measured aspect, this page load only
+    function setCellAspect(cell, ar) {
+        if (!REMOTE || !cell || !(ar > 0.2 && ar < 6)) return; // ignore nonsense (a 0x0 frame, say)
+        cell.style.setProperty('--cell-ar', ar);
+    }
+    // The guess a tile starts with, before (or instead of) a measurement.
+    function guessAspect(h) {
+        if (h && h.rname && cellAspect[h.rname]) return cellAspect[h.rname];
+        // A U1 serves its camera at http://<printer>/webcam/webrtc; its sensor is 4:3.
+        if (h && h.rkind === 'url' && h.rurl && h.rurl.indexOf('/webcam/') !== -1) return 4 / 3;
+        return CELL_AR_DEFAULT;
+    }
+    // Our own player, same origin, telling us what it actually decoded.
+    window.addEventListener('message', function(e) {
+        if (e.origin !== location.origin) return;
+        var d = e.data;
+        if (!d || typeof d !== 'object' || typeof d.snorcaAspect !== 'number') return;
+        var ar = d.snorcaAspect;
+        if (!(ar > 0.2 && ar < 6)) return;
+        if (d.src) cellAspect[d.src] = ar;
+        // Find the cell whose iframe sent this - e.source is the frame's window.
+        document.querySelectorAll('#grid .cell').forEach(function(cell) {
+            var f = cell.querySelector('iframe');
+            if (f && f.contentWindow === e.source) setCellAspect(cell, ar);
+        });
+    });
+
     // Phone mode cells: everything comes through the slicer's token-gated listener.
     function remoteCell(h, cell) {
         var msg = null;
+        setCellAspect(cell, guessAspect(h));
         if (h.rkind === 'go2rtc' || (h.rkind === 'url' && h.relay && h.rname && relayPreferred())) {
+            // Trade-off left as it is on purpose: on the LAN a U1 tile embeds the printer's own
+            // page (no hub CPU, but a cross-origin frame with its own controls), while the relay
+            // would give us our player and consistent controls at the cost of a go2rtc pipeline
+            // per camera on the PC. relayPreferred() keeps the printer page for private origins.
             var f = document.createElement('iframe');
             f.allow = 'autoplay';
             f.setAttribute('scrolling', 'no'); // iOS otherwise grows the frame to its content
@@ -871,6 +926,11 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         } else if (h.rkind === 'p1') {
             var im = document.createElement('img');
             im.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
+            // Same document, so the frame's own size is readable - no guess needed. (A Bambu's is
+            // 16:9, which is the default anyway; this just makes it exact and survives a change.)
+            im.addEventListener('load', function() {
+                if (im.naturalWidth && im.naturalHeight) setCellAspect(cell, im.naturalWidth / im.naturalHeight);
+            });
             im.src = REMOTE + 'bambu?id=' + encodeURIComponent(h.id);
             cell.appendChild(im);
         } else if (h.rkind === 'url' && h.rurl) {
@@ -1341,19 +1401,21 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         grid.style.gridTemplateColumns = 'repeat(' + lay.cols + ', 1fr)';
         // The layout sets the columns and how many rows fit on screen; every selected
         // stream is rendered and extra rows scroll.
-        var rowH;
         if (REMOTE) {
-            // Phone: tiles keep a 16:9 shape at the column width and scroll, instead of being
-            // stretched to fill the rows on screen (which letterboxes the stream). The layout's
-            // row count only decides when the "more below" note shows.
-            var tileW = (grid.clientWidth - 8 - (lay.cols - 1) * 4) / lay.cols;
-            rowH = Math.max(60, Math.floor(tileW * 9 / 16));
-            // ... but never taller than the screen (a one-column layout in landscape).
-            if (grid.clientHeight > 68) rowH = Math.min(rowH, grid.clientHeight - 8);
+            // Phone: each tile takes its own camera's shape (CSS aspect-ratio on the cell, see
+            // body.remote .cell) and the rows size themselves, instead of one 16:9 row height for
+            // every tile - a 4:3 U1 stream in a 16:9 box is letterboxed with wide black bars, and
+            // the label / expand button then sit beside the picture rather than over it. The
+            // layout's row count still only decides when the "more below" note shows.
+            grid.style.gridAutoRows = 'auto';
+            // The landscape cap that the old row height carried: a tile is never taller than the
+            // visible grid (a one-column layout turned sideways). Published as a custom property
+            // so the cap follows a cell whatever aspect it ends up with.
+            grid.style.setProperty('--cell-max', grid.clientHeight > 68 ? (grid.clientHeight - 8) + 'px' : 'none');
         } else {
-            rowH = Math.max(60, Math.floor((grid.clientHeight - 8 - (lay.rows - 1) * 4) / lay.rows));
+            var rowH = Math.max(60, Math.floor((grid.clientHeight - 8 - (lay.rows - 1) * 4) / lay.rows));
+            if (grid.clientWidth > 0) grid.style.gridAutoRows = rowH + 'px'; // hidden (another view): keep the last size
         }
-        if (grid.clientWidth > 0) grid.style.gridAutoRows = rowH + 'px'; // hidden (another view): keep the last size
         var count = Math.ceil(Math.max(state.active.length, lay.n) / lay.cols) * lay.cols;
 
         var shown = state.active;

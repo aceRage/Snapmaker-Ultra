@@ -25,6 +25,54 @@ html, body { height: 100%; width: 100%; margin: 0; padding: 0; background: #000;
     video.style.flex = '1 0 ' + (params.get('width') || '320px');
     video.src = new URL('api/ws?src=' + encodeURIComponent(params.get('src') || '') + (lt ? '&lt=' + encodeURIComponent(lt) : ''), location.href);
     document.body.appendChild(video);
+
+    // Tell the embedding page (stream_center.html) the stream's real aspect ratio, so it can give
+    // this tile a matching shape instead of assuming 16:9 and letterboxing a 4:3 camera (the
+    // Snapmaker U1's is 4:3). We are same-origin with the parent - the hub serves both pages - so
+    // the message is posted to location.origin and the parent checks e.origin the same way.
+    // <video-stream> builds its one <video> in oninit() (from connectedCallback), and every mode it
+    // can settle on - mse / webrtc / mp4 / mjpeg - paints into that same element, so watching it
+    // covers all of them. This module runs after ./video-stream.js (both are modules, in document
+    // order), so the element is already defined and the append above has upgraded it; the poll is
+    // only a belt-and-braces for a browser that upgrades late.
+    const bind = () => {
+        const inner = video.video || video.querySelector('video');
+        if (!inner) return false;
+        let last = 0;
+        const post = (w, h) => {
+            if (!w || !h) return;
+            const ar = w / h;
+            if (Math.abs(ar - last) < 0.001) return; // the same number, over and over, on 'resize'
+            last = ar;
+            try {
+                parent.postMessage({ snorcaAspect: ar, src: params.get('src') || '' }, location.origin);
+            } catch (e) {}
+        };
+        const report = () => post(inner.videoWidth, inner.videoHeight);
+        // 'resize' fires whenever the decoded frame size changes (a camera switching profile, or
+        // the first frame after a reconnect); 'loadedmetadata' is the first report of the two.
+        inner.addEventListener('loadedmetadata', report);
+        inner.addEventListener('resize', report);
+        report(); // metadata may already be in (a warm element)
+        // mjpeg is the one mode that paints into video.poster instead of decoding into the element,
+        // so videoWidth stays 0 there and neither event above ever fires. The poster is replaced
+        // frame by frame and its intrinsic size is the frame size, so look at it a few times after
+        // the stream starts and stop as soon as one reports (or the modes that do decode do).
+        let posterTries = 0;
+        const pt = setInterval(() => {
+            if (last || ++posterTries > 20) { clearInterval(pt); return; }
+            if (inner.videoWidth) { report(); return; }
+            if (!inner.poster) return;
+            const probe = new Image();
+            probe.onload = () => post(probe.naturalWidth, probe.naturalHeight);
+            probe.src = inner.poster;
+        }, 500);
+        return true;
+    };
+    if (!bind()) {
+        let tries = 0;
+        const t = setInterval(() => { if (bind() || ++tries > 40) clearInterval(t); }, 250);
+    }
 </script>
 </body>
 </html>
