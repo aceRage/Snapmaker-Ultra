@@ -922,11 +922,13 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     function remoteCell(h, cell) {
         var msg = null;
         setCellAspect(cell, guessAspect(h));
-        if (h.rkind === 'go2rtc' || (h.rkind === 'url' && h.relay && h.rname && relayPreferred())) {
-            // Trade-off left as it is on purpose: on the LAN a U1 tile embeds the printer's own
-            // page (no hub CPU, but a cross-origin frame with its own controls), while the relay
-            // would give us our player and consistent controls at the cost of a go2rtc pipeline
-            // per camera on the PC. relayPreferred() keeps the printer page for private origins.
+        if (h.rkind === 'go2rtc' || (h.rkind === 'url' && h.relay && h.rname)) {
+            // The relay whenever the hub has one, on the LAN too (2026-09-12). The U1's own
+            // /webcam/webrtc page serves a 640x480 crop of its camera, while the raw H.264 the
+            // relay carries is the full 1920x1080 frame the PC shows - so the phone page looked
+            // "zoomed in" next to the desktop. And the printer accepts one camera consumer at a
+            // time: with every viewer on go2rtc it sees exactly one, and a second phone or the
+            // desktop no longer knocks the first off to a black tile.
             var f = document.createElement('iframe');
             f.allow = 'autoplay';
             f.setAttribute('scrolling', 'no'); // iOS otherwise grows the frame to its content
