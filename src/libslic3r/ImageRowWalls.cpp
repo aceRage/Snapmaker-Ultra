@@ -469,10 +469,22 @@ std::vector<std::unique_ptr<ExtrusionEntityCollection>> image_row_split_wall_ent
             continue;
 
         auto coll = std::make_unique<ExtrusionEntityCollection>();
-        // no_sort: the runs describe ONE continuous path around the wall and must print in the
-        // order they were cut. Letting the collection reorder them would scatter the nozzle
-        // around the loop and destroy both the seam and the continuity.
-        coll->no_sort                   = true;
+        // no_sort MUST stay false here, and the reason is not an optimisation - it is what makes
+        // the run reach the nozzle at all. ObjectByExtruder::Island::Region::append() (GCode.cpp)
+        // splats a sortable collection's children into the flat `perimeters` list, but pushes a
+        // NON-sortable collection in WHOLE. GCode::extrude_perimeters() then hands each element
+        // of that list to extrude_entity(), which accepts only ExtrusionPath / ExtrusionMultiPath
+        // / ExtrusionLoop and throws InvalidArgument on a collection. Unlike fills - whose
+        // emission path does descend into nested collections - perimeters have no such handling,
+        // which is why phase 3's fill runs could set no_sort and these cannot.
+        //
+        // Nothing is lost by it: each run collection holds EXACTLY ONE entity (one ExtrusionPath
+        // or one ExtrusionMultiPath covering that run's whole span), and a single entity has no
+        // order to preserve. The ordering that does matter - runs printing in the sequence they
+        // were cut - is not this flag's job anyway: it comes from the per-layer, per-extruder
+        // grouping in GCode.cpp's emission loop, the same mechanism that bounds tool changes by
+        // filament count rather than run count.
+        coll->no_sort                   = false;
         coll->image_row_extruder_1based = unsigned(runs[r].filament_id);
         if (run_paths.size() == 1)
             coll->entities.push_back(new ExtrusionPath(run_paths.front()));
