@@ -224,7 +224,7 @@ std::vector<uint8_t> cut_recipe_mesh_to_blob(const TriangleMesh& mesh)
         blob_put_f32(blob, v.y());
         blob_put_f32(blob, v.z());
     }
-    for (const Vec3i& f : its.indices) {
+    for (const Vec3i32& f : its.indices) {
         blob_put_u32(blob, uint32_t(f[0]));
         blob_put_u32(blob, uint32_t(f[1]));
         blob_put_u32(blob, uint32_t(f[2]));
@@ -264,7 +264,7 @@ bool cut_recipe_mesh_from_blob(const std::vector<uint8_t>& blob, TriangleMesh& o
         // consumer of the mesh downstream.
         if (a >= n_vert || b >= n_vert || c >= n_vert)
             return false;
-        its.indices[i] = Vec3i(int(a), int(b), int(c));
+        its.indices[i] = Vec3i32(int(a), int(b), int(c));
     }
     out = TriangleMesh(std::move(its));
     return true;

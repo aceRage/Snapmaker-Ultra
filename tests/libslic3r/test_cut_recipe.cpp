@@ -62,7 +62,7 @@ static indexed_triangle_set recipe_centred_cube(double s = RCUBE)
 static double recipe_mesh_volume(const indexed_triangle_set &its)
 {
     double v = 0.0;
-    for (const Vec3i &f : its.indices) {
+    for (const Vec3i32 &f : its.indices) {
         const Vec3d a = its.vertices[size_t(f[0])].cast<double>();
         const Vec3d b = its.vertices[size_t(f[1])].cast<double>();
         const Vec3d c = its.vertices[size_t(f[2])].cast<double>();
