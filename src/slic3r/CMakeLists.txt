@@ -86,6 +86,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/RoundDialog.hpp
     GUI/QuadRemeshDialog.cpp
     GUI/QuadRemeshDialog.hpp
+    GUI/SliceBakeDialog.cpp
+    GUI/SliceBakeDialog.hpp
     GUI/ColorSplitDialog.cpp
     GUI/ColorSplitDialog.hpp
     GUI/ImageFillDialog.cpp
@@ -276,6 +278,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Jobs/BusyCursorJob.hpp
     GUI/Jobs/ColorSplitJob.cpp
     GUI/Jobs/ColorSplitJob.hpp
+    GUI/Jobs/SliceBakeJob.cpp
+    GUI/Jobs/SliceBakeJob.hpp
     GUI/Jobs/CreateFontNameImageJob.cpp
     GUI/Jobs/CreateFontNameImageJob.hpp
     GUI/Jobs/CreateFontStyleImagesJob.cpp

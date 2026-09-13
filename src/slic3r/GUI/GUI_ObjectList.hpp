@@ -442,6 +442,12 @@ public:
     // close_gizmos: shut an open gizmo first, for the Edit panel's button - a gizmo
     // .cpp cannot reach GLGizmosManager, so it asks for the close here.
     void round_all_edges(bool close_gizmos = false);
+    // Ultra: slice baking (phase 1) - turn the SLICED outer wall into a mesh that can be
+    // re-sliced. Enabled only when this object has been sliced and has perimeters.
+    // docs/superpowers/specs/2026-09-12-slice-bake-research.md
+    void bake_slice_to_mesh();
+    // Whether the menu item should be enabled for the current selection.
+    static bool can_bake_slice_to_mesh();
     void toggle_visibility_state(const wxDataViewItem& item);
     void update_visibility_icons();
     // Ultra (support groups): resync every part row's group badge with ModelVolume::config.

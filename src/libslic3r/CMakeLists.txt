@@ -469,6 +469,8 @@ set(lisbslic3r_sources
     #SLA/SupportTreeIGL.cpp
     SLA/SupportTreeMesher.cpp
     SLA/SupportTreeMesher.hpp
+    SliceBake.cpp
+    SliceBake.hpp
     SlicesToTriangleMesh.cpp
     SlicesToTriangleMesh.hpp
     SlicingAdaptive.cpp
