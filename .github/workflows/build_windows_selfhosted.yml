@@ -11,11 +11,14 @@
 # the runner (see "Detect optional plugin payloads" below). Releases still go through
 # build_all.yml plus the owner's local pack step.
 #
-# Shell note: every PowerShell step says `shell: powershell` (Windows PowerShell 5.1), not
-# the Actions default `pwsh` - PowerShell 7 is not installed on this VM and `pwsh` steps
-# fail with "command not found". For the same reason the GITHUB_ENV / GITHUB_OUTPUT writes
-# use -Encoding ascii: 5.1's "utf8" emits a BOM, which Actions parses as part of the first
-# variable name.
+# Shell note: PowerShell steps spell out their own interpreter rather than using the Actions
+# defaults, for two reasons that both come from this VM. PowerShell 7 is not installed, so
+# the default `pwsh` fails with "command not found"; and the runner account's execution
+# policy is the unconfigured default (Restricted), so Windows PowerShell refuses to dot-source
+# the step's temp .ps1 - hence the explicit `-ExecutionPolicy Bypass`, which applies to that
+# one process and leaves the machine's policy alone. Relatedly, GITHUB_ENV / GITHUB_OUTPUT
+# writes use -Encoding ascii: 5.1's "utf8" emits a BOM, which Actions parses as part of the
+# first variable's name.
 
 name: Build Windows (self-hosted)
 
@@ -75,7 +78,7 @@ jobs:
           clean: true
 
       - name: Resolve version
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $label = '${{ inputs.version_label }}'
@@ -97,7 +100,7 @@ jobs:
           Write-Host "version: $ver  (pure: $verPure)"
 
       - name: Verify toolchain
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $required = @(
@@ -116,7 +119,7 @@ jobs:
           Write-Host "cores: $env:NUMBER_OF_PROCESSORS"
 
       - name: Install NSIS if missing
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $nsisExe = 'C:\Program Files (x86)\NSIS\makensis.exe'
@@ -144,7 +147,7 @@ jobs:
           "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
 
       - name: Ensure the runner account can read the shared deps
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $root = $env:SHARED_DEPS_ROOT
@@ -169,7 +172,7 @@ jobs:
 
       - name: Decide whether the deps need a refresh
         id: deps
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           # The dep tree was built from some commit of deps/. If deps/ has moved since, the
@@ -206,7 +209,7 @@ jobs:
           "want_stamp=$wantStamp"                    | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding ascii
 
       - name: Link the shared deps tree into the workspace
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           # build_release_vs2022.bat does `cd deps && mkdir build && cd build` and then sets
@@ -242,7 +245,7 @@ jobs:
 
       - name: Stamp the rebuilt deps
         if: steps.deps.outputs.refresh == 'true'
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $stampFile = Join-Path $env:SHARED_DEPS_ROOT '.edgeslicer_deps_stamp'
@@ -251,7 +254,7 @@ jobs:
 
       - name: Detect optional plugin payloads
         id: ship
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           # The UltraNet / FlashNetwork / ffmpeg binaries are not in this public repo and are
@@ -345,7 +348,7 @@ jobs:
 
       - name: Collect artifacts and checksums
         id: pack
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $out   = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
