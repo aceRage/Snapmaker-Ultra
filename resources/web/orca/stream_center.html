@@ -993,15 +993,15 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         // 'webrtc' forces an attempt even from a Serve origin (the user asked for it); 'auto'
         // tries WebRTC only where it can actually work - webrtcUsable() is the hub's listener
         // AND an origin that can carry UDP.
-        if (videoPref === 'mse') return 'mp4,mjpeg';
-        if (videoPref === 'webrtc' && webrtcOffered()) return 'webrtc,mp4,mjpeg';
-        return webrtcUsable() ? 'webrtc,mp4,mjpeg' : 'mp4,mjpeg';
+        if (videoPref === 'mse') return 'mse,mp4,mjpeg';
+        if (videoPref === 'webrtc' && webrtcOffered()) return 'webrtc,mse,mp4,mjpeg';
+        return webrtcUsable() ? 'webrtc,mse,mp4,mjpeg' : 'mse,mp4,mjpeg';
     }
     function streamMode(id) {
         var p = modePrefs[id];
         // A dead offer is not a black square: WebRTC always carries its fallbacks behind it, and
         // player.html drops the peer connection after rtctimeout if it has not produced a picture.
-        if (p === 'webrtc') return 'webrtc,mp4,mjpeg';
+        if (p === 'webrtc') return 'webrtc,mse,mp4,mjpeg';
         if (p === 'mp4' || p === 'mjpeg' || p === 'mse') return p;
         return autoStreamMode();
     }
