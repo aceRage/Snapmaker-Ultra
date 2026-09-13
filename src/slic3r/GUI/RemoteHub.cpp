@@ -27,6 +27,7 @@
 #include <deque>
 #include <functional>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -103,6 +104,15 @@ static const int         MAX_INSTANCES      = 6;
 // Printer events (RemoteEvents.hpp): how many the hub keeps, and how many of those it writes back
 // to disk so a hub restart does not lose the last hour of a print.
 static const size_t      MAX_EVENTS         = 200;
+// The last-known printer status the hub keeps for itself, so /summary and /state can answer with
+// no slicer window open at all (the app's follow-up 2). The hub polls each live instance's own
+// /api/printers on this cadence, merges the rows by printer id and remembers them in
+// <datadir>/hub/printers.json; a row nobody has refreshed since is served with its age, marked
+// stale, rather than withheld. STALE_AFTER_MS only decides the `stale` flag - the row is served
+// either way, because a status from an hour ago is still what the printer was last seen doing.
+static const int         PRINTERS_POLL_MS   = 10000;
+static const long long   PRINTERS_STALE_MS  = 30000;
+static const size_t      MAX_CACHED_PRINTERS = 64;
 
 // ------------------------------------------------------------------ paths ----
 
@@ -114,6 +124,7 @@ static std::string hub_json_path()     { return (fs::path(hub_dir()) / "hub.json
 static std::string streams_json_path() { return (fs::path(hub_dir()) / "streams.json").string(); }
 static std::string settings_json_path() { return (fs::path(hub_dir()) / "settings.json").string(); } // survives a hub quit (hub.json does not)
 static std::string events_json_path()   { return (fs::path(hub_dir()) / "events.json").string(); }   // the printer-event ring, likewise
+static std::string printers_json_path() { return (fs::path(hub_dir()) / "printers.json").string(); } // the last-known printer status, likewise
 
 static void ensure_dirs()
 {
@@ -1508,9 +1519,36 @@ public:
     void accept_event(nlohmann::json& event);
     json events_json(int since); // {events: [...], last_id: n} for /hub/events and /r/<token>/events
 
+    // ---- what the native app asks for (EdgeSlicer app phase 3 follow-ups) ----
+    // One answer with everything the app's Devices screen draws, built from what THIS process
+    // knows: the printer rows it polled off the instances and remembered, the camera wall, the
+    // event high-water mark and this hub's own identity. It never needs an open slicer window -
+    // that was the whole complaint: with the slicer closed the app could say nothing at all.
+    json summary_json();
+    json pair_json();                       // the pairing document: names, both URLs, capabilities
+    // The last-known status of every printer any instance has reported, newest value per id, each
+    // row carrying `age_s` and `stale`. `instance` is the pid that last reported it, or 0 when no
+    // window is open any more.
+    json printers_json();
+    // The running job's picture per printer, from the G-code archive's sidecars. The map form is
+    // what /summary uses: the archive is one folder of small JSON files, so it is read ONCE for
+    // every printer rather than once per printer. `jobs` says which job each printer is running,
+    // so the record whose name matches wins over the merely newest one.
+    std::map<std::string, std::string> printer_thumbnail_paths(const std::map<std::string, std::string>& jobs);
+    std::string printer_thumbnail_path(const std::string& printer_id); // one printer, same rules
+    std::string printer_thumbnail(const std::string& printer_id);      // ... and its bytes
+    // This hub's identity: a uuid minted once, when this data dir's hub settings are created, and
+    // never again. A client that sees it change knows the event ids restarted - which it otherwise
+    // has to infer from an id going backwards (the app's follow-up 6).
+    std::string hub_instance();
+    void poll_printers();                   // one round: ask every live instance, merge, remember
+
 private:
     void load_events();          // start(): the ring from the last run
     void save_events_locked();   // m_mutex held
+    void load_printers();        // start(): the last-known printer status from the last run
+    void save_printers_locked(); // m_mutex held
+    std::string archive_dir();   // where the G-code archive keeps its sidecars (see m_archive_dir)
     json  info_json();
     json  instances_json();
     void  write_hub_json();
@@ -1574,6 +1612,25 @@ private:
     // instance that reports and across a restart of the hub itself.
     std::deque<json>               m_events;
     int                            m_next_event_id { 0 };
+    // The printers, as the instances last reported them: printer id -> the row plus when it
+    // arrived and which window sent it. This is what makes the phone app's Devices screen work
+    // with the slicer closed; it is refreshed by poll_printers() and persisted to printers.json.
+    struct CachedPrinter
+    {
+        json      row;             // the instance's own /api/printers row, as it sent it
+        long long at { 0 };        // unix ms when this value was read
+        long      instance { 0 };  // the pid that reported it; 0 once that window is gone
+    };
+    std::map<std::string, CachedPrinter> m_printers;
+    // Where the archive's sidecars are, as an instance reported it (GET /api/info). Remembered so
+    // a thumbnail still resolves after the window that told us closed; empty falls back to
+    // <datadir>/gcode_archive, which is the archive's own default.
+    std::string                    m_archive_dir;
+    std::string                    m_hub_instance; // this data dir's hub uuid (settings.json)
+    // How many phone links this data dir has ever had, 1 for the first. It has to be its own
+    // counter rather than the number of remembered old tokens, because that list is capped at
+    // three: a client comparing versions must see a number that only ever goes up.
+    int                            m_token_version { 1 };
 };
 
 // The tray balloon, set by HubApp once the icon exists (the server itself is wx-free and runs on
@@ -1659,6 +1716,8 @@ void HubServer::write_hub_json()
         std::lock_guard<std::mutex> lock(m_mutex);
         st["token"]      = m_token;
         st["old_tokens"] = m_old_tokens;
+        st["hub_instance"] = m_hub_instance; // written once, then carried forward unchanged
+        st["token_version"] = m_token_version;
     }
     // The notification destinations live here too, and for the same reason: a hub restart must
     // not lose the relay somebody set up. RemoteNotify owns them; this is the only writer of the
@@ -1814,6 +1873,9 @@ json HubServer::events_json(int since)
     for (const json& e : m_events)
         if (e.value("id", 0) > since) out["events"].push_back(e);
     out["last_id"] = m_next_event_id;
+    // Which hub these ids belong to. A data dir's hub keeps this for ever; a fresh one mints a new
+    // value, and that - not an id that went backwards - is how a client detects the reset.
+    out["hub_instance"] = m_hub_instance;
     return out;
 }
 
@@ -1824,6 +1886,407 @@ void HubServer::save_events_locked()
     j["events"]  = json::array();
     for (const json& e : m_events) j["events"].push_back(e);
     write_file(events_json_path(), j.dump());
+}
+
+// ------------------------------------------------ the printers the hub remembers ----
+//
+// Everything below exists for one reason: with no slicer window open the phone app could say
+// nothing about the printers at all, because /i/<pid>/api/printers needs a live instance. The hub
+// already hears about the printers (it is where the instances' events land), so it now also keeps
+// what they last reported: one row per printer id, the time it arrived and the window that sent
+// it. /summary and /state serve those rows whether or not a window is open, and a row nobody has
+// refreshed lately is handed over with its age and a `stale` flag rather than withheld - "this is
+// what it was last doing, 40 minutes ago" is exactly the answer a person wants.
+
+// The PC's own name, as a person recognises it in a list of hubs. Cached: the resolver call is
+// not free and this never changes while we run.
+static std::string pc_host_name()
+{
+    static std::string cached;
+    static std::once_flag once;
+    std::call_once(once, []() {
+        try { cached = asio::ip::host_name(); } catch (...) {}
+#ifdef _WIN32
+        if (cached.empty()) { const char* c = std::getenv("COMPUTERNAME"); if (c) cached = c; }
+#endif
+        if (cached.empty()) cached = "this PC";
+    });
+    return cached;
+}
+
+// What this hub goes by on the phone. The product name plus the PC, which is what distinguishes
+// two hubs in the app's list; the hub has no name a person can set (yet), so it is derived.
+static std::string hub_name()
+{
+    return std::string(SLIC3R_APP_NAME) + " on " + pc_host_name();
+}
+
+// The job a printer row says it is running. Which field that is depends on the printer: a Bambu
+// row has `task` (MachineObject::subtask_name), while a print host - Klipper, Moonraker, PrusaLink -
+// has it in `stage`, where fill_from_print_stats puts print_stats.filename. A summary that only
+// looked at `task` would show no job for every print host, which is most of them.
+static std::string row_job(const nlohmann::json& row)
+{
+    if (!row.is_object()) return "";
+    std::string job = row.value("task", std::string());
+    if (job.empty()) job = row.value("subtask_name", std::string());
+    if (job.empty()) job = row.value("stage", std::string());
+    return job;
+}
+
+static long long now_millis()
+{
+    return (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// One round of the poll: ask each live instance for its printers, merge what comes back into the
+// cache and write it down. Runs on the hub's own loop thread, never on a request; an instance that
+// is slicing may take a moment to answer and nothing here may hold m_mutex across that.
+void HubServer::poll_printers()
+{
+    const std::vector<Instance> live = instances(false);
+    for (const Instance& inst : live) {
+        if (inst.port <= 0) continue;
+        std::string body;
+        int         status = 0;
+        Http::get("http://127.0.0.1:" + std::to_string(inst.port) + "/api/printers")
+            .timeout_connect(1).timeout_max(10)
+            .on_complete([&](std::string b, unsigned s) { status = (int) s; body = b; })
+            .on_error([&](std::string, std::string, unsigned) {})
+            .perform_sync();
+        if (status != 200) continue;
+        json rows;
+        try { rows = json::parse(body); } catch (...) { continue; }
+        if (!rows.is_object() || !rows.contains("printers") || !rows["printers"].is_array()) continue;
+        const long long at = now_millis();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const json& row : rows["printers"]) {
+            if (!row.is_object()) continue;
+            const std::string id = row.value("id", std::string());
+            if (id.empty() || id.size() > 200) continue;
+            CachedPrinter& c = m_printers[id];
+            c.row      = row;
+            c.at       = at;
+            c.instance = inst.pid;
+        }
+        // A hub that ran for weeks with a changing fleet must not grow without bound: keep the
+        // most recently seen rows and drop the oldest.
+        while (m_printers.size() > MAX_CACHED_PRINTERS) {
+            auto oldest = m_printers.begin();
+            for (auto it = m_printers.begin(); it != m_printers.end(); ++it)
+                if (it->second.at < oldest->second.at) oldest = it;
+            m_printers.erase(oldest);
+        }
+        save_printers_locked();
+    }
+    // Where the archive keeps its sidecars, so a thumbnail still resolves once every window is
+    // closed. Asked once per round off the same instances, and only while we do not have it.
+    bool need_dir;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        need_dir = m_archive_dir.empty();
+    }
+    if (need_dir) {
+        for (const Instance& inst : live) {
+            if (inst.port <= 0) continue;
+            std::string body;
+            Http::get("http://127.0.0.1:" + std::to_string(inst.port) + "/api/info")
+                .timeout_connect(1).timeout_max(5)
+                .on_complete([&](std::string b, unsigned s) { if (s == 200) body = b; })
+                .on_error([&](std::string, std::string, unsigned) {})
+                .perform_sync();
+            std::string dir;
+            try { dir = json::parse(body).value("archive_dir", std::string()); } catch (...) {}
+            if (dir.empty()) continue;
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_archive_dir = dir;
+            save_printers_locked();
+            break;
+        }
+    }
+}
+
+// The rows, as the phone and the app get them. `age_s` is how long ago the value was read and
+// `stale` says whether that is longer than the poll can explain; `instance` is the window that can
+// still be asked to act on this printer (0 = none open, and then the app knows not to offer the
+// control buttons rather than offering ones that would 404).
+json HubServer::printers_json()
+{
+    const std::vector<Instance> live = instances(false);
+    const long long             now  = now_millis();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    json out = json::array();
+    for (const auto& kv : m_printers) {
+        json row = kv.second.row;
+        row["id"] = kv.first;
+        const long long age_ms = now > kv.second.at ? now - kv.second.at : 0;
+        row["age_s"]  = (long long) (age_ms / 1000);
+        row["stale"]  = age_ms > PRINTERS_STALE_MS;
+        row["seen_at"] = kv.second.at;
+        // The pid only stays in the row while that window is still there: the app addresses the
+        // control route as /i/<pid>/..., so a pid that has gone would be worse than none.
+        long pid = 0;
+        for (const Instance& i : live)
+            if (i.pid == kv.second.instance) pid = i.pid;
+        row["instance"] = pid;
+        out.push_back(row);
+    }
+    return out;
+}
+
+void HubServer::save_printers_locked()
+{
+    json j;
+    j["printers"] = json::array();
+    for (const auto& kv : m_printers) {
+        json e;
+        e["id"]       = kv.first;
+        e["row"]      = kv.second.row;
+        e["at"]       = kv.second.at;
+        e["instance"] = (long long) kv.second.instance;
+        j["printers"].push_back(e);
+    }
+    if (!m_archive_dir.empty()) j["archive_dir"] = m_archive_dir;
+    write_file(printers_json_path(), j.dump());
+}
+
+// What the printers were doing when this hub last ran. Served straight away (with an age that says
+// how old it is), so the app's first refresh after a PC reboot is not blank.
+void HubServer::load_printers()
+{
+    try {
+        json j = json::parse(read_file(printers_json_path()));
+        for (const auto& e : j.value("printers", json::array())) {
+            if (!e.is_object()) continue;
+            const std::string id = e.value("id", std::string());
+            if (id.empty() || !e.contains("row") || !e["row"].is_object()) continue;
+            CachedPrinter c;
+            c.row      = e["row"];
+            c.at       = e.value("at", (long long) 0);
+            c.instance = 0; // whatever window reported it last time is certainly gone
+            m_printers[id] = c;
+        }
+        m_archive_dir = j.value("archive_dir", std::string());
+    } catch (...) {}
+}
+
+std::string HubServer::archive_dir()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_archive_dir.empty()) return m_archive_dir;
+    }
+    return (fs::path(data_dir()) / "gcode_archive").string();
+}
+
+// The running job's picture, from the G-code archive: the hub reads the sidecars itself (they are
+// plain JSON next to a <id>.png), so this works with every slicer window closed - which is the
+// case the app asked about. Preference goes to the record whose sent name is the job the printer
+// says it is running; failing that, the newest record for that printer, which is what a person
+// looking at a card would expect. "" when there is nothing to show, and the caller answers 404.
+std::map<std::string, std::string> HubServer::printer_thumbnail_paths(const std::map<std::string, std::string>& jobs)
+{
+    struct Pick { std::string best, named; long long best_t { -1 }, named_t { -1 }; };
+    std::map<std::string, Pick>        picks;
+    std::map<std::string, std::string> out;
+
+    const fs::path            root(archive_dir());
+    boost::system::error_code ec;
+    if (!fs::is_directory(root, ec)) return out;
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        boost::system::error_code ig;
+        if (!fs::is_regular_file(it->path(), ig) || it->path().extension() != ".json") continue;
+        json j;
+        try { j = json::parse(read_file(it->path().string())); } catch (...) { continue; }
+        if (!j.is_object() || !j.contains("printer") || !j["printer"].is_object()) continue;
+        const std::string printer = j["printer"].value("id", std::string());
+        const std::string id      = j.value("id", std::string());
+        if (printer.empty() || id.empty()) continue;
+        // The picture is a sibling of the sidecar, named after the record. Nothing from a request
+        // is involved in building this path.
+        const fs::path png = root / (id + ".png");
+        if (!fs::is_regular_file(png, ig)) continue;
+        const long long t = j.value("time", (long long) 0);
+        Pick& p = picks[printer];
+        if (t > p.best_t) { p.best_t = t; p.best = png.string(); }
+        // The job the printer says it is running, matched against the name the printer was really
+        // given and against the archived file name: either can be what it reports.
+        const auto job = jobs.find(printer);
+        if (job != jobs.end() && !job->second.empty() &&
+            (j.value("sent_name", std::string()) == job->second || j.value("file", std::string()) == job->second))
+            if (t > p.named_t) { p.named_t = t; p.named = png.string(); }
+    }
+    for (const auto& kv : picks)
+        out[kv.first] = kv.second.named.empty() ? kv.second.best : kv.second.named;
+    return out;
+}
+
+std::string HubServer::printer_thumbnail_path(const std::string& printer_id)
+{
+    if (printer_id.empty()) return "";
+    std::map<std::string, std::string> jobs;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_printers.find(printer_id);
+        if (it != m_printers.end()) jobs[printer_id] = row_job(it->second.row);
+    }
+    const std::map<std::string, std::string> all = printer_thumbnail_paths(jobs);
+    const auto hit = all.find(printer_id);
+    return hit == all.end() ? std::string() : hit->second;
+}
+
+// The bytes, for the route. "" both when there is no such picture and when the file went away
+// between the two calls, and the route answers 404 either way.
+std::string HubServer::printer_thumbnail(const std::string& printer_id)
+{
+    const std::string path = printer_thumbnail_path(printer_id);
+    return path.empty() ? std::string() : read_file(path);
+}
+
+// This hub's identity, minted when this data dir's hub settings are created and never again.
+// Everything a client can use to spot an event-id reset in one step hangs off this value, so it
+// must not change for any other reason - not a hub restart, not a new phone link, not an upgrade.
+std::string HubServer::hub_instance()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_hub_instance;
+}
+
+// One JSON with everything the app's Devices screen draws. Deliberately built here rather than
+// proxied: the point is that it answers with no slicer window open.
+json HubServer::summary_json()
+{
+    const PhoneLinks links = phone_links();   // opens sockets: never under m_mutex
+    const json       rows  = printers_json(); // takes m_mutex itself
+    json cams = json::array();
+    std::string state;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        state = m_state;
+    }
+    // The camera wall, so a printer row can name the camera that watches it. Joined by id and, for
+    // a LAN printer, by the address the camera sits on - which is the join the app was doing by
+    // hand out of /state, and the one that is easy to get wrong.
+    try {
+        json j = json::parse(state);
+        for (const auto& h : j.value("hosts", json::array()))
+            cams.push_back(json{ { "id", h.value("id", "") }, { "alias", h.value("alias", "") }, { "ip", h.value("ip", "") } });
+    } catch (...) {}
+
+    json out;
+    // `name` is the PC, because that is what a person picks a hub by in the app's list (and what
+    // the app labels its card with); `hub` is this hub's own longer label. Both are sent so a
+    // client can show either without inventing one out of the URL.
+    out["name"]         = pc_host_name();
+    out["hub"]          = hub_name();
+    out["host"]         = pc_host_name();
+    out["version"]      = std::string(SLIC3R_VERSION);
+    out["hub_instance"] = hub_instance();
+    out["lan_url"]      = links.lan;
+    out["remote_url"]   = links.remote;
+    out["urls"]         = json{ { "lan", links.lan }, { "remote", links.remote } };
+    out["printers"]     = json::array();
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        out["last_id"] = m_next_event_id; // the same high-water mark /events reports
+        token          = m_token;         // for the thumbnail URLs built below
+    }
+    // One pass over the archive for every row, rather than one per printer: which job each is
+    // running first, then the pictures.
+    std::map<std::string, std::string> jobs;
+    for (const json& row : rows)
+        jobs[row.value("id", std::string())] = row_job(row);
+    const std::map<std::string, std::string> thumbs = printer_thumbnail_paths(jobs);
+
+    for (const json& row : rows) {
+        const std::string id = row.value("id", std::string());
+        json p;
+        p["id"]       = id;
+        p["name"]     = row.value("name", std::string());
+        p["model"]    = row.value("model", std::string());
+        p["vendor"]   = row.value("kind", std::string()); // bambu | snapmaker | printhost | connect
+        p["kind"]     = row.value("kind", std::string());
+        // A row here is deliberately ALSO a valid /api/printers row: the app's existing mapper
+        // reads print_status first and falls back to status, so both are carried under their own
+        // names, and `state` is the plain-language name /summary documents.
+        p["state"]        = row.contains("print_status") ? row.value("print_status", std::string()) : row.value("status", std::string());
+        p["status"]       = p["state"];
+        p["print_status"] = p["state"];
+        p["online"]   = row.value("online", false);
+        p["printing"] = row.value("printing", false);
+        p["percent"]     = row.value("percent", 0);
+        p["left_time_s"] = row.value("left_time_s", 0);
+        // `job` is the plain-language name; `task` is kept as well, because that is the name the
+        // app's existing mapper reads off an /api/printers row.
+        p["job"]      = row_job(row);
+        p["task"]     = p["job"];
+        p["layer"]        = row.value("layer", 0);
+        p["total_layers"] = row.value("total_layers", 0);
+        // Temperatures only when the printer really reported them: a card that shows 0 C where
+        // nothing is known reads as "cold", which is a different statement from "not known".
+        if (row.contains("bed_temp"))   p["bed_temp"]   = row["bed_temp"];
+        if (row.contains("bed_target")) p["bed_target"] = row["bed_target"];
+        if (row.contains("nozzles"))    p["nozzles"]    = row["nozzles"];
+        // What the app's buttons need, carried through unchanged.
+        for (const char* k : { "can_pause", "can_resume", "can_stop", "can_print", "can_upload" })
+            if (row.contains(k)) p[k] = row[k];
+        // The address, for a client that joins a camera to a printer by it (and for a card that
+        // shows where a LAN printer is), and why the printer stopped, in its own words.
+        if (row.contains("ip"))          p["ip"]          = row["ip"];
+        if (row.contains("print_error")) p["print_error"] = row["print_error"];
+        if (row.contains("stage"))       p["stage"]       = row["stage"];
+        p["stale"]    = row.value("stale", false);
+        p["age_s"]    = row.value("age_s", 0);
+        p["instance"] = row.value("instance", 0);
+        // The camera that watches this printer, if any: its own id first, then a LAN camera on the
+        // same address.
+        std::string cam;
+        const std::string ip = row.value("ip", std::string());
+        for (const json& c : cams) {
+            if (c.value("id", std::string()) == id) { cam = id; break; }
+            if (!ip.empty() && (c.value("id", std::string()) == ip || c.value("ip", std::string()) == ip)) cam = c.value("id", std::string());
+        }
+        if (!cam.empty()) p["camera"] = cam;
+        // The thumbnail URL is offered whenever there is a picture to serve, so the app can draw
+        // it without a probe that would 404 most of the time.
+        if (thumbs.find(id) != thumbs.end())
+            p["thumbnail"] = "/r/" + token + "/printers/" + percent_encode(id) + "/thumbnail.png";
+        out["printers"].push_back(p);
+    }
+    return out;
+}
+
+// The pairing document, in the shape the app already reads (tools/mock_hub.py --with-pair).
+json HubServer::pair_json()
+{
+    const PhoneLinks links = phone_links();
+    json j;
+    j["name"]    = pc_host_name();  // the PC, which is what the app labels the card with
+    j["hub"]     = hub_name();      // the name this hub goes by
+    j["host"]    = pc_host_name();
+    j["version"] = std::string(SLIC3R_VERSION);
+    j["hub_instance"] = hub_instance();
+    j["urls"]    = json{ { "lan", links.lan }, { "remote", links.remote } };
+    j["ips"]     = links.ips;
+    // What this build and this configuration can actually push with, so the app does not register
+    // for a provider that will never deliver (APNs needs the .p8 AND HTTP/2 in our libcurl).
+    const json prov = AppPush::providers_json();
+    j["push"]    = json{ { "webpush", true },
+                         { "apns", prov.value("apns", false) },
+                         { "fcm", prov.value("fcm", false) },
+                         { "unified", false } };
+    // The token's generation, so a client can tell "the link was replaced" from "the same link
+    // again" without comparing the tokens themselves. 1 for a data dir's first link, +1 for every
+    // "New link" since; persisted, because it must never go backwards.
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        j["token_version"] = m_token_version;
+    }
+    j["features"] = json::array({ "events", "control", "send", "summary", "thumbnail", "webrtc", "quality", "apppush" });
+    j["capabilities"] = j["features"];
+    return j;
 }
 
 void HubServer::load_events()
@@ -2218,6 +2681,13 @@ std::string HubServer::state_for_phone()
     out["lan_url"]    = links.lan;
     out["remote_url"] = links.remote;
     out["ips"]        = links.ips;
+    // Added for the native app (phase 3 follow-ups 2 and 6), and additive on purpose: every field
+    // the page already reads is untouched.
+    //   printers      the last-known status of every printer, each row with age_s / stale /
+    //                 instance - so the Devices screen works with no slicer window open;
+    //   hub_instance  this hub's identity, the same value /events and /summary carry.
+    out["printers"]     = printers_json();
+    out["hub_instance"] = hub_instance();
     return out.dump();
 }
 
@@ -2421,6 +2891,7 @@ std::string HubServer::new_link()
         std::lock_guard<std::mutex> lock(m_mutex);
         remember_old_token_locked(m_token);
         m_token = random_token();
+        ++m_token_version; // this data dir is on its next link; /pair says which
         token   = m_token;
     }
     write_hub_json();
@@ -2842,6 +3313,37 @@ static bool instance_api_allowed(const std::string& method, const std::string& s
 
 void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string& rest)
 {
+    // ---- what the native app asks for (EdgeSlicer app phase 3 follow-ups 1-4 and 6) ----
+    // All three answer from what this process knows, with no live slicer instance involved. That is
+    // the requirement: the app's Devices screen used to be able to say nothing at all with the
+    // slicer closed, because the printers were only reachable through /i/<pid>/api/printers.
+    if (r.method == "GET" && (rest == "/summary" || rest == "/summary/")) {
+        respond_json(client, 200, summary_json().dump());
+        return;
+    }
+    if (r.method == "GET" && (rest == "/pair" || rest == "/pair/")) {
+        respond_json(client, 200, pair_json().dump());
+        return;
+    }
+    // GET /printers/<id>/thumbnail.png - the running job's picture for one printer, out of the
+    // G-code archive's sidecars. The id is whatever /api/printers calls the printer, so it is
+    // percent-decoded and then only ever compared against what a sidecar says; nothing from the
+    // request reaches a file name (printer_thumbnail() builds the path from the sidecar's own id).
+    if (r.method == "GET" && rest.compare(0, 10, "/printers/") == 0 && rest.size() > 10) {
+        const std::string tail = rest.substr(10);
+        const size_t      slash = tail.rfind('/');
+        if (slash == std::string::npos || tail.substr(slash) != "/thumbnail.png") {
+            respond_json(client, 404, json_error("no such route; see /api"));
+            return;
+        }
+        const std::string id = percent_decode(tail.substr(0, slash));
+        if (id.empty() || id.size() > 200) { respond_json(client, 404, json_error("no such printer")); return; }
+        const std::string png = printer_thumbnail(id);
+        if (png.empty()) { respond_json(client, 404, json_error("no thumbnail for this printer")); return; }
+        // Never cached: the next job on the same printer has a different picture at the same URL.
+        respond(client, 200, "image/png", png, "Pragma: no-cache\r\nExpires: 0\r\n");
+        return;
+    }
     // ---- the installable web app: manifest, icons, service worker (P2/P7) ----
     // Everything here is under /r/<token>/, which means three things at once: the token gate the
     // caller already passed is the only gate these need, the manifest's relative start_url and
@@ -2981,9 +3483,12 @@ void HubServer::handle_phone(tcp::socket& client, Request& r, const std::string&
             { {"method", "POST"}, {"path", "/api/instances/open"},  {"description", "body = a .3mf/.stl/.obj/.step/.glb file, header X-File-Name = its name; starts a new (hidden) slicer instance with it; ?visible=1 opens a window"} },
             { {"method", "POST"}, {"path", "/i/{id}/open?mode=load|import"}, {"description", "same upload, opened in instance {id}: load = save the current project, then open this project (default for .3mf); import = add the model to the current plate (default otherwise)"} },
             { {"method", "*"},    {"path", "/i/{id}/api/..."},      {"description", "the instance's own API (see GET /i/{id}/api)"} },
-            { {"method", "GET"},  {"path", "/state"},               {"description", "camera list for the stream wall, plus lan_url / remote_url / ips: the two origins this hub answers on"} },
+            { {"method", "GET"},  {"path", "/state"},               {"description", "camera list for the stream wall, plus lan_url / remote_url / ips (the two origins this hub answers on), the last-known printer rows and hub_instance"} },
+            { {"method", "GET"},  {"path", "/summary"},             {"description", "one answer for a phone's device list: hub / host / version / hub_instance, both URLs, last_id, and the printers (id, name, model, vendor, state, percent, left_time_s, job, temps when known, camera, thumbnail, instance pid, plus age_s and stale). Answers with no slicer window open: these are the rows the hub last read off the open windows"} },
+            { {"method", "GET"},  {"path", "/pair"},                {"description", "the pairing document: name (this PC), hub, version, hub_instance, urls {lan, remote}, ips, push {webpush, apns, fcm, unified}, token_version and features"} },
+            { {"method", "GET"},  {"path", "/printers/{id}/thumbnail.png"}, {"description", "the running job's picture for that printer, from the G-code archive; 404 when there is none"} },
             { {"method", "GET"},  {"path", "/ping.gif"},            {"description", "a 43-byte never-cached GIF; the phone page's beacon for \"is the home network reachable from here\""} },
-            { {"method", "GET"},  {"path", "/events?since={id}"},   {"description", "printer events the slicer instances reported (started / finished / failed / cancelled / paused / resumed / runout / error), newest last: {events, last_id}"} },
+            { {"method", "GET"},  {"path", "/events?since={id}"},   {"description", "printer events the slicer instances reported (started / finished / failed / cancelled / paused / resumed / runout / error), newest last: {events, last_id, hub_instance}. hub_instance changes only when a data dir's hub settings are created, so a client can tell an id reset from an id it has already seen"} },
             { {"method", "GET"},  {"path", "/push/key"},            {"description", "the hub's VAPID public key, for PushManager.subscribe()"} },
             { {"method", "POST"}, {"path", "/push/subscription"},   {"description", "this browser's PushSubscription JSON; re-post it on every launch"} },
             { {"method", "DELETE"}, {"path", "/push/subscription"}, {"description", "body {endpoint} - this browser unsubscribed"} },
@@ -3299,6 +3804,13 @@ bool HubServer::start()
         // quit, and a hub that came back with a new token would break every saved link. The
         // remembered one beats a --hub-token from the slicer, whose copy can be older than the
         // last "New link" somebody made from the tray; a hint only seeds a data dir with none.
+        // This hub's identity, for the phone app: minted when these settings are first written and
+        // never again, so a client can tell a fresh data dir (whose event ids restart at 1) from
+        // this one carrying on. See hub_instance().
+        m_hub_instance = j.value("hub_instance", std::string());
+        // A data dir written before this existed gets its version from what it can still see: the
+        // links it remembers replacing, plus this one. Only ever a floor, and it only ever grows.
+        m_token_version = std::max(1, j.value("token_version", 0));
         const std::string saved = j.value("token", "");
         for (const auto& t : j.value("old_tokens", json::array())) remember_old_token_locked(t.get<std::string>());
         if (valid_token(saved)) {
@@ -3308,9 +3820,17 @@ bool HubServer::start()
         }
     } catch (...) {} // nothing else runs yet: start() is single-threaded, the _locked helper is safe here
     if (!valid_token(m_token)) m_token = random_token();
+    // A data dir with no settings.json yet (or one written before this existed) gets its uuid here,
+    // once. write_hub_json() below persists it, and nothing ever replaces it.
+    if ((int) m_old_tokens.size() + 1 > m_token_version) m_token_version = (int) m_old_tokens.size() + 1;
+    if (m_hub_instance.empty()) {
+        m_hub_instance = random_hex(16);
+        BOOST_LOG_TRIVIAL(info) << "RemoteHub: this data dir's hub instance is " << m_hub_instance;
+    }
     m_secret = random_hex(16);
     m_state  = read_file(streams_json_path());
     load_events(); // what the printers did before this hub was restarted, and where the ids got to
+    load_printers(); // ... and what they were doing, so the app's first refresh is not blank
     // Web Push before the relay worker: RemoteNotify::deliver() asks it whether any phone is
     // subscribed before deciding there is nothing to queue.
     WebPush::start(webpush_saved); // mints the VAPID key pair the first time this data dir runs
@@ -3340,9 +3860,17 @@ bool HubServer::start()
 void HubServer::loop(bool idle_exit)
 {
     auto idle_since = std::chrono::steady_clock::now();
+    auto printers_at = std::chrono::steady_clock::now() - std::chrono::milliseconds(PRINTERS_POLL_MS);
     while (!m_quit) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
         flush_logs(); // the file sink buffers; keep hub.log readable while we run
+        // The printers every open window can see, remembered here so /summary and /state can
+        // answer once every window is closed. One round costs one loopback GET per instance and
+        // runs on this thread, never on a request.
+        if (std::chrono::steady_clock::now() - printers_at >= std::chrono::milliseconds(PRINTERS_POLL_MS)) {
+            printers_at = std::chrono::steady_clock::now();
+            try { poll_printers(); } catch (...) {}
+        }
         // A phone subscribed, or the sender pruned one the push service said was gone. Saving
         // from here means the sender thread never has to reach back into HubServer.
         if (WebPush::consume_dirty() || AppPush::consume_dirty()) write_hub_json();

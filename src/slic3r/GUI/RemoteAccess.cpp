@@ -1972,6 +1972,11 @@ RemoteAccess::ApiResponse RemoteAccess::api_info()
     j["slicing"] = m_slicing;
     j["hidden"]  = m_hidden;
     j["version"] = std::string(SLIC3R_VERSION);
+    // Where this PC keeps the G-code archive. The hub reads it so that a running job's
+    // thumbnail still resolves once every slicer window is closed (GET /r/<token>/printers/
+    // <id>/thumbnail.png): the sidecars are plain files, but only an instance knows which
+    // folder the preference points at. A path on this PC, and this API is loopback-only.
+    j["archive_dir"] = GcodeArchive::dir();
     j["needs_attention"]  = m_needs_attention;
     j["attention_reason"] = m_attention_reason;
     j["attention_kind"]   = m_attention_kind;
@@ -2234,7 +2239,7 @@ RemoteAccess::ApiResponse RemoteAccess::handle_api(const std::string& method, co
         j["version"] = 2;
         j["routes"]  = nlohmann::json::array({
             { {"method", "GET"},  {"path", "/api"},                        {"description", "this manifest"} },
-            { {"method", "GET"},  {"path", "/api/info"},                   {"description", "this instance: pid, project title and path, slicing flag, hidden flag"} },
+            { {"method", "GET"},  {"path", "/api/info"},                   {"description", "this instance: pid, project title and path, slicing flag, hidden flag, archive_dir (where the G-code archive keeps its sidecars)"} },
             { {"method", "GET"},  {"path", "/api/window"},                 {"description", "is this instance's window shown? {hidden, iconized}"} },
             { {"method", "POST"}, {"path", "/api/window?show=1|0"},        {"description", "show (and raise) or hide this instance's window"} },
             { {"method", "POST"}, {"path", "/api/quit[?discard=1]"},       {"description", "close this instance; without discard the unsaved project is saved first (an unnamed one under <datadir>/hub/saves)"} },

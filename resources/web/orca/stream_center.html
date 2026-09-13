@@ -142,6 +142,13 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
 .card .bar div { height: 100%; background: #0a9e50; width: 0; transition: width .3s; }
 .printer { background: #2f2f2f; border-left: 4px solid #555; border-radius: 6px; padding: 10px 12px; color: #ddd; margin-bottom: 8px; }
 .printer.online { border-left-color: #0a9e50; }
+/* The card a notification was tapped through on: the app writes its printer id to localStorage
+   (edgeslicer_pending_printer) and the page scrolls here and says so for a moment. Deliberately a
+   fading outline rather than a lasting state - it answers "which one was that?" and then gets out
+   of the way. */
+.printer.pointed { box-shadow: 0 0 0 2px #3d8fd6; animation: pointed 6s ease-out forwards; }
+@keyframes pointed { 0%, 60% { box-shadow: 0 0 0 2px #3d8fd6; } 100% { box-shadow: 0 0 0 2px rgba(61,143,214,0); } }
+@media (prefers-reduced-motion: reduce) { .printer.pointed { animation: none; } }
 .printer .name { font-weight: 600; margin-bottom: 4px; }
 .printer .meta { color: #aaa; font-size: 12px; line-height: 1.5; }
 .printer .temps { display: flex; gap: 14px; margin-top: 6px; }
@@ -3902,13 +3909,59 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             .catch(function(e) { rpJson = ''; refreshReprints(); done(e.message || 'The delete failed.'); });
     }
 
+    // ---- the printer a native-app notification was tapped through on ----
+    // The app writes the printer id into localStorage before the page loads (its NotificationRouter
+    // does it with evaluateJavascript, alongside the tab it wants), because a URL fragment would
+    // reach a page that chooses its own tab from storage anyway. We read it once per load, hold it
+    // until the card with that id is actually drawn, then scroll to it and clear it - so a redraw a
+    // second later does not yank the view back, and a printer that is not listed yet (the slicer is
+    // still starting) still gets its scroll when it appears.
+    var PENDING_KEY = 'edgeslicer_pending_printer';
+    var pendingPrinter = '';
+    try { pendingPrinter = localStorage.getItem(PENDING_KEY) || ''; } catch (e) {}
+    // A stale value must not hijack a later visit, so it is consumed either when its card is found
+    // or after a few Devices renders - whichever comes first. The budget exists because the printer
+    // may not be listed on the very first pass (a slicer window that is still starting has no
+    // printers yet, and the Devices view redraws every 5 s).
+    var pendingLeft = 4;
+    function pendingClear() {
+        pendingPrinter = '';
+        try { localStorage.removeItem(PENDING_KEY); } catch (e) {}
+    }
+    // Called at the end of every Devices render with the list element the cards were drawn into
+    // (null when there are no cards at all, e.g. no slicer window is open).
+    function pendingApply(list) {
+        if (!pendingPrinter) return;
+        var card = list && list.querySelector('.printer[data-printer-id="' + cssEsc(pendingPrinter) + '"]');
+        if (!card) {
+            if (--pendingLeft <= 0) pendingClear(); // stop waiting; never carry it to a later visit
+            return;
+        }
+        card.classList.add('pointed');
+        try { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+        catch (e) { card.scrollIntoView(); } // older WebViews take no options object
+        pendingClear();
+    }
+    // The value goes inside a double-quoted attribute selector, [data-printer-id="..."], where the
+    // only two characters that can end or escape the string are the quote and the backslash. NOT
+    // CSS.escape, which escapes for an *identifier* and would over-escape here: a printer id like
+    // "sm:U1-0042" carries a colon, which is fine inside the quotes and has to stay as it is or the
+    // selector stops matching the attribute we set.
+    function cssEsc(s) { return String(s).replace(/[\\"]/g, '\\$&'); }
+
     function refreshDevices() {
         var root = document.getElementById('devices');
         pushRender(); // the Enable-notifications control survives every redraw of the tab
         srcRender();  // and so does the licence/source line below it
         // No slicer, no printer cards - but the hub keeps the events after every instance is
         // closed, so they stay on the tab.
-        if (!instSel) { root.innerHTML = ''; root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.')); evRender(); pushRender(); srcRender(); return; }
+        if (!instSel) {
+            root.innerHTML = '';
+            root.appendChild(el('div', 'empty', 'No slicer is open on the PC. Printers are listed by the slicer.'));
+            evRender(); pushRender(); srcRender();
+            pendingApply(null); // no cards at all; the value ages out rather than sticking for ever
+            return;
+        }
         // One request per card source: the printers (every card) and the Snapmaker devices call for
         // the optional PC-side connect. A failing devices call only costs the connect button.
         Promise.all([api('/printers'), api('/snapmaker/devices').catch(function() { return {}; })]).then(function(res) {
@@ -3933,6 +3986,8 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 // card: one card, and that card's Disconnect covers the connection.
                 if (p.kind === 'connect' && lanHosts[smHost(p.url)]) return;
                 var card = el('div', 'printer' + (p.online ? ' online' : ''));
+                // The id the app names in a notification, so the tap-through can find this card.
+                card.setAttribute('data-printer-id', p.id || '');
                 card.appendChild(el('div', 'name', p.name + (p.selected ? ' ★' : '') + (p.model ? '  ·  ' + p.model : '')));
                 var meta = p.online ? (p.print_status || p.status || 'idle') : 'offline';
                 if (p.printing) meta += ' · ' + p.percent + '% · ' + fmtTime(p.left_time_s) + ' left' + (p.total_layers ? ' · layer ' + p.layer + '/' + p.total_layers : '');
@@ -4008,6 +4063,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
                 if (!anySm) root.appendChild(el('div', 'empty', 'No Snapmaker found yet. Add one by its address below - the PC does not have to be connected to it.'));
                 smAddRow(page, typing);
             }
+            pendingApply(root); // a tap-through from the app: scroll to that printer's card
         }).catch(function(e) {
             var list = root.querySelector('.plist');
             if (!list) { list = el('div', 'plist'); root.appendChild(list); }
