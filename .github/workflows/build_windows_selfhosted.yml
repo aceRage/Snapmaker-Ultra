@@ -1,0 +1,396 @@
+# Windows build on the owner's self-hosted runner (devwin11-lance).
+#
+# Why this exists: the hosted windows-2022 runner in build_all.yml rebuilds the whole
+# dependency tree (or restores a multi-GB cache) on every run. The self-hosted VM keeps a
+# pre-built dep tree at C:\Dev\EdgeSlicer\deps\build\OrcaSlicer_dep, so a slicer-only build
+# is roughly 25 min instead of 90. Artifact names match build_orca.yml's Windows job so the
+# release flow can consume either one.
+#
+# What this workflow deliberately does NOT do: it does not sign, does not deploy to a
+# release, and does not build the private network plugins unless they have been staged on
+# the runner (see "Detect optional plugin payloads" below). Releases still go through
+# build_all.yml plus the owner's local pack step.
+
+name: Build Windows (self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_label:
+        description: 'Version label for artifact names (blank = read Snapmaker_VERSION from the source)'
+        required: false
+        type: string
+        default: ''
+      refresh_deps:
+        description: 'Force a dependency rebuild even if the stamp matches'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      - 'ci/**'
+
+# One build at a time. The runner has a single work directory and a single shared dep tree,
+# so two concurrent runs would fight over both. Queue rather than cancel: a half-finished
+# build cancelled mid-link leaves a confusing tree behind.
+concurrency:
+  group: build-windows-selfhosted
+  cancel-in-progress: false
+
+env:
+  # Everything the build shells out to. The runner service account (NETWORK SERVICE) has no
+  # user PATH of its own, so each of these has to be spelled out.
+  CMAKE_DIR: 'C:\Dev\tools\cmake-3.31.8-windows-x86_64\bin'
+  PERL_DIR: 'C:\Dev\tools\strawberry\perl\bin'
+  SEVENZIP: 'C:\Program Files\7-Zip\7z.exe'
+  VCVARS: 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+  # The shared, pre-built dependency tree. build_release_vs2022.bat computes
+  # DEPS=%CD%/OrcaSlicer_dep after cd-ing into the repo's deps\build, so the workspace's
+  # deps\build is made a junction to this path (see "Link the shared deps tree").
+  SHARED_DEPS_ROOT: 'C:\Dev\EdgeSlicer\deps\build'
+  # Where the owner stages the closed-source payloads. Absent on a clean VM; each is probed
+  # for so the same workflow ships them the moment they appear.
+  SHIP_ROOT: 'C:\Dev\ship'
+
+jobs:
+  build:
+    name: Build slicer
+    runs-on: [self-hosted, Windows, edgeslicer-build]
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          lfs: 'true'
+          # A clean tree each run. The build directory lives inside the workspace, so this
+          # also guarantees a from-scratch CMake configure rather than a stale cache
+          # pointing at a previous run's paths.
+          clean: true
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $label = '${{ inputs.version_label }}'
+          if ([string]::IsNullOrWhiteSpace($label)) {
+            # Same source of truth as build_orca.yml: the version lives in the header, not version.inc.
+            $content = Get-Content src/common_func/common_func.hpp -Raw
+            if ($content -match '#define\s+Snapmaker_VERSION\s+"(.*?)"') {
+              $verPure = $matches[1]
+            } else {
+              throw "could not read Snapmaker_VERSION from src/common_func/common_func.hpp"
+            }
+            $ver = "V$verPure"
+          } else {
+            $verPure = $label -replace '^[Vv]', ''
+            $ver = if ($label -match '^[Vv]') { $label } else { "V$label" }
+          }
+          "ver=$ver"          | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "ver_pure=$verPure" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          Write-Host "version: $ver  (pure: $verPure)"
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $required = @(
+            @{ n = 'vcvars64'; p = $env:VCVARS },
+            @{ n = 'cmake';    p = (Join-Path $env:CMAKE_DIR 'cmake.exe') },
+            @{ n = 'perl';     p = (Join-Path $env:PERL_DIR 'perl.exe') },
+            @{ n = '7-Zip';    p = $env:SEVENZIP }
+          )
+          $missing = @()
+          foreach ($r in $required) {
+            if (Test-Path -LiteralPath $r.p) { Write-Host ("OK      {0,-10} {1}" -f $r.n, $r.p) }
+            else { Write-Host ("MISSING {0,-10} {1}" -f $r.n, $r.p); $missing += $r.n }
+          }
+          if ($missing.Count) { throw "missing on the runner: $($missing -join ', ')" }
+          & (Join-Path $env:CMAKE_DIR 'cmake.exe') --version
+          Write-Host "cores: $env:NUMBER_OF_PROCESSORS"
+
+      - name: Install NSIS if missing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nsisExe = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          if (Test-Path -LiteralPath $nsisExe) {
+            Write-Host "NSIS already installed:"
+            & $nsisExe /VERSION
+            "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+            exit 0
+          }
+          # Pinned NSIS 3.10. Both the canonical SourceForge project path and the prdownloads
+          # mirror serve this exact file; the sha256 is checked before we run it, so a mirror
+          # swapping the payload fails the build rather than executing it.
+          $url    = 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe'
+          $sha256 = '4313D352E0DAFD1F22B6517126A655CAE3B444FA758D2845EDDFBE72F24F7BDD'
+          $dst    = Join-Path $env:RUNNER_TEMP 'nsis-3.10-setup.exe'
+          Write-Host "downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing -MaximumRedirection 10
+          $got = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash
+          if ($got -ne $sha256) { throw "NSIS sha256 mismatch: expected $sha256, got $got" }
+          Write-Host "sha256 verified, installing silently"
+          $p = Start-Process -FilePath $dst -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "NSIS installer exited $($p.ExitCode)" }
+          if (-not (Test-Path -LiteralPath $nsisExe)) { throw "NSIS installed but $nsisExe is missing" }
+          & $nsisExe /VERSION
+          "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+      - name: Ensure the runner account can read the shared deps
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:SHARED_DEPS_ROOT
+          if (-not (Test-Path -LiteralPath $root)) {
+            Write-Host "::warning::$root does not exist yet - the deps step will build it from scratch (~60 min)"
+            exit 0
+          }
+          # The service runs as NETWORK SERVICE. It is an Authenticated User, so the inherited
+          # Modify ACE on C:\Dev already covers it - but prove that by actually reading a file
+          # rather than trusting the ACL, and grant explicitly if the read fails.
+          $probe = Get-ChildItem -LiteralPath $root -Recurse -File -Filter '*.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($probe) {
+            try {
+              [System.IO.File]::OpenRead($probe.FullName).Dispose()
+              Write-Host "read probe OK: $($probe.FullName)"
+            } catch {
+              Write-Host "read probe FAILED, granting NETWORK SERVICE read access"
+              & icacls $root /grant '"NT AUTHORITY\NETWORK SERVICE":(OI)(CI)RX' /T /C | Out-Null
+            }
+          }
+          '{0} contains {1:N1} GB' -f $root, ((Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1GB) | Write-Host
+
+      - name: Decide whether the deps need a refresh
+        id: deps
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The dep tree was built from some commit of deps/. If deps/ has moved since, the
+          # pre-built tree is stale and the build would link against the wrong thing (or fail
+          # to configure). Compare the current deps/ commit against a stamp beside the tree.
+          $wantStamp  = (git log -1 --format=%H -- deps).Trim()
+          $stampFile  = Join-Path $env:SHARED_DEPS_ROOT '.edgeslicer_deps_stamp'
+          $haveStamp  = if (Test-Path -LiteralPath $stampFile) { (Get-Content -LiteralPath $stampFile -Raw).Trim() } else { '' }
+          $treeExists = Test-Path -LiteralPath (Join-Path $env:SHARED_DEPS_ROOT 'OrcaSlicer_dep\usr\local')
+          $forced     = '${{ inputs.refresh_deps }}' -eq 'true'
+
+          Write-Host "deps/ HEAD commit : $wantStamp"
+          Write-Host "stamp on runner   : $(if ($haveStamp) { $haveStamp } else { '<none>' })"
+          Write-Host "dep tree present  : $treeExists"
+          Write-Host "forced refresh    : $forced"
+
+          # No stamp at all, with a tree already present, is the first-run case on a VM whose
+          # deps were built by hand: adopt the current commit rather than burning an hour.
+          # Anything else that disagrees means rebuild.
+          $refresh = $false
+          if (-not $treeExists) {
+            $refresh = $true; Write-Host "reason: no dep tree"
+          } elseif ($forced) {
+            $refresh = $true; Write-Host "reason: refresh_deps input"
+          } elseif ($haveStamp -and $haveStamp -ne $wantStamp) {
+            $refresh = $true; Write-Host "reason: deps/ changed since the tree was built"
+          }
+
+          if (-not $refresh -and -not $haveStamp) {
+            Write-Host "adopting the existing hand-built tree at commit $wantStamp"
+            Set-Content -LiteralPath $stampFile -Value $wantStamp -NoNewline -Encoding ascii
+          }
+          "refresh=$($refresh.ToString().ToLower())" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          "want_stamp=$wantStamp"                    | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+
+      - name: Link the shared deps tree into the workspace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # build_release_vs2022.bat does `cd deps && mkdir build && cd build` and then sets
+          # DEPS=%CD%/OrcaSlicer_dep. Making the workspace's deps\build a junction to the shared
+          # location means the script's own path arithmetic lands on the pre-built tree, with no
+          # patching of the script and no -D override to keep in sync.
+          $link = Join-Path $env:GITHUB_WORKSPACE 'deps\build'
+          if (Test-Path -LiteralPath $link) {
+            $item = Get-Item -LiteralPath $link -Force
+            if ($item.LinkType) {
+              Write-Host "removing existing link $link -> $($item.Target)"
+              [System.IO.Directory]::Delete($link, $false)
+            } else {
+              Write-Host "removing existing real directory $link"
+              Remove-Item -LiteralPath $link -Recurse -Force
+            }
+          }
+          if (-not (Test-Path -LiteralPath $env:SHARED_DEPS_ROOT)) {
+            New-Item -ItemType Directory -Path $env:SHARED_DEPS_ROOT -Force | Out-Null
+          }
+          & cmd /c mklink /J "$link" "$env:SHARED_DEPS_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed ($LASTEXITCODE)" }
+          Write-Host "junction resolves to a usable tree: $(Test-Path -LiteralPath (Join-Path $link 'OrcaSlicer_dep\usr\local'))"
+
+      - name: Build dependencies (only when stale)
+        if: steps.deps.outputs.refresh == 'true'
+        shell: cmd
+        run: |
+          call "%VCVARS%" || exit /b 1
+          set "PATH=%CMAKE_DIR%;%PERL_DIR%;%PATH%"
+          echo Rebuilding the dependency tree - this takes about an hour.
+          call build_release_vs2022.bat deps || exit /b 1
+
+      - name: Stamp the rebuilt deps
+        if: steps.deps.outputs.refresh == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stampFile = Join-Path $env:SHARED_DEPS_ROOT '.edgeslicer_deps_stamp'
+          Set-Content -LiteralPath $stampFile -Value '${{ steps.deps.outputs.want_stamp }}' -NoNewline -Encoding ascii
+          Write-Host "stamped $stampFile"
+
+      - name: Detect optional plugin payloads
+        id: ship
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The UltraNet / FlashNetwork / ffmpeg binaries are not in this public repo and are
+          # not redistributable from it. If the owner has staged them on the VM under
+          # C:\Dev\ship\{ultranet,flashnetwork,ffmpeg}, pass the corresponding -D so the same
+          # workflow produces a complete package; otherwise build without them and say so.
+          $flags = @()
+          $probes = @(
+            @{ d = 'ultranet';     f = 'bambu_networking.dll'; var = 'ULTRANET_BIN_DIR' },
+            @{ d = 'flashnetwork'; f = 'FlashNetwork.dll';     var = 'FLASHNETWORK_BIN_DIR' },
+            @{ d = 'ffmpeg';       f = 'ffmpeg.exe';           var = 'FFMPEG_BIN_DIR' }
+          )
+          foreach ($p in $probes) {
+            $dir = Join-Path $env:SHIP_ROOT $p.d
+            if (Test-Path -LiteralPath (Join-Path $dir $p.f)) {
+              Write-Host "found $($p.f) - shipping via $($p.var)"
+              $flags += ('-D{0}={1}' -f $p.var, ($dir -replace '\\', '/'))
+            } else {
+              Write-Host "::notice::no $($p.f) under $dir - the package will omit that component"
+            }
+          }
+          "flags=$($flags -join ' ')" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+
+      - name: Configure and build the slicer
+        shell: cmd
+        run: |
+          call "%VCVARS%" || exit /b 1
+          set "PATH=%CMAKE_DIR%;%PERL_DIR%;%PATH%"
+          set "DEPS=%GITHUB_WORKSPACE%\deps\build\OrcaSlicer_dep"
+          if not exist "%DEPS%\usr\local" (
+            echo ERROR: no dependency tree at %DEPS%
+            exit /b 1
+          )
+          if not exist build mkdir build
+          cd build
+          cmake .. -G "Visual Studio 17 2022" -A x64 ^
+            -DBBL_RELEASE_TO_PUBLIC=1 ^
+            -DORCA_TOOLS=ON ^
+            -DCMAKE_PREFIX_PATH="%DEPS%/usr/local" ^
+            -DCMAKE_INSTALL_PREFIX="./Snapmaker_Orca" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DWIN10SDK_PATH="%WindowsSdkDir%Include\%WindowsSDKVersion%" ^
+            ${{ steps.ship.outputs.flags }} || exit /b 1
+          cmake --build . --config Release --target ALL_BUILD -- -m || exit /b 1
+
+      - name: Compile translations
+        shell: cmd
+        run: |
+          call scripts\run_gettext.bat || exit /b 1
+
+      - name: Run unit tests
+        shell: cmd
+        working-directory: build
+        run: |
+          @rem Three cases are known-failing upstream and are tagged [!mayfail] / [NotWorking].
+          @rem Catch2 reports [!mayfail] as "failed as expected" and does not fail the run;
+          @rem [NotWorking] has to be excluded explicitly.
+          set FAILED=0
+          for %%T in (libslic3r slic3rutils fff_print) do (
+            echo ============================================================
+            echo Running %%T_tests
+            echo ============================================================
+            tests\%%T\Release\%%T_tests.exe "exclude:[NotWorking]" || set FAILED=1
+          )
+          if %FAILED% NEQ 0 (
+            echo One or more test binaries reported failures.
+            exit /b 1
+          )
+          echo All three test binaries passed.
+
+      - name: Install the portable tree
+        shell: cmd
+        working-directory: build
+        run: |
+          call "%VCVARS%" || exit /b 1
+          set "PATH=%CMAKE_DIR%;%PATH%"
+          cmake --build . --target install --config Release || exit /b 1
+
+      - name: Build the NSIS installer
+        shell: cmd
+        working-directory: build
+        run: |
+          set "PATH=%CMAKE_DIR%;%NSIS_DIR%;%PATH%"
+          cpack -G NSIS || exit /b 1
+
+      - name: Pack the portable zip
+        shell: cmd
+        working-directory: build
+        run: |
+          "%SEVENZIP%" a -tzip "Snapmaker_Orca_Windows_%ver%_portable.zip" "%GITHUB_WORKSPACE%\build\Snapmaker_Orca" || exit /b 1
+
+      - name: Collect artifacts and checksums
+        id: pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out   = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          $build = Join-Path $env:GITHUB_WORKSPACE 'build'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+
+          # CPack names the installer from CPACK_PACKAGE_FILE_NAME
+          # (EdgeSlicer_Windows_Installer_V<ver>.exe). Rename to the Snapmaker_Orca_* naming
+          # build_orca.yml's Windows job publishes, so downstream tooling sees one shape.
+          $installer = Get-ChildItem -LiteralPath $build -Filter '*.exe' -File |
+                       Where-Object { $_.Name -match 'Installer' } | Select-Object -First 1
+          if (-not $installer) { throw "cpack produced no installer .exe in $build" }
+          $installerName = "Snapmaker_Orca_Windows_Installer_$($env:ver).exe"
+          Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $out $installerName) -Force
+
+          $zip = Join-Path $build "Snapmaker_Orca_Windows_$($env:ver)_portable.zip"
+          if (-not (Test-Path -LiteralPath $zip)) { throw "portable zip missing: $zip" }
+          Copy-Item -LiteralPath $zip -Destination $out -Force
+
+          # SHA256SUMS in the usual "<hash>  <name>" shape so `sha256sum -c` works.
+          $lines = Get-ChildItem -LiteralPath $out -File | Sort-Object Name | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          }
+          Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS') -Value $lines -Encoding ascii
+
+          Write-Host "--- artifacts ---"
+          Get-ChildItem -LiteralPath $out -File | ForEach-Object {
+            '{0,-60} {1,10:N1} MB' -f $_.Name, ($_.Length / 1MB) | Write-Host
+          }
+          Write-Host "--- SHA256SUMS ---"
+          Get-Content -LiteralPath (Join-Path $out 'SHA256SUMS') | Write-Host
+
+          "installer_name=$installerName" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Snapmaker_Orca_Windows_${{ env.ver }}
+          path: artifacts/${{ steps.pack.outputs.installer_name }}
+          if-no-files-found: error
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Snapmaker_Orca_Windows_${{ env.ver }}_portable
+          path: artifacts/Snapmaker_Orca_Windows_${{ env.ver }}_portable.zip
+          if-no-files-found: error
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS_Windows_${{ env.ver }}
+          path: artifacts/SHA256SUMS
+          if-no-files-found: error
