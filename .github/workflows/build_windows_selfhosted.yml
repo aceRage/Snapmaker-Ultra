@@ -129,17 +129,39 @@ jobs:
             "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
             exit 0
           }
-          # Pinned NSIS 3.10. Both the canonical SourceForge project path and the prdownloads
-          # mirror serve this exact file; the sha256 is checked before we run it, so a mirror
-          # swapping the payload fails the build rather than executing it.
-          $url    = 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe'
+          # Pinned NSIS 3.10, verified by sha256 before it is ever executed - a mirror that
+          # serves something else fails the build instead of running it.
+          #
+          # The download goes straight at SourceForge's mirror hosts rather than the
+          # downloads.sourceforge.net front door: that front door answers a non-browser client
+          # with a ~140 KB HTML interstitial ("your download will start shortly") and HTTP 200,
+          # which is what the first run here actually got. Mirrors are tried in turn so one
+          # being down is not a build failure, and TLS 1.2 is forced because 5.1 on this VM
+          # still defaults to SSL3/TLS1.0 for Invoke-WebRequest.
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $sha256 = '4313D352E0DAFD1F22B6517126A655CAE3B444FA758D2845EDDFBE72F24F7BDD'
-          $dst    = Join-Path $env:RUNNER_TEMP 'nsis-3.10-setup.exe'
-          Write-Host "downloading $url"
-          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing -MaximumRedirection 10
-          $got = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash
-          if ($got -ne $sha256) { throw "NSIS sha256 mismatch: expected $sha256, got $got" }
-          Write-Host "sha256 verified, installing silently"
+          $mirrors = @(
+            'https://deac-riga.dl.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe',
+            'https://phoenixnap.dl.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe',
+            'https://netix.dl.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe'
+          )
+          $dst = Join-Path $env:RUNNER_TEMP 'nsis-3.10-setup.exe'
+          $ok  = $false
+          foreach ($url in $mirrors) {
+            try {
+              Write-Host "downloading $url"
+              Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 180
+              $got = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash
+              if ($got -eq $sha256) { Write-Host "sha256 verified"; $ok = $true; break }
+              Write-Host "::warning::sha256 mismatch from this mirror (got $got) - trying the next one"
+            } catch {
+              Write-Host "::warning::download failed from this mirror: $($_.Exception.Message)"
+            }
+          }
+          if (-not $ok) {
+            throw "could not fetch a NSIS 3.10 installer matching $sha256 from any mirror. Install NSIS on the runner by hand and re-run."
+          }
+          Write-Host "installing silently"
           $p = Start-Process -FilePath $dst -ArgumentList '/S' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "NSIS installer exited $($p.ExitCode)" }
           if (-not (Test-Path -LiteralPath $nsisExe)) { throw "NSIS installed but $nsisExe is missing" }
