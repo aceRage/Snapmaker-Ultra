@@ -129,37 +129,40 @@ jobs:
             "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
             exit 0
           }
-          # Pinned NSIS 3.10, verified by sha256 before it is ever executed - a mirror that
-          # serves something else fails the build instead of running it.
+          # Pinned NSIS 3.10, sha256-verified before it is ever executed: a host that serves
+          # something else gets skipped rather than run.
           #
-          # The download goes straight at SourceForge's mirror hosts rather than the
-          # downloads.sourceforge.net front door: that front door answers a non-browser client
-          # with a ~140 KB HTML interstitial ("your download will start shortly") and HTTP 200,
-          # which is what the first run here actually got. Mirrors are tried in turn so one
-          # being down is not a build failure, and TLS 1.2 is forced because 5.1 on this VM
-          # still defaults to SSL3/TLS1.0 for Invoke-WebRequest.
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          # Fetched with Windows' own curl.exe, and that detail is load-bearing. SourceForge
+          # answers Invoke-WebRequest's default agent with a ~140 KB HTML interstitial under
+          # HTTP 200 (every mirror, every time - the first attempts here hashed three different
+          # web pages), and answers a browser user-agent string with a Cloudflare JS challenge.
+          # curl.exe's own default agent gets the actual binary. The ?viasf=1 keeps the mirror
+          # host from bouncing back to the project page.
           $sha256 = '4313D352E0DAFD1F22B6517126A655CAE3B444FA758D2845EDDFBE72F24F7BDD'
           $mirrors = @(
-            'https://deac-riga.dl.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe',
-            'https://phoenixnap.dl.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe',
-            'https://netix.dl.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe'
+            'https://deac-riga.dl.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe?viasf=1',
+            'https://phoenixnap.dl.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe?viasf=1',
+            'https://netix.dl.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10-setup.exe?viasf=1'
           )
           $dst = Join-Path $env:RUNNER_TEMP 'nsis-3.10-setup.exe'
           $ok  = $false
           foreach ($url in $mirrors) {
-            try {
-              Write-Host "downloading $url"
-              Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 180
-              $got = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash
-              if ($got -eq $sha256) { Write-Host "sha256 verified"; $ok = $true; break }
-              Write-Host "::warning::sha256 mismatch from this mirror (got $got) - trying the next one"
-            } catch {
-              Write-Host "::warning::download failed from this mirror: $($_.Exception.Message)"
+            Write-Host "downloading $url"
+            if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Force }
+            & curl.exe -sL --fail --max-time 180 -o $dst $url
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::curl exited $LASTEXITCODE for this mirror - trying the next one"
+              continue
             }
+            $got = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash
+            if ($got -eq $sha256) { Write-Host "sha256 verified"; $ok = $true; break }
+            Write-Host "::warning::sha256 mismatch from this mirror (got $got) - trying the next one"
           }
           if (-not $ok) {
-            throw "could not fetch a NSIS 3.10 installer matching $sha256 from any mirror. Install NSIS on the runner by hand and re-run."
+            # Not fatal on its own: the slicer, the tests and the portable zip do not need NSIS.
+            # Only the cpack step does, and it is skipped when NSIS_DIR is unset.
+            Write-Host "::warning::could not fetch a verified NSIS 3.10 installer - the installer package will be skipped. Install NSIS on the runner to restore it."
+            exit 0
           }
           Write-Host "installing silently"
           $p = Start-Process -FilePath $dst -ArgumentList '/S' -Wait -PassThru
@@ -355,7 +358,11 @@ jobs:
           set "PATH=%CMAKE_DIR%;%PATH%"
           cmake --build . --target install --config Release || exit /b 1
 
+      # Skipped when the NSIS step could not obtain a verified installer. Everything else
+      # (portable zip, tests, sums) still ships, so a SourceForge outage costs the installer
+      # rather than the whole build.
       - name: Build the NSIS installer
+        if: env.NSIS_DIR != ''
         shell: cmd
         working-directory: build
         run: |
@@ -380,11 +387,17 @@ jobs:
           # CPack names the installer from CPACK_PACKAGE_FILE_NAME
           # (EdgeSlicer_Windows_Installer_V<ver>.exe). Rename to the Snapmaker_Orca_* naming
           # build_orca.yml's Windows job publishes, so downstream tooling sees one shape.
+          $installerName = ''
           $installer = Get-ChildItem -LiteralPath $build -Filter '*.exe' -File |
                        Where-Object { $_.Name -match 'Installer' } | Select-Object -First 1
-          if (-not $installer) { throw "cpack produced no installer .exe in $build" }
-          $installerName = "Snapmaker_Orca_Windows_Installer_$($env:ver).exe"
-          Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $out $installerName) -Force
+          if ($installer) {
+            $installerName = "Snapmaker_Orca_Windows_Installer_$($env:ver).exe"
+            Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $out $installerName) -Force
+          } elseif ([string]::IsNullOrEmpty($env:NSIS_DIR)) {
+            Write-Host "::warning::no NSIS on the runner, so no installer was built"
+          } else {
+            throw "NSIS is present but cpack produced no installer .exe in $build"
+          }
 
           $zip = Join-Path $build "Snapmaker_Orca_Windows_$($env:ver)_portable.zip"
           if (-not (Test-Path -LiteralPath $zip)) { throw "portable zip missing: $zip" }
@@ -406,6 +419,7 @@ jobs:
           "installer_name=$installerName" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding ascii
 
       - name: Upload installer
+        if: steps.pack.outputs.installer_name != ''
         uses: actions/upload-artifact@v4
         with:
           name: Snapmaker_Orca_Windows_${{ env.ver }}
