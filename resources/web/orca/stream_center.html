@@ -708,7 +708,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             var hosts = (s && s.hosts) || [];
             var known = {};
             hosts.forEach(function(h) { known[h.id] = true; });
-            var wasMode = remoteVideoMode();
+            var wasMode = autoStreamMode();
             remoteWebrtc = !!(s && s.webrtc);
             videoNote = (s && s.video_note) || '';
             hubQuality      = (s && s.quality) || [];
@@ -716,7 +716,7 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
             hostQNames = {};
             hosts.forEach(function(h) { if (h.qnames) hostQNames[h.id] = h.qnames; });
             renderQualityBox();
-            var changed = JSON.stringify(hosts) !== JSON.stringify(state.hosts) || remoteVideoMode() !== wasMode;
+            var changed = JSON.stringify(hosts) !== JSON.stringify(state.hosts) || autoStreamMode() !== wasMode;
             renderVideoBox();
             state.hosts = hosts;
             var before = state.active.join(',');
