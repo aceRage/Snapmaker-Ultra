@@ -517,6 +517,20 @@ void GLGizmoCut3D::rotate_vec3d_around_plane_center(Vec3d&vec)
 
 void GLGizmoCut3D::put_connectors_on_cut_plane(const Vec3d& cp_normal, double cp_offset)
 {
+    // 2026-09-12, OWNER FEEDBACK 3 (the connectors half of it). This snaps every
+    // connector onto the FLAT PLANE, and it runs from update_clipper() - i.e. on every
+    // plane nudge, every rotation and every gizmo open. On a DRAWN cut that is exactly
+    // wrong: a connector there was placed by a raycast against the drawn surface, and
+    // a drawn surface is not the plane, so the snap would walk it straight off the cut
+    // and it would end up half in the air.
+    //
+    // A drawn connector needs no snapping at all - unproject_on_draw_surface() puts it
+    // ON the cut surface and there is no "same parameters, new surface" relationship to
+    // restore (phase 2, deviation #4). So this is a no-op in Draw mode, which is also
+    // what keeps connector_rotation_m()'s frame - derived from the surface at the
+    // connector's own (s, w) - describing the place the connector actually is.
+    if (is_draw_surface())
+        return;
     ModelObject* mo = m_c->selection_info()->model_object();
     if (CutConnectors& connectors = mo->cut_connectors; !connectors.empty()) {
         const float sla_shift        = m_c->selection_info()->get_sla_shift();
@@ -580,6 +594,13 @@ void GLGizmoCut3D::update_clipper()
     // upper/lower halves follow it instead of the flat plane above. A flat (or
     // untouched) sheet clears it, and the plain plane split stands.
     apply_curved_color_clip();
+    // DRAW surface, 2026-09-12 (owner feedback item 3): the same job against the drawn
+    // cutter's voxel field. Here rather than anywhere the field is marked dirty, because
+    // this is reached from the top of on_render() and so has the GL context current for
+    // the texture upload. A clean field makes it a no-op, and an open chain (no cut
+    // surface yet) clears the field so the plain plane split stands - which is honest,
+    // since there is nothing else to show yet.
+    apply_draw_color_clip();
     // Per-side visibility rides the same update: the colour clip is shared
     // state on the canvas, so it has to be re-armed whenever the clip is.
     apply_side_visibility();
@@ -2317,20 +2338,24 @@ bool GLGizmoCut3D::on_cut_char(int key_code, bool shift_down, bool ctrl_down)
             return true;
         }
         if (m_draw_capturing) {
-            // Mid-stroke: abandon the line being drawn and put back the one that
-            // was there before the press (push_draw_undo() stored it).
+            // Mid-stroke: abandon the STROKE being drawn. 2026-09-12 this is simply
+            // dropping the capture buffer - the chain was never touched, because the
+            // append happens on LeftUp - so the undo entry the press pushed goes back
+            // too rather than being consumed to restore something that never changed.
             m_draw_capturing  = false;
             m_draw_last_mouse = Vec2d::Zero();
-            if (!m_draw_undo.empty()) {
-                const DrawStrokeState st = m_draw_undo.back();
+            m_draw_snap_armed = false;
+            m_draw_capture.clear();
+            if (!m_draw_undo.empty())
                 m_draw_undo.pop_back();
-                apply_draw_stroke_state(st);
-            }
-            else
-                clear_draw_stroke(/*push_undo*/ false);
+            invalidate_draw_stroke();
+            m_parent.set_as_dirty();
             return true;
         }
-        if (!m_draw_stroke.empty()) {
+        // The CHAIN, not the stroke: an open chain has a line the user can see, and
+        // m_draw_stroke is deliberately empty for it, so gating on the stroke would
+        // make Esc a no-op on exactly the state it is most wanted for.
+        if (!m_draw_chain.empty()) {
             clear_draw_stroke(/*push_undo*/ true);
             return true;
         }
@@ -2571,9 +2596,13 @@ void GLGizmoCut3D::render_curved_surface_inputs()
     bool draw = m_surface_mode == CutSurfaceMode::Draw;
     if (m_imgui->bbl_radio_button(draw_label.c_str(), draw)) {
         m_surface_mode = CutSurfaceMode::Draw;
-        // A fresh Draw session starts with no stroke and no stroke history. The
-        // sheet is left alone rather than reset: switching back to Curved should
-        // find the surface where it was.
+        // A fresh Draw session starts with no line and no history. The sheet is left
+        // alone rather than reset: switching back to Curved should find the surface
+        // where it was.
+        m_draw_chain.clear();
+        m_draw_capture.clear();
+        m_draw_snap_armed = false;
+        m_draw_reject_msg = DrawRejectReason::None;
         m_draw_stroke.clear();
         clear_draw_undo();
         m_draw_capturing = false;
@@ -2862,7 +2891,15 @@ bool GLGizmoCut3D::draw_sample_at(const Vec2d& mouse_position)
     if (!m_draw_raycaster->unproject_on_mesh(mouse_position, plane_to_world, camera, hit_f, normal_f, nullptr, &facet))
         return false;
 
-    m_draw_stroke.append(hit_f.cast<double>(), normal_f.cast<double>(), facet);
+    // 2026-09-12: the sample goes into the IN-PROGRESS STROKE, not straight into the
+    // line. The chain only learns about it on LeftUp, which is what lets a gesture be
+    // abandoned (Esc, or a press that turns out not to continue the chain) without the
+    // line ever having changed.
+    DrawCutSample smp;
+    smp.pos    = hit_f.cast<double>();
+    smp.normal = normal_f.cast<double>().normalized();
+    smp.facet  = facet;
+    m_draw_capture.push_back(smp);
     // The painter's contract: the last mouse position is re-set only on an actual
     // HIT, which is what makes a miss non-fatal - the next hit interpolates from
     // the last place the ray found the surface rather than from a miss.
@@ -2929,7 +2966,14 @@ void GLGizmoCut3D::refresh_draw_stroke()
     m_draw_params.thickness_offset = cut_thickness_offset();
     m_draw_params.angle_deg   = double(m_draw_angle);
 
-    m_draw_stroke.finish(DrawCutStroke::DefaultSpacing, double(m_draw_smoothing));
+    // 2026-09-12: THE STROKE COMES FROM THE CHAIN, and only from a CLOSED one.
+    //
+    // DrawCutChain::finish() leaves the stroke cleared with DrawCutError::NotClosed
+    // while the chain is open, which is owner feedback items 1 and 2 in one line:
+    // every "is there a cut surface" site in this file asks m_draw_stroke.valid(),
+    // so an open chain lofts nothing, previews no cutter shell, classifies nothing
+    // and greys out the Cut button - without any of those sites knowing about chains.
+    m_draw_chain.finish(m_draw_stroke, DrawCutStroke::DefaultSpacing, double(m_draw_smoothing));
 
     // PHASE 2 closes phase 1's deviation #7: push the smoothed path back onto the
     // model. draw_cut_smooth() cannot - it lives in libslic3r, where there is no
@@ -2960,7 +3004,23 @@ void GLGizmoCut3D::refresh_draw_stroke()
     update_draw_connector_warnings();
     invalidate_draw_stroke();
     m_draw_surface_pick_dirty = true;
+    // OWNER FEEDBACK 3: the coloured halves follow the DRAWN surface, so the field the
+    // shader samples is stale the moment the stroke or a sweep parameter changes.
+    //
+    // MARKED DIRTY ONLY. The field is a TEXTURE, and this runs from mouse and panel
+    // handlers; the upload happens in update_clipper(), which is called at the top of
+    // on_render() where the canvas's GL context is current. That is also exactly where
+    // apply_curved_color_clip() uploads the sheet's texture, so both surfaces arm their
+    // colour clip in the same place.
+    m_draw_field_dirty = true;
     m_parent.set_as_dirty();
+}
+
+// The snap radius for this object, in mm - scaled by its size, so the gesture feels
+// the same on a trinket and on a 200 mm print.
+double GLGizmoCut3D::draw_chain_snap_radius() const
+{
+    return draw_cut_chain_snap_radius(m_bounding_box);
 }
 
 // The reach the cut will actually use, in mm. Through-all derives it from the
@@ -3067,14 +3127,21 @@ void GLGizmoCut3D::commit_draw_points()
     // closed from the gap between the first and the last sample and the path is
     // stored OPEN (no duplicate first point at the end). Without this an edit would
     // silently open every loop.
-    const bool was_closed = m_draw_stroke.is_closed();
-    DrawCutStroke edited;
-    for (const DrawCutSample& s : m_draw_points)
-        edited.append(s.pos, s.normal, s.facet);
-    if (was_closed)
-        edited.append(m_draw_points.front().pos, m_draw_points.front().normal, m_draw_points.front().facet);
-
-    m_draw_stroke = edited;
+    // 2026-09-12: THE EDIT REWRITES THE CHAIN, not the stroke - refresh_draw_stroke()
+    // derives the stroke from the chain, so writing the stroke here would be undone on
+    // the next line.
+    //
+    // The edited points become the chain's samples as ONE stroke, which is the honest
+    // answer: an edit that inserts or deletes a point changes the sample count, so the
+    // original per-stroke ranges no longer describe this line and pretending they do
+    // would corrupt undo. Undo still works - the entry pushed before the edit holds the
+    // chain as it was, ranges and all - it just makes the edited line one link.
+    //
+    // Editing is only reachable on a VALID stroke, which means a CLOSED chain, so the
+    // closed flag is restored unconditionally. (set_samples() refuses to call a chain
+    // of fewer than MinChainSamples closed, which is the guard against an edit that
+    // deletes its way down to a triangle.)
+    m_draw_chain.set_samples(m_draw_points, /*closed*/ true);
     refresh_draw_stroke();
 }
 
@@ -3395,10 +3462,21 @@ void GLGizmoCut3D::update_draw_empty_sides()
 
 void GLGizmoCut3D::clear_draw_stroke(bool push_undo)
 {
-    if (m_draw_stroke.empty())
+    // The CHAIN is what "is there a line" means now: a chain that is open has a line
+    // the user can see and continue, while m_draw_stroke is deliberately empty, so
+    // gating on the stroke would make Clear line a no-op on exactly the state the user
+    // most wants to clear.
+    if (m_draw_chain.empty() && m_draw_capture.empty())
         return;
     if (push_undo)
         push_draw_undo();
+    m_draw_chain.clear();
+    m_draw_capture.clear();
+    m_draw_snap_armed = false;
+    // The refusal message describes ONE GESTURE, not a state of the line, so clearing
+    // the line clears it too - otherwise "the line is already closed" would still be on
+    // screen next to an empty canvas.
+    m_draw_reject_msg = DrawRejectReason::None;
     m_draw_stroke.clear();
     m_draw_capturing  = false;
     m_draw_last_mouse = Vec2d::Zero();
@@ -3414,6 +3492,9 @@ void GLGizmoCut3D::clear_draw_stroke(bool push_undo)
     m_draw_tilted_connectors = m_draw_unflat_connectors = m_draw_offsurface_connectors = 0;
     m_draw_surface_pick_dirty = true;
     m_draw_surface_raycaster.reset();
+    // Dirty only, as in refresh_draw_stroke(): the upload and the release both happen
+    // from update_clipper(), inside the render.
+    m_draw_field_dirty = true;
     invalidate_draw_stroke();
     m_parent.set_as_dirty();
 }
@@ -3430,17 +3511,21 @@ void GLGizmoCut3D::clear_draw_stroke(bool push_undo)
 GLGizmoCut3D::DrawStrokeState GLGizmoCut3D::draw_stroke_state() const
 {
     DrawStrokeState st;
-    st.samples = m_draw_stroke.samples();
-    st.closed  = m_draw_stroke.is_closed();
+    st.chain = m_draw_chain;
     return st;
 }
 
 void GLGizmoCut3D::apply_draw_stroke_state(const DrawStrokeState& st)
 {
-    DrawCutStroke restored;
-    for (const DrawCutSample& smp : st.samples)
-        restored.append(smp.pos, smp.normal, smp.facet);
-    m_draw_stroke = restored;
+    m_draw_chain = st.chain;
+    // Abandon any gesture in flight: restoring a chain under a half-drawn stroke would
+    // append that stroke to a chain whose endpoints have moved out from under it.
+    m_draw_capture.clear();
+    m_draw_capturing  = false;
+    m_draw_snap_armed = false;
+    // An undo answers the refusal the message was complaining about (it is usually the
+    // very reason the user pressed Ctrl+Z), so the message goes with it.
+    m_draw_reject_msg = DrawRejectReason::None;
     refresh_draw_stroke();
 }
 
@@ -3455,6 +3540,12 @@ void GLGizmoCut3D::push_draw_undo()
     m_draw_redo.clear();
 }
 
+// 2026-09-12: ONE STEP PER APPENDED STROKE. The entry holds the whole chain as it
+// stood before that stroke - including whether it was closed - so Ctrl+Z after a
+// continuation gives back the chain minus that link, and Ctrl+Z after the stroke that
+// closed the loop gives back the open chain with the surface preview gone. That is the
+// behaviour the brief asks to keep ("Ctrl+Z per stroke segment inside the gizmo"), now
+// meaning a segment of the chain rather than a whole separate line.
 bool GLGizmoCut3D::draw_undo()
 {
     if (m_surface_mode != CutSurfaceMode::Draw || m_draw_undo.empty())
@@ -3596,6 +3687,26 @@ bool GLGizmoCut3D::draw_on_mouse(const wxMouseEvent& mouse_event)
     if (m_draw_capturing) {
         if (mouse_event.Dragging()) {
             draw_interpolate_to(mouse_pos);
+            // SNAP FEEDBACK. Light the far endpoint's ring up while the cursor is
+            // inside the radius that would close the chain on release, so the user can
+            // see the closure coming rather than discovering it afterwards. Measured
+            // against the last captured sample (which is on the model) rather than
+            // against the mouse ray, so it agrees exactly with the test append() will
+            // make on release.
+            m_draw_snap_armed = false;
+            if (!m_draw_capture.empty() && !m_draw_chain.empty()) {
+                const Vec3d far_end = m_draw_capture_end == DrawChainEnd::Back
+                                    ? m_draw_chain.front_pos() : m_draw_chain.back_pos();
+                const size_t total = m_draw_chain.size() + m_draw_capture.size();
+                m_draw_snap_armed = total >= DrawCutChain::MinChainSamples &&
+                                    (m_draw_capture.back().pos - far_end).norm() <= draw_chain_snap_radius();
+            }
+            else if (m_draw_capture.size() >= DrawCutChain::MinChainSamples) {
+                // A FIRST stroke closes on its own start - the phase 1 "a circle in one
+                // gesture" case, which still works exactly as it did.
+                m_draw_snap_armed = (m_draw_capture.back().pos - m_draw_capture.front().pos).norm()
+                                    <= draw_chain_snap_radius();
+            }
             // The RIBBON is rebuilt every tick - it is a light strip of triangles
             // and the raycaster's AABB tree stays valid all stroke (Draw never
             // moves a vertex, so none of Sculpt's stale-tree caveats apply). The
@@ -3608,28 +3719,32 @@ bool GLGizmoCut3D::draw_on_mouse(const wxMouseEvent& mouse_event)
         if (mouse_event.LeftUp() || mouse_event.Leaving()) {
             m_draw_capturing  = false;
             m_draw_last_mouse = Vec2d::Zero();
+            m_draw_snap_armed = false;
             // The camera angle AT THE MOMENT THE STROKE WAS DRAWN is the one a
             // "View" cut means, so latch it here rather than re-reading it on every
             // later parameter change (see refresh_draw_stroke).
             latch_draw_view_dir();
-            // Resample, smooth, decide open/closed, rebuild the preview - one
-            // undo entry per COMPLETED stroke, which was pushed on the press.
+
+            // APPEND THE CAPTURED STROKE TO THE CHAIN. This is the whole of the 2026-09-12
+            // change on the gesture side: the stroke is not the line, it is one link of it,
+            // and append() decides which end it joins and whether it closes the chain.
+            //
+            // A stroke of one sample (a click, or a drag that only ever hit once) is
+            // dropped rather than appended: append() needs two samples to have a
+            // direction, and a one-sample link would be invisible and unremovable.
+            const std::vector<DrawCutSample> captured = m_draw_capture;
+            m_draw_capture.clear();
+            const DrawChainEnd at = captured.size() >= 2
+                                  ? m_draw_chain.append(captured, draw_chain_snap_radius())
+                                  : DrawChainEnd::None;
             refresh_draw_stroke();
-            // A press-and-release that captured nothing USABLE must not leave a step
-            // on the undo stack: the first Ctrl+Z would then appear to do nothing,
-            // and the only thing it would take back is a line the user never got.
-            // Same suppression the sheet's drag and snap use, keyed on "the stroke
-            // that came out is not one you could cut with" rather than on comparing
-            // it to the entry (which holds the PREVIOUS stroke, so a comparison
-            // would be meaningless).
-            if (!m_draw_stroke.valid() && !m_draw_undo.empty()) {
-                // Put the previous stroke back, rather than leaving the user with a
-                // dab that replaced a good line.
-                const DrawStrokeState st = m_draw_undo.back();
+
+            // NOTHING WAS APPENDED: no step belongs on the undo stack. Otherwise the
+            // first Ctrl+Z would appear to do nothing, taking back a link the user
+            // never got. (The press pushed the entry speculatively, because it has to
+            // hold the state to come BACK to and by LeftUp that state is gone.)
+            if (at == DrawChainEnd::None && !m_draw_undo.empty())
                 m_draw_undo.pop_back();
-                if (!st.samples.empty())
-                    apply_draw_stroke_state(st);
-            }
             m_parent.set_as_dirty();
             return true;
         }
@@ -3640,29 +3755,47 @@ bool GLGizmoCut3D::draw_on_mouse(const wxMouseEvent& mouse_event)
         if (!update_draw_raycaster())
             return false;
 
-        // A new stroke replaces the old one, and that is an edit worth taking back.
-        // The undo entry is pushed FIRST, while m_draw_stroke still holds the old
-        // stroke, because the entry has to be the state to come back TO - the same
-        // "push before the change" rule push_curved_undo() follows.
-        push_draw_undo();
-
-        // The painter's guard: a click that MISSES the mesh must not capture the
-        // mouse, or the rest of the gizmo (and the plater's own rectangle select)
-        // stops working wherever the model is not. So clear, probe, and put the old
-        // stroke back out of the entry we just pushed if the probe found nothing.
-        DrawCutStroke previous = m_draw_stroke;
-        m_draw_stroke.clear();
+        // The painter's guard: a click that MISSES the mesh must not capture the mouse,
+        // or the rest of the gizmo (and the plater's own rectangle select) stops working
+        // wherever the model is not. Probe FIRST, before anything is touched.
+        m_draw_capture.clear();
         m_draw_last_mouse = Vec2d::Zero();
-        if (!draw_sample_at(mouse_pos)) {
-            m_draw_stroke     = previous;
+        if (!draw_sample_at(mouse_pos))
+            return false;
+
+        // OWNER FEEDBACK 4: ONLY ONE CHAIN MAY EXIST, and a stroke that does not begin
+        // at one of the current chain's endpoints is REJECTED. The check happens here,
+        // on the press, so the refusal costs the user a click rather than a whole
+        // stroke they then watch disappear.
+        //
+        // A CLOSED chain accepts nothing (end_for_start() says None at both endpoints):
+        // it is finished, and the way to get a different line is Clear line or Ctrl+Z,
+        // which are deliberate gestures rather than a stray drag on the model. That is
+        // the branch of the feedback's "(or, if the chain is closed, replaces it after
+        // confirmation...)" this takes - no implicit replacement at all.
+        const DrawChainEnd at = m_draw_chain.end_for_start(m_draw_capture.front().pos, draw_chain_snap_radius());
+        if (at == DrawChainEnd::None) {
+            m_draw_capture.clear();
             m_draw_last_mouse = Vec2d::Zero();
-            if (!m_draw_undo.empty())
-                m_draw_undo.pop_back();
+            // Say why, in the place the user is already looking. The panel's own line
+            // is static text, so this goes through the notification manager the way the
+            // rest of the gizmo's refusals do.
+            m_draw_reject_msg = m_draw_chain.is_closed()
+                              ? DrawRejectReason::ChainClosed : DrawRejectReason::Disjoint;
+            m_parent.set_as_dirty();
             return false;
         }
+        m_draw_reject_msg  = DrawRejectReason::None;
+        m_draw_capture_end = at;
+
+        // ONE UNDO ENTRY PER APPENDED STROKE, pushed here while m_draw_chain still holds
+        // the state to come back TO - the same "push before the change" rule
+        // push_curved_undo() follows. LeftUp pops it again if nothing was appended.
+        push_draw_undo();
 
         Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Draw cut line"), UndoRedo::SnapshotType::GizmoAction);
-        m_draw_capturing = true;
+        m_draw_capturing  = true;
+        m_draw_snap_armed = false;
         invalidate_draw_stroke();
         m_parent.set_as_dirty();
         return true;
@@ -3689,9 +3822,29 @@ void GLGizmoCut3D::update_draw_preview_models()
     // mid-drag does not walk the point out from under the cursor), so both the ribbon
     // and the cutter shell below read m_draw_points instead. That is what makes the
     // preview update live under the drag.
+    // 2026-09-12: while the chain is OPEN there is no finished path at all (that is the
+    // point - nothing is lofted), so the polyline is drawn from the chain's own samples,
+    // with whatever stroke is being captured right now spliced on at the end it
+    // continues. That is what the user watches as they draw.
+    std::vector<DrawCutSample> live;
     const bool dragging_pt = m_draw_drag_pt >= 0 && m_draw_points.size() >= 2;
+    if (!dragging_pt && m_draw_stroke.path().empty()) {
+        live = m_draw_chain.samples();
+        if (!m_draw_capture.empty()) {
+            if (m_draw_capture_end == DrawChainEnd::Front && !live.empty()) {
+                // The in-progress stroke runs AWAY from the chain's front, so it is
+                // reversed and put in front - the same thing append() will do on release,
+                // so what the user sees while drawing is what they get.
+                std::vector<DrawCutSample> rev = m_draw_capture;
+                std::reverse(rev.begin(), rev.end());
+                live.insert(live.begin(), rev.begin(), rev.end());
+            }
+            else
+                live.insert(live.end(), m_draw_capture.begin(), m_draw_capture.end());
+        }
+    }
     const std::vector<DrawCutSample>& pts = dragging_pt ? m_draw_points
-                                          : m_draw_stroke.path().empty() ? m_draw_stroke.samples()
+                                          : m_draw_stroke.path().empty() ? live
                                                                          : m_draw_stroke.path();
     if (pts.size() >= 2) {
         // Half width scaled to the part, so the line reads the same on a 10 mm
@@ -3877,9 +4030,212 @@ void GLGizmoCut3D::render_draw_stroke()
             curr_shader->start_using();
     }
 
+    // 2026-09-12: THE CHAIN'S TWO ENDPOINTS, clearly marked, because they are the only
+    // places a new stroke may begin. Drawn before the edit handles so a handle sitting
+    // on an endpoint wins the depth fight.
+    render_draw_chain_endpoints();
+
     // PHASE 2: the editable points, on top of everything, with the depth buffer
     // cleared so a closed loop's far handles are grabbable too.
     render_draw_point_handles();
+}
+
+// 2026-09-12. The chain's two endpoints, as spheres, with the SNAP RING round the one a
+// release would close on.
+//
+// Not drawn for a CLOSED chain: it has no free endpoints, so marking two arbitrary
+// samples as special would be a lie about what a click there does (nothing - a closed
+// chain refuses continuation).
+void GLGizmoCut3D::render_draw_chain_endpoints()
+{
+    // A FINISHED-OPEN chain still has two free endpoints - the user can carry on from
+    // either, which clears the "finished" verdict - so its handles stay up. Only a CLOSED
+    // chain has no free ends, and marking two arbitrary samples special there would be a
+    // lie about what clicking them does.
+    if (m_draw_chain.empty() || m_draw_chain.is_closed())
+        return;
+
+    GLShaderProgram* shader = wxGetApp().get_shader("gouraud_light");
+    if (shader == nullptr)
+        return;
+
+    const Camera&     camera          = wxGetApp().plater()->get_camera();
+    const Transform3d plane_to_world  = translation_transform(m_plane_center) * m_rotation_m;
+
+    // Same size rule the edit handles and the plane grabbers use, so the three read as
+    // one family.
+    const double r = 0.75 * m_grabber_radius;
+
+    // WHICH END A RELEASE WOULD CLOSE ON. While a stroke is in flight that is the end
+    // it is NOT continuing; with no stroke in flight neither is armed, so both rings
+    // are drawn in the plain colour.
+    const bool  capturing = m_draw_capturing && !m_draw_capture.empty();
+    const bool  arm_front = capturing && m_draw_capture_end == DrawChainEnd::Back;
+    const bool  arm_back  = capturing && m_draw_capture_end == DrawChainEnd::Front;
+
+    // The depth buffer is cleared first, exactly as render_draw_point_handles() does:
+    // an endpoint on the far side of a tall part still has to be findable, because it
+    // is where the user has to start their next stroke.
+    glsafe(::glClear(GL_DEPTH_BUFFER_BIT));
+    shader->start_using();
+    shader->set_uniform("emission_factor", 0.1f);
+
+    auto sphere = [&](const Vec3d& p_plane, bool armed) {
+        const Transform3d m = camera.get_view_matrix() * plane_to_world *
+                              translation_transform(p_plane) * scale_transform(armed ? 1.4 * r : r);
+        shader->set_uniform("view_model_matrix", m);
+        shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+        shader->set_uniform("view_normal_matrix", (Matrix3d) m.matrix().block(0, 0, 3, 3).inverse().transpose());
+        // ARMED is bright green - "let go here and the loop closes" - and a plain
+        // endpoint is the same orange the line is, so the two read as one object.
+        m_sphere.model.set_color(armed ? ColorRGBA(0.1f, 0.95f, 0.3f, 1.f)
+                                       : ColorRGBA(1.f, 0.65f, 0.f, 1.f));
+        m_sphere.model.render();
+    };
+
+    sphere(m_draw_chain.front_pos(), arm_front && m_draw_snap_armed);
+    sphere(m_draw_chain.back_pos(),  arm_back  && m_draw_snap_armed);
+    shader->stop_using();
+}
+
+// ---------------------------------------------------------------------------
+// 2026-09-12, OWNER FEEDBACK 3: the halves classification.
+//
+// The cyan/magenta colouring, the Visible/Ghost/Hidden side display and the
+// connectors all read the same per-fragment "which side" the colour-clip shader
+// computes. In Draw mode that was the FLAT PLANE's dot product, so the colours ran
+// straight through the drawn surface and told the user nothing.
+//
+// The curved cut answers this with a height field in a 2D texture. A ruled strip is
+// NOT a height field over the plane - it is not single-valued in (u,v), which is
+// precisely what the mode exists for - so there is no (u,v) -> z to put in a 2D
+// texture and the sheet's mechanism cannot be reused at all.
+//
+// What IS available is the question the split itself asks: is the point inside the
+// cutter solid. That is exact by construction (it is the same solid the boolean gets)
+// and needs no assumption about the surface being a graph over anything. Baked into a
+// 3D texture, one voxel per cell of the part's bounding box, it is one fetch per
+// fragment. sampler3D is core GL 1.2 / GLSL 110, so this works on the 2.1 fallback
+// path as well as the 140 one.
+// ---------------------------------------------------------------------------
+
+void GLGizmoCut3D::update_draw_field_texture()
+{
+    if (!m_draw_field_dirty && m_draw_field_tex != 0)
+        return;
+
+    m_draw_field_bbox = BoundingBoxf3();
+    if (!m_draw_stroke.valid()) {
+        // No closed line, no field - and no texture, so apply_draw_color_clip() leaves
+        // the plain flat split standing. That is the right thing to show while the user
+        // is still drawing: the plane's own colours are at least honest about being the
+        // plane's.
+        release_draw_field_texture();
+        m_draw_field_dirty = false;
+        return;
+    }
+
+    indexed_triangle_set mesh;
+    if (!m_draw_pick_its.empty())
+        mesh = m_draw_pick_its;
+    else if (!curved_instance_mesh_in_plane(mesh)) {
+        release_draw_field_texture();
+        m_draw_field_dirty = false;
+        return;
+    }
+
+    BoundingBoxf3 bbox;
+    for (const Vec3f& v : mesh.vertices)
+        bbox.merge(v.cast<double>());
+
+    // The cutter with the kerf's LOWER face, which is the one that bounds the upper
+    // half: with a kerf there are two surfaces and the band between them belongs to
+    // neither side, so the colouring has to pick one and the upper half's own boundary
+    // is the one that makes "cyan is what you keep on top" true.
+    double face_lo = 0.0, face_hi = 0.0;
+    cut_thickness_faces(face_lo, face_hi);
+    const indexed_triangle_set cutter = draw_cut_cutter_solid(m_draw_stroke, m_draw_params, bbox,
+                                                             m_draw_stroke.is_closed() ? face_hi : face_lo);
+    if (cutter.empty()) {
+        release_draw_field_texture();
+        m_draw_field_dirty = false;
+        return;
+    }
+
+    const std::vector<float> field = draw_cut_inside_field(cutter, m_draw_stroke.is_closed(), bbox,
+                                                           DrawFieldRes, DrawFieldRes, DrawFieldRes,
+                                                           &m_draw_field_bbox);
+
+    if (m_draw_field_tex == 0) {
+        GLuint id = 0;
+        glsafe(::glGenTextures(1, &id));
+        m_draw_field_tex = (unsigned int) id;
+    }
+    glsafe(::glActiveTexture(GL_TEXTURE4));
+    glsafe(::glBindTexture(GL_TEXTURE_3D, (GLuint) m_draw_field_tex));
+    // NEAREST, not LINEAR. The field is a two-valued sign, and interpolating between
+    // -1 and +1 puts a band of intermediate values across the boundary whose sign
+    // depends on which side of 0 the interpolation lands - which reads as a ragged
+    // edge that moves as the camera moves. Nearest gives a boundary on voxel faces,
+    // which at 48^3 over a part is finer than the eye resolves on a translucent
+    // preview.
+    glsafe(::glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST));
+    glsafe(::glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST));
+    glsafe(::glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE));
+    glsafe(::glPixelStorei(GL_UNPACK_ALIGNMENT, 1));
+    // GL_R32F / GL_RED from 3.0, GL_LUMINANCE on the 2.1 fallback - the same pair the
+    // sheet's 2D texture uses. The field is a SIGN, so the fallback's clamp to [0,1] is
+    // handled by storing 0 for upper and 1 for lower and testing against 0.5 in the
+    // shader rather than by an encode/decode of a range.
+    if (wxGetApp().is_gl_version_greater_or_equal_to(3, 0))
+        glsafe(::glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, DrawFieldRes, DrawFieldRes, DrawFieldRes, 0,
+                              GL_RED, GL_FLOAT, field.data()));
+    else {
+        std::vector<float> enc(field.size());
+        for (size_t i = 0; i < field.size(); ++ i)
+            enc[i] = field[i] < 0.f ? 0.f : 1.f;
+        glsafe(::glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE, DrawFieldRes, DrawFieldRes, DrawFieldRes, 0,
+                              GL_LUMINANCE, GL_FLOAT, enc.data()));
+    }
+    glsafe(::glBindTexture(GL_TEXTURE_3D, 0));
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+
+    m_draw_field_dirty = false;
+}
+
+void GLGizmoCut3D::release_draw_field_texture()
+{
+    if (m_draw_field_tex != 0) {
+        GLuint id = (GLuint) m_draw_field_tex;
+        glsafe(::glDeleteTextures(1, &id));
+        m_draw_field_tex = 0;
+    }
+    m_draw_field_dirty = true;
+}
+
+void GLGizmoCut3D::apply_draw_color_clip()
+{
+    // Only a Draw cut with a CLOSED, usable line takes over the split. An open chain
+    // keeps the plain plane colours, which is honest: there is no cut surface yet.
+    if (!is_draw_surface() || !m_draw_stroke.valid() || m_connectors_editing || m_hide_cut_plane) {
+        m_parent.set_draw_color_clip(0, Transform3d::Identity(), Vec3d::Zero(), Vec3d::Ones());
+        return;
+    }
+
+    update_draw_field_texture();
+    if (m_draw_field_tex == 0 || !m_draw_field_bbox.defined) {
+        m_parent.set_draw_color_clip(0, Transform3d::Identity(), Vec3d::Zero(), Vec3d::Ones());
+        return;
+    }
+
+    // world -> plane frame, and the field's own box in that frame, so the shader can
+    // turn a world position into a texture coordinate. Exactly the shape
+    // apply_curved_color_clip() passes for the sheet, one dimension wider.
+    const Transform3d plane_to_world = translation_transform(m_plane_center) * m_rotation_m;
+    m_parent.set_draw_color_clip(m_draw_field_tex, plane_to_world.inverse(),
+                                 m_draw_field_bbox.min, m_draw_field_bbox.size());
 }
 
 // --- panel ----------------------------------------------------------------
@@ -4010,7 +4366,42 @@ void GLGizmoCut3D::render_draw_surface_inputs()
 
     ImGui::SameLine();
 
-    m_imgui->disabled_begin(m_draw_stroke.empty());
+    // CLOSE LOOP: the explicit way to finish a chain whose two ends the user cannot
+    // comfortably bring together - a line round a feature that comes back to within a
+    // few millimetres but not within the snap radius. The closing span is then whatever
+    // gap is left, which the resampler walks like any other span.
+    m_imgui->disabled_begin(m_draw_chain.is_closed() || m_draw_chain.size() < DrawCutChain::MinChainSamples);
+    if (m_imgui->button(_L("Close loop"), _L("Join the two ends of the line, so the cut surface can be made"))) {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Close draw cut loop"), UndoRedo::SnapshotType::GizmoAction);
+        push_draw_undo();
+        m_draw_chain.force_close();
+        m_draw_reject_msg = DrawRejectReason::None;
+        refresh_draw_stroke();
+    }
+    m_imgui->disabled_end();
+
+    ImGui::SameLine();
+
+    // PHASE 1'S OPEN CUT, now explicit. A line right across a part splits it in two
+    // with no inside or outside, which is a perfectly good cut - but the chain cannot
+    // loft it automatically, because "not finished yet" and "finished, not a loop" look
+    // identical from the samples, and lofting every partial line is the wild-shape
+    // preview this change exists to remove. So the user says which.
+    m_imgui->disabled_begin(m_draw_chain.is_closed() || m_draw_chain.is_finished_open() ||
+                            m_draw_chain.size() < DrawCutChain::MinChainSamples);
+    if (m_imgui->button(_L("Cut along the line"),
+                        _L("Use the line as it is, without closing it: the cut splits the part along it"))) {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Finish draw cut line"), UndoRedo::SnapshotType::GizmoAction);
+        push_draw_undo();
+        m_draw_chain.finish_open();
+        m_draw_reject_msg = DrawRejectReason::None;
+        refresh_draw_stroke();
+    }
+    m_imgui->disabled_end();
+
+    ImGui::SameLine();
+
+    m_imgui->disabled_begin(m_draw_chain.empty());
     if (m_imgui->button(_L("Clear line"), _L("Remove the drawn line"))) {
         Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Clear draw cut line"), UndoRedo::SnapshotType::GizmoAction);
         clear_draw_stroke(/*push_undo*/ true);
@@ -4020,11 +4411,42 @@ void GLGizmoCut3D::render_draw_surface_inputs()
     ImGui::PushTextWrapPos(m_editing_window_width);
     if (m_draw_editing)
         m_imgui->text(_L("Drag a handle to move it; right-click one to delete it; Shift+click a segment to add one."));
+    else if (m_draw_chain.empty())
+        m_imgui->text(_L("Drag on the model to start the cut line. You can rotate the view and carry on from either end until the line closes on itself."));
+    else if (m_draw_chain.is_finished_open())
+        m_imgui->text(_L("Using the line as it is. Draw from an end to carry on; Esc clears it; "
+                         "Ctrl+Z takes back one stroke and Ctrl+Y puts it back."));
+    else if (!m_draw_chain.is_closed())
+        // THE INSTRUCTION THAT MAKES THE FEATURE DISCOVERABLE (owner feedback item 1):
+        // the gesture is not "draw the whole thing in one go", and nothing on screen
+        // said so.
+        m_imgui->text(_L("Start your next stroke at one of the marked ends. Rotate the view freely. "
+                         "Finish a stroke near the other end and the loop closes - or press "
+                         "\"Cut along the line\" to use it open."));
     else
-        m_imgui->text(_L("Drag on the model to draw the cut line. Esc clears it; Ctrl+Z and Ctrl+Y step through your lines."));
+        m_imgui->text(_L("Closed. Esc clears the line; Ctrl+Z takes back one stroke and Ctrl+Y puts it back."));
 
-    if (m_draw_stroke.empty())
+    // WHY THE LAST PRESS WAS REFUSED. Only one chain may exist, so a press that does
+    // not continue it does nothing - and "nothing happened" is the worst possible
+    // feedback for a gesture the user thought they made.
+    if (m_draw_reject_msg == DrawRejectReason::Disjoint)
+        m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                              _L("That stroke did not start at either end of the line, so it was not added. "
+                                 "Start at one of the marked ends, or clear the line first."));
+    else if (m_draw_reject_msg == DrawRejectReason::ChainClosed)
+        m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                              _L("The line is already closed. Clear it, or press Ctrl+Z, before drawing a different one."));
+
+    if (m_draw_chain.empty())
         m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT, _L("Draw a line on the model."));
+    else if (!m_draw_chain.is_closed() && !m_draw_chain.is_finished_open())
+        // OWNER FEEDBACK ITEMS 1 AND 2: no surface until the line is finished, said in
+        // the panel so the absence of a preview reads as "not yet" rather than as broken.
+        m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                              format_wxstr(_L("The line is not finished, so there is no cut surface yet. "
+                                              "Carry on from an end until it comes within %1% mm of the other, "
+                                              "or use it open."),
+                                           int(std::lround(draw_chain_snap_radius()))));
     else if (!m_draw_stroke.valid()) {
         // The message comes from libslic3r as untranslated English (the tests read the
         // enum, so the strings live next to it), and _L() needs a literal to extract.
@@ -4422,12 +4844,20 @@ void GLGizmoCut3D::on_set_state()
     // The drawn stroke goes the same way: on_set_state() runs on open AND on
     // close, which is where a stroke has to be cleared or the next object would
     // open the gizmo with the last one's line still on it.
+    m_draw_chain.clear();
+    m_draw_capture.clear();
+    m_draw_snap_armed  = false;
+    m_draw_reject_msg  = DrawRejectReason::None;
     m_draw_stroke.clear();
     clear_draw_undo();
     m_draw_capturing   = false;
     m_draw_last_mouse  = Vec2d::Zero();
     m_draw_upper_empty = m_draw_lower_empty = false;
     m_draw_folds       = false;
+    // OWNER FEEDBACK 3: the classification field is per-cut state too, and it holds a
+    // GL texture, so it has to be released here and not merely marked dirty.
+    release_draw_field_texture();
+    m_draw_field_bbox  = BoundingBoxf3();
     // PHASE 2 state goes the same way, and for the same reason: the Angle is a
     // property of ONE cut (leaving it set would silently draft the next object's),
     // and Edit points with no line is a mode with no way out.
@@ -6227,14 +6657,22 @@ void GLGizmoCut3D::flip_cut_plane()
     // the same for the normals, which are directions in that frame. That is the
     // exact matching change, and like the sheet's it is pure arithmetic: no
     // re-projection, no re-fit, nothing lost.
-    const bool carry_stroke = m_surface_mode == CutSurfaceMode::Draw && !m_draw_stroke.empty();
+    // 2026-09-12: the CHAIN is what carries, and its stroke ranges are untouched by the
+    // flip - the samples keep their order and only their coordinates change - so
+    // set_samples() would be wrong here (it would collapse the chain to one stroke and
+    // lose the per-stroke undo the user has built up). The chain is rebuilt by replaying
+    // its own ranges instead.
+    const bool carry_stroke = m_surface_mode == CutSurfaceMode::Draw && !m_draw_chain.empty();
     if (carry_stroke) {
         push_draw_undo();
-        DrawCutStroke flipped;
-        for (const DrawCutSample& s : m_draw_stroke.samples())
-            flipped.append(Vec3d(s.pos.x(), -s.pos.y(), -s.pos.z()),
-                           Vec3d(s.normal.x(), -s.normal.y(), -s.normal.z()), s.facet);
-        m_draw_stroke = flipped;
+        std::vector<DrawCutSample> flipped = m_draw_chain.samples();
+        for (DrawCutSample& smp : flipped) {
+            smp.pos    = Vec3d(smp.pos.x(), -smp.pos.y(), -smp.pos.z());
+            smp.normal = Vec3d(smp.normal.x(), -smp.normal.y(), -smp.normal.z());
+        }
+        CutRecipeStroke keep = cut_recipe_stroke_from_chain(m_draw_chain, double(m_draw_smoothing));
+        keep.samples = flipped;
+        cut_recipe_stroke_to_chain(keep, m_draw_chain);
     }
 
     m_rotation_m = m_rotation_m * rotation_transform(PI * Vec3d::UnitX());
@@ -7427,9 +7865,11 @@ CutRecipe GLGizmoCut3D::build_recipe_from_gizmo(const ModelObject* mo, const Tri
         // The RAW samples, not the finished path: finish() regenerates the path,
         // the smoothing and the binormals from them deterministically, and storing
         // both would let the two disagree. See CutRecipeStroke.
-        r.stroke.samples   = m_draw_stroke.samples();
-        r.stroke.closed    = m_draw_stroke.is_closed();
-        r.stroke.smoothing = double(m_draw_smoothing);
+        // 2026-09-12: from the CHAIN, which also carries the per-stroke ranges the
+        // chain's own undo works off - so reopening a cut gives back a line whose
+        // Ctrl+Z takes back one stroke, not the whole thing. Version 2 of the schema;
+        // a version 1 file has no ranges and loads as one stroke.
+        r.stroke = cut_recipe_stroke_from_chain(m_draw_chain, double(m_draw_smoothing));
 
         r.draw_direction   = m_draw_direction;
         r.draw_view_dir    = m_draw_params.view_dir;
@@ -7549,10 +7989,12 @@ void GLGizmoCut3D::apply_recipe_to_gizmo(const CutRecipe& recipe)
         // Rebuild the stroke from the RAW samples, exactly as capture would have
         // left it, then re-run finish() with the recipe's own smoothing - which is
         // what makes the reproduced path identical to the one that was cut with.
-        m_draw_stroke.clear();
-        for (const DrawCutSample& s : recipe.stroke.samples)
-            m_draw_stroke.append(s.pos, s.normal, s.facet);
-        m_draw_stroke.finish(DrawCutStroke::DefaultSpacing, double(m_draw_smoothing), recipe.stroke.closed);
+        // 2026-09-12: rebuild the CHAIN from the stored samples and ranges, then let
+        // refresh_draw_stroke() derive the stroke from it - the one path a stroke is ever
+        // produced by, so a reopened cut and a freshly drawn one cannot diverge.
+        cut_recipe_stroke_to_chain(recipe.stroke, m_draw_chain);
+        m_draw_capture.clear();
+        m_draw_snap_armed = false;
         sync_draw_points();
         invalidate_draw_stroke();
         refresh_draw_stroke();

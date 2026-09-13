@@ -5,6 +5,8 @@
 
 #include <cstring>
 #include <cmath>
+#include <limits>
+#include <algorithm>
 
 namespace Slic3r {
 
@@ -35,6 +37,8 @@ bool CutRecipeConnector::operator==(const CutRecipeConnector& o) const
 bool CutRecipeStroke::operator==(const CutRecipeStroke& o) const
 {
     if (closed != o.closed || smoothing != o.smoothing || samples.size() != o.samples.size())
+        return false;
+    if (stroke_bounds != o.stroke_bounds || finished_open != o.finished_open)
         return false;
     for (size_t i = 0; i < samples.size(); ++i)
         if (samples[i].pos != o.samples[i].pos || samples[i].normal != o.samples[i].normal ||
@@ -78,7 +82,10 @@ bool CutRecipe::operator==(const CutRecipe& o) const
 
 bool CutRecipe::valid() const
 {
-    if (version != CutRecipeVersion)
+    // Any version this build knows, not only the newest: a version 1 file's cut is
+    // reproducible from what it carries, so refusing it would take "Edit cut" away
+    // from every project saved before the chain landed.
+    if (!cut_recipe_version_supported(version))
         return false;
     if (!has_mesh())
         return false;
@@ -273,6 +280,118 @@ bool cut_recipe_mesh_from_blob(const std::vector<uint8_t>& blob, TriangleMesh& o
 std::string cut_recipe_mesh_hash(const std::vector<uint8_t>& blob)
 {
     return image_fill_sha256_hex(blob);
+}
+
+// ---------------------------------------------------------------------------
+// The stroke <-> chain conversion. 2026-09-12.
+// ---------------------------------------------------------------------------
+
+void cut_recipe_stroke_to_chain(const CutRecipeStroke& in, DrawCutChain& out)
+{
+    out.clear();
+    if (in.samples.empty())
+        return;
+
+    // Do the bounds TILE the sample list exactly? Anything else - a gap, an overlap,
+    // a range past the end, a first range not starting at 0 - and they are discarded
+    // in favour of the one-stroke fallback. A chain whose ranges disagree with its
+    // samples corrupts undo silently, which is worse than losing the stroke split.
+    bool tiles = !in.stroke_bounds.empty();
+    size_t expect = 0;
+    for (const std::pair<uint32_t, uint32_t>& b : in.stroke_bounds) {
+        if (size_t(b.first) != expect || b.second <= b.first || size_t(b.second) > in.samples.size()) {
+            tiles = false;
+            break;
+        }
+        expect = size_t(b.second);
+    }
+    if (tiles && expect != in.samples.size())
+        tiles = false;
+
+    // A line that was CUT WITH and is not a loop was, by definition, finished - so an
+    // unclosed stored stroke is finished-open whether or not the flag says so. That is
+    // what makes a version 1 recipe (which has no flag) re-cut to the same halves.
+    const bool fin_open = !in.closed && (in.finished_open || in.samples.size() >= DrawCutChain::MinChainSamples);
+
+    if (!tiles) {
+        out.set_samples(in.samples, in.closed, fin_open);
+        return;
+    }
+
+    // Rebuild the chain by replaying the appends. Every one is a BACK append, which
+    // is what the stored ranges describe: they are ranges in the final sample order,
+    // and replaying them in order reproduces exactly that order whether the strokes
+    // were originally drawn onto the front or the back.
+    //
+    // THE SNAP RADIUS HERE MUST BE TINY, NOT HUGE, and the reason is worth stating
+    // because the obvious choice is exactly backwards. A huge radius does make every
+    // append's START test pass - but the same radius is what append() measures the
+    // CLOSURE with, so the very first replayed stroke would be judged to have closed
+    // the chain on its far endpoint, and a closed chain refuses every later append.
+    // The whole replay would then fall back to one stroke, silently.
+    //
+    // The joins are EXACT by construction (each range begins where the last ended, and
+    // the join sample is re-inserted below), so an epsilon radius passes every start
+    // test and fails every closure test - which is what is wanted, since the closure is
+    // restored explicitly at the end from the stored flag.
+    const double any = 1e-9;
+    for (const std::pair<uint32_t, uint32_t>& b : in.stroke_bounds) {
+        std::vector<DrawCutSample> stroke(in.samples.begin() + int(b.first), in.samples.begin() + int(b.second));
+        if (stroke.size() < 2) {
+            // A one-sample stroke cannot be appended (append() needs two to have a
+            // direction), so fall back rather than dropping a sample.
+            out.set_samples(in.samples, in.closed, fin_open);
+            return;
+        }
+        // append() drops a first sample duplicating the join, so re-insert the join
+        // sample at the front of each continuation: the stored ranges do NOT repeat it
+        // (cut_recipe_stroke_from_chain writes the chain's own flat list), and without
+        // it append() would see a stroke starting a whole span away from the endpoint.
+        if (!out.empty())
+            stroke.insert(stroke.begin(), out.samples()[out.size() - 1]);
+        if (out.append(stroke, any) == DrawChainEnd::None) {
+            out.set_samples(in.samples, in.closed, fin_open);
+            return;
+        }
+    }
+    if (out.size() != in.samples.size()) {
+        out.set_samples(in.samples, in.closed, fin_open);
+        return;
+    }
+    // Every append cleared the flag, so the verdict is restored last, from what was
+    // stored rather than from what the replay happened to produce.
+    if (in.closed)
+        out.force_close();
+    else if (fin_open)
+        out.finish_open();
+}
+
+CutRecipeStroke cut_recipe_stroke_from_chain(const DrawCutChain& chain, double smoothing)
+{
+    CutRecipeStroke out;
+    out.samples       = chain.samples();
+    out.closed        = chain.is_closed();
+    out.finished_open = chain.is_finished_open();
+    out.smoothing     = smoothing;
+    // The chain's own ranges, SORTED BY POSITION rather than in append order.
+    //
+    // DrawCutChain::stroke_bounds() is in APPEND order, because that is the order undo
+    // consumes it in - and a front append puts its samples at index 0 while its range
+    // goes to the end of the list. The recipe cannot store that order, because the
+    // replay in cut_recipe_stroke_to_chain() rebuilds the chain by walking the sample
+    // list forwards: it is the only replay that reproduces the stored sample ORDER,
+    // which is what the cut is made from.
+    //
+    // What is lost is the sequence the strokes were drawn in, so a reopened cut's
+    // Ctrl+Z takes back the LAST stroke along the line rather than the last one drawn.
+    // That is a fair trade: nobody remembers the drawing order of a line from a
+    // previous session, and the alternative - storing both orders - would let the two
+    // disagree about the same line.
+    out.stroke_bounds.reserve(chain.stroke_count());
+    for (const std::pair<size_t, size_t>& b : chain.stroke_bounds())
+        out.stroke_bounds.emplace_back(uint32_t(b.first), uint32_t(b.second));
+    std::sort(out.stroke_bounds.begin(), out.stroke_bounds.end());
+    return out;
 }
 
 } // namespace Slic3r

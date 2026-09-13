@@ -604,3 +604,165 @@ TEST_CASE("Deft: a recipe with no stored mesh is not offered for editing", "[Cut
     REQUIRE_FALSE(bent.sheet.valid());
     REQUIRE_FALSE(bent.valid());
 }
+// ===========================================================================
+// THE CHAIN (recipe version 2, 2026-09-12). The drawn line became a chain of
+// strokes; the recipe grew the per-stroke ranges, and a version 1 recipe still
+// loads as a chain of one stroke.
+// ===========================================================================
+
+TEST_CASE("Cut recipe: a chain round-trips through the stored stroke", "[CutRecipe]")
+{
+    // Build a chain the way the gizmo does: three strokes, one of them onto the FRONT
+    // (which is where the stored order and the drawn order part company).
+    auto run = [](const Vec3d& a, const Vec3d& b, int n) {
+        std::vector<DrawCutSample> out;
+        for (int i = 0; i < n; ++ i) {
+            DrawCutSample s;
+            s.pos    = a + (double(i) / double(n - 1)) * (b - a);
+            s.normal = Vec3d::UnitZ();
+            s.facet  = size_t(i);
+            out.push_back(s);
+        }
+        return out;
+    };
+
+    const double r = 2.0;
+    DrawCutChain chain;
+    REQUIRE(chain.append(run(Vec3d(0, 0, 0), Vec3d(10, 0, 0), 11), r) == DrawChainEnd::Back);
+    REQUIRE(chain.append(run(Vec3d(10, 0, 0), Vec3d(10, 10, 0), 11), r) == DrawChainEnd::Back);
+    REQUIRE(chain.append(run(Vec3d(0, 0, 0), Vec3d(0, -10, 0), 11), r) == DrawChainEnd::Front);
+    REQUIRE(chain.size() == 31);
+    REQUIRE(chain.stroke_count() == 3);
+
+    const CutRecipeStroke stored = cut_recipe_stroke_from_chain(chain, 0.35);
+    REQUIRE(stored.samples.size() == 31);
+    REQUIRE(stored.smoothing == Approx(0.35));
+    REQUIRE(stored.stroke_bounds.size() == 3);
+    // SORTED BY POSITION, because that is the order the replay walks the sample list
+    // in - the drawn order (which put the front append last) cannot be replayed.
+    REQUIRE(stored.stroke_bounds[0].first == 0);
+    for (size_t i = 1; i < stored.stroke_bounds.size(); ++ i)
+        REQUIRE(stored.stroke_bounds[i].first == stored.stroke_bounds[i - 1].second);
+    REQUIRE(stored.stroke_bounds.back().second == 31);
+
+    DrawCutChain back;
+    cut_recipe_stroke_to_chain(stored, back);
+    // THE SAMPLES AND THEIR ORDER SURVIVE EXACTLY, which is what the cut is made from.
+    REQUIRE(back.size() == chain.size());
+    for (size_t i = 0; i < back.size(); ++ i)
+        REQUIRE(back.samples()[i].pos.isApprox(chain.samples()[i].pos));
+    REQUIRE(back.front_pos().isApprox(chain.front_pos()));
+    REQUIRE(back.back_pos().isApprox(chain.back_pos()));
+    // And so does the stroke split, so undo still works per stroke after a reopen.
+    REQUIRE(back.stroke_count() == 3);
+    REQUIRE(back.undo_last_stroke());
+    REQUIRE(back.size() < chain.size());
+}
+
+TEST_CASE("Cut recipe: a version 1 stroke loads as a chain of one stroke", "[CutRecipe]")
+{
+    // A version 1 recipe carries samples and the closed flag and NOTHING about strokes
+    // - which is exactly what an empty stroke_bounds means. It has to load, because the
+    // samples were always the whole description of the line.
+    CutRecipeStroke v1 = recipe_straight_stroke();
+    REQUIRE(v1.stroke_bounds.empty());
+
+    DrawCutChain chain;
+    cut_recipe_stroke_to_chain(v1, chain);
+    REQUIRE(chain.size() == v1.samples.size());
+    REQUIRE(chain.stroke_count() == 1);
+    REQUIRE_FALSE(chain.is_closed());
+    for (size_t i = 0; i < chain.size(); ++ i)
+        REQUIRE(chain.samples()[i].pos.isApprox(v1.samples[i].pos));
+
+    // A version 1 recipe is still `valid()`, so "Edit cut" stays available on every
+    // project saved before the chain landed.
+    CutRecipe r = recipe_make(CutRecipeKind::Drawn);
+    r.version   = 1;
+    r.stroke    = v1;
+    REQUIRE(cut_recipe_version_supported(1));
+    REQUIRE(cut_recipe_version_supported(CutRecipeVersion));
+    REQUIRE_FALSE(cut_recipe_version_supported(CutRecipeVersion + 1));
+    REQUIRE(r.valid());
+}
+
+TEST_CASE("Cut recipe: bounds that do not tile the samples fall back to one stroke", "[CutRecipe]")
+{
+    // A chain whose ranges disagree with its samples would corrupt undo in a way the
+    // user cannot see coming, so a malformed set is DISCARDED rather than half-applied.
+    CutRecipeStroke st = recipe_straight_stroke();
+    const size_t n = st.samples.size();
+
+    auto loads_as_one = [&](std::vector<std::pair<uint32_t, uint32_t>> bounds) {
+        st.stroke_bounds = std::move(bounds);
+        DrawCutChain c;
+        cut_recipe_stroke_to_chain(st, c);
+        REQUIRE(c.size() == n);
+        return c.stroke_count() == 1;
+    };
+
+    REQUIRE(loads_as_one({ { 0, 5 }, { 7, uint32_t(n) } }));            // a gap
+    REQUIRE(loads_as_one({ { 0, 10 }, { 5, uint32_t(n) } }));           // an overlap
+    REQUIRE(loads_as_one({ { 3, uint32_t(n) } }));                      // not starting at 0
+    REQUIRE(loads_as_one({ { 0, uint32_t(n) + 5 } }));                  // past the end
+    REQUIRE(loads_as_one({ { 0, 10 } }));                               // short of the end
+    // A well-formed pair really does keep both strokes, so the fallback is not simply
+    // firing every time.
+    st.stroke_bounds = { { 0, 10 }, { 10, uint32_t(n) } };
+    DrawCutChain ok;
+    cut_recipe_stroke_to_chain(st, ok);
+    REQUIRE(ok.size() == n);
+    REQUIRE(ok.stroke_count() == 2);
+}
+TEST_CASE("Cut recipe: the open-line verdict round-trips, and version 1 keeps its cut", "[CutRecipe]")
+{
+    auto run = [](const Vec3d& a, const Vec3d& b, int n) {
+        std::vector<DrawCutSample> out;
+        for (int i = 0; i < n; ++ i) {
+            DrawCutSample s;
+            s.pos    = a + (double(i) / double(n - 1)) * (b - a);
+            s.normal = Vec3d::UnitZ();
+            out.push_back(s);
+        }
+        return out;
+    };
+
+    DrawCutChain chain;
+    REQUIRE(chain.append(run(Vec3d(-20, 0, 20), Vec3d(20, 0, 20), 41), 2.0) == DrawChainEnd::Back);
+    REQUIRE(chain.finish_open());
+
+    const CutRecipeStroke stored = cut_recipe_stroke_from_chain(chain, 0.2);
+    REQUIRE(stored.finished_open);
+    REQUIRE_FALSE(stored.closed);
+
+    DrawCutChain back;
+    cut_recipe_stroke_to_chain(stored, back);
+    REQUIRE(back.is_finished_open());
+    REQUIRE_FALSE(back.is_closed());
+    // Which is what makes a reopened open cut reproduce a stroke at all.
+    DrawCutStroke st;
+    REQUIRE(back.finish(st, 1.0, 0.0) == DrawCutError::None);
+    REQUIRE_FALSE(st.is_closed());
+
+    // A VERSION 1 recipe has no flag, and its line WAS cut with - so an unclosed one is
+    // finished-open whether or not the flag says so. Without this a version 1 open cut
+    // would reopen with no surface and no way to tell why.
+    CutRecipeStroke v1 = recipe_straight_stroke();
+    REQUIRE_FALSE(v1.finished_open);
+    REQUIRE_FALSE(v1.closed);
+    DrawCutChain from_v1;
+    cut_recipe_stroke_to_chain(v1, from_v1);
+    REQUIRE(from_v1.is_finished_open());
+    DrawCutStroke st_v1;
+    REQUIRE(from_v1.finish(st_v1, 1.0, 0.2) == DrawCutError::None);
+    REQUIRE(st_v1.valid());
+
+    // A CLOSED stored stroke is not touched by any of that.
+    CutRecipeStroke closed = stored;
+    closed.closed        = true;
+    closed.finished_open = false;
+    DrawCutChain c2;
+    cut_recipe_stroke_to_chain(closed, c2);
+    REQUIRE(c2.is_closed());
+    REQUIRE_FALSE(c2.is_finished_open());
+}

@@ -7,6 +7,8 @@
 #include "CurvedCut.hpp"
 
 #include <vector>
+#include <utility>
+#include <cstdint>
 
 namespace Slic3r {
 
@@ -132,7 +134,13 @@ enum class DrawCutError {
     // The generated cutter, or one of the booleans, produced nothing usable.
     CutterDegenerate,
     // The cut ran but one side came back with no material.
-    EmptySide
+    EmptySide,
+    // 2026-09-12, owner feedback items 1 and 2: the CHAIN is not closed yet, so
+    // there is no cut surface to make. Distinct from TooShort because the line may
+    // be perfectly long and perfectly good - it simply is not a loop yet, and the
+    // thing the user has to do about it (carry on from an endpoint until it snaps)
+    // is different from "draw a longer line".
+    NotClosed
 };
 
 // Human-readable, untranslated. The gizmo wraps these in _L(); the tests read
@@ -520,6 +528,273 @@ void draw_cut_empty_sides(const indexed_triangle_set& mesh,
                           const DrawCutParams&        params,
                           bool&                       upper_empty,
                           bool&                       lower_empty);
+
+// ---------------------------------------------------------------------------
+// THE CHAIN. 2026-09-12, from owner click-testing.
+//
+// Phase 1 and 2 modelled the line as ONE stroke: a press, a drag, a release, and
+// whatever came out of that one gesture was the whole cut line. On a tall box you
+// cannot draw all the way round without rotating the view, so the line could never
+// be a loop round a large part - and because a partial stroke was lofted anyway,
+// what the user got was a preview of a meaningless half-surface.
+//
+// A DrawCutChain is the line as a CHAIN OF STROKES instead. One chain exists at a
+// time. Its samples are one ordered sequence with two ENDPOINTS; a new stroke is
+// accepted only when it starts at one of them, and is appended at that end (in the
+// order that keeps the chain's sequence continuous). The chain is CLOSED when a
+// stroke's last sample comes within the snap radius of the FAR endpoint. Until it
+// is closed there is no cut surface at all: draw_cut_split() is never called, the
+// cutter shell is not built, and the only thing drawn is the polyline with its two
+// endpoints marked.
+//
+// WHY A CHAIN AND NOT "JUST KEEP APPENDING". Two reasons the append-at-either-end
+// rule earns:
+//  - the user rotates the view between strokes, so the stroke that continues the
+//    line can start at either end, and which end it is is not knowable in advance;
+//  - a stroke whose first sample is at the FRONT endpoint runs AWAY from the chain,
+//    so its samples have to be reversed before they are prepended, or the sequence
+//    doubles back on itself and every tangent at the join is wrong.
+//
+// UNDO IS PER STROKE, which is why the chain remembers its stroke BOUNDARIES rather
+// than only the flat sample list: Ctrl+Z takes back the last appended stroke, whole,
+// including the closure it may have made.
+// ---------------------------------------------------------------------------
+
+// The snap radius, in mm: how near the far endpoint the cursor has to come for the
+// chain to close. Scaled by the object's size, because a 2 mm radius that is
+// comfortable on a 200 mm print is most of a 10 mm trinket - and clamped, because a
+// radius bigger than the line is long would close every chain the moment it started.
+//
+//   r = clamp(ChainSnapFraction * bbox diagonal, ChainSnapMinMm, ChainSnapMaxMm)
+//
+// `bbox` is the object's bounding box in the cut plane's frame. An undefined bbox
+// gives ChainSnapMinMm, which is the safe end: too small a radius means the user has
+// to be accurate, too large means a chain closes behind their back.
+static constexpr double ChainSnapFraction = 0.02;
+static constexpr double ChainSnapMinMm    = 1.0;
+static constexpr double ChainSnapMaxMm    = 6.0;
+double draw_cut_chain_snap_radius(const BoundingBoxf3& bbox);
+
+// Which end of the chain a new stroke starting at `p` continues, if either.
+enum class DrawChainEnd {
+    // Not within the snap radius of either endpoint: the stroke is DISJOINT and is
+    // refused. (Owner feedback item 4: only one chain may exist, and a stroke that
+    // does not continue it is rejected rather than silently replacing it.)
+    None = 0,
+    // At the chain's FIRST sample. The stroke runs away from the chain, so its
+    // samples are reversed and prepended.
+    Front,
+    // At the chain's LAST sample. Appended as captured.
+    Back
+};
+
+class DrawCutChain
+{
+public:
+    DrawCutChain() = default;
+
+    // --- state ------------------------------------------------------------
+    bool   empty() const { return m_samples.empty(); }
+    size_t size() const { return m_samples.size(); }
+    // The raw samples of the WHOLE chain, in order. This is what the recipe stores
+    // and what the stroke is finished from.
+    const std::vector<DrawCutSample>& samples() const { return m_samples; }
+    bool   is_closed() const { return m_closed; }
+    // How many strokes have been appended. Each is one undo step.
+    size_t stroke_count() const { return m_bounds.size(); }
+    // [begin, end) of each appended stroke in samples(), newest last. The recipe
+    // stores these so a reopened cut's Ctrl+Z takes back one stroke.
+    const std::vector<std::pair<size_t, size_t>>& stroke_bounds() const { return m_bounds; }
+
+    const Vec3d& front_pos() const { return m_samples.front().pos; }
+    const Vec3d& back_pos() const { return m_samples.back().pos; }
+
+    void clear();
+
+    // --- building ---------------------------------------------------------
+    // Which end `p` continues, given `snap_radius`. An EMPTY chain accepts anything
+    // (returns Back), because the first stroke has nothing to continue. A CLOSED
+    // chain accepts nothing: it is finished, and the caller either replaces it
+    // wholesale or refuses.
+    DrawChainEnd end_for_start(const Vec3d& p, double snap_radius) const;
+
+    // Append `stroke` (raw captured samples, chronological) to the chain.
+    //
+    // `snap_radius` decides two things: whether the stroke's FIRST sample continues
+    // the chain at all, and whether its LAST sample closes the chain on the far
+    // endpoint. Returns the end it was appended at, or DrawChainEnd::None when the
+    // stroke was REFUSED - which happens when the chain is closed, when the stroke
+    // is disjoint from both endpoints, or when the stroke has fewer than two
+    // samples.
+    //
+    // On a Front append the samples are REVERSED before prepending, so the chain's
+    // sequence stays continuous.
+    //
+    // CLOSURE. The chain closes when the appended stroke's far-running end lands
+    // within `snap_radius` of the chain's OTHER endpoint. The sample that closed it
+    // is kept (it is on the model, it was drawn, and dropping it would leave a
+    // visible notch); what is NOT done is snapping it exactly onto the other
+    // endpoint, because the closing span is a real span the resampler walks - within
+    // one snap radius of zero length, which on any real part is under the resample
+    // spacing.
+    //
+    // A SINGLE stroke can close the chain on its own - a circle drawn in one gesture
+    // is the phase 1 case and still works exactly as it did, which is why the closure
+    // test runs for the first stroke too (against the chain's own first sample).
+    DrawChainEnd append(const std::vector<DrawCutSample>& stroke, double snap_radius);
+
+    // Take back the last appended stroke, whole, including any closure it made.
+    // Returns false when there is nothing to take back. A chain that ends up empty
+    // is empty, not "one sample long".
+    bool undo_last_stroke();
+
+    // Force the chain closed even though its endpoints did not meet - the panel's
+    // explicit "Close loop". Refused for a chain with fewer than MinChainSamples
+    // samples, which is not a loop.
+    bool force_close();
+
+    // THE OPEN CUT, kept from phase 1 but now DELIBERATE.
+    //
+    // Phase 1 supported an open line right across a part: the strip cuts it in two with
+    // no inside or outside, which is a perfectly good cut. The chain cannot loft that
+    // automatically any more, because "the line is not finished yet" and "the line is
+    // finished and is not a loop" look identical from the samples alone - and lofting
+    // every partial line is exactly the wild-shape preview this change removes.
+    //
+    // So the USER says which: the panel's "Cut along the line" sets this, and a chain
+    // with it set produces an OPEN stroke from finish() the way phase 1 did. Any append
+    // clears it, because a chain that has just grown is one the user is still drawing.
+    bool is_finished_open() const { return m_finished_open; }
+    bool finish_open();
+
+    // --- the stroke it makes ---------------------------------------------
+    // Finish the chain's samples into a DrawCutStroke. This is the ONLY way a cut
+    // surface is ever produced from a chain, and it produces NOTHING for an open
+    // chain: `out` is left cleared with DrawCutError::NotClosed.
+    //
+    // That is owner feedback items 1 and 2 in one line - "until the chain is closed,
+    // no cut surface is generated or previewed". The polyline is drawn from
+    // samples() regardless, which is what the user needs to see while they work.
+    DrawCutError finish(DrawCutStroke& out, double spacing = DrawCutStroke::DefaultSpacing,
+                        double smoothing = 0.2) const;
+
+    // A chain needs at least this many samples before it can be closed at all. Below
+    // it a "closure" is a dab, not a loop.
+    static constexpr size_t MinChainSamples = 6;
+
+    // Cereal, for the recipe: the flat samples, the closed flag and the stroke
+    // boundaries (so undo survives a round trip through the undo/redo stack).
+    template<class Archive> void save(Archive& ar) const {
+        ar(m_finished_open);
+        ar(m_closed);
+        ar(uint64_t(m_samples.size()));
+        for (const DrawCutSample& s : m_samples)
+            ar(s.pos, s.normal, uint64_t(s.facet));
+        ar(uint64_t(m_bounds.size()));
+        for (const std::pair<size_t, size_t>& b : m_bounds)
+            ar(uint64_t(b.first), uint64_t(b.second));
+    }
+    template<class Archive> void load(Archive& ar) {
+        uint64_t n = 0, nb = 0;
+        ar(m_finished_open);
+        ar(m_closed);
+        ar(n);
+        m_samples.clear();
+        m_samples.resize(size_t(n));
+        for (DrawCutSample& s : m_samples) {
+            uint64_t facet = 0;
+            ar(s.pos, s.normal, facet);
+            s.facet = size_t(facet);
+        }
+        ar(nb);
+        m_bounds.clear();
+        m_bounds.reserve(size_t(nb));
+        for (uint64_t i = 0; i < nb; ++ i) {
+            uint64_t a = 0, b = 0;
+            ar(a, b);
+            m_bounds.emplace_back(size_t(a), size_t(b));
+        }
+    }
+
+    bool operator==(const DrawCutChain& o) const;
+    bool operator!=(const DrawCutChain& o) const { return !(*this == o); }
+
+    // Rebuild a chain from stored samples (the recipe's loader). The whole thing
+    // counts as ONE stroke for undo purposes, because the strokes it was originally
+    // drawn in are not what a reopened cut is editing.
+    void set_samples(const std::vector<DrawCutSample>& samples, bool closed, bool finished_open = false);
+
+private:
+    std::vector<DrawCutSample> m_samples;
+    // [begin, end) of each appended stroke in m_samples, newest last. A FRONT append
+    // shifts every earlier stroke's indices, which is why undo_last_stroke() works
+    // off the recorded range rather than off a count.
+    std::vector<std::pair<size_t, size_t>> m_bounds;
+    bool m_closed{ false };
+    // The user said "this line is finished and is not a loop". See finish_open().
+    bool m_finished_open{ false };
+};
+
+// ---------------------------------------------------------------------------
+// THE HALVES CLASSIFICATION. 2026-09-12, owner feedback item 3.
+//
+// The cyan/magenta preview, the Visible/Ghost/Hidden side display and the
+// connectors' notion of "which half am I in" all asked the FLAT PLANE which side a
+// point was on, even in Draw mode - so the colours ran straight through the drawn
+// surface and meant nothing.
+//
+// The curved cut answers this with a height field in a 2D texture, which a ruled
+// strip cannot be (it is not single-valued over the plane - that is the whole point
+// of the mode). So Draw answers it with the question the split itself asks: IS THE
+// POINT INSIDE THE CUTTER SOLID. That is exact by construction - it is the same
+// solid draw_cut_split() hands to the boolean - and it needs no assumption about the
+// surface being a graph over anything.
+//
+// For the preview the answer has to be available PER FRAGMENT in a shader, so it is
+// baked into a VOXEL FIELD over the object's bounding box: draw_cut_inside_field()
+// below. sampler3D is core GL 1.2 / GLSL 110, so this works on the 2.1 fallback path
+// too, unlike anything needing a compute pass.
+// ---------------------------------------------------------------------------
+
+// Which half of a drawn cut the point `p` (in the cut plane's frame) falls in.
+// `true` means the UPPER half, using draw_cut_split()'s own convention: for a
+// closed stroke the upper half is the PLUG (inside the cutter), for an open one it
+// is the side the cutter does not contain.
+//
+// Exact, and the reference the voxel field below is tested against. One parity ray
+// per call against the cutter's faces, so it is for connectors and for tests, not
+// for a per-pixel loop.
+bool draw_cut_classify_upper(const indexed_triangle_set& cutter,
+                             bool                        closed,
+                             const Vec3d&                p);
+
+// The same question over a whole grid, as a scalar field a shader can sample.
+//
+// The field is +1 on the LOWER side and -1 on the UPPER side, matching the sign
+// convention the colour-clip shader already uses (`side < 0` is side 1, the upper
+// half - see GLVolumeCollection::set_color_clip_plane, which stores -normal). A
+// caller that wants a smooth boundary can ask for `signed_distance`, which stores
+// the distance to the cutter's surface with that sign instead - the sign is what
+// the shader tests, so the two are interchangeable there, and the distance form is
+// what makes the boundary land in the right place between two voxels rather than on
+// a voxel face.
+//
+// `nx, ny, nz` are the grid dimensions; the grid spans `bbox` GROWN by one voxel on
+// each side, so a fragment exactly on the part's surface is inside the field rather
+// than on its clamped border. The layout is x-major within a row, rows within a
+// slice: index = (k * ny + j) * nx + i.
+//
+// COST: one parity ray per COLUMN, not per voxel. For each (i, j) the ray along +Z
+// is cast once, its crossings sorted, and the whole column filled from the
+// crossing list - which is what makes a 64^3 field affordable on a mouse-up.
+std::vector<float> draw_cut_inside_field(const indexed_triangle_set& cutter,
+                                         bool                        closed,
+                                         const BoundingBoxf3&        bbox,
+                                         int                         nx,
+                                         int                         ny,
+                                         int                         nz,
+                                         BoundingBoxf3*              field_bbox = nullptr);
+
 
 } // namespace Slic3r
 
