@@ -122,19 +122,35 @@ jobs:
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
-          $nsisExe = 'C:\Program Files (x86)\NSIS\makensis.exe'
-          if (Test-Path -LiteralPath $nsisExe) {
-            Write-Host "NSIS already installed:"
-            & $nsisExe /VERSION
-            "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
-            exit 0
+          # NSIS is only needed by cpack. Prefer a system-wide install if the owner has made
+          # one; otherwise keep our own copy under C:\Dev\tools, beside the other build tools.
+          #
+          # It has to go there rather than Program Files: the runner service is NETWORK
+          # SERVICE, which is not an administrator, so the installer's default target silently
+          # writes nothing and exits 0 (that is exactly what run 34735485636 hit - "installed"
+          # with no makensis.exe behind it). C:\Dev\tools is writable by Authenticated Users,
+          # and installing a build tool for the build is a smaller thing than granting the
+          # service account rights to Program Files.
+          $candidates = @(
+            'C:\Program Files (x86)\NSIS\makensis.exe',
+            'C:\Program Files\NSIS\makensis.exe',
+            'C:\Dev\tools\nsis\makensis.exe'
+          )
+          foreach ($c in $candidates) {
+            if (Test-Path -LiteralPath $c) {
+              Write-Host "NSIS already present at $c"
+              & $c /VERSION
+              "NSIS_DIR=$(Split-Path -Parent $c)" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
+              exit 0
+            }
           }
+
           # Pinned NSIS 3.10, sha256-verified before it is ever executed: a host that serves
           # something else gets skipped rather than run.
           #
           # Fetched with Windows' own curl.exe, and that detail is load-bearing. SourceForge
           # answers Invoke-WebRequest's default agent with a ~140 KB HTML interstitial under
-          # HTTP 200 (every mirror, every time - the first attempts here hashed three different
+          # HTTP 200 (every mirror, every time - earlier attempts here hashed three different
           # web pages), and answers a browser user-agent string with a Cloudflare JS challenge.
           # curl.exe's own default agent gets the actual binary. The ?viasf=1 keeps the mirror
           # host from bouncing back to the project page.
@@ -164,12 +180,18 @@ jobs:
             Write-Host "::warning::could not fetch a verified NSIS 3.10 installer - the installer package will be skipped. Install NSIS on the runner to restore it."
             exit 0
           }
-          Write-Host "installing silently"
-          $p = Start-Process -FilePath $dst -ArgumentList '/S' -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "NSIS installer exited $($p.ExitCode)" }
-          if (-not (Test-Path -LiteralPath $nsisExe)) { throw "NSIS installed but $nsisExe is missing" }
-          & $nsisExe /VERSION
-          "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
+
+          $target = 'C:\Dev\tools\nsis'
+          Write-Host "installing silently into $target"
+          # /D must be last and unquoted - that is NSIS's own command-line rule.
+          $p = Start-Process -FilePath $dst -ArgumentList '/S', "/D=$target" -Wait -PassThru
+          $makensis = Join-Path $target 'makensis.exe'
+          if (-not (Test-Path -LiteralPath $makensis)) {
+            Write-Host "::warning::NSIS installer exited $($p.ExitCode) but left no makensis.exe in $target - skipping the installer package"
+            exit 0
+          }
+          & $makensis /VERSION
+          "NSIS_DIR=$target" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
 
       - name: Ensure the runner account can read the shared deps
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
