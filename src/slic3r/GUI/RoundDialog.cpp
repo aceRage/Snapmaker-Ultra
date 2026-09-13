@@ -49,7 +49,10 @@ RoundOptions RoundDialog::load_from_config()
 
     // Clamp on load against the same limits libslic3r enforces, so a config written
     // by a future build (or by hand) can never hand the geometry a value it rejects.
-    o.radius        = std::clamp(o.radius, ROUND_RADIUS_MIN, ROUND_RADIUS_MAX);
+    o.radius = std::clamp(o.radius, ROUND_RADIUS_MIN, ROUND_RADIUS_MAX);
+    // 0 is the DEFAULT and a meaningful value - "no slab, mirror the base instead" -
+    // so it has to survive the round trip rather than being read as "unset". The
+    // minimum is 0 for that reason, not merely because a negative slab is nonsense.
     o.bottom_margin = std::clamp(o.bottom_margin, 0., ROUND_BOTTOM_MARGIN_MAX);
     // 0 stays 0 - it means "derive it from the radius" and must survive the round trip.
     if (o.voxel_size > 0.)
@@ -133,10 +136,12 @@ RoundDialog::RoundDialog(wxWindow *parent, double bbox_min_extent, size_t triang
     // ---- keep the bottom flat -----------------------------------------------------------------
     const wxString flat_tip = _L("Rounding every edge includes the one where the part meets the "
                                  "bed, which lifts the outline off the plate and leaves the first "
-                                 "layer unsupported. With this on, the part is cut just above its "
-                                 "base, only the upper piece is rounded, and the untouched bottom "
-                                 "slab is joined back on - so the base comes through exactly as it "
-                                 "went in and only the edges above it are filleted.\n\n"
+                                 "layer unsupported. With this on the base stays flat on the "
+                                 "plate.\n\n"
+                                 "How it does that is set by the slab height below: at 0 - the "
+                                 "default - the bottom face is kept flat and sharp while the upright "
+                                 "edges stay rounded all the way down; above 0 an unrounded lip of "
+                                 "that height is left at the bottom instead.\n\n"
                                  "Parts with no flat base are rounded whole, as if it were off.");
 
     auto flat_label = new ::Label(this, Label::Body_14, _L("Keep the bottom flat") + ":");
@@ -150,14 +155,21 @@ RoundDialog::RoundDialog(wxWindow *parent, double bbox_min_extent, size_t triang
 
     auto margin_label = new ::Label(this, Label::Body_14, _L("Bottom slab height") + ":");
     margin_label->Wrap(FromDIP(300));
-    m_margin_input = make_input(m_options.bottom_margin > 0. ? m_options.bottom_margin
-                                                             : ROUND_BOTTOM_MARGIN_RADII * m_options.radius,
-                                _L("mm"));
-    m_margin_input->SetToolTip(_L("How much of the original base is kept untouched. It has to clear "
-                                  "the fillet itself, so leave it at about one and a half times the "
-                                  "radius: any thinner and the cut runs through the rounding, any "
-                                  "thicker and a sloped wall picks up a visible seam where the two "
-                                  "pieces meet."));
+    // The stored value verbatim, 0 included: 0 is the default and means something
+    // specific, so substituting a suggestion for it would silently change the mode.
+    m_margin_input = make_input(m_options.bottom_margin, _L("mm"));
+    m_margin_input->SetToolTip(_L("How tall a band of the original base is left completely "
+                                  "unrounded.\n\n"
+                                  "0 (the default) keeps no band at all: the part is reflected in "
+                                  "its own base plane before the rounding, so the bottom face comes "
+                                  "through perfectly flat with a sharp 90 degree edge all round it, "
+                                  "while the upright edges stay filleted right down to the plate - "
+                                  "the footprint gets rounded corners of the radius, and the part "
+                                  "still sits flat.\n\n"
+                                  "Any value above 0 leaves a straight, unrounded lip of that height "
+                                  "at the bottom, which reads as a pedestal under the part. If you "
+                                  "want one, give it at least one and a half times the radius or the "
+                                  "cut runs through the rounding and leaves a step."));
     m_margin_input->Enable(m_options.keep_bottom_flat);
     f_sizer->Add(margin_label, 0, wxEXPAND | wxALIGN_CENTER_VERTICAL);
     f_sizer->Add(m_margin_input, 0, wxALIGN_CENTER_VERTICAL);
@@ -220,7 +232,9 @@ RoundOptions RoundDialog::current_options() const
     o.voxel_size = voxel > 0. ? std::clamp(voxel, ROUND_VOXEL_MIN, ROUND_VOXEL_MAX) : 0.;
     o.round_concave    = m_concave_cb != nullptr ? m_concave_cb->GetValue() : m_options.round_concave;
     o.keep_bottom_flat = m_flat_cb != nullptr ? m_flat_cb->GetValue() : m_options.keep_bottom_flat;
-    o.bottom_margin    = std::clamp(read_mm(m_margin_input, m_options.bottom_margin), 0., ROUND_BOTTOM_MARGIN_MAX);
+    // Minimum 0: it is both the floor and the default, and it selects the mirror
+    // mode rather than meaning "unset".
+    o.bottom_margin = std::clamp(read_mm(m_margin_input, m_options.bottom_margin), 0., ROUND_BOTTOM_MARGIN_MAX);
     return o;
 }
 
