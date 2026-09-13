@@ -222,16 +222,23 @@ jobs:
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
-          # The dep tree was built from some commit of deps/. If deps/ has moved since, the
+          # The dep tree was built from some state of deps/. If deps/ has changed since, the
           # pre-built tree is stale and the build would link against the wrong thing (or fail
-          # to configure). Compare the current deps/ commit against a stamp beside the tree.
-          $wantStamp  = (git log -1 --format=%H -- deps).Trim()
+          # to configure). Compare the current deps/ against a stamp beside the tree.
+          #
+          # The stamp is `git rev-parse HEAD:deps` - the git TREE OBJECT for deps/, which is a
+          # content hash of that directory. Not `git log -1 -- deps`: actions/checkout fetches
+          # with --depth=1, so there is no history to walk and that command just answers HEAD,
+          # which changes on every commit and would order a 60-minute dep rebuild for a
+          # one-line edit somewhere else entirely (it did exactly that on run 34736678876).
+          # The tree object needs no history and is identical whenever deps/ is identical.
+          $wantStamp  = (git rev-parse 'HEAD:deps').Trim()
           $stampFile  = Join-Path $env:SHARED_DEPS_ROOT '.edgeslicer_deps_stamp'
           $haveStamp  = if (Test-Path -LiteralPath $stampFile) { (Get-Content -LiteralPath $stampFile -Raw).Trim() } else { '' }
           $treeExists = Test-Path -LiteralPath (Join-Path $env:SHARED_DEPS_ROOT 'OrcaSlicer_dep\usr\local')
           $forced     = '${{ inputs.refresh_deps }}' -eq 'true'
 
-          Write-Host "deps/ HEAD commit : $wantStamp"
+          Write-Host "deps/ tree object : $wantStamp"
           Write-Host "stamp on runner   : $(if ($haveStamp) { $haveStamp } else { '<none>' })"
           Write-Host "dep tree present  : $treeExists"
           Write-Host "forced refresh    : $forced"
@@ -249,7 +256,7 @@ jobs:
           }
 
           if (-not $refresh -and -not $haveStamp) {
-            Write-Host "adopting the existing hand-built tree at commit $wantStamp"
+            Write-Host "adopting the existing hand-built tree for deps/ tree $wantStamp"
             Set-Content -LiteralPath $stampFile -Value $wantStamp -NoNewline -Encoding ascii
           }
           "refresh=$($refresh.ToString().ToLower())" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding ascii
