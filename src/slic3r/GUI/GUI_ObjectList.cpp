@@ -6091,7 +6091,11 @@ void ObjectList::round_all_edges(bool close_gizmos)
         BOOST_LOG_TRIVIAL(info) << "round_all_edges: '" << mv.name << "' r=" << rep.radius_used
                                 << " voxel=" << rep.voxel_used << " " << rep.triangles_before
                                 << " -> " << rep.triangles_after << " triangles, flat bottom "
-                                << (rep.kept_bottom_flat ? "kept" : (rep.fell_back ? "declined: " + rep.note : "off"));
+                                << (rep.kept_bottom_flat
+                                        ? (rep.mirrored_base
+                                               ? std::string("kept (mirrored base, no slab)")
+                                               : "kept (slab " + std::to_string(rep.bottom_margin_used) + " mm)")
+                                        : (rep.fell_back ? "declined: " + rep.note : std::string("off")));
         mv.set_mesh(std::move(its));
         mv.set_new_unique_id();
         mv.calculate_convex_hull();
