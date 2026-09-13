@@ -10,6 +10,12 @@
 # release, and does not build the private network plugins unless they have been staged on
 # the runner (see "Detect optional plugin payloads" below). Releases still go through
 # build_all.yml plus the owner's local pack step.
+#
+# Shell note: every PowerShell step says `shell: powershell` (Windows PowerShell 5.1), not
+# the Actions default `pwsh` - PowerShell 7 is not installed on this VM and `pwsh` steps
+# fail with "command not found". For the same reason the GITHUB_ENV / GITHUB_OUTPUT writes
+# use -Encoding ascii: 5.1's "utf8" emits a BOM, which Actions parses as part of the first
+# variable name.
 
 name: Build Windows (self-hosted)
 
@@ -69,7 +75,7 @@ jobs:
           clean: true
 
       - name: Resolve version
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $label = '${{ inputs.version_label }}'
@@ -86,12 +92,12 @@ jobs:
             $verPure = $label -replace '^[Vv]', ''
             $ver = if ($label -match '^[Vv]') { $label } else { "V$label" }
           }
-          "ver=$ver"          | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
-          "ver_pure=$verPure" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "ver=$ver"          | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
+          "ver_pure=$verPure" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
           Write-Host "version: $ver  (pure: $verPure)"
 
       - name: Verify toolchain
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $required = @(
@@ -110,14 +116,14 @@ jobs:
           Write-Host "cores: $env:NUMBER_OF_PROCESSORS"
 
       - name: Install NSIS if missing
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $nsisExe = 'C:\Program Files (x86)\NSIS\makensis.exe'
           if (Test-Path -LiteralPath $nsisExe) {
             Write-Host "NSIS already installed:"
             & $nsisExe /VERSION
-            "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+            "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
             exit 0
           }
           # Pinned NSIS 3.10. Both the canonical SourceForge project path and the prdownloads
@@ -135,10 +141,10 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "NSIS installer exited $($p.ExitCode)" }
           if (-not (Test-Path -LiteralPath $nsisExe)) { throw "NSIS installed but $nsisExe is missing" }
           & $nsisExe /VERSION
-          "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "NSIS_DIR=C:\Program Files (x86)\NSIS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding ascii
 
       - name: Ensure the runner account can read the shared deps
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $root = $env:SHARED_DEPS_ROOT
@@ -163,7 +169,7 @@ jobs:
 
       - name: Decide whether the deps need a refresh
         id: deps
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           # The dep tree was built from some commit of deps/. If deps/ has moved since, the
@@ -196,11 +202,11 @@ jobs:
             Write-Host "adopting the existing hand-built tree at commit $wantStamp"
             Set-Content -LiteralPath $stampFile -Value $wantStamp -NoNewline -Encoding ascii
           }
-          "refresh=$($refresh.ToString().ToLower())" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
-          "want_stamp=$wantStamp"                    | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          "refresh=$($refresh.ToString().ToLower())" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding ascii
+          "want_stamp=$wantStamp"                    | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding ascii
 
       - name: Link the shared deps tree into the workspace
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           # build_release_vs2022.bat does `cd deps && mkdir build && cd build` and then sets
@@ -236,7 +242,7 @@ jobs:
 
       - name: Stamp the rebuilt deps
         if: steps.deps.outputs.refresh == 'true'
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $stampFile = Join-Path $env:SHARED_DEPS_ROOT '.edgeslicer_deps_stamp'
@@ -245,7 +251,7 @@ jobs:
 
       - name: Detect optional plugin payloads
         id: ship
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           # The UltraNet / FlashNetwork / ffmpeg binaries are not in this public repo and are
@@ -267,7 +273,7 @@ jobs:
               Write-Host "::notice::no $($p.f) under $dir - the package will omit that component"
             }
           }
-          "flags=$($flags -join ' ')" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          "flags=$($flags -join ' ')" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding ascii
 
       - name: Configure and build the slicer
         shell: cmd
@@ -339,7 +345,7 @@ jobs:
 
       - name: Collect artifacts and checksums
         id: pack
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $out   = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
@@ -372,7 +378,7 @@ jobs:
           Write-Host "--- SHA256SUMS ---"
           Get-Content -LiteralPath (Join-Path $out 'SHA256SUMS') | Write-Host
 
-          "installer_name=$installerName" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          "installer_name=$installerName" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding ascii
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
