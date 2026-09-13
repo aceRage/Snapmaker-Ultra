@@ -974,7 +974,9 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
     // The mode list is rebuilt whenever that answer changes, so the entry appears the moment the
     // hub's first /state arrives rather than only on a reload.
     function streamModes() {
-        return webrtcOffered() ? ['auto', 'webrtc', 'mp4', 'mjpeg', 'mse'] : ['auto', 'mp4', 'mjpeg', 'mse'];
+        // MP4 (go2rtc's keyframe stills) and MJPEG (needs an MJPEG producer our H.264 sources lack)
+        // stay in the Auto fallback chain but are no longer offered by hand (owner, 2026-09-12).
+        return webrtcOffered() ? ['auto', 'webrtc', 'mse'] : ['auto', 'mse'];
     }
     var MODE_LABEL   = { auto: 'Auto', webrtc: 'WebRTC', mp4: 'MP4', mjpeg: 'MJPEG', mse: 'MSE' };
     var MODE_KEY     = 'snorca_stream_mode';
@@ -1009,7 +1011,8 @@ body.dragging .cell iframe, body.dragging .cell img { pointer-events: none; }
         // A dead offer is not a black square: WebRTC always carries its fallbacks behind it, and
         // player.html drops the peer connection after rtctimeout if it has not produced a picture.
         if (p === 'webrtc') return 'webrtc,mse,mp4,mjpeg';
-        if (p === 'mp4' || p === 'mjpeg' || p === 'mse') return p;
+        if (p === 'mse') return p;
+        // A pick saved while MP4/MJPEG were still on the menu is treated as Auto rather than honoured.
         return autoStreamMode();
     }
     function setStreamMode(id, v) {
