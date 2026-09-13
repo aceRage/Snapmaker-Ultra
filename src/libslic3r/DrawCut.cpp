@@ -22,6 +22,7 @@ const char* draw_cut_error_message(DrawCutError err)
     case DrawCutError::LeavesMesh:       return "The line leaves the model";
     case DrawCutError::CutterDegenerate: return "The line does not make a usable cut surface";
     case DrawCutError::EmptySide:        return "The stroke does not separate the part";
+    case DrawCutError::NotClosed:        return "Carry on from an end of the line until it closes on the other";
     }
     return "";
 }
@@ -1510,6 +1511,356 @@ bool draw_cut_split(const indexed_triangle_set& mesh,
     if (!ok)
         return fail(DrawCutError::EmptySide);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// THE CHAIN. 2026-09-12, from owner click-testing.
+// ---------------------------------------------------------------------------
+
+double draw_cut_chain_snap_radius(const BoundingBoxf3& bbox)
+{
+    if (!bbox.defined)
+        return ChainSnapMinMm;
+    return std::clamp(ChainSnapFraction * bbox.size().norm(), ChainSnapMinMm, ChainSnapMaxMm);
+}
+
+void DrawCutChain::clear()
+{
+    m_samples.clear();
+    m_bounds.clear();
+    m_closed        = false;
+    m_finished_open = false;
+}
+
+void DrawCutChain::set_samples(const std::vector<DrawCutSample>& samples, bool closed, bool finished_open)
+{
+    m_samples = samples;
+    m_bounds.clear();
+    if (!m_samples.empty())
+        // ONE stroke, because the strokes a reopened cut was originally drawn in are
+        // not what is being edited: the undo step a user expects after "Edit cut" is
+        // "take back what I just did", and the recipe's line is not something they
+        // just did.
+        m_bounds.emplace_back(size_t(0), m_samples.size());
+    m_closed = closed && m_samples.size() >= MinChainSamples;
+    // Mutually exclusive by construction: a closed chain is a loop, and "finished open"
+    // is the answer to a question a loop does not raise.
+    m_finished_open = !m_closed && finished_open && m_samples.size() >= MinChainSamples;
+}
+
+DrawChainEnd DrawCutChain::end_for_start(const Vec3d& p, double snap_radius) const
+{
+    // An empty chain accepts anything: the first stroke has nothing to continue.
+    if (m_samples.empty())
+        return DrawChainEnd::Back;
+    // A closed chain accepts nothing. It is finished; continuing it would have to
+    // pick a place to reopen it, and there is no gesture that says which.
+    if (m_closed)
+        return DrawChainEnd::None;
+
+    const double r    = std::max(1e-6, snap_radius);
+    const double d_bk = (p - back_pos()).norm();
+    const double d_fr = (p - front_pos()).norm();
+    // The NEARER endpoint wins when both are in range, which happens on a short
+    // chain whose two ends are within a snap radius of each other.
+    if (d_bk <= r && d_bk <= d_fr)
+        return DrawChainEnd::Back;
+    if (d_fr <= r)
+        return DrawChainEnd::Front;
+    return DrawChainEnd::None;
+}
+
+DrawChainEnd DrawCutChain::append(const std::vector<DrawCutSample>& stroke, double snap_radius)
+{
+    if (stroke.size() < 2)
+        return DrawChainEnd::None;
+
+    const DrawChainEnd at = end_for_start(stroke.front().pos, snap_radius);
+    if (at == DrawChainEnd::None)
+        return DrawChainEnd::None;
+
+    const double r     = std::max(1e-6, snap_radius);
+    const bool   first = m_samples.empty();
+
+    // WHICH ENDPOINT THE NEW STROKE'S OWN END MIGHT CLOSE ON.
+    //  - appending at the Back: the free end is the chain's FRONT;
+    //  - prepending at the Front: the free end is the chain's BACK;
+    //  - a FIRST stroke has no other end, so it closes on its own first sample,
+    //    which is the phase 1 "a circle drawn in one gesture" case.
+    const Vec3d far_end = first ? stroke.front().pos
+                        : (at == DrawChainEnd::Back ? front_pos() : back_pos());
+
+    // Drop the stroke's own first sample when it is a duplicate of the endpoint it
+    // continues from - it is the SAME point on the model, and a zero-length span at
+    // the join is exactly what the tangent maths cannot read. Not done for a first
+    // stroke, which has no join.
+    size_t skip = 0;
+    if (!first) {
+        const Vec3d& join = at == DrawChainEnd::Back ? back_pos() : front_pos();
+        if ((stroke.front().pos - join).norm() < 1e-9)
+            skip = 1;
+    }
+    if (stroke.size() - skip < 1)
+        return DrawChainEnd::None;
+
+    // The closure test uses the stroke's LAST sample, whichever end it is appended
+    // at: the last sample is where the cursor was when the user let go, which is the
+    // point they aimed at the far endpoint.
+    //
+    // MinChainSamples is checked on the RESULT, not on the chain so far: a chain that
+    // would close with four samples in total is a dab, and calling it a loop would
+    // hand the cutter builder a triangle.
+    const size_t total_after = m_samples.size() + (stroke.size() - skip);
+    const bool   closes      = total_after >= MinChainSamples &&
+                               (stroke.back().pos - far_end).norm() <= r;
+
+    if (at == DrawChainEnd::Back) {
+        const size_t begin = m_samples.size();
+        m_samples.insert(m_samples.end(), stroke.begin() + int(skip), stroke.end());
+        m_bounds.emplace_back(begin, m_samples.size());
+    }
+    else {
+        // REVERSED, then prepended. The stroke was drawn AWAY from the chain's front,
+        // so as captured it runs the wrong way: prepending it unreversed makes the
+        // sequence double back at the join and every tangent there is wrong.
+        std::vector<DrawCutSample> rev(stroke.begin() + int(skip), stroke.end());
+        std::reverse(rev.begin(), rev.end());
+        const size_t added = rev.size();
+        m_samples.insert(m_samples.begin(), rev.begin(), rev.end());
+        // Every earlier stroke's range shifts by what was prepended, which is why the
+        // bounds are stored as ranges and fixed up here rather than inferred.
+        for (std::pair<size_t, size_t>& b : m_bounds) {
+            b.first  += added;
+            b.second += added;
+        }
+        // APPENDED AT THE END OF m_bounds, not at its start, even though the samples
+        // went in at the start of m_samples. m_bounds is in APPEND order - "newest
+        // last" - because that is the order undo consumes it in; ordering it by
+        // position in m_samples instead would make undo_last_stroke() take back the
+        // OLDEST stroke after any front append, which is a bug whose symptom is the
+        // line losing its far end when you Ctrl+Z the near one.
+        m_bounds.emplace_back(size_t(0), added);
+    }
+
+    if (closes)
+        m_closed = true;
+    // A chain that has just grown is one the user is still drawing, so any earlier
+    // "finished, not a loop" verdict no longer applies.
+    m_finished_open = false;
+    return at;
+}
+
+bool DrawCutChain::undo_last_stroke()
+{
+    if (m_bounds.empty())
+        return false;
+
+    // The LAST APPENDED stroke is the last entry of m_bounds (which is in append
+    // order), wherever in m_samples it happens to sit - a Front append puts it at
+    // index 0.
+    const std::pair<size_t, size_t> b = m_bounds.back();
+    m_bounds.pop_back();
+    m_samples.erase(m_samples.begin() + int(b.first), m_samples.begin() + int(b.second));
+
+    const size_t removed = b.second - b.first;
+    for (std::pair<size_t, size_t>& r : m_bounds) {
+        // Only the ranges AFTER the removed one move, and a Front append means every
+        // remaining range is after it.
+        if (r.first >= b.second) {
+            r.first  -= removed;
+            r.second -= removed;
+        }
+    }
+
+    // Taking back a stroke takes back the closure it made. A chain cannot stay closed
+    // after losing the span that closed it, and the alternative (keeping m_closed and
+    // letting the resampler bridge a gap of any size) is the "wild shape" the whole
+    // change exists to remove.
+    m_closed        = false;
+    m_finished_open = false;
+    if (m_samples.size() < 2)
+        clear();
+    return true;
+}
+
+bool DrawCutChain::force_close()
+{
+    if (m_samples.size() < MinChainSamples)
+        return false;
+    m_closed        = true;
+    m_finished_open = false;
+    return true;
+}
+
+bool DrawCutChain::finish_open()
+{
+    if (m_closed || m_samples.size() < MinChainSamples)
+        return false;
+    m_finished_open = true;
+    return true;
+}
+
+DrawCutError DrawCutChain::finish(DrawCutStroke& out, double spacing, double smoothing) const
+{
+    out.clear();
+    // OWNER FEEDBACK 1 AND 2, in one branch: an open chain produces NO stroke, so no
+    // caller can build a cutter from it, so nothing is lofted and nothing is
+    // previewed. The gizmo draws the polyline from samples() instead, which is what
+    // the user needs while they work.
+    // An unfinished chain produces NO stroke. "Finished and not a loop" is a different
+    // thing from "not finished yet", and only the user can tell those apart from the
+    // samples - which is what finish_open() is for.
+    if (!m_closed && !m_finished_open)
+        return DrawCutError::NotClosed;
+    if (m_samples.size() < MinChainSamples)
+        return DrawCutError::TooShort;
+
+    for (const DrawCutSample& s : m_samples)
+        out.append(s.pos, s.normal, s.facet);
+    if (m_finished_open) {
+        // PHASE 1'S OPEN CUT. finish() decides open from the gap between the first and
+        // the last sample, and here that gap is whatever the user drew - for a line
+        // across a part, the whole part - so the decision comes out open on its own.
+        const DrawCutError err = out.finish(spacing, smoothing, /*force_closed*/ false);
+        if (err == DrawCutError::None && out.is_closed()) {
+            // The user said this is NOT a loop, so a stroke that came back closed is not
+            // the thing they asked for. Refusing beats cutting a plug out of a part they
+            // meant to halve. (The snap radius is wider than finish()'s own closing
+            // tolerance, so a chain that reaches here should never be closed - this is
+            // the guard for the case where those two constants ever cross.)
+            out.clear();
+            return DrawCutError::NotClosed;
+        }
+        return err;
+    }
+    // force_closed, because the CHAIN decided it is closed - by the snap radius,
+    // which is deliberately wider than finish()'s own closing tolerance on a large
+    // part. Letting finish() re-decide would silently reopen a chain the user watched
+    // snap shut.
+    return out.finish(spacing, smoothing, /*force_closed*/ true);
+}
+
+bool DrawCutChain::operator==(const DrawCutChain& o) const
+{
+    if (m_closed != o.m_closed || m_finished_open != o.m_finished_open ||
+        m_samples.size() != o.m_samples.size() || m_bounds != o.m_bounds)
+        return false;
+    for (size_t i = 0; i < m_samples.size(); ++ i)
+        if (!m_samples[i].pos.isApprox(o.m_samples[i].pos) ||
+            !m_samples[i].normal.isApprox(o.m_samples[i].normal) ||
+            m_samples[i].facet != o.m_samples[i].facet)
+            return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// THE HALVES CLASSIFICATION. 2026-09-12, owner feedback item 3.
+// ---------------------------------------------------------------------------
+
+bool draw_cut_classify_upper(const indexed_triangle_set& cutter, bool closed, const Vec3d& p)
+{
+    if (cutter.empty())
+        return false;
+    const bool inside = point_in_solid(cutter, p);
+    // draw_cut_split()'s convention, and the reason this cannot just return `inside`:
+    // for a CLOSED stroke the plug (inside the cutter) is the UPPER half, and for an
+    // OPEN one the cutter is the swept slab on the lower side, so inside is LOWER.
+    return closed ? inside : !inside;
+}
+
+std::vector<float> draw_cut_inside_field(const indexed_triangle_set& cutter,
+                                         bool                        closed,
+                                         const BoundingBoxf3&        bbox,
+                                         int                         nx,
+                                         int                         ny,
+                                         int                         nz,
+                                         BoundingBoxf3*              field_bbox)
+{
+    nx = std::max(2, nx);
+    ny = std::max(2, ny);
+    nz = std::max(2, nz);
+    std::vector<float> field(size_t(nx) * size_t(ny) * size_t(nz), 1.0f);
+
+    BoundingBoxf3 fb = bbox;
+    if (!fb.defined || cutter.empty()) {
+        if (field_bbox)
+            *field_bbox = fb;
+        return field;
+    }
+
+    // GROW by one voxel on each side, so a fragment exactly on the part's surface -
+    // which is every fragment the shader will ever ask about - sits INSIDE the field
+    // rather than on its clamped border, where a linear fetch would read a half-value
+    // from outside and the boundary would creep by half a voxel.
+    const Vec3d raw = fb.size();
+    const Vec3d cell(std::max(1e-6, raw.x() / double(nx - 1)),
+                     std::max(1e-6, raw.y() / double(ny - 1)),
+                     std::max(1e-6, raw.z() / double(nz - 1)));
+    fb.min -= cell;
+    fb.max += cell;
+    const Vec3d span = fb.size();
+    const Vec3d step(span.x() / double(nx - 1), span.y() / double(ny - 1), span.z() / double(nz - 1));
+
+    // ONE PARITY RAY PER COLUMN, not per voxel. The column runs along +Z, so for each
+    // (i, j) the crossings of that line with the cutter's triangles are collected
+    // once, sorted, and the whole column of nz voxels is filled by walking them - the
+    // parity between two consecutive crossings is constant, which is what makes a
+    // 64^3 field affordable on a mouse-up instead of 262144 full mesh passes.
+    //
+    // The DEGENERACY the per-point test avoids by using an irrational direction is
+    // handled differently here, because the direction is fixed at +Z: a triangle the
+    // column's line passes exactly through the edge of would be counted twice or not
+    // at all. The column's XY is nudged by a fixed sub-voxel irrational fraction of
+    // the cell, which moves every column off the axis-aligned grid the cutter's own
+    // faces are built on (a stroke on a cube's top face gives faces parallel to +Z
+    // everywhere) without moving any column more than a fraction of a voxel - the
+    // same trick, applied to the sample points rather than to the ray.
+    const double jx = 0.00031831 * step.x();
+    const double jy = 0.00027183 * step.y();
+
+    std::vector<double> zs;
+    for (int j = 0; j < ny; ++ j) {
+        const double y = fb.min.y() + double(j) * step.y() + jy;
+        for (int i = 0; i < nx; ++ i) {
+            const double x = fb.min.x() + double(i) * step.x() + jx;
+
+            zs.clear();
+            for (const Vec3i32& tri : cutter.indices) {
+                const Vec3d a = cutter.vertices[tri(0)].cast<double>();
+                const Vec3d b = cutter.vertices[tri(1)].cast<double>();
+                const Vec3d c = cutter.vertices[tri(2)].cast<double>();
+                // Barycentric solve at (x, y) in the XY plane.
+                const double det = (b.y() - c.y()) * (a.x() - c.x()) + (c.x() - b.x()) * (a.y() - c.y());
+                if (std::abs(det) < 1e-12)
+                    continue; // edge-on to the column; a neighbour carries the crossing
+                const double l0 = ((b.y() - c.y()) * (x - c.x()) + (c.x() - b.x()) * (y - c.y())) / det;
+                const double l1 = ((c.y() - a.y()) * (x - c.x()) + (a.x() - c.x()) * (y - c.y())) / det;
+                const double l2 = 1.0 - l0 - l1;
+                if (l0 < 0.0 || l1 < 0.0 || l2 < 0.0)
+                    continue;
+                zs.push_back(l0 * a.z() + l1 * b.z() + l2 * c.z());
+            }
+            std::sort(zs.begin(), zs.end());
+
+            // Walk the column. `crossed` counts how many crossings are BELOW the
+            // current z, so its parity is "inside".
+            size_t crossed = 0;
+            for (int k = 0; k < nz; ++ k) {
+                const double z = fb.min.z() + double(k) * step.z();
+                while (crossed < zs.size() && zs[crossed] < z)
+                    ++ crossed;
+                const bool inside = (crossed & 1) != 0;
+                const bool upper  = closed ? inside : !inside;
+                // -1 UPPER, +1 LOWER: the shader's `side < 0` is side 1, which
+                // apply_color_clip_plane_colors() feeds with UPPER_PART_COLOR.
+                field[(size_t(k) * size_t(ny) + size_t(j)) * size_t(nx) + size_t(i)] = upper ? -1.0f : 1.0f;
+            }
+        }
+    }
+
+    if (field_bbox)
+        *field_bbox = fb;
+    return field;
 }
 
 } // namespace Slic3r

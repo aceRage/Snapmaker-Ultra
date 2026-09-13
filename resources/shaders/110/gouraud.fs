@@ -50,6 +50,22 @@ uniform vec2  curved_sheet_half_size;
 // 0.0: the texture holds f in mm. Otherwise it holds (f/range + 1)/2, which is
 // what the GL 2.1 fallback has to do - GL_LUMINANCE is fixed point on [0,1].
 uniform float curved_sheet_range;
+// DRAWN cut field (cut gizmo, Surface = Draw; 2026-09-12). A ruled strip swept along a
+// drawn stroke is NOT a height field over the plane, so curved_sheet_tex above cannot
+// describe it - there is no single-valued (u,v) -> z. What there is instead is the
+// question the split itself asks: IS THE POINT INSIDE THE CUTTER SOLID. That is baked
+// into a 3D SIGN FIELD over the part's bounding box in the cut plane's frame, NEGATIVE
+// on the upper half, which is the same convention color_clip_plane already uses.
+//
+// draw_field_matrix takes a world point into the plane frame; origin and size normalise
+// it into the texture's [0,1]^3. The fetch is NEAREST-filtered on the C++ side, because
+// interpolating a two-valued sign puts a ragged, camera-dependent band across the
+// boundary.
+uniform bool      draw_field_active;
+uniform sampler3D draw_field_tex;
+uniform mat4      draw_field_matrix;
+uniform vec3      draw_field_origin;
+uniform vec3      draw_field_size;
 
 // Phase 2, side visibility. Per-half alpha for the two colour-clip sides, so a
 // half can be shown solid (1.0), ghosted (~0.25) or hidden. A NEGATIVE value
@@ -158,7 +174,21 @@ void main()
     vec4 color;
 	if (use_color_clip_plane) {
 		float side = color_clip_plane_dot;
-		if (curved_sheet_active) {
+		if (draw_field_active) {
+			// The DRAWN field wins over the sheet: a cut is Curved or Draw, never both,
+			// and giving the newer one precedence means a stale sheet texture left over
+			// from a mode switch cannot colour a drawn cut.
+			vec3 local = (draw_field_matrix * vec4(world_pos.xyz, 1.0)).xyz;
+			vec3 uvw = (local - draw_field_origin) / draw_field_size;
+			// Outside the field the part does not exist, so clamping continues the
+			// border value rather than snapping back to the flat plane at the box edge.
+			float v = texture3D(draw_field_tex, clamp(uvw, 0.0, 1.0)).r;
+			// The GL 2.1 fallback stores 0 for upper and 1 for lower (GL_LUMINANCE is
+			// fixed point on [0,1] and cannot hold -1), so the test is against the
+			// midpoint and works for both encodings: -1 and 0 are both below 0.5.
+			side = v - 0.5;
+		}
+		else if (curved_sheet_active) {
 			vec3 local = (curved_sheet_matrix * vec4(world_pos.xyz, 1.0)).xyz;
 			vec2 uv = local.xy / (2.0 * curved_sheet_half_size) + vec2(0.5, 0.5);
 			// Outside the sheet's domain the height field is not defined; clamp

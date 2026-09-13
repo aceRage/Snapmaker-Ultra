@@ -337,6 +337,18 @@ class GLGizmoCut3D : public GLGizmoBase
     // frame the sheet lives in and the frame the cut runs in), so it survives a
     // plane nudge the way the sheet does. Session state, like the sheet: the cut
     // is baked and nothing about it reaches the 3MF.
+    // THE CHAIN (2026-09-12, owner click-testing). The line is now a chain of
+    // strokes rather than one stroke: after a stroke ends the user picks either
+    // endpoint and carries on, from any view direction, and the chain closes when a
+    // stroke comes within the snap radius of the far endpoint.
+    //
+    // m_draw_chain is THE SOURCE OF TRUTH for the line. m_draw_stroke below is the
+    // FINISHED, CLOSED stroke derived from it - and it is left EMPTY while the chain
+    // is open, which is what makes items 1 and 2 of the feedback hold everywhere at
+    // once: every "is there a cut surface" gate in this file already asks
+    // m_draw_stroke.valid(), so an open chain lofts nothing, previews nothing,
+    // classifies nothing and cannot be cut with, without any of those sites changing.
+    DrawCutChain    m_draw_chain;
     DrawCutStroke   m_draw_stroke;
     DrawCutParams   m_draw_params;
     // The panel's smoothing, 0..1, which draw_cut_smooth_passes() turns into
@@ -353,6 +365,23 @@ class GLGizmoCut3D : public GLGizmoBase
     // HIT, which is what makes a miss non-fatal).
     bool            m_draw_capturing{ false };
     Vec2d           m_draw_last_mouse{ Vec2d::Zero() };
+    // The stroke being captured right now, separate from the chain: it is only
+    // appended on LeftUp, so an abandoned gesture (Esc, a stroke that turns out to
+    // start nowhere near an endpoint) leaves the chain exactly as it was.
+    std::vector<DrawCutSample> m_draw_capture;
+    // Which end the in-progress stroke is continuing, decided on the PRESS. Latched
+    // rather than re-derived, because the chain's endpoints do not move during the
+    // gesture and re-asking as the cursor travels would flip the answer.
+    DrawChainEnd    m_draw_capture_end{ DrawChainEnd::Back };
+    // Why the last press was refused, so the panel can say so. Cleared on the next
+    // press that is accepted, and on Clear line - it describes one gesture, not a
+    // state of the line.
+    enum class DrawRejectReason { None = 0, Disjoint, ChainClosed };
+    DrawRejectReason m_draw_reject_msg{ DrawRejectReason::None };
+    // Snap feedback while capturing: true when the cursor is inside the snap radius
+    // of the endpoint this stroke would close on, so the ring under the far endpoint
+    // can light up and the user knows a release will close the loop.
+    bool            m_draw_snap_armed{ false };
     // The instance mesh in the PLANE frame plus a raycaster over it, cached for
     // the duration of one stroke: it does not change while the button is down,
     // and re-deriving it per motion event would stall the drag on a heavy model.
@@ -372,6 +401,30 @@ class GLGizmoCut3D : public GLGizmoBase
     bool            m_draw_lower_empty{ false };
     // Advisory: the ruled strip folds near a corner tighter than the Extension.
     bool            m_draw_folds{ false };
+
+    // THE HALVES CLASSIFICATION (2026-09-12, owner feedback item 3). The cyan/magenta
+    // colouring, the Visible/Ghost/Hidden side display and the connectors all used to
+    // ask the FLAT PLANE which side a point was on, so in Draw mode the colours ran
+    // straight through the drawn surface. They now ask the CUTTER SOLID instead - the
+    // same solid the boolean uses - baked into a voxel field the volume shader
+    // samples per fragment.
+    //
+    // A 3D texture, not the sheet's 2D one: a ruled strip is not a height field over
+    // the plane (that is the whole point of the mode), so there is no (u,v) -> z to
+    // put in a 2D texture. sampler3D is core GL 1.2 / GLSL 110, so this works on the
+    // 2.1 fallback path too.
+    unsigned int    m_draw_field_tex{ 0 };
+    bool            m_draw_field_dirty{ true };
+    // The box the field spans, in the PLANE frame - the part's box grown by a voxel.
+    BoundingBoxf3   m_draw_field_bbox;
+    void            update_draw_field_texture();
+    void            release_draw_field_texture();
+    void            apply_draw_color_clip();
+    // The field's resolution. 48^3 is 110k voxels and one parity ray per column
+    // (2304 rays) against a cutter of a few thousand faces - tens of milliseconds on
+    // a mouse-up, which is where it runs. Finer buys nothing the eye can see at the
+    // scale a cut surface is inspected at.
+    static const int DrawFieldRes = 48;
 
     // --- DRAW CUT (phase 2) ------------------------------------------------
     // THE DRAFT ANGLE, in degrees, signed: positive flares the cut outward (the
@@ -405,9 +458,13 @@ class GLGizmoCut3D : public GLGizmoBase
     // completed stroke, per Clear, and before a lossy parameter change - the same
     // granularity the sheet uses, and consumed by the same on_cut_char() hook.
     struct DrawStrokeState {
-        std::vector<DrawCutSample> samples; // the RAW samples, so finish() can re-run
-        bool                       closed{ false };
+        DrawCutChain chain; // the whole chain, so finish() can re-run and undo is per stroke
     };
+    // 2026-09-12: the entry carries the WHOLE CHAIN, because undo is per stroke and a
+    // stroke is a range of the chain rather than a line of its own. Restoring the
+    // chain and re-deriving the stroke from it is what makes Ctrl+Z after a
+    // continuation put back the chain as it stood before that stroke - including its
+    // open/closed state, which a stroke-only entry could not express.
     std::vector<DrawStrokeState> m_draw_undo;
     std::vector<DrawStrokeState> m_draw_redo;
 
@@ -443,6 +500,11 @@ class GLGizmoCut3D : public GLGizmoBase
     // points are never re-projected onto the mesh.
     void   draw_interpolate_to(const Vec2d& mouse_position);
     void   clear_draw_stroke(bool push_undo);
+    // Where the chain's two endpoints are, in the plane frame, and the snap radius
+    // that closes it. Both used by the renderer (the endpoint handles) and by the
+    // mouse handler (which end a press continues).
+    double draw_chain_snap_radius() const;
+    void   render_draw_chain_endpoints();
     // The inward direction for DrawCutDirection::View, in the plane frame.
     Vec3d  draw_view_dir_in_plane() const;
     // Take the camera's current forward direction as the one a Direction = View cut

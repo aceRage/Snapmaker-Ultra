@@ -1725,3 +1725,584 @@ TEST_CASE("Draw cut: demo exports", "[DrawCut][.demo]")
     TriangleMesh(upper).WriteOBJFile("draw_plug_upper.obj");
     TriangleMesh(lower).WriteOBJFile("draw_plug_lower.obj");
 }
+// ===========================================================================
+// THE CHAIN. 2026-09-12, from owner click-testing: a line round a large object
+// has to be drawn in several strokes with the view rotated between them, the
+// chain is only lofted once it CLOSES, and only one chain may exist.
+// ===========================================================================
+
+// A tall box, 20 x 20 x 80, centred on the origin - the article the owner was
+// click-testing on. Four side faces, so a loop round it has to be drawn from at
+// least two view directions.
+static indexed_triangle_set tall_box(double w = 20.0, double d = 20.0, double h = 80.0)
+{
+    indexed_triangle_set its = its_make_cube(w, d, h);
+    for (Vec3f& v : its.vertices)
+        v -= Vec3f(float(0.5 * w), float(0.5 * d), float(0.5 * h));
+    return its;
+}
+
+// One stroke's worth of raw samples along a straight run on a face of the tall
+// box, from `a` to `b` with the face normal `n`, endpoints included.
+static std::vector<DrawCutSample> face_run(const Vec3d& a, const Vec3d& b, const Vec3d& n, int n_samples)
+{
+    std::vector<DrawCutSample> out;
+    for (int i = 0; i < n_samples; ++ i) {
+        const double t = double(i) / double(n_samples - 1);
+        DrawCutSample s;
+        s.pos    = a + t * (b - a);
+        s.normal = n.normalized();
+        s.facet  = size_t(i);
+        out.push_back(s);
+    }
+    return out;
+}
+
+TEST_CASE("Draw cut chain: a stroke continues from either endpoint", "[DrawCut]")
+{
+    const double r = 2.0;
+    DrawCutChain chain;
+
+    // First stroke: nothing to continue, so it is taken at the Back.
+    std::vector<DrawCutSample> s1 = face_run(Vec3d(0, 0, 0), Vec3d(10, 0, 0), Vec3d::UnitZ(), 11);
+    REQUIRE(chain.append(s1, r) == DrawChainEnd::Back);
+    REQUIRE(chain.size() == 11);
+    REQUIRE_FALSE(chain.is_closed());
+    REQUIRE(chain.stroke_count() == 1);
+    REQUIRE(chain.front_pos().isApprox(Vec3d(0, 0, 0)));
+    REQUIRE(chain.back_pos().isApprox(Vec3d(10, 0, 0)));
+
+    // CONTINUE FROM THE BACK. Starting at (10,0,0), which is the back endpoint.
+    std::vector<DrawCutSample> s2 = face_run(Vec3d(10, 0, 0), Vec3d(10, 10, 0), Vec3d::UnitZ(), 11);
+    REQUIRE(chain.append(s2, r) == DrawChainEnd::Back);
+    REQUIRE(chain.stroke_count() == 2);
+    // The duplicated join sample is dropped: 11 + 11 - 1.
+    REQUIRE(chain.size() == 21);
+    REQUIRE(chain.back_pos().isApprox(Vec3d(10, 10, 0)));
+    REQUIRE(chain.front_pos().isApprox(Vec3d(0, 0, 0)));
+
+    // CONTINUE FROM THE FRONT. Starting at (0,0,0), running AWAY from the chain -
+    // so the samples must be reversed and prepended, or the sequence doubles back.
+    std::vector<DrawCutSample> s3 = face_run(Vec3d(0, 0, 0), Vec3d(0, -10, 0), Vec3d::UnitZ(), 11);
+    REQUIRE(chain.append(s3, r) == DrawChainEnd::Front);
+    REQUIRE(chain.stroke_count() == 3);
+    REQUIRE(chain.size() == 31);
+    // The chain's FRONT is now the far end of the third stroke, and the sequence is
+    // continuous: the new front is (0,-10,0) and the old front is still in the
+    // middle of the list, not duplicated at the join.
+    REQUIRE(chain.front_pos().isApprox(Vec3d(0, -10, 0)));
+    REQUIRE(chain.back_pos().isApprox(Vec3d(10, 10, 0)));
+    // CONTINUITY: no span in the whole chain is longer than the sampling step of
+    // 1 mm. A stroke prepended unreversed would leave a 10 mm span at the join.
+    const std::vector<DrawCutSample>& all = chain.samples();
+    for (size_t i = 1; i < all.size(); ++ i)
+        REQUIRE((all[i].pos - all[i - 1].pos).norm() < 1.5);
+
+    // A snap radius of zero, and a start at neither endpoint, is DISJOINT.
+    std::vector<DrawCutSample> s4 = face_run(Vec3d(5, 5, 0), Vec3d(6, 6, 0), Vec3d::UnitZ(), 5);
+    REQUIRE(chain.append(s4, r) == DrawChainEnd::None);
+    REQUIRE(chain.size() == 31); // unchanged
+    REQUIRE(chain.stroke_count() == 3);
+}
+
+TEST_CASE("Draw cut chain: a second disjoint stroke is rejected", "[DrawCut]")
+{
+    const double r = 2.0;
+    DrawCutChain chain;
+    REQUIRE(chain.append(face_run(Vec3d(0, 0, 0), Vec3d(10, 0, 0), Vec3d::UnitZ(), 11), r) == DrawChainEnd::Back);
+
+    // ONLY ONE CHAIN MAY EXIST (owner feedback item 4). A stroke that begins nowhere
+    // near either endpoint is refused, and the chain it did not join is untouched -
+    // the samples, the stroke count and the closed state all stand.
+    const std::vector<DrawCutSample> before = chain.samples();
+    REQUIRE(chain.append(face_run(Vec3d(0, 20, 0), Vec3d(10, 20, 0), Vec3d::UnitZ(), 11), r) == DrawChainEnd::None);
+    REQUIRE(chain.samples().size() == before.size());
+    REQUIRE(chain.stroke_count() == 1);
+
+    // Just OUTSIDE the radius is still refused; just inside is taken. The boundary
+    // is the claim, so both sides of it are asserted.
+    REQUIRE(chain.append(face_run(Vec3d(10 + 1.05 * r, 0, 0), Vec3d(14, 0, 0), Vec3d::UnitZ(), 5), r) == DrawChainEnd::None);
+    REQUIRE(chain.append(face_run(Vec3d(10 + 0.95 * r, 0, 0), Vec3d(14, 0, 0), Vec3d::UnitZ(), 5), r) == DrawChainEnd::Back);
+}
+
+TEST_CASE("Draw cut chain: the snap radius closes the chain and only within it", "[DrawCut]")
+{
+    const double r = 2.0;
+
+    // A square loop on one plane, drawn in four strokes, whose last stroke ends
+    // 1 mm from the first stroke's start - INSIDE the radius, so it snaps closed.
+    auto square = [&](double final_gap) {
+        DrawCutChain c;
+        const Vec3d n = Vec3d::UnitZ();
+        REQUIRE(c.append(face_run(Vec3d(0, 0, 0), Vec3d(10, 0, 0), n, 11), r) != DrawChainEnd::None);
+        REQUIRE(c.append(face_run(Vec3d(10, 0, 0), Vec3d(10, 10, 0), n, 11), r) != DrawChainEnd::None);
+        REQUIRE(c.append(face_run(Vec3d(10, 10, 0), Vec3d(0, 10, 0), n, 11), r) != DrawChainEnd::None);
+        // The closing run, stopping `final_gap` short of (0,0,0).
+        REQUIRE(c.append(face_run(Vec3d(0, 10, 0), Vec3d(0, final_gap, 0), n, 11), r) != DrawChainEnd::None);
+        return c;
+    };
+
+    // 1 mm short, inside a 2 mm radius: CLOSED.
+    DrawCutChain closed = square(1.0);
+    REQUIRE(closed.is_closed());
+
+    // 5 mm short, outside it: still OPEN, and therefore still produces no stroke.
+    DrawCutChain open = square(5.0);
+    REQUIRE_FALSE(open.is_closed());
+
+    DrawCutStroke st;
+    REQUIRE(open.finish(st) == DrawCutError::NotClosed);
+    REQUIRE(st.path().empty());
+    REQUIRE_FALSE(st.valid());
+
+    // The closed one DOES produce a stroke, and it is a closed one.
+    DrawCutStroke st2;
+    REQUIRE(closed.finish(st2, 1.0, 0.0) == DrawCutError::None);
+    REQUIRE(st2.is_closed());
+    REQUIRE(st2.valid());
+
+    // The snap radius scales with the part and is clamped at both ends.
+    BoundingBoxf3 small(Vec3d(0, 0, 0), Vec3d(10, 10, 10));
+    BoundingBoxf3 mid(Vec3d(0, 0, 0), Vec3d(100, 100, 100));
+    BoundingBoxf3 huge(Vec3d(0, 0, 0), Vec3d(2000, 2000, 2000));
+    REQUIRE(draw_cut_chain_snap_radius(small) == Approx(ChainSnapMinMm));
+    REQUIRE(draw_cut_chain_snap_radius(mid) > ChainSnapMinMm);
+    REQUIRE(draw_cut_chain_snap_radius(mid) < ChainSnapMaxMm);
+    REQUIRE(draw_cut_chain_snap_radius(huge) == Approx(ChainSnapMaxMm));
+    REQUIRE(draw_cut_chain_snap_radius(BoundingBoxf3()) == Approx(ChainSnapMinMm));
+}
+
+TEST_CASE("Draw cut chain: undo takes back the last stroke, and the closure with it", "[DrawCut]")
+{
+    const double r = 2.0;
+    const Vec3d  n = Vec3d::UnitZ();
+    DrawCutChain c;
+    REQUIRE(c.append(face_run(Vec3d(0, 0, 0), Vec3d(10, 0, 0), n, 11), r) == DrawChainEnd::Back);
+    REQUIRE(c.append(face_run(Vec3d(10, 0, 0), Vec3d(10, 10, 0), n, 11), r) == DrawChainEnd::Back);
+    // A FRONT append, so undo has to work on a stroke that sits at index 0.
+    REQUIRE(c.append(face_run(Vec3d(0, 0, 0), Vec3d(0, -10, 0), n, 11), r) == DrawChainEnd::Front);
+    REQUIRE(c.size() == 31);
+    REQUIRE(c.front_pos().isApprox(Vec3d(0, -10, 0)));
+
+    // Take back the FRONT-appended stroke: the front endpoint goes back to (0,0,0)
+    // and the back one has not moved.
+    REQUIRE(c.undo_last_stroke());
+    REQUIRE(c.stroke_count() == 2);
+    REQUIRE(c.size() == 21);
+    REQUIRE(c.front_pos().isApprox(Vec3d(0, 0, 0)));
+    REQUIRE(c.back_pos().isApprox(Vec3d(10, 10, 0)));
+
+    // Now close it, then undo: the closure goes away with the stroke that made it.
+    REQUIRE(c.append(face_run(Vec3d(10, 10, 0), Vec3d(0.5, 0, 0), n, 16), r) == DrawChainEnd::Back);
+    REQUIRE(c.is_closed());
+    REQUIRE(c.undo_last_stroke());
+    REQUIRE_FALSE(c.is_closed());
+    REQUIRE(c.stroke_count() == 2);
+
+    // Down to nothing, and no further.
+    REQUIRE(c.undo_last_stroke());
+    REQUIRE(c.undo_last_stroke());
+    REQUIRE(c.empty());
+    REQUIRE_FALSE(c.undo_last_stroke());
+}
+
+TEST_CASE("Draw cut chain: a closed chain refuses a continuation", "[DrawCut]")
+{
+    const double r = 2.0;
+    const Vec3d  n = Vec3d::UnitZ();
+    DrawCutChain c;
+    REQUIRE(c.append(face_run(Vec3d(0, 0, 0), Vec3d(10, 0, 0), n, 11), r) == DrawChainEnd::Back);
+    REQUIRE(c.append(face_run(Vec3d(10, 0, 0), Vec3d(0.5, 0, 0), n, 11), r) == DrawChainEnd::Back);
+    REQUIRE(c.is_closed());
+    // A closed chain has no free endpoints: end_for_start() says None wherever the
+    // new stroke starts, including AT an endpoint. The gizmo's answer to "I want a
+    // different line now" is Clear line / Ctrl+Z, which is a deliberate gesture.
+    REQUIRE(c.end_for_start(Vec3d(0, 0, 0), r) == DrawChainEnd::None);
+    REQUIRE(c.end_for_start(Vec3d(10, 0, 0), r) == DrawChainEnd::None);
+    REQUIRE(c.append(face_run(Vec3d(0, 0, 0), Vec3d(0, 10, 0), n, 11), r) == DrawChainEnd::None);
+}
+
+TEST_CASE("Draw cut chain: a closed circle on one face cuts a plug and a body", "[DrawCut]")
+{
+    // OWNER FEEDBACK 4, the last sentence: a closed loop entirely on ONE face is a
+    // valid chain and cuts a plug out of that face. Drawn in TWO strokes, so it is
+    // the chain doing the closing rather than one gesture.
+    const indexed_triangle_set cube = centred_cube();
+    const double cube_volume = double(its_volume(cube));
+    const double R = 12.0;
+    const double z = 0.5 * CUBE;
+    const double r = 2.0;
+
+    auto arc = [&](double a0, double a1, int n) {
+        std::vector<DrawCutSample> out;
+        for (int i = 0; i < n; ++ i) {
+            const double a = a0 + (a1 - a0) * double(i) / double(n - 1);
+            DrawCutSample s;
+            s.pos    = Vec3d(R * std::cos(a), R * std::sin(a), z);
+            s.normal = Vec3d::UnitZ();
+            out.push_back(s);
+        }
+        return out;
+    };
+
+    DrawCutChain chain;
+    REQUIRE(chain.append(arc(0.0, M_PI, 60), r) == DrawChainEnd::Back);
+    REQUIRE_FALSE(chain.is_closed());
+    // The second stroke starts at the first's end and comes back round to (R,0,z).
+    REQUIRE(chain.append(arc(M_PI, 2.0 * M_PI - 0.02, 60), r) == DrawChainEnd::Back);
+    REQUIRE(chain.is_closed());
+
+    DrawCutStroke stroke;
+    REQUIRE(chain.finish(stroke, 1.0, 0.0) == DrawCutError::None);
+    REQUIRE(stroke.is_closed());
+    REQUIRE(stroke.valid());
+
+    DrawCutParams params;
+    params.direction   = DrawCutDirection::SurfaceNormal;
+    params.extension   = 5.0;
+    params.through_all = true;
+
+    indexed_triangle_set upper, lower;
+    REQUIRE(draw_cut_split(cube, stroke, params, &upper, &lower, nullptr));
+    REQUIRE(watertight(upper));
+    REQUIRE(watertight(lower));
+    // The PLUG is a cylinder of radius R through the cube; the BODY is the rest.
+    const double plug = double(its_volume(upper));
+    const double body = double(its_volume(lower));
+    REQUIRE(plug == Approx(M_PI * R * R * CUBE).epsilon(0.05));
+    REQUIRE(plug + body == Approx(cube_volume).epsilon(1e-3));
+    REQUIRE(body > plug);
+}
+
+TEST_CASE("Draw cut chain: a tall box looped in three strokes cuts two watertight halves", "[DrawCut]")
+{
+    // THE OWNER'S CASE. A 20 x 20 x 80 box; a horizontal loop round it at z == 0,
+    // drawn in THREE strokes from TWO view directions - which is exactly what you
+    // cannot do with one gesture, and what the chain exists for.
+    //
+    // The four side faces at x = +-10 and y = +-10. From the front you can reach the
+    // +Y face and part of each side; rotating 180 degrees gets you the -Y face. So:
+    //   stroke 1: along +Y face,  (-10, 10) -> (10, 10)
+    //   stroke 2: round the +X face, (10, 10) -> (10, -10)
+    //   stroke 3: the rest, (10,-10) -> (-10,-10) -> (-10, 10), closing on the start.
+    const indexed_triangle_set box = tall_box();
+    const double box_volume = double(its_volume(box));
+    const double r = draw_cut_chain_snap_radius(BoundingBoxf3(Vec3d(-10, -10, -40), Vec3d(10, 10, 40)));
+    REQUIRE(r > 0.9);
+
+    const Vec3d nY(0, 1, 0), nX(1, 0, 0), nYn(0, -1, 0), nXn(-1, 0, 0);
+
+    DrawCutChain chain;
+    // Stroke 1, on the +Y face.
+    REQUIRE(chain.append(face_run(Vec3d(-10, 10, 0), Vec3d(10, 10, 0), nY, 21), r) == DrawChainEnd::Back);
+    // Stroke 2, on the +X face (drawn after rotating the view a quarter turn).
+    REQUIRE(chain.append(face_run(Vec3d(10, 10, 0), Vec3d(10, -10, 0), nX, 21), r) == DrawChainEnd::Back);
+    REQUIRE_FALSE(chain.is_closed());
+    // Stroke 3, from the other side: the -Y face and then the -X face, ending back
+    // at the chain's FRONT endpoint (-10, 10, 0) - so the chain snaps closed.
+    {
+        std::vector<DrawCutSample> s3 = face_run(Vec3d(10, -10, 0), Vec3d(-10, -10, 0), nYn, 21);
+        const std::vector<DrawCutSample> tail = face_run(Vec3d(-10, -10, 0), Vec3d(-10, 9.5, 0), nXn, 21);
+        s3.insert(s3.end(), tail.begin() + 1, tail.end());
+        REQUIRE(chain.append(s3, r) == DrawChainEnd::Back);
+    }
+    REQUIRE(chain.is_closed());
+    REQUIRE(chain.stroke_count() == 3);
+
+    DrawCutStroke stroke;
+    REQUIRE(chain.finish(stroke, 1.0, 0.0) == DrawCutError::None);
+    REQUIRE(stroke.is_closed());
+    REQUIRE(stroke.valid());
+
+    // Direction = Surface normal on a loop round a box points INWARD on each face,
+    // so the cutter is a horizontal band through the box: the "plug" is the slab
+    // between the two rails and the rest is the two ends. That is not the cut the
+    // owner wants for a loop round an object - Axis Z is - so this is the AXIS case,
+    // which cuts the box into a top half and a bottom half.
+    DrawCutParams params;
+    params.direction   = DrawCutDirection::AxisZ;
+    params.extension   = 5.0;
+    params.through_all = true;
+
+    indexed_triangle_set upper, lower;
+    DrawCutError err = DrawCutError::None;
+    REQUIRE(draw_cut_split(box, stroke, params, &upper, &lower, &err));
+    REQUIRE(err == DrawCutError::None);
+
+    // TWO WATERTIGHT HALVES, and they partition the box.
+    REQUIRE(watertight(upper));
+    REQUIRE(watertight(lower));
+    const double a = double(its_volume(upper));
+    const double b = double(its_volume(lower));
+    REQUIRE(a > 0.0);
+    REQUIRE(b > 0.0);
+    REQUIRE(a + b == Approx(box_volume).epsilon(1e-3));
+
+    // Axis Z through a loop at z == 0 with 5 mm of extension: the cutter reaches
+    // from z == -5 down through the box, so the "plug" is everything below the loop
+    // and the other half is everything above it. Each is close to half the box.
+    REQUIRE(a == Approx(0.5 * box_volume).epsilon(0.2));
+    REQUIRE(b == Approx(0.5 * box_volume).epsilon(0.2));
+
+    // And they really are stacked, not nested: one half's z range is above the
+    // other's, which is the geometric claim "the loop cut the box in two".
+    BoundingBoxf3 bu, bl;
+    for (const Vec3f& v : upper.vertices) bu.merge(v.cast<double>());
+    for (const Vec3f& v : lower.vertices) bl.merge(v.cast<double>());
+    const bool stacked = bu.min.z() >= bl.max.z() - 1e-3 || bl.min.z() >= bu.max.z() - 1e-3;
+    REQUIRE(stacked);
+}
+
+// ---------------------------------------------------------------------------
+// THE HALVES CLASSIFICATION. Owner feedback item 3: the cyan/magenta colouring,
+// the Visible/Ghost/Hidden display and the connectors must follow the DRAWN
+// surface, not the flat plane.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Draw cut: the halves classification follows the drawn surface", "[DrawCut]")
+{
+    // A closed circle of radius 12 on a 40 mm cube's top face, cut through all with
+    // Surface normal. The plug is the cylinder r < 12; the body is the rest. The
+    // FLAT PLANE at z == 0 would classify by z, which is the bug - so the test picks
+    // points that the plane and the drawn surface disagree about.
+    const indexed_triangle_set cube = centred_cube();
+    const double R = 12.0;
+    DrawCutStroke stroke = circle_on_top(R, 96);
+    REQUIRE(stroke.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE(stroke.is_closed());
+
+    DrawCutParams params;
+    params.extension   = 5.0;
+    params.through_all = true;
+
+    BoundingBoxf3 bbox;
+    for (const Vec3f& v : cube.vertices)
+        bbox.merge(v.cast<double>());
+    const indexed_triangle_set cutter = draw_cut_cutter_solid(stroke, params, bbox, 0.0);
+    REQUIRE_FALSE(cutter.empty());
+
+    // Inside the plug, ABOVE and BELOW the plane: both are UPPER, because the drawn
+    // surface is a cylinder wall and the plug spans the full height. The flat plane
+    // would call the lower one "lower", which is the whole complaint.
+    REQUIRE(draw_cut_classify_upper(cutter, true, Vec3d(0, 0, +15)));
+    REQUIRE(draw_cut_classify_upper(cutter, true, Vec3d(0, 0, -15)));
+    REQUIRE(draw_cut_classify_upper(cutter, true, Vec3d(8, 0, -18)));
+    // Outside the plug, above and below: both LOWER, for the same reason.
+    REQUIRE_FALSE(draw_cut_classify_upper(cutter, true, Vec3d(18, 18, +15)));
+    REQUIRE_FALSE(draw_cut_classify_upper(cutter, true, Vec3d(18, 18, -15)));
+    REQUIRE_FALSE(draw_cut_classify_upper(cutter, true, Vec3d(0, 17, 0)));
+
+    // AGAINST THE SPLIT ITSELF. Every vertex of the plug half must classify UPPER,
+    // and every vertex of the body half LOWER - except the ones ON the cut face,
+    // which belong to both and can go either way. Test the vertices pulled slightly
+    // toward each half's own centroid, which moves them off the shared face.
+    indexed_triangle_set upper, lower;
+    REQUIRE(draw_cut_split(cube, stroke, params, &upper, &lower, nullptr));
+
+    // The nudge is RADIAL, not toward each half's centroid. The body half is a cube
+    // with a cylindrical hole down the middle, so its centroid sits INSIDE the hole -
+    // i.e. inside the other half - and nudging toward it walks every vertex the wrong
+    // way. The cut surface here is the cylinder wall, so the direction that moves a
+    // point off it and into its own half is radial: inward for the plug, outward for
+    // the body. (The cube's own top and bottom faces are not cut surfaces, so a vertex
+    // there needs no nudge at all and the radial one does it no harm.)
+    auto radial = [](const Vec3d& p) {
+        const Vec2d xy = p.head<2>();
+        return xy.norm() > 1e-9 ? Vec3d(xy.x() / xy.norm(), xy.y() / xy.norm(), 0.0) : Vec3d::UnitX();
+    };
+
+    int n_up = 0, n_up_ok = 0;
+    for (const Vec3f& v : upper.vertices) {
+        const Vec3d p = v.cast<double>();
+        // Only the vertices ON the cylinder wall need moving; the plug's flat ends are
+        // already unambiguous. Nudging them all is simpler and equally valid.
+        const Vec3d q = p - 0.5 * radial(p);
+        ++ n_up;
+        if (draw_cut_classify_upper(cutter, true, q))
+            ++ n_up_ok;
+    }
+    int n_lo = 0, n_lo_ok = 0;
+    for (const Vec3f& v : lower.vertices) {
+        const Vec3d p = v.cast<double>();
+        const Vec3d q = p + 0.5 * radial(p);
+        // A vertex on the cube's outer wall nudged outward leaves the part entirely -
+        // which is still OUTSIDE the plug, so the classification is unchanged and the
+        // assertion holds. Skip nothing.
+        ++ n_lo;
+        if (!draw_cut_classify_upper(cutter, true, q))
+            ++ n_lo_ok;
+    }
+    REQUIRE(n_up > 20);
+    REQUIRE(n_lo > 20);
+    // EVERY nudged vertex, not a majority: the radial nudge is exact for this geometry,
+    // so anything less would mean the classification really is wrong somewhere.
+    REQUIRE(n_up_ok == n_up);
+    REQUIRE(n_lo_ok == n_lo);
+}
+
+TEST_CASE("Draw cut: the voxel field agrees with the exact classification", "[DrawCut]")
+{
+    // The field is what the shader samples, so it has to agree with
+    // draw_cut_classify_upper() everywhere except within a voxel of the boundary.
+    const indexed_triangle_set cube = centred_cube();
+    DrawCutStroke stroke = circle_on_top(12.0, 96);
+    REQUIRE(stroke.finish(1.0, 0.0) == DrawCutError::None);
+
+    DrawCutParams params;
+    params.extension   = 5.0;
+    params.through_all = true;
+
+    BoundingBoxf3 bbox;
+    for (const Vec3f& v : cube.vertices)
+        bbox.merge(v.cast<double>());
+    const indexed_triangle_set cutter = draw_cut_cutter_solid(stroke, params, bbox, 0.0);
+
+    const int N = 32;
+    BoundingBoxf3 fb;
+    const std::vector<float> field = draw_cut_inside_field(cutter, true, bbox, N, N, N, &fb);
+    REQUIRE(field.size() == size_t(N) * N * N);
+    REQUIRE(fb.defined);
+    // The field's box is the part's box GROWN by a voxel, so a fragment on the
+    // part's own surface is inside the field rather than on its clamped border.
+    REQUIRE(fb.min.x() < bbox.min.x());
+    REQUIRE(fb.max.z() > bbox.max.z());
+
+    const Vec3d span = fb.size();
+    const Vec3d step(span.x() / double(N - 1), span.y() / double(N - 1), span.z() / double(N - 1));
+    const double voxel = step.maxCoeff();
+
+    int checked = 0, agreed = 0, upper_seen = 0, lower_seen = 0;
+    for (int k = 0; k < N; ++ k)
+        for (int j = 0; j < N; ++ j)
+            for (int i = 0; i < N; ++ i) {
+                const Vec3d p(fb.min.x() + i * step.x(), fb.min.y() + j * step.y(), fb.min.z() + k * step.z());
+                // Skip the boundary band: within a voxel of the cylinder wall the
+                // parity answer legitimately differs between the field's own jittered
+                // column and an arbitrary probe ray.
+                const double dr = std::abs(p.head<2>().norm() - 12.0);
+                if (dr < 1.5 * voxel)
+                    continue;
+                const bool exact = draw_cut_classify_upper(cutter, true, p);
+                const bool from_field = field[(size_t(k) * N + j) * N + i] < 0.f;
+                ++ checked;
+                if (exact == from_field)
+                    ++ agreed;
+                if (from_field) ++ upper_seen; else ++ lower_seen;
+            }
+    REQUIRE(checked > 10000);
+    REQUIRE(agreed == checked);
+    // Both halves are actually represented, so an all-one-sign field cannot pass.
+    REQUIRE(upper_seen > 100);
+    REQUIRE(lower_seen > 100);
+
+    // SIGN CONVENTION: negative is UPPER, which is `side < 0` in the shader and so
+    // side 1, which apply_color_clip_plane_colors() feeds with the upper colour.
+    // Dead centre of the plug:
+    const int ci = int(std::lround((0.0 - fb.min.x()) / step.x()));
+    const int cj = int(std::lround((0.0 - fb.min.y()) / step.y()));
+    const int ck = int(std::lround((0.0 - fb.min.z()) / step.z()));
+    REQUIRE(field[(size_t(ck) * N + cj) * N + ci] < 0.f);
+}
+
+TEST_CASE("Draw cut: an open stroke's classification is the other way round", "[DrawCut]")
+{
+    // The convention flips between the two cases, which is the one thing about this
+    // that is easy to get backwards: for a CLOSED stroke "inside the cutter" is the
+    // plug and therefore UPPER, for an OPEN one the cutter is the swept slab on the
+    // LOWER side.
+    const indexed_triangle_set cube = centred_cube();
+    DrawCutStroke stroke = line_on_top(25.0, 60);
+    REQUIRE(stroke.finish(1.0, 0.0) == DrawCutError::None);
+    REQUIRE_FALSE(stroke.is_closed());
+
+    DrawCutParams params;
+    params.extension   = 5.0;
+    params.through_all = true;
+
+    BoundingBoxf3 bbox;
+    for (const Vec3f& v : cube.vertices)
+        bbox.merge(v.cast<double>());
+    const indexed_triangle_set cutter = draw_cut_cutter_solid(stroke, params, bbox, 0.0);
+    REQUIRE_FALSE(cutter.empty());
+
+    indexed_triangle_set upper, lower;
+    REQUIRE(draw_cut_split(cube, stroke, params, &upper, &lower, nullptr));
+
+    // Which side is which comes from the split, not from a guess: take a point well
+    // inside each half (their centroids, which for two slabs are inside them) and
+    // require the classification to name the same halves the split produced.
+    auto centroid = [](const indexed_triangle_set& its) {
+        Vec3d c = Vec3d::Zero();
+        for (const Vec3f& v : its.vertices)
+            c += v.cast<double>();
+        return Vec3d(c / double(its.vertices.size()));
+    };
+    REQUIRE(draw_cut_classify_upper(cutter, false, centroid(upper)));
+    REQUIRE_FALSE(draw_cut_classify_upper(cutter, false, centroid(lower)));
+}
+TEST_CASE("Draw cut chain: an open line is cut with only when the user says so", "[DrawCut]")
+{
+    // PHASE 1'S OPEN CUT, kept but made explicit. "The line is not finished yet" and "the
+    // line is finished and is not a loop" look identical from the samples alone, and
+    // lofting every partial line is the wild-shape preview the chain exists to remove -
+    // so the chain refuses until the user commits one way or the other.
+    const indexed_triangle_set cube = centred_cube();
+    const double cube_volume = double(its_volume(cube));
+    const double r = 2.0;
+
+    DrawCutChain chain;
+    // A line right across the cube's top face, drawn in TWO strokes.
+    REQUIRE(chain.append(face_run(Vec3d(-25, 0, 20), Vec3d(0, 0, 20), Vec3d::UnitZ(), 26), r) == DrawChainEnd::Back);
+    REQUIRE(chain.append(face_run(Vec3d(0, 0, 20), Vec3d(25, 0, 20), Vec3d::UnitZ(), 26), r) == DrawChainEnd::Back);
+    REQUIRE_FALSE(chain.is_closed());
+    REQUIRE_FALSE(chain.is_finished_open());
+
+    // Not finished: NO stroke, so nothing can be lofted or previewed.
+    DrawCutStroke st;
+    REQUIRE(chain.finish(st, 1.0, 0.0) == DrawCutError::NotClosed);
+    REQUIRE_FALSE(st.valid());
+
+    // The user says "use it as it is".
+    REQUIRE(chain.finish_open());
+    REQUIRE(chain.is_finished_open());
+    REQUIRE_FALSE(chain.is_closed());
+    REQUIRE(chain.finish(st, 1.0, 0.0) == DrawCutError::None);
+    REQUIRE(st.valid());
+    REQUIRE_FALSE(st.is_closed());   // still an OPEN stroke, which is the point
+
+    // And it cuts the way phase 1's open line did: two watertight halves partitioning
+    // the cube, on opposite sides of the line.
+    DrawCutParams params;
+    params.extension   = 5.0;
+    params.through_all = true;
+    indexed_triangle_set upper, lower;
+    REQUIRE(draw_cut_split(cube, st, params, &upper, &lower, nullptr));
+    REQUIRE(watertight(upper));
+    REQUIRE(watertight(lower));
+    REQUIRE(double(its_volume(upper)) + double(its_volume(lower)) == Approx(cube_volume).epsilon(1e-3));
+
+    // CARRYING ON CLEARS THE VERDICT: a chain that has just grown is one the user is
+    // still drawing, so the surface goes away again until they commit afresh.
+    REQUIRE(chain.append(face_run(Vec3d(25, 0, 20), Vec3d(25, 10, 20), Vec3d::UnitZ(), 11), r) == DrawChainEnd::Back);
+    REQUIRE_FALSE(chain.is_finished_open());
+    REQUIRE(chain.finish(st, 1.0, 0.0) == DrawCutError::NotClosed);
+
+    // So does an undo, and so does closing the loop.
+    REQUIRE(chain.finish_open());
+    REQUIRE(chain.undo_last_stroke());
+    REQUIRE_FALSE(chain.is_finished_open());
+    REQUIRE(chain.finish_open());
+    REQUIRE(chain.force_close());
+    REQUIRE(chain.is_closed());
+    REQUIRE_FALSE(chain.is_finished_open());
+
+    // A CLOSED chain refuses finish_open(): the two are mutually exclusive, and the way
+    // back to an open line is Ctrl+Z, not a second verdict on the same chain.
+    REQUIRE_FALSE(chain.finish_open());
+
+    // And a chain too short to be a line at all refuses both.
+    DrawCutChain tiny;
+    REQUIRE(tiny.append(face_run(Vec3d(0, 0, 0), Vec3d(1, 0, 0), Vec3d::UnitZ(), 3), r) == DrawChainEnd::Back);
+    REQUIRE_FALSE(tiny.finish_open());
+    REQUIRE_FALSE(tiny.force_close());
+}

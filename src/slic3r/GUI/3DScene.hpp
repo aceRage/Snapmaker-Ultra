@@ -432,6 +432,18 @@ private:
     // f itself - the GL 2.1 fallback, where GL_LUMINANCE clamps to [0,1].
     float        m_curved_sheet_range{ 0.f };
 
+    // DRAWN cut field (cut gizmo, Surface = Draw; 2026-09-12). A ruled strip is not a
+    // height field over the plane, so the sheet's 2D texture cannot describe it. What
+    // can is the question the split itself asks - IS THE POINT INSIDE THE CUTTER SOLID
+    // - baked into a 3D sign field over the part's bounding box in the plane frame.
+    // NEGATIVE is the upper half, matching m_color_clip_plane's own convention.
+    unsigned int m_draw_field_tex{ 0 };
+    Transform3d  m_draw_field_matrix{ Transform3d::Identity() };
+    // The field's box in the plane frame: its origin and its size, so the shader can
+    // normalise a plane-frame point into [0,1]^3.
+    Vec3f        m_draw_field_origin{ Vec3f::Zero() };
+    Vec3f        m_draw_field_size{ Vec3f::Ones() };
+
     struct Slope
     {
         // toggle for slope rendering
@@ -533,6 +545,18 @@ public:
         m_curved_sheet_matrix    = world_to_plane;
         m_curved_sheet_half_size = Vec2f(float(half_size_u), float(half_size_v));
         m_curved_sheet_range     = float(range);
+    }
+    // world -> cut plane frame, plus the field's box in that frame (origin and size).
+    // Pass tex == 0 to go back to the plain flat colour split. The two fields are
+    // mutually exclusive in practice (a cut is Curved or Draw, never both), and the
+    // shader gives the DRAWN one precedence so a stale sheet texture cannot win.
+    void set_draw_color_clip(unsigned int tex, const Transform3d& world_to_plane, const Vec3d& origin, const Vec3d& size) {
+        m_draw_field_tex    = tex;
+        m_draw_field_matrix = world_to_plane;
+        m_draw_field_origin = origin.cast<float>();
+        m_draw_field_size   = Vec3f(float(size.x() > 1e-6 ? size.x() : 1.0),
+                                    float(size.y() > 1e-6 ? size.y() : 1.0),
+                                    float(size.z() > 1e-6 ? size.z() : 1.0));
     }
 
     bool is_slope_GlobalActive() const { return m_slope.isGlobalActive; }

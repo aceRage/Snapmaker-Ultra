@@ -2855,7 +2855,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             r.version = rt.get<int>("<xmlattr>.version", 0);
             // A recipe from a SCHEMA WE DO NOT KNOW is dropped, not guessed at. The object
             // still loads; it simply has no "Edit cut".
-            if (r.version != CutRecipeVersion) {
+            // A recipe from a SCHEMA WE DO NOT KNOW is dropped, not guessed at - but every
+            // version this build DOES know loads, with the fields it does not carry left at
+            // their defaults. Version 1 (before the drawn line became a chain) carries the
+            // samples and the closed flag, which were always the whole description of the
+            // line, so it re-cuts to exactly the same halves.
+            if (!cut_recipe_version_supported(r.version)) {
                 BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cut recipe for object " << obj_idx
                                            << " has unsupported version " << r.version << ", ignored";
                 continue;
@@ -2955,6 +2960,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 CutRecipeStroke &st = r.stroke;
                 st.closed    = stroke_tree->get<int>("<xmlattr>.closed", 0) != 0;
                 st.smoothing = stroke_tree->get<double>("<xmlattr>.smoothing", 0.2);
+                // VERSION 2. Absent in a version 1 file, where it defaults to 0 - and
+                // cut_recipe_stroke_to_chain() then infers it from "unclosed and long
+                // enough", which is what a line that was cut with always was.
+                st.finished_open = stroke_tree->get<int>("<xmlattr>.finished_open", 0) != 0;
                 for (const auto &sample : *stroke_tree) {
                     if (sample.first != "s")
                         continue;
@@ -2971,6 +2980,24 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     const long long facet = sample.second.get<long long>("<xmlattr>.f", 0);
                     smp.facet = (facet >= 0) ? size_t(facet) : 0;
                     st.samples.emplace_back(smp);
+                }
+                // VERSION 2: the chain's per-stroke ranges, as "b,e b,e ..." in one
+                // attribute rather than as elements - there are a handful of them and a
+                // version 1 file simply has no attribute, which reads back as empty and
+                // is exactly the one-stroke fallback cut_recipe_stroke_to_chain() wants.
+                const std::string bounds = stroke_tree->get<std::string>("<xmlattr>.strokes", "");
+                if (!bounds.empty()) {
+                    std::istringstream iss(bounds);
+                    std::string tok;
+                    while (iss >> tok) {
+                        const size_t comma = tok.find(',');
+                        if (comma == std::string::npos)
+                            continue;
+                        const long long b = atoll(tok.substr(0, comma).c_str());
+                        const long long e = atoll(tok.substr(comma + 1).c_str());
+                        if (b >= 0 && e > b)
+                            st.stroke_bounds.emplace_back(uint32_t(b), uint32_t(e));
+                    }
                 }
             }
 
@@ -8754,6 +8781,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 pt::ptree &st = rt.add("stroke", "");
                 st.put("<xmlattr>.closed",    r.stroke.closed ? 1 : 0);
                 st.put("<xmlattr>.smoothing", r.stroke.smoothing);
+                st.put("<xmlattr>.finished_open", r.stroke.finished_open ? 1 : 0);
+                if (!r.stroke.stroke_bounds.empty()) {
+                    std::ostringstream bss;
+                    for (size_t i = 0; i < r.stroke.stroke_bounds.size(); ++ i)
+                        bss << (i ? " " : "") << r.stroke.stroke_bounds[i].first << ','
+                            << r.stroke.stroke_bounds[i].second;
+                    st.put("<xmlattr>.strokes", bss.str());
+                }
                 for (const DrawCutSample &smp : r.stroke.samples) {
                     pt::ptree &s = st.add("s", "");
                     s.put("<xmlattr>.px", smp.pos.x());

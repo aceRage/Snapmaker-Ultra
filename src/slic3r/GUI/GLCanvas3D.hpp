@@ -834,6 +834,7 @@ public:
     void set_color_clip_plane_colors(const std::array<ColorRGBA, 2>& colors) { m_volumes.set_color_clip_plane_colors(colors); }
     void set_color_clip_plane_alphas(float side_1, float side_2) { m_volumes.set_color_clip_plane_alphas(side_1, side_2); }
     void set_curved_color_clip(unsigned int tex, const Transform3d& world_to_plane, double half_size_u, double half_size_v, double range = 0.) { m_volumes.set_curved_color_clip(tex, world_to_plane, half_size_u, half_size_v, range); }
+    void set_draw_color_clip(unsigned int tex, const Transform3d& world_to_plane, const Vec3d& origin, const Vec3d& size) { m_volumes.set_draw_color_clip(tex, world_to_plane, origin, size); }
 
     void set_show_world_axes(bool flag) { m_show_world_axes = flag; }
     void refresh_camera_scene_box();

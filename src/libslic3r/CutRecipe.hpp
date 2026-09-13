@@ -54,7 +54,21 @@ struct CutConnector;
 // produce a DIFFERENT cut from the one the halves were made with.
 //
 //  1  initial: flat / curved / drawn, thickness, visibility, connectors, mesh blob.
-static constexpr int CutRecipeVersion = 1;
+//  2  the drawn line became a CHAIN of strokes (2026-09-12): CutRecipeStroke grew
+//     `stroke_bounds`, the per-stroke ranges the chain's undo works off.
+//
+// A version 1 recipe STILL LOADS. Its samples ARE the chain - the samples and the
+// closed flag were always the whole description of the line - so a version 1 file
+// re-cuts to exactly the same halves; what it does not carry is where one stroke
+// ended and the next began, and cut_recipe_stroke_to_chain() then treats the whole
+// list as one stroke, which is the right answer for a line drawn in one gesture and
+// the harmless answer for any other.
+static constexpr int CutRecipeVersion = 2;
+
+// The oldest version a reader accepts. Between this and CutRecipeVersion the fields
+// a recipe does not carry are left at their defaults.
+static constexpr int CutRecipeMinVersion = 1;
+inline bool cut_recipe_version_supported(int v) { return v >= CutRecipeMinVersion && v <= CutRecipeVersion; }
 
 // Which surface the cut was made with. Mirrors the gizmo's CutSurfaceMode
 // crossed with its CutMode, flattened into the one choice that actually decides
@@ -141,6 +155,23 @@ struct CutRecipeStroke
     // The panel's 0..1 smoothing, which is an INPUT to finish(), so it belongs
     // with the samples rather than with the sweep parameters.
     double                     smoothing{ 0.2 };
+    // VERSION 2 (2026-09-12). The line is a CHAIN of strokes, and the chain's undo
+    // works off the range each appended stroke occupies in `samples`. Storing the
+    // ranges is what lets a reopened cut's Ctrl+Z take back one stroke rather than
+    // the whole line.
+    //
+    // Empty for a version 1 recipe. cut_recipe_stroke_to_chain() then treats the
+    // whole sample list as one stroke.
+    std::vector<std::pair<uint32_t, uint32_t>> stroke_bounds;
+    // VERSION 2. The user's explicit "this line is finished and is not a loop" - the
+    // panel's "Cut along the line". Distinct from `closed == false`, which on its own
+    // means only "not a loop", and which for a chain still being drawn means "not
+    // finished". See DrawCutChain::finish_open().
+    //
+    // A version 1 recipe was always one of the two: its line was cut with, so it was
+    // finished. cut_recipe_stroke_to_chain() therefore treats an unclosed version 1
+    // stroke as finished-open, which is what it was.
+    bool                       finished_open{ false };
 
     bool operator==(const CutRecipeStroke& o) const;
     bool operator!=(const CutRecipeStroke& o) const { return !(*this == o); }
@@ -148,14 +179,23 @@ struct CutRecipeStroke
     // DrawCutSample has no serializer of its own (it is a plain capture record in
     // DrawCut.hpp, which knows nothing about cereal), so its fields go through
     // one by one rather than pulling cereal into that header.
+    // Cereal is for the UNDO STACK and the project backup, never across versions -
+    // a blob is written and read by the same binary - so both sides always carry
+    // stroke_bounds. The 3MF path is the one that has to read a version 1 stream,
+    // and it has its own explicit schema in bbs_3mf.cpp.
     template<class Archive> void save(Archive& ar) const {
+        ar(finished_open);
         ar(closed, smoothing);
         ar(uint64_t(samples.size()));
         for (const DrawCutSample& s : samples)
             ar(s.pos, s.normal, uint64_t(s.facet));
+        ar(uint64_t(stroke_bounds.size()));
+        for (const std::pair<uint32_t, uint32_t>& b : stroke_bounds)
+            ar(b.first, b.second);
     }
     template<class Archive> void load(Archive& ar) {
-        uint64_t n = 0;
+        uint64_t n = 0, nb = 0;
+        ar(finished_open);
         ar(closed, smoothing);
         ar(n);
         samples.clear();
@@ -164,6 +204,14 @@ struct CutRecipeStroke
             uint64_t facet = 0;
             ar(s.pos, s.normal, facet);
             s.facet = size_t(facet);
+        }
+        ar(nb);
+        stroke_bounds.clear();
+        stroke_bounds.reserve(size_t(nb));
+        for (uint64_t i = 0; i < nb; ++ i) {
+            uint32_t a = 0, b = 0;
+            ar(a, b);
+            stroke_bounds.emplace_back(a, b);
         }
     }
 };
@@ -312,6 +360,20 @@ std::string cut_recipe_mesh_hash(const std::vector<uint8_t>& blob);
 // CutRecipe.cpp, which may include Model.hpp.
 void cut_recipe_connectors_from_model(const std::vector<CutConnector>& in, std::vector<CutRecipeConnector>& out);
 void cut_recipe_connectors_to_model(const std::vector<CutRecipeConnector>& in, std::vector<CutConnector>& out);
+
+// Convert between the recipe's stored stroke and the DrawCutChain the gizmo edits.
+//
+// A recipe whose `stroke_bounds` is empty - every version 1 recipe, and any version 2
+// one written from a line drawn in a single gesture - becomes a chain of ONE stroke
+// covering every sample. That is right twice over: it is what a single-gesture line
+// was, and a reopened cut's first Ctrl+Z should take back "the line", not unpick
+// strokes from a session the user does not remember.
+//
+// Bounds that do not tile [0, samples.size()) exactly are DISCARDED rather than
+// half-applied, and the one-stroke fallback is used: a chain whose ranges do not
+// match its samples would corrupt undo in a way the user cannot see coming.
+void            cut_recipe_stroke_to_chain(const CutRecipeStroke& in, DrawCutChain& out);
+CutRecipeStroke cut_recipe_stroke_from_chain(const DrawCutChain& chain, double smoothing);
 
 } // namespace Slic3r
 
