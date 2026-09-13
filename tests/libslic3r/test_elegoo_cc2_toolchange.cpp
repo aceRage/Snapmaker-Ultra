@@ -34,9 +34,17 @@ namespace {
 std::string read_cc2_change_filament_gcode()
 {
     // tests run from the build tree; walk up to the repository root
-    boost::filesystem::path dir = boost::filesystem::current_path();
     boost::filesystem::path preset;
-    for (int up = 0; up < 6 && !dir.empty(); ++up) {
+    // TEST_DATA_DIR is <repo>/tests/data, so the profiles live two levels up from it; try that
+    // first so the test does not depend on the working directory it was launched from.
+    {
+        const boost::filesystem::path from_data = boost::filesystem::path(TEST_DATA_DIR).parent_path().parent_path()
+            / "resources" / "profiles" / "Elegoo" / "machine" / "ECC2" / "Elegoo Centauri Carbon 2 0.4 nozzle.json";
+        if (boost::filesystem::exists(from_data))
+            preset = from_data;
+    }
+    boost::filesystem::path dir = boost::filesystem::current_path();
+    for (int up = 0; preset.empty() && up < 6 && !dir.empty(); ++up) {
         const boost::filesystem::path candidate =
             dir / "resources" / "profiles" / "Elegoo" / "machine" / "ECC2" /
             "Elegoo Centauri Carbon 2 0.4 nozzle.json";
