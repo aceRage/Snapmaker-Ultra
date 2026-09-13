@@ -271,6 +271,181 @@ TranslateResult translate_region(const indexed_triangle_set &its,
                                  const FaceRegion           &region,
                                  const TranslateParams      &params);
 
+// ----------------------------------------------------------------------------
+// Edge bevel / chamfer - PHASE 2, the real algorithm
+// ----------------------------------------------------------------------------
+//
+// Takes a set of feature edges (phase 1's EdgeChain, or several of them, or every
+// edge of the mesh) and replaces each one with a strip of new geometry: a single
+// flat facet band for a CHAMFER, or an N-segment approximation of a circular arc
+// for a BEVEL.
+//
+// THE CONTRACT IS DIFFERENT FROM PHASE 1's, and deliberately so. This INSERTS
+// GEOMETRY: vertices are added, facets are added and every index is renumbered.
+// So the commit must take the OTHER path - Plater::clear_before_change_mesh()
+// first, the way Subdivide and Simplify do - and painted supports, seams, MMU
+// colours and fuzzy skin are all CLEARED. The header says it once here so nobody
+// has to rediscover it from a bug report.
+//
+// ---------------------------------------------------------------------------
+// The algorithm, and why it is shaped this way
+// ---------------------------------------------------------------------------
+//
+// The single most important design decision, taken straight from the research
+// spec's reading of Blender's bmesh_bevel: SOLVE EVERY WIDTH GLOBALLY BEFORE
+// BUILDING ANY GEOMETRY. Blender's first bevel solved widths greedily, one edge
+// at a time, depth-first - and was scrapped because it was ORDER-DEPENDENT: two
+// topologically identical parts came out with different widths depending on
+// which edge the walk happened to start from. This repo has determinism gates,
+// so that failure mode is not acceptable here either.
+//
+// Concretely the pass order is:
+//
+//   1. VALIDATE. Every requested edge must be manifold (exactly two incident
+//      facets) and non-degenerate. A non-manifold edge is refused outright
+//      rather than guessed at.
+//   2. SOLVE WIDTHS. Compute one offset distance per BEVELLED EDGE, as the
+//      minimum of the requested d and every geometric limit that edge is subject
+//      to - the length of the incident facets' other edges, the room left by
+//      other bevelled edges meeting it at a shared vertex, and the chain's own
+//      shortest edge. The solve is a pure function of the mesh and the edge SET,
+//      never of the order the edges are visited in, so the same input always
+//      gives the same widths.
+//   3. BUILD. Only now is any geometry emitted: offset points, then edge strips,
+//      then corner patches, then the re-cut interiors of the incident facets.
+//   4. CLEAN. its_merge_vertices / its_remove_degenerate_faces /
+//      its_compactify_vertices, then assert closedness.
+//
+// Steps 3 and 4 cannot change a width, so no amount of reordering them can
+// change the result.
+
+// Which cross-section to put on the edge.
+enum class BevelProfile : unsigned char {
+    // One flat band: the straight chord between the two offset points. This is
+    // exactly the N = 1 case of Round, and the tests pin that equivalence.
+    Chamfer,
+    // N segments interpolated along the circular arc tangent to both incident
+    // faces. N = 1 degenerates to the chamfer, which is the degeneracy test.
+    Round
+};
+
+struct BevelParams
+{
+    // The offset distance from the edge, measured along each incident face, in
+    // mesh units. This is the "width" the global solve clamps.
+    float        width{1.f};
+    // Segments in the cross-section. 1 is a chamfer whatever the profile says;
+    // higher values only matter for Round. Clamped to [1, BevelMaxSegments].
+    int          segments{1};
+    BevelProfile profile{BevelProfile::Chamfer};
+    // Below this dihedral an edge is too flat to be worth bevelling, and
+    // bevelling it would only add facets for nothing. Such edges are dropped from
+    // the request (and counted in the result) rather than refused.
+    float        min_dihedral_deg{5.f};
+    // The fraction of a limiting length a width may take up. 0.5 means "never
+    // take more than half of the shortest edge you are competing for", which is
+    // what stops two bevels meeting in the middle and inverting.
+    float        clamp_fraction{0.5f};
+    // Run the self-intersection guard on the result. Off for a live preview.
+    bool         check_self_intersection{false};
+};
+
+static constexpr int BevelMaxSegments = 32;
+
+// Why a bevel did or did not happen.
+enum class BevelStatus : unsigned char {
+    Ok,
+    // No edges were asked for, or every one of them was dropped as too flat.
+    EmptyChain,
+    // At least one requested edge is non-manifold. Refused outright: the strip
+    // has no well-defined two sides, so there is nothing honest to build.
+    NonManifold,
+    // width <= 0, or segments <= 0. The mesh comes back unchanged.
+    NoOp,
+    // The global solve clamped every width to zero - the requested width does not
+    // fit anywhere on this mesh at all.
+    WidthTooSmall,
+    // The build produced an open or self-intersecting mesh. This is the "should
+    // not happen" bucket; the input mesh is returned unchanged rather than a
+    // broken one being handed on.
+    Failed
+};
+
+struct BevelResult
+{
+    BevelStatus          status{BevelStatus::EmptyChain};
+    // The bevelled mesh. Empty on any status but Ok and NoOp; NoOp returns the
+    // input unchanged.
+    indexed_triangle_set mesh;
+
+    // --- what the solve decided, for the panel and the tests ---
+    // How many edges were actually bevelled.
+    size_t bevelled_edges{0};
+    // How many were dropped for being flatter than min_dihedral_deg.
+    size_t dropped_flat{0};
+    // How many were dropped for being CONCAVE. A known limitation, spelled out at
+    // the drop site in MeshEdit.cpp: the corner split removes material, which is
+    // right for an outside edge and wrong for an inside one. "Round all edges"
+    // (MeshRound.hpp) rounds concave edges and is the tool for them meanwhile.
+    size_t dropped_concave{0};
+    // How many corner patches were emitted (one per vertex where two or more
+    // bevelled edges meet).
+    size_t corner_patches{0};
+    // The narrowest and widest width the solve settled on. When `clamped` is set,
+    // min_width is below the requested one and the panel should say so.
+    float  min_width{0.f};
+    float  max_width{0.f};
+    bool   clamped{false};
+
+    bool ok() const { return status == BevelStatus::Ok || status == BevelStatus::NoOp; }
+};
+
+// Bevel `edges` (global edge ids, in any order - the result does not depend on
+// it) on `its`.
+//
+// Corners: where two or more bevelled edges share a vertex, their strips would
+// overlap, so the shared vertex is replaced by a CORNER PATCH - the polygon
+// whose boundary is the arriving end-rings of each strip, triangulated as a fan
+// from its own centroid. On a cube with all 12 edges bevelled this produces the
+// classic 8 three-sided corner patches, which is the thing the tests check for.
+//
+// Returns Ok with the new mesh, or a status saying why not. The mesh is always
+// either watertight and manifold or not returned at all.
+BevelResult bevel_edges(const indexed_triangle_set &its,
+                        const MeshTopology         &topo,
+                        const std::vector<int>     &edges,
+                        const BevelParams          &params);
+
+// Convenience: bevel one chain. Exactly bevel_edges() over chain.edges.
+BevelResult bevel_chain(const indexed_triangle_set &its,
+                        const MeshTopology         &topo,
+                        const EdgeChain            &chain,
+                        const BevelParams          &params);
+
+// The width solve, exposed so the tests can pin order-independence directly
+// rather than inferring it from the output mesh, and so the gizmo's panel can
+// show the clamped width before the user presses Apply.
+//
+// Returns one width per entry of `edges`, in the SAME ORDER as `edges`. An entry
+// is 0 for an edge that was dropped (too flat) or could not be bevelled.
+std::vector<float> solve_bevel_widths(const indexed_triangle_set &its,
+                                      const MeshTopology         &topo,
+                                      const std::vector<int>     &edges,
+                                      const BevelParams          &params);
+
+// The volume a box of `size` loses when `r` is chamfered off each of its twelve
+// edges - the yardstick the cube tests measure against. A single edge of length
+// L loses the triangular prism 0.5 * w^2 * L where w is the offset; twelve of
+// them share eight corners, which the corner patches cut back.
+//
+// Exposed because both the tests and the gizmo's panel want the same number.
+double chamfered_box_volume_loss(const Vec3d &size, double w);
+
+// True when every edge of `its` is shared by exactly two facets: the closedness
+// assertion the bevel finishes with, and what the tests mean by "watertight and
+// manifold".
+bool is_closed_manifold(const indexed_triangle_set &its);
+
 // True when `its` intersects itself. Thin wrapper over
 // MeshBoolean::cgal::does_self_intersect so the tests and the gizmo have one
 // name for the guard and MeshEdit.cpp owns the only include of it.
@@ -315,6 +490,21 @@ public:
     // undo entry is pushed first; on anything else nothing changes and the
     // status says why. NoOp changes nothing and pushes nothing.
     TranslateResult apply_translate(const FaceRegion &region, const TranslateParams &params);
+
+    // Apply a bevel to the working mesh. Same contract as apply_translate: on Ok
+    // the mesh is replaced and an undo entry is pushed FIRST; on anything else
+    // nothing changes and the status says why.
+    //
+    // Unlike a translate this renumbers everything, so the caller must commit it
+    // through the clear_before_change_mesh() path - see BevelResult's header
+    // comment. The session itself does not care: it rebuilds its topology either
+    // way, and the undo stack stores whole meshes.
+    BevelResult apply_bevel(const std::vector<int> &edges, const BevelParams &params);
+    BevelResult apply_bevel(const EdgeChain &chain, const BevelParams &params);
+
+    // Preview a bevel WITHOUT touching the working mesh or the undo stack, so the
+    // gizmo can show the result mesh while the width slider moves.
+    BevelResult preview_bevel(const std::vector<int> &edges, const BevelParams &params) const;
 
     // Replace the working mesh outright (the drag preview reverting to the
     // pre-drag mesh between ticks). Does NOT push undo - a preview is not an

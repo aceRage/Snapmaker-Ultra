@@ -16,6 +16,8 @@
 #include "libslic3r/Line.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/MeshSculpt.hpp"
+// Ultra: voxel_ops_available() gates the "Round all edges..." button in the panel.
+#include "libslic3r/MeshRepair.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
 #include <glad/gl.h>
@@ -56,7 +58,7 @@ bool GLGizmoEdit::on_init()
     m_desc["mode_chain"]        = _L("Edge chain");
     m_desc["mode_face_hint"]    = _L("Click a face: the whole flat face is selected.");
     m_desc["mode_smooth_hint"]  = _L("Click a face: a gently curved face is selected whole instead of one triangle at a time.");
-    m_desc["mode_chain_hint"]   = _L("Hover an edge: the whole edge chain lights up. Selecting a chain is preparation for bevel and chamfer, which are not in this release.");
+    m_desc["mode_chain_hint"]   = _L("Hover an edge: the whole edge chain lights up. Select it to chamfer or bevel it.");
     m_desc["feature_angle"]     = _L("Edge angle");
     m_desc["feature_angle_hint"]= _L("An edge counts as an edge when the two faces meeting at it turn by more than this.");
     m_desc["planar_tol"]        = _L("Face tolerance");
@@ -74,7 +76,25 @@ bool GLGizmoEdit::on_init()
     m_desc["redo_caption"]      = ctrl + _L("Y");
     m_desc["no_part"]           = _L("Select a single part to edit it.");
     m_desc["no_selection"]      = _L("Click a face on the part to select it, then drag the arrow or type a distance.");
-    m_desc["chain_selected"]    = _L("Edge chain selected. Push and pull work on faces; bevel and chamfer arrive in a later release.");
+    m_desc["chain_selected"]    = _L("Edge chain selected. Set a width and press Apply to bevel it.");
+    // --- bevel / chamfer (phase 2) ---
+    m_desc["bevel"]             = _L("Bevel");
+    m_desc["bevel_width"]       = _L("Width");
+    m_desc["bevel_segments"]    = _L("Segments");
+    m_desc["bevel_profile"]     = _L("Profile");
+    m_desc["bevel_chamfer"]     = _L("Chamfer");
+    m_desc["bevel_round"]       = _L("Round");
+    m_desc["bevel_apply"]       = _L("Apply bevel");
+    m_desc["bevel_hint"]        = _L("The selected edges are replaced by a flat band (chamfer) or an arc of the chosen number of segments (round). Where chains meet, a corner patch closes the join.");
+    m_desc["bevel_chamfer_hint"]= _L("A chamfer is a single flat band, so the segment count does not apply to it.");
+    m_desc["bevel_clamped"]     = _L("Width clamped to %1% mm: the faces next to the selection are too small for the value you asked for.");
+    m_desc["bevel_corners"]     = _L("%1% corner patch(es)");
+    m_desc["bevel_cleared"]     = _L("A bevel adds triangles, so painted supports, seams, colours and fuzzy skin are cleared when it is applied.");
+    m_desc["bevel_err_manifold"]= _L("That selection contains an edge shared by more than two faces, which cannot be bevelled. Repair the part first.");
+    m_desc["bevel_err_small"]   = _L("The width does not fit anywhere on this selection. Try a smaller value.");
+    m_desc["bevel_err_flat"]    = _L("Those edges are too flat to bevel.");
+    m_desc["bevel_err_concave"] = _L("Inside corners are not bevelled yet. Use \"Round all edges\" to fillet them, or select an outside edge.");
+    m_desc["bevel_err_failed"]  = _L("The bevel did not produce a valid solid, so nothing was changed. Try a smaller width or fewer segments.");
     m_desc["paint_kept"]        = _L("Pushing a face keeps painted supports, seams, colours and fuzzy skin: it moves points and adds no triangles.");
     m_desc["drag_hint"]         = _L("Drag the arrow to push the face along its normal.");
     m_desc["selected_info"]     = _L("Selected: %1% triangles, %2% mm2");
@@ -84,6 +104,11 @@ bool GLGizmoEdit::on_init()
     m_desc["err_bounds"]        = _L("That distance is larger than the part, so it was not applied.");
     m_desc["err_whole"]         = _L("That selection is the whole part. Use the Move gizmo to move a whole part.");
     m_desc["err_empty"]         = _L("Nothing is selected.");
+    // Ultra: the interim whole-mesh fillet, offered here as well as in the object
+    // menu because "round the edges" is the first thing a user reaches for once
+    // they are already in the Edit gizmo.
+    m_desc["round_all"]         = _L("Round all edges...");
+    m_desc["round_all_hint"]    = _L("Fillet every edge of the part at once by a radius. This rebuilds the whole part, so painted data is cleared and the gizmo closes.");
 
     return true;
 }
@@ -326,6 +351,11 @@ void GLGizmoEdit::clear_selection()
     m_hover_chain        = MeshEdit::EdgeChain{};
     m_push_distance      = 0.f;
     m_show_last_status   = false;
+    // A bevel preview belongs to a selection; dropping the selection has to drop
+    // the preview too, or the renderer keeps showing a bevel of edges that are no
+    // longer selected.
+    m_show_bevel_status = false;
+    clear_bevel_preview();
     invalidate_highlight_models();
 }
 
@@ -556,6 +586,171 @@ void GLGizmoEdit::commit_to_volume()
     // throwing the session away.
     m_volume_id = m_volume->id();
     invalidate_highlight_models();
+}
+
+// ----------------------------------------------------------------------------
+// Bevel / chamfer - phase 2
+// ----------------------------------------------------------------------------
+
+MeshEdit::BevelParams GLGizmoEdit::bevel_params() const
+{
+    MeshEdit::BevelParams p;
+    // The panel works in WORLD millimetres, the mesh in its own units; a scaled
+    // volume needs the width pulled back the way the push distance is.
+    const double s = mesh_scale();
+    p.width    = float(double(m_bevel_width) / (s > 1e-9 ? s : 1.));
+    p.segments = std::clamp(m_bevel_segments, 1, MeshEdit::BevelMaxSegments);
+    p.profile  = m_bevel_profile == 0 ? MeshEdit::BevelProfile::Chamfer : MeshEdit::BevelProfile::Round;
+    // The preview must stay interactive, so the self-intersection guard is left
+    // to Apply. update_bevel_preview() passes false; apply_bevel() turns it on.
+    p.check_self_intersection = false;
+    return p;
+}
+
+void GLGizmoEdit::clear_bevel_preview()
+{
+    if (!m_bevel_preview_valid)
+        return;
+    m_bevel_preview_valid = false;
+    m_bevel_preview_mesh.clear();
+    m_bevel_preview_width    = -1.f;
+    m_bevel_preview_segments = -1;
+    m_bevel_preview_profile  = -1;
+    m_bevel_preview_seed     = -1;
+    // Put the real mesh back under the renderer. When the session has already gone
+    // (detach() resets it before clearing the selection) refresh_render_volume()
+    // has nothing to restore from - but the volume is being dropped anyway, and
+    // the plater rebuilds its own volumes on the next data_changed(), so there is
+    // nothing stale left to show.
+    refresh_render_volume();
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoEdit::update_bevel_preview()
+{
+    if (!m_session || !m_has_selection || !m_selection_is_chain || m_selected_chain.empty()) {
+        clear_bevel_preview();
+        return;
+    }
+
+    // Rebuild only when something the preview depends on actually moved: a slider
+    // that has not changed redraws the same mesh many times a second otherwise.
+    const int seed = m_selected_chain.edges.empty() ? -1 : m_selected_chain.edges.front();
+    if (m_bevel_preview_valid && m_bevel_preview_width == m_bevel_width &&
+        m_bevel_preview_segments == m_bevel_segments && m_bevel_preview_profile == m_bevel_profile &&
+        m_bevel_preview_seed == seed)
+        return;
+
+    const MeshEdit::BevelResult r = m_session->preview_bevel(m_selected_chain.edges, bevel_params());
+
+    m_bevel_status         = r.status;
+    m_bevel_applied_width  = float(double(r.min_width) * mesh_scale());
+    m_bevel_clamped        = r.clamped;
+    m_bevel_corner_patches = r.corner_patches;
+    m_bevel_dropped_concave = r.dropped_concave;
+    m_show_bevel_status    = true;
+
+    if (r.status != MeshEdit::BevelStatus::Ok || r.mesh.indices.empty()) {
+        // A refusal shows the UNBEVELLED part rather than nothing: the panel says
+        // why, and the user can see what they still have.
+        clear_bevel_preview();
+        return;
+    }
+
+    m_bevel_preview_mesh     = r.mesh;
+    m_bevel_preview_valid    = true;
+    m_bevel_preview_width    = m_bevel_width;
+    m_bevel_preview_segments = m_bevel_segments;
+    m_bevel_preview_profile  = m_bevel_profile;
+    m_bevel_preview_seed     = seed;
+
+    // Show it. The session's own mesh is untouched, so cancelling is free.
+    if (m_object_idx >= 0 && m_volume_idx >= 0) {
+        GLVolumeCollection &volumes = m_parent.get_volumes();
+        for (GLVolume *v : volumes.volumes) {
+            if (v == nullptr || v->composite_id.object_id != m_object_idx || v->composite_id.volume_id != m_volume_idx)
+                continue;
+            v->model.reset();
+            v->model.init_from(m_bevel_preview_mesh);
+        }
+    }
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoEdit::commit_bevelled_mesh(indexed_triangle_set &&its)
+{
+    if (m_volume == nullptr)
+        return;
+
+    Plater *plater = wxGetApp().plater();
+    Plater::TakeSnapshot snapshot(plater, _u8L("Bevel edges"), UndoRedo::SnapshotType::GizmoAction);
+
+    // THE DIFFERENCE FROM A PUSH, and the reason this is a separate function
+    // rather than a flag on commit_to_volume(): a bevel inserts vertices and
+    // facets, so every facet index changes and the painted annotations no longer
+    // refer to the triangles they were painted on. They have to be dropped, which
+    // is what clear_before_change_mesh() does - the same call Subdivide, Simplify
+    // and Remesh make, for the same reason.
+    plater->clear_before_change_mesh(m_object_idx);
+
+    m_volume->set_mesh(std::move(its));
+    m_volume->calculate_convex_hull();
+    m_volume->invalidate_convex_hull_2d();
+    m_volume->set_new_unique_id();
+    if (ModelObject *obj = m_volume->get_object(); obj != nullptr) {
+        obj->invalidate_bounding_box();
+        obj->ensure_on_bed();
+    }
+
+    plater->changed_mesh(m_object_idx);
+    wxGetApp().obj_list()->update_item_error_icon(m_object_idx, -1);
+
+    if (m_c != nullptr)
+        m_c->update(on_get_requirements());
+    m_volume_id = m_volume->id();
+    invalidate_highlight_models();
+}
+
+void GLGizmoEdit::apply_bevel()
+{
+    if (!m_session || !m_has_selection || !m_selection_is_chain || m_selected_chain.empty())
+        return;
+
+    // The preview skipped the self-intersection guard to stay interactive; the
+    // real apply pays for it once.
+    MeshEdit::BevelParams p = bevel_params();
+    p.check_self_intersection = true;
+
+    const MeshEdit::BevelResult r = m_session->apply_bevel(m_selected_chain.edges, p);
+
+    m_bevel_status         = r.status;
+    m_bevel_applied_width  = float(double(r.min_width) * mesh_scale());
+    m_bevel_clamped        = r.clamped;
+    m_bevel_corner_patches = r.corner_patches;
+    m_bevel_dropped_concave = r.dropped_concave;
+    m_show_bevel_status    = true;
+
+    if (r.status != MeshEdit::BevelStatus::Ok) {
+        // Nothing changed; the panel says why. Put the un-bevelled part back under
+        // the renderer in case a preview was up.
+        clear_bevel_preview();
+        return;
+    }
+
+    // The session now holds the bevelled mesh. Drop the preview bookkeeping
+    // FIRST - the preview is now the real thing - then commit and re-sync.
+    m_bevel_preview_valid = false;
+    m_bevel_preview_mesh.clear();
+    m_bevel_preview_width = -1.f;
+    m_bevel_preview_seed  = -1;
+
+    indexed_triangle_set committed = m_session->mesh();
+    commit_bevelled_mesh(std::move(committed));
+
+    // Every index changed, so the old selection means nothing on the new mesh.
+    clear_selection();
+    refresh_render_volume();
+    m_parent.set_as_dirty();
 }
 
 void GLGizmoEdit::refresh_render_volume()
@@ -1069,6 +1264,108 @@ void GLGizmoEdit::on_render_input_window(float x, float y, float bottom_limit)
             clear_selection();
     }
 
+    // --- bevel / chamfer (phase 2) ---
+    //
+    // Offered only for a CHAIN selection: a bevel acts on edges, and a face region
+    // has none of its own. That is also why the two sections are mutually
+    // exclusive rather than both always visible - the panel shows the tool that
+    // applies to what is actually selected.
+    if (m_has_selection && m_selection_is_chain) {
+        ImGui::Separator();
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(m_desc.at("bevel"));
+
+        bool bevel_changed = false;
+
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(m_desc.at("bevel_width"));
+        ImGui::SameLine(label_col);
+        ImGui::PushItemWidth(sliders_width);
+        if (ImGui::BBLDragFloat("##edit_bevel_width", &m_bevel_width, 0.05f, 0.0f, 0.0f, "%.2f mm"))
+            bevel_changed = true;
+        m_bevel_width = std::clamp(m_bevel_width, BevelWidthMin, BevelWidthMax);
+
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(m_desc.at("bevel_segments"));
+        ImGui::SameLine(label_col);
+        ImGui::PushItemWidth(sliders_width);
+        {
+            static const int seg_min = 1;
+            static const int seg_max = MeshEdit::BevelMaxSegments;
+            int              n       = m_bevel_segments;
+            if (ImGui::BBLSliderScalar("##edit_bevel_segments", ImGuiDataType_S32, &n, &seg_min, &seg_max, "%d")) {
+                n = std::max(seg_min, std::min(seg_max, n));
+                if (n != m_bevel_segments) {
+                    m_bevel_segments = n;
+                    bevel_changed    = true;
+                }
+            }
+        }
+
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(m_desc.at("bevel_profile"));
+        {
+            int profile = m_bevel_profile;
+            const bool picked =
+                ImGui::RadioButton(into_u8(m_desc.at("bevel_chamfer")).c_str(), &profile, 0) ||
+                (ImGui::SameLine(), ImGui::RadioButton(into_u8(m_desc.at("bevel_round")).c_str(), &profile, 1));
+            if (picked && profile != m_bevel_profile) {
+                m_bevel_profile = profile;
+                bevel_changed   = true;
+            }
+        }
+        // A chamfer IS the one-segment case, so the segment control means nothing
+        // for it. Say so rather than letting a live-looking slider do nothing.
+        if (m_bevel_profile == 0)
+            m_imgui->text_wrapped(m_desc.at("bevel_chamfer_hint"), wrap_width);
+
+        // The live preview: re-run whenever a control moved, and once on entry so
+        // the user sees the result before touching anything.
+        if (bevel_changed || !m_bevel_preview_valid)
+            update_bevel_preview();
+
+        m_imgui->text_wrapped(m_desc.at("bevel_hint"), wrap_width);
+
+        // What the solve decided, before Apply is pressed.
+        if (m_show_bevel_status) {
+            if (m_bevel_clamped && m_bevel_applied_width > 0.f)
+                m_imgui->warning_text(GUI::format_wxstr(m_desc.at("bevel_clamped"),
+                                                        wxString::Format("%.2f", double(m_bevel_applied_width))));
+            if (m_bevel_corner_patches > 0)
+                m_imgui->text_wrapped(GUI::format_wxstr(m_desc.at("bevel_corners"), m_bevel_corner_patches),
+                                      wrap_width);
+            const wxString *err = nullptr;
+            switch (m_bevel_status) {
+            case MeshEdit::BevelStatus::NonManifold:    err = &m_desc.at("bevel_err_manifold"); break;
+            case MeshEdit::BevelStatus::WidthTooSmall:  err = &m_desc.at("bevel_err_small"); break;
+            // An empty result has two quite different causes, and telling them
+            // apart is the difference between "nothing to do" and "use the other
+            // tool", so the concave case gets its own line.
+            case MeshEdit::BevelStatus::EmptyChain:
+                err = m_bevel_dropped_concave > 0 ? &m_desc.at("bevel_err_concave")
+                                                  : &m_desc.at("bevel_err_flat");
+                break;
+            case MeshEdit::BevelStatus::Failed:         err = &m_desc.at("bevel_err_failed"); break;
+            default: break;
+            }
+            if (err != nullptr)
+                m_imgui->warning_text(*err);
+        }
+
+        if (m_imgui->button(m_desc.at("bevel_apply")))
+            apply_bevel();
+        ImGui::SameLine();
+        if (m_imgui->button(m_desc.at("reset_selection"))) {
+            clear_bevel_preview();
+            clear_selection();
+        }
+
+        // The painted-data warning, stated where the decision is taken rather than
+        // only in the note at the bottom - which is about a PUSH and says the
+        // opposite.
+        m_imgui->text_wrapped(m_desc.at("bevel_cleared"), wrap_width);
+    }
+
     // --- undo / redo ---
     ImGui::Separator();
     {
@@ -1104,6 +1401,28 @@ void GLGizmoEdit::on_render_input_window(float x, float y, float bottom_limit)
 
     ImGui::Separator();
     m_imgui->text_wrapped(m_desc.at("paint_kept"), wrap_width);
+
+    // --- the interim whole-mesh fillet ---
+    //
+    // Deliberately last and visually separated: unlike everything above it, this is
+    // NOT a local edit. It rebuilds the entire part from its distance field, which
+    // renumbers every facet, clears painted data and invalidates this session's
+    // topology cache and undo stack outright - so it closes the gizmo rather than
+    // trying to keep a session alive over a mesh that no longer matches it. The
+    // ObjectList entry point does the closing, because a gizmo cannot reach
+    // GLGizmosManager from here.
+    //
+    // Hidden without OpenVDB, matching the object menu.
+    if (voxel_ops_available()) {
+        ImGui::Separator();
+        // CallAfter, exactly as GLGizmoSculpt's Quad-remesh button does: the handler
+        // closes this gizmo, and destroying the gizmo's state from inside its own
+        // ImGui frame is not survivable. Deferring to the next idle runs it once the
+        // frame is finished.
+        if (m_imgui->button(m_desc.at("round_all")))
+            wxGetApp().CallAfter([]() { wxGetApp().obj_list()->round_all_edges(/*close_gizmos*/ true); });
+        m_imgui->text_wrapped(m_desc.at("round_all_hint"), wrap_width);
+    }
 
     GizmoImguiEnd();
     ImGuiWrapper::pop_toolbar_style();
